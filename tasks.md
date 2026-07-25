@@ -32,7 +32,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo build --release` · `buf lint` · `cargo nextest run -p rmaild health` · `cargo fmt --all -- --check` · `cargo clippy --all-targets --all-features -- -D warnings`
 
 ## 2. Configuration system
-- [ ] status
+- [x] status
 - **depends-on:** 1
 - **parallel-safe:** yes
 - **acceptance:**

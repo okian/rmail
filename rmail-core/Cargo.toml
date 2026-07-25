@@ -15,3 +15,9 @@ tower.workspace = true
 hyper-util.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+figment.workspace = true
+
+[dev-dependencies]
+# Enable figment's `Jail` sandbox for isolated env/file config tests.
+figment = { workspace = true, features = ["test"] }

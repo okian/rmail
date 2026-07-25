@@ -43,6 +43,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 
 thiserror = "2"
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+figment = { version = "0.10", features = ["toml", "env"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

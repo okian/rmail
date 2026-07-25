@@ -5,6 +5,8 @@
 //! the `mail` CLI. Domain, storage, sync, index, search, and AI subsystems land
 //! in later tasks.
 
+pub mod config;
 pub mod transport;
 
+pub use config::{Config, ConfigError};
 pub use transport::{connect_uds, default_socket_path, socket_path_from_env, SOCKET_ENV};
