@@ -1,0 +1,17 @@
+[package]
+name = "rmail-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core domain, storage, sync, index, search, and AI logic for rmail."
+
+[lints]
+workspace = true
+
+[dependencies]
+tonic.workspace = true
+tower.workspace = true
+hyper-util.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

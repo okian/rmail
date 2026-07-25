@@ -1,0 +1,17 @@
+[package]
+name = "rmail-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Generated protobuf/gRPC types for the rmail service (rmail.v1)."
+
+[lints]
+workspace = true
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true

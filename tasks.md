@@ -18,7 +18,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 ---
 
 ## 1. Workspace & toolchain scaffold
-- [ ] status
+- [x] status
 - **depends-on:** none
 - **parallel-safe:** no
 - **acceptance:**

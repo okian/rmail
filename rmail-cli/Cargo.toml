@@ -1,0 +1,26 @@
+[package]
+name = "rmail-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The `mail` command-line client — a thin gRPC client for rmaild."
+
+[[bin]]
+name = "mail"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+rmail-core.workspace = true
+tonic-health.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+rmaild.workspace = true
+rmail-core.workspace = true
+tokio = { workspace = true, features = ["process"] }

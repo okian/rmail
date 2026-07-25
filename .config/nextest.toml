@@ -1,0 +1,5 @@
+[profile.default]
+# Surface output from failing tests immediately.
+failure-output = "immediate"
+# Retry nothing by default; flakiness should be fixed, not masked.
+retries = 0

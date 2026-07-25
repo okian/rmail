@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["rmail-proto", "rmail-core", "rmaild", "rmail-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+
+# Non-negotiables from CLAUDE.md: no unwrap/expect/panic/todo in non-test code.
+# `allow-*-in-tests` (clippy.toml) exempts test code so this is a hard gate for
+# production paths only.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[workspace.dependencies]
+rmail-proto = { path = "rmail-proto" }
+rmail-core = { path = "rmail-core" }
+rmaild = { path = "rmaild" }
+
+tonic = "0.12"
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

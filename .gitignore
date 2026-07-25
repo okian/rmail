@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.env
+*.sock
+
+# This workspace ships binaries (rmaild, mail), so the lockfile is committed for
+# reproducible builds. Override a global gitignore that excludes it.
+!Cargo.lock
+

@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+// rmail.v1 is the first versioned surface of the rmail gRPC API. Breaking
+// changes require a new package version (rmail.v2, ...).
+package rmail.v1;
+
+// HealthPing is a trivial liveness payload used to bootstrap and exercise the
+// service wiring. Real domain messages arrive in later tasks; this exists so
+// the proto toolchain, descriptor set, and reflection have something to compile
+// from day one.
+message HealthPing {
+  // Human-readable message echoed by liveness checks.
+  string message = 1;
+}

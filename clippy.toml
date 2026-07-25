@@ -1,0 +1,4 @@
+# Exempt test code from the unwrap/expect denials declared in the workspace
+# lint table so production paths stay strict while tests read naturally.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

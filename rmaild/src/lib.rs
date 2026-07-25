@@ -1,0 +1,145 @@
+//! The rmail daemon library.
+//!
+//! [`serve_uds`] boots a minimal tonic server on a Unix domain socket exposing
+//! gRPC health and reflection. It is exposed as a library function so both the
+//! `rmaild` binary and integration tests drive the same code path.
+
+use std::future::Future;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use tokio::net::UnixListener;
+use tokio_stream::wrappers::UnixListenerStream;
+use tonic::transport::Server;
+
+/// Errors returned while standing up or running the gRPC server.
+#[derive(Debug, thiserror::Error)]
+pub enum ServeError {
+    /// Binding the Unix domain socket failed.
+    #[error("failed to bind unix socket at {path}: {source}")]
+    Bind {
+        /// Socket path that could not be bound.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A filesystem operation around the socket (mkdir, chmod, unlink) failed.
+    #[error("socket filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// The tonic transport layer failed while serving.
+    #[error("gRPC transport error: {0}")]
+    Transport(#[from] tonic::transport::Error),
+
+    /// Building the reflection service failed.
+    #[error("gRPC reflection setup error: {0}")]
+    Reflection(#[from] tonic_reflection::server::Error),
+}
+
+/// Serve the rmail gRPC surface on a Unix domain socket until `shutdown`
+/// resolves.
+///
+/// The socket is created with `0600` permissions (owner-only). A stale socket
+/// left by a previous run is removed first, and the socket file is unlinked on
+/// graceful shutdown. The server exposes:
+///
+/// - `grpc.health.v1.Health` (reporting `SERVING`), and
+/// - gRPC reflection (v1) over the compiled `rmail.v1` descriptor set.
+///
+/// # Errors
+///
+/// Returns [`ServeError`] if the socket cannot be prepared/bound, the
+/// reflection service cannot be built, or the transport fails while serving.
+pub async fn serve_uds<F>(socket_path: impl AsRef<Path>, shutdown: F) -> Result<(), ServeError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let path = socket_path.as_ref().to_path_buf();
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            // Create the runtime directory owner-only. We only set the mode when
+            // we create it — never chmod a pre-existing (possibly shared) dir.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+    }
+
+    // Bind to a temporary sibling path, lock it down to 0600, then atomically
+    // rename it into place. This closes the window in which a freshly bound
+    // socket is reachable at its final path under umask-derived (world-visible)
+    // permissions, and atomically replaces any stale socket left by a prior run.
+    let tmp_path = path.with_file_name(format!(
+        "{}.tmp.{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "rmaild.sock".to_owned()),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let listener = UnixListener::bind(&tmp_path).map_err(|source| ServeError::Bind {
+        path: path.clone(),
+        source,
+    })?;
+    // Restrict the socket to the owning user before it is reachable at `path`.
+    if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    // Empty service name is the server-wide health per the gRPC health spec.
+    health_reporter
+        .set_service_status("", tonic_health::ServingStatus::Serving)
+        .await;
+
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(rmail_proto::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+
+    let incoming = UnixListenerStream::new(listener);
+    let serve_result = Server::builder()
+        .add_service(health_service)
+        .add_service(reflection)
+        .serve_with_incoming_shutdown(incoming, shutdown)
+        .await;
+
+    // Best-effort cleanup so the next boot starts clean regardless of outcome.
+    let _ = std::fs::remove_file(&path);
+
+    serve_result.map_err(ServeError::from)
+}
+
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM.
+///
+/// Used as the graceful-shutdown trigger for [`serve_uds`] in the binary.
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // If we cannot install the SIGTERM handler, fall back to waiting on
+            // Ctrl-C alone rather than shutting down immediately.
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
