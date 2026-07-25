@@ -1,0 +1,6 @@
+[default.extend-words]
+# Rust crate/tool names the spell-checker misreads.
+ratatui = "ratatui"
+# Intentional misspelling used in prd.md as a spell-correction/fuzzy-find
+# example ("invoce" -> "invoice"). Keep it verbatim.
+invoce = "invoce"
