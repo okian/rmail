@@ -239,6 +239,36 @@ pub fn insert_mailbox(conn: &Connection, new: &NewMailbox) -> rusqlite::Result<i
     Ok(conn.last_insert_rowid())
 }
 
+/// Insert a mailbox by `(account_id, name)`, or update its attributes if it
+/// already exists (folder discovery). Returns the mailbox id.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn upsert_mailbox(
+    conn: &Connection,
+    account_id: i64,
+    name: &str,
+    attributes: Option<&str>,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO mailboxes (account_id, name, attributes)
+         VALUES (:account_id, :name, :attributes)
+         ON CONFLICT(account_id, name) DO UPDATE SET
+             attributes = excluded.attributes,
+             updated_at = unixepoch()",
+        named_params! {
+            ":account_id": account_id,
+            ":name": name,
+            ":attributes": attributes,
+        },
+    )?;
+    conn.query_row(
+        "SELECT id FROM mailboxes WHERE account_id = ?1 AND name = ?2",
+        rusqlite::params![account_id, name],
+        |row| row.get(0),
+    )
+}
+
 /// Fetch a mailbox by id.
 ///
 /// # Errors

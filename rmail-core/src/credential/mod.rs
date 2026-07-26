@@ -7,9 +7,15 @@
 //! never leak into logs.
 
 use std::fmt;
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::error::Error;
+
+/// Wall-clock bound on a credential command so a wedged process cannot pin a
+/// blocking-pool thread.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A resolved secret whose value never appears in `Debug`/`Display` output.
 ///
@@ -130,26 +136,55 @@ impl CredentialSource {
     }
 }
 
-/// Run a shell command and take its trimmed stdout as the secret.
-///
-/// Note: this has no wall-clock timeout. The task that first wires `resolve`
-/// onto a blocking pool (task 8) must bound the subprocess so a wedged command
-/// cannot pin a blocking thread indefinitely.
+/// Run a shell command and take its trimmed stdout as the secret, bounded by
+/// [`COMMAND_TIMEOUT`] so a wedged command is killed rather than pinning a
+/// blocking-pool thread. Never echoes the command's output (it may be secret).
 fn resolve_command(command: &str) -> Result<Secret, Error> {
-    let output = Command::new("sh")
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|e| Error::unauthenticated(format!("credential command failed to start: {e}")))?;
 
-    if !output.status.success() {
-        // Deliberately does not echo stdout/stderr, which may carry secrets.
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= COMMAND_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::unauthenticated(
+                        "credential command timed out".to_owned(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                return Err(Error::unauthenticated(format!(
+                    "credential command failed: {e}"
+                )))
+            }
+        }
+    };
+
+    if !status.success() {
         return Err(Error::unauthenticated(
             "credential command exited with a non-zero status".to_owned(),
         ));
     }
 
-    let value = String::from_utf8(output.stdout).map_err(|_| {
+    // The password is small, so reading after exit won't deadlock the pipe.
+    let mut raw = Vec::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        stdout.read_to_end(&mut raw).map_err(|e| {
+            Error::unauthenticated(format!("failed to read credential command output: {e}"))
+        })?;
+    }
+    let value = String::from_utf8(raw).map_err(|_| {
         Error::unauthenticated("credential command produced non-UTF-8 output".to_owned())
     })?;
     let trimmed = value.trim_end_matches(['\r', '\n']);

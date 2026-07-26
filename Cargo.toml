@@ -52,6 +52,10 @@ r2d2 = "0.8"
 r2d2_sqlite = "0.25"
 refinery = { version = "0.8", features = ["rusqlite"] }
 security-framework = "3"
+async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

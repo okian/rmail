@@ -9,6 +9,7 @@ pub mod account;
 pub mod config;
 pub mod credential;
 pub mod error;
+pub mod imap;
 pub mod repo;
 pub mod storage;
 pub mod telemetry;

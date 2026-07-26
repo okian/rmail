@@ -1,8 +1,8 @@
 //! The `AccountService` gRPC implementation.
 //!
 //! `Create`/`List`/`Get`/`Delete` are wired to the account CRUD in
-//! `rmail_core`; `TestConnection` returns `UNIMPLEMENTED` until IMAP login
-//! lands (task 8). Domain errors map to `tonic::Status` at this boundary.
+//! `rmail_core`; `TestConnection` logs in over IMAP and discovers folders.
+//! Domain errors map to `tonic::Status` at this boundary.
 //
 // `tonic::Status` is intentionally the error type throughout a gRPC service
 // boundary; its size makes `result_large_err` fire on every `Result<_, Status>`
@@ -88,13 +88,19 @@ impl AccountService for AccountApi {
         &self,
         request: Request<TestConnectionRequest>,
     ) -> Result<Response<TestConnectionResponse>, Status> {
-        tracing::Span::current().record(
-            rmail_core::telemetry::FIELD_ACCOUNT,
-            request.into_inner().id,
+        let id = request.into_inner().id;
+        tracing::Span::current().record(rmail_core::telemetry::FIELD_ACCOUNT, id);
+        let report = rmail_core::imap::test_connection(&self.db, id).await?;
+        let caps = report.capabilities;
+        let detail = format!(
+            "connected; {} folders; capabilities: idle={} condstore={} qresync={} move={}",
+            report.folders.len(),
+            caps.idle,
+            caps.condstore,
+            caps.qresync,
+            caps.move_,
         );
-        Err(Status::unimplemented(
-            "TestConnection requires IMAP login, which lands in task 8",
-        ))
+        Ok(Response::new(TestConnectionResponse { ok: true, detail }))
     }
 }
 

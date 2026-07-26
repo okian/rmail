@@ -96,7 +96,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core account:: credential::` · `cargo nextest run -p rmaild account_service`
 
 ## 8. IMAP connection, login & folder listing
-- [ ] status
+- [x] status
 - **depends-on:** 3, 4, 7
 - **parallel-safe:** no
 - **acceptance:**

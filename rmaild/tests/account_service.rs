@@ -1,7 +1,7 @@
 //! Integration test: drive `AccountService` end-to-end against an in-process
 //! tonic server over a Unix domain socket, covering CRUD, the error/`Status`
-//! paths, credential-reference round-tripping, and the `UNIMPLEMENTED`
-//! `TestConnection`.
+//! paths, credential-reference round-tripping, and `TestConnection`'s
+//! precondition/unreachable failure mappings.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
@@ -192,10 +192,12 @@ async fn account_service_out_of_range_port_is_invalid_argument() {
 }
 
 #[tokio::test]
-async fn account_service_test_connection_unimplemented() {
+async fn account_service_test_connection_requires_config() {
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
+    // An account with no IMAP server can't be tested -> FAILED_PRECONDITION
+    // (the RPC is wired; it just needs configuration).
     let created = client
         .create(CreateAccountRequest {
             name: "Personal".to_owned(),
@@ -208,8 +210,41 @@ async fn account_service_test_connection_unimplemented() {
     let status = client
         .test_connection(TestConnectionRequest { id: created.id })
         .await
-        .expect_err("test_connection not yet wired");
-    assert_eq!(status.code(), Code::Unimplemented);
+        .expect_err("test_connection needs an IMAP server");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn account_service_test_connection_unreachable_is_unavailable() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    // A fully-configured account pointed at a refused port exercises the whole
+    // path (credential resolve -> TLS connect) and must map to UNAVAILABLE.
+    let created = client
+        .create(CreateAccountRequest {
+            name: "Unreachable".to_owned(),
+            imap_server: Some("127.0.0.1".to_owned()),
+            imap_port: Some(1),
+            username: Some("u".to_owned()),
+            credential: Some(CredentialRef {
+                source: Some(credential_ref::Source::PasswordCommand(
+                    "printf pw".to_owned(),
+                )),
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner();
+
+    let status = client
+        .test_connection(TestConnectionRequest { id: created.id })
+        .await
+        .expect_err("unreachable server");
+    assert_eq!(status.code(), Code::Unavailable);
 
     server.shutdown().await;
 }
