@@ -61,7 +61,7 @@ pub struct ConnectionReport {
 ///
 /// A `NO`/authentication response is `UNAUTHENTICATED`; a `Validate` error is
 /// `INVALID_ARGUMENT`; I/O and protocol errors are `UNAVAILABLE` (retryable).
-fn map_imap_err(err: async_imap::error::Error) -> Error {
+pub(crate) fn map_imap_err(err: async_imap::error::Error) -> Error {
     use async_imap::error::Error as E;
     match err {
         E::No(msg) => Error::unauthenticated(format!("IMAP login rejected: {msg}")),

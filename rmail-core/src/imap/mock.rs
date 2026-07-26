@@ -16,6 +16,16 @@ pub(crate) struct MockConfig {
     password: String,
     /// `(name, attributes)` pairs returned by `LIST`.
     folders: Vec<(String, String)>,
+    /// A single message returned by `UID FETCH`, if configured.
+    fetch: Option<FetchSpec>,
+}
+
+/// A canned message the mock returns for `UID FETCH`.
+#[derive(Clone)]
+pub(crate) struct FetchSpec {
+    pub(crate) uid: u32,
+    pub(crate) flags: Vec<String>,
+    pub(crate) raw: Vec<u8>,
 }
 
 impl Default for MockConfig {
@@ -23,6 +33,7 @@ impl Default for MockConfig {
         Self {
             password: "password".to_owned(),
             folders: vec![("INBOX".to_owned(), String::new())],
+            fetch: None,
         }
     }
 }
@@ -40,6 +51,16 @@ impl MockConfig {
             .into_iter()
             .map(|(n, a)| (n.to_owned(), a.to_owned()))
             .collect();
+        self
+    }
+
+    /// Set the single message returned by `UID FETCH`.
+    pub(crate) fn fetch(mut self, uid: u32, flags: &[&str], raw: &[u8]) -> Self {
+        self.fetch = Some(FetchSpec {
+            uid,
+            flags: flags.iter().map(|f| (*f).to_owned()).collect(),
+            raw: raw.to_vec(),
+        });
         self
     }
 }
@@ -128,6 +149,26 @@ async fn serve(sock: TcpStream, config: MockConfig) -> std::io::Result<()> {
                 }
                 write
                     .write_all(format!("{tag} OK LIST completed\r\n").as_bytes())
+                    .await?;
+            }
+            "UID" => {
+                // Only `UID FETCH` is modeled.
+                if let Some(spec) = &config.fetch {
+                    let raw = &spec.raw;
+                    let n = raw.len();
+                    let flags = spec.flags.join(" ");
+                    let head = format!(
+                        "* 1 FETCH (UID {} FLAGS ({flags}) \
+                         INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" \
+                         RFC822.SIZE {n} BODY[] {{{n}}}\r\n",
+                        spec.uid
+                    );
+                    write.write_all(head.as_bytes()).await?;
+                    write.write_all(raw).await?;
+                    write.write_all(b")\r\n").await?;
+                }
+                write
+                    .write_all(format!("{tag} OK UID FETCH completed\r\n").as_bytes())
                     .await?;
             }
             "LOGOUT" => {

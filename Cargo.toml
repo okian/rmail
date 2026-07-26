@@ -56,6 +56,9 @@ async-imap = { version = "0.10", default-features = false, features = ["runtime-
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 futures = "0.3"
+mail-parser = "0.9"
+html2text = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

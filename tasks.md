@@ -107,7 +107,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core imap::conn imap::folders`
 
 ## 9. Message fetch, parse & persist
-- [ ] status
+- [x] status
 - **depends-on:** 6, 8
 - **parallel-safe:** no
 - **acceptance:**
