@@ -4,6 +4,13 @@ modules:
 lint:
   use:
     - STANDARD
+  except:
+    # rmail keeps all services in one versioned package and reuses messages
+    # (e.g. Account is both a Create result and a Get result), so the strict
+    # per-RPC request/response naming + uniqueness rules do not apply.
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
 breaking:
   use:
     - FILE

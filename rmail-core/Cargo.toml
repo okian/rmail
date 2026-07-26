@@ -25,6 +25,9 @@ r2d2.workspace = true
 r2d2_sqlite.workspace = true
 refinery.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
+
 [dev-dependencies]
 # Enable figment's `Jail` sandbox for isolated env/file config tests.
 figment = { workspace = true, features = ["test"] }

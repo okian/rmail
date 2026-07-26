@@ -41,6 +41,7 @@ tokio = { version = "1", features = [
 tokio-stream = { version = "0.1", features = ["net"] }
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
 
 thiserror = "2"
 anyhow = "1"
@@ -50,6 +51,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
 refinery = { version = "0.8", features = ["rusqlite"] }
+security-framework = "3"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -29,9 +29,14 @@ pub struct NewAccount {
     pub smtp_server: Option<String>,
     /// SMTP port.
     pub smtp_port: Option<u16>,
+    /// Credential kind (`none`|`command`|`env`|`keychain`); defaults to `none`.
+    pub secret_kind: Option<String>,
+    /// Credential reference (command / env var name / keychain service).
+    pub secret_ref: Option<String>,
 }
 
-/// A persisted account.
+/// A persisted account. Never carries the plaintext password — only the
+/// `secret_kind`/`secret_ref` describing how to resolve it.
 #[derive(Debug, Clone)]
 pub struct Account {
     /// Stable primary key.
@@ -48,6 +53,10 @@ pub struct Account {
     pub smtp_server: Option<String>,
     /// SMTP port.
     pub smtp_port: Option<u16>,
+    /// Credential kind (`none`|`command`|`env`|`keychain`).
+    pub secret_kind: String,
+    /// Credential reference (command / env var name / keychain service).
+    pub secret_ref: Option<String>,
     /// Creation time (unix seconds).
     pub created_at: i64,
     /// Last-update time (unix seconds).
@@ -64,14 +73,16 @@ impl Account {
             username: row.get("username")?,
             smtp_server: row.get("smtp_server")?,
             smtp_port: row.get("smtp_port")?,
+            secret_kind: row.get("secret_kind")?,
+            secret_ref: row.get("secret_ref")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         })
     }
 }
 
-const ACCOUNT_COLS: &str =
-    "id, name, imap_server, imap_port, username, smtp_server, smtp_port, created_at, updated_at";
+const ACCOUNT_COLS: &str = "id, name, imap_server, imap_port, username, smtp_server, smtp_port, \
+     secret_kind, secret_ref, created_at, updated_at";
 
 /// Insert an account, returning its new id.
 ///
@@ -79,8 +90,11 @@ const ACCOUNT_COLS: &str =
 /// Propagates any `rusqlite` error (e.g. a duplicate `name`).
 pub fn insert_account(conn: &Connection, new: &NewAccount) -> rusqlite::Result<i64> {
     conn.execute(
-        "INSERT INTO accounts (name, imap_server, imap_port, username, smtp_server, smtp_port)
-         VALUES (:name, :imap_server, :imap_port, :username, :smtp_server, :smtp_port)",
+        "INSERT INTO accounts
+             (name, imap_server, imap_port, username, smtp_server, smtp_port, secret_kind, secret_ref)
+         VALUES
+             (:name, :imap_server, :imap_port, :username, :smtp_server, :smtp_port,
+              COALESCE(:secret_kind, 'none'), :secret_ref)",
         named_params! {
             ":name": new.name,
             ":imap_server": new.imap_server,
@@ -88,9 +102,20 @@ pub fn insert_account(conn: &Connection, new: &NewAccount) -> rusqlite::Result<i
             ":username": new.username,
             ":smtp_server": new.smtp_server,
             ":smtp_port": new.smtp_port,
+            ":secret_kind": new.secret_kind,
+            ":secret_ref": new.secret_ref,
         },
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Delete an account by id. Returns whether a row was removed.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn delete_account(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    let affected = conn.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
+    Ok(affected > 0)
 }
 
 /// Fetch an account by id.

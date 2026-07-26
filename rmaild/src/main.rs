@@ -1,8 +1,8 @@
 //! rmail daemon entry point.
 
-use anyhow::Result;
-use rmail_core::socket_path_from_env;
+use anyhow::{Context, Result};
 use rmail_core::telemetry::{self, LogFormat};
+use rmail_core::{db_path_from_env, socket_path_from_env, Database};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -11,9 +11,14 @@ async fn main() -> Result<()> {
     telemetry::init(LogFormat::from_env())?;
 
     let socket = socket_path_from_env();
-    tracing::info!(socket = %socket.display(), "starting rmaild");
+    let db_path = db_path_from_env();
+    tracing::info!(socket = %socket.display(), db = %db_path.display(), "starting rmaild");
 
-    rmaild::serve_uds(&socket, rmaild::shutdown_signal()).await?;
+    // Open the local database, running pending migrations idempotently.
+    let db = Database::open(&db_path)
+        .with_context(|| format!("opening database at {}", db_path.display()))?;
+
+    rmaild::serve_uds(&socket, db, rmaild::shutdown_signal()).await?;
 
     tracing::info!("rmaild stopped");
     Ok(())

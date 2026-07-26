@@ -10,6 +10,9 @@ use tonic::transport::{Channel, Endpoint, Uri};
 /// Environment variable naming the rmaild Unix domain socket.
 pub const SOCKET_ENV: &str = "RMAIL_SOCKET";
 
+/// Environment variable naming the rmail SQLite database file.
+pub const DB_ENV: &str = "RMAIL_DB";
+
 /// Default socket path when [`SOCKET_ENV`] is unset.
 ///
 /// Prefers `$HOME/.local/state/rmail/rmaild.sock`, falling back to a path under
@@ -33,6 +36,28 @@ pub fn socket_path_from_env() -> PathBuf {
     std::env::var_os(SOCKET_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(default_socket_path)
+}
+
+/// Default database path when [`DB_ENV`] is unset: `<data dir>/rmail.db`,
+/// sibling to the default socket.
+#[must_use]
+pub fn default_db_path() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("rmail")
+            .join("rmail.db"),
+        None => std::env::temp_dir().join("rmail").join("rmail.db"),
+    }
+}
+
+/// Database path resolved from [`DB_ENV`], falling back to [`default_db_path`].
+#[must_use]
+pub fn db_path_from_env() -> PathBuf {
+    std::env::var_os(DB_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(default_db_path)
 }
 
 /// Connection-establishment timeout applied to [`connect_uds`]. A per-request

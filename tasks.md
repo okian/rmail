@@ -84,7 +84,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core schema:: repo::`
 
 ## 7. Account model & credential providers
-- [ ] status
+- [x] status
 - **depends-on:** 3, 6
 - **parallel-safe:** no
 - **acceptance:**

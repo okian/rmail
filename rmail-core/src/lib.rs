@@ -5,7 +5,9 @@
 //! the `mail` CLI. Domain, storage, sync, index, search, and AI subsystems land
 //! in later tasks.
 
+pub mod account;
 pub mod config;
+pub mod credential;
 pub mod error;
 pub mod repo;
 pub mod storage;
@@ -13,7 +15,11 @@ pub mod telemetry;
 pub mod transport;
 
 pub use config::{Config, ConfigError};
+pub use credential::{CredentialSource, Secret};
 pub use error::{Error, ErrorReason, Result, ERROR_DOMAIN};
 pub use storage::{Database, StorageError};
 pub use telemetry::{LogFormat, TelemetryError};
-pub use transport::{connect_uds, default_socket_path, socket_path_from_env, SOCKET_ENV};
+pub use transport::{
+    connect_uds, db_path_from_env, default_db_path, default_socket_path, socket_path_from_env,
+    DB_ENV, SOCKET_ENV,
+};

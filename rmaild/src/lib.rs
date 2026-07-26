@@ -1,13 +1,23 @@
 //! The rmail daemon library.
 //!
-//! [`serve_uds`] boots a minimal tonic server on a Unix domain socket exposing
-//! gRPC health and reflection. It is exposed as a library function so both the
-//! `rmaild` binary and integration tests drive the same code path.
+//! [`serve_uds`] boots the tonic server on a Unix domain socket exposing gRPC
+//! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and
+//! `AccountService` — all wrapped in a [`RequestTraceLayer`] that opens a span
+//! per RPC. It is exposed as a library function so both the `rmaild` binary and
+//! integration tests drive the same code path.
+
+mod account_service;
+mod trace;
+
+pub use account_service::AccountApi;
+pub use trace::RequestTraceLayer;
 
 use std::future::Future;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use rmail_core::Database;
+use rmail_proto::v1::account_service_server::AccountServiceServer;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
@@ -52,7 +62,11 @@ pub enum ServeError {
 ///
 /// Returns [`ServeError`] if the socket cannot be prepared/bound, the
 /// reflection service cannot be built, or the transport fails while serving.
-pub async fn serve_uds<F>(socket_path: impl AsRef<Path>, shutdown: F) -> Result<(), ServeError>
+pub async fn serve_uds<F>(
+    socket_path: impl AsRef<Path>,
+    db: Database,
+    shutdown: F,
+) -> Result<(), ServeError>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -106,10 +120,15 @@ where
         .register_encoded_file_descriptor_set(rmail_proto::FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
+    let account_service = AccountServiceServer::new(AccountApi::new(db));
+
     let incoming = UnixListenerStream::new(listener);
     let serve_result = Server::builder()
+        // Every RPC runs inside a request-tracing span.
+        .layer(RequestTraceLayer::new())
         .add_service(health_service)
         .add_service(reflection)
+        .add_service(account_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 

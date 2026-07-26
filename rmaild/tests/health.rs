@@ -28,9 +28,16 @@ fn unique_socket_path() -> PathBuf {
     PathBuf::from("/tmp").join(format!("rmail-test-{pid}-{n}.sock"))
 }
 
+fn unique_db_path() -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("rmail-health-{pid}-{n}.db"))
+}
+
 /// A running in-process server plus the handles to shut it down and join it.
 struct TestServer {
     socket: PathBuf,
+    db_path: PathBuf,
     shutdown: oneshot::Sender<()>,
     handle: JoinHandle<Result<(), rmaild::ServeError>>,
 }
@@ -39,10 +46,12 @@ impl TestServer {
     /// Spawn the server and wait until it answers a health check.
     async fn start() -> Self {
         let socket = unique_socket_path();
+        let db_path = unique_db_path();
+        let db = rmail_core::Database::open(&db_path).unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let server_socket = socket.clone();
         let handle = tokio::spawn(async move {
-            rmaild::serve_uds(&server_socket, async move {
+            rmaild::serve_uds(&server_socket, db, async move {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -69,6 +78,7 @@ impl TestServer {
         assert!(ready, "server {} never became ready", socket.display());
         Self {
             socket,
+            db_path,
             shutdown: shutdown_tx,
             handle,
         }
@@ -89,6 +99,10 @@ impl TestServer {
             "socket {} should be unlinked on shutdown",
             self.socket.display()
         );
+        for suffix in ["", "-wal", "-shm"] {
+            let _ =
+                std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.db_path.display())));
+        }
     }
 }
 

@@ -22,10 +22,16 @@ fn unique_socket_path(tag: &str) -> PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ping_round_trips_health_check() {
     let socket = unique_socket_path("ok");
+    let db_path = std::env::temp_dir().join(format!(
+        "rmail-cli-ping-{}-{}.db",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let db = rmail_core::Database::open(&db_path).expect("open db");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_socket = socket.clone();
     let server = tokio::spawn(async move {
-        rmaild::serve_uds(&server_socket, async move {
+        rmaild::serve_uds(&server_socket, db, async move {
             let _ = shutdown_rx.await;
         })
         .await
@@ -66,6 +72,10 @@ async fn ping_round_trips_health_check() {
         .await
         .expect("join server")
         .expect("server ran cleanly");
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", db_path.display())));
+    }
 }
 
 /// `mail ping` against a missing socket exits non-zero (error path).

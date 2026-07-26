@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// AccountService manages IMAP/SMTP account configuration. Credentials are never
+// carried as plaintext — only a reference describing how to resolve them.
+service AccountService {
+  // Create a new account.
+  rpc Create(CreateAccountRequest) returns (Account);
+  // List all configured accounts.
+  rpc List(ListAccountsRequest) returns (ListAccountsResponse);
+  // Fetch a single account by id.
+  rpc Get(GetAccountRequest) returns (Account);
+  // Delete an account (cascades to its mailboxes and messages).
+  rpc Delete(DeleteAccountRequest) returns (DeleteAccountResponse);
+  // Verify the account can log in to its IMAP server (wired in task 8).
+  rpc TestConnection(TestConnectionRequest) returns (TestConnectionResponse);
+}
+
+// A configured account. Never includes the password — only how to resolve it.
+message Account {
+  int64 id = 1;
+  string name = 2;
+  optional string imap_server = 3;
+  optional uint32 imap_port = 4;
+  optional string username = 5;
+  optional string smtp_server = 6;
+  optional uint32 smtp_port = 7;
+  // Credential resolution: one of none|command|env|keychain.
+  string credential_kind = 8;
+  // The command / env var name / keychain service (absent for `none`).
+  optional string credential_ref = 9;
+  int64 created_at = 10;
+  int64 updated_at = 11;
+}
+
+// A credential reference — how to obtain the password, never the password.
+message CredentialRef {
+  oneof source {
+    // A shell command whose stdout is the password.
+    string password_command = 1;
+    // The name of an environment variable holding the password.
+    string password_env = 2;
+    // A macOS Keychain generic-password service name.
+    string keychain = 3;
+  }
+}
+
+message CreateAccountRequest {
+  string name = 1;
+  optional string imap_server = 2;
+  optional uint32 imap_port = 3;
+  optional string username = 4;
+  optional string smtp_server = 5;
+  optional uint32 smtp_port = 6;
+  // Optional credential reference; absent means no credential.
+  CredentialRef credential = 7;
+}
+
+message ListAccountsRequest {}
+
+message ListAccountsResponse {
+  repeated Account accounts = 1;
+}
+
+message GetAccountRequest {
+  int64 id = 1;
+}
+
+message DeleteAccountRequest {
+  int64 id = 1;
+}
+
+message DeleteAccountResponse {
+  bool deleted = 1;
+}
+
+message TestConnectionRequest {
+  int64 id = 1;
+}
+
+message TestConnectionResponse {
+  bool ok = 1;
+  string detail = 2;
+}

@@ -49,6 +49,7 @@ Environment knobs are documented in [`.env.example`](.env.example). Copy it to
 | Variable            | Meaning                                                       |
 |---------------------|---------------------------------------------------------------|
 | `RMAIL_SOCKET`      | Unix domain socket the daemon serves and the CLI dials.       |
+| `RMAIL_DB`          | SQLite database file the daemon opens (migrations run on open).|
 | `RUST_LOG`          | `tracing-subscriber` `EnvFilter` directive for daemon logs.   |
 | `RMAIL_LOG_FORMAT`  | Daemon log format: `text` (default) or `json`.                |
 
