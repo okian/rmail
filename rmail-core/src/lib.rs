@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod error;
+pub mod repo;
 pub mod storage;
 pub mod telemetry;
 pub mod transport;

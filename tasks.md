@@ -74,7 +74,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core storage::` (WAL enabled, read pool concurrency, migration up/rollback)
 
 ## 6. Baseline core schema
-- [ ] status
+- [x] status
 - **depends-on:** 5
 - **parallel-safe:** no
 - **acceptance:**

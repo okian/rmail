@@ -20,6 +20,8 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
+pub mod schema;
+
 /// Migrations embedded from `rmail-core/migrations` at compile time.
 mod embedded {
     refinery::embed_migrations!("./migrations");

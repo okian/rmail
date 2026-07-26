@@ -68,7 +68,17 @@ fn wal_and_pragmas_are_configured() {
 #[test]
 fn migrations_apply_once_idempotently() {
     let tmp = TempDbPath::new();
-    {
+
+    let applied_history = |db: &Database| -> i64 {
+        db.with_read(|c| {
+            c.query_row("SELECT count(*) FROM refinery_schema_history", [], |r| {
+                r.get(0)
+            })
+        })
+        .unwrap()
+    };
+
+    let first = {
         let db = Database::open(tmp.path()).unwrap();
         let meta_tables: i64 = db
             .with_read(|c| {
@@ -80,18 +90,17 @@ fn migrations_apply_once_idempotently() {
             })
             .unwrap();
         assert_eq!(meta_tables, 1, "V1 migration must create _rmail_meta");
-    }
+        applied_history(&db)
+    };
+    assert!(first > 0, "at least one migration must have applied");
 
-    // Re-open: no pending migrations; the V1 row is present exactly once.
+    // Re-opening applies nothing new — the history is stable (idempotent).
     let db2 = Database::open(tmp.path()).unwrap();
-    let applied: i64 = db2
-        .with_read(|c| {
-            c.query_row("SELECT count(*) FROM refinery_schema_history", [], |r| {
-                r.get(0)
-            })
-        })
-        .unwrap();
-    assert_eq!(applied, 1, "V1 must be applied exactly once across reopens");
+    assert_eq!(
+        applied_history(&db2),
+        first,
+        "reopening must not re-apply migrations"
+    );
 }
 
 #[test]
