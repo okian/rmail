@@ -2,13 +2,13 @@
 
 use anyhow::Result;
 use rmail_core::socket_path_from_env;
-use tracing_subscriber::EnvFilter;
+use rmail_core::telemetry::{self, LogFormat};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Minimal tracing init; the full telemetry baseline lands in task 4.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Install the tracing subscriber before anything else logs. Format is
+    // selected by RMAIL_LOG_FORMAT (text|json); levels by RUST_LOG.
+    telemetry::init(LogFormat::from_env())?;
 
     let socket = socket_path_from_env();
     tracing::info!(socket = %socket.display(), "starting rmaild");

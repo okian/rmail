@@ -53,7 +53,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core error::` (asserts each variant → expected code + reason)
 
 ## 4. Tracing & observability baseline
-- [ ] status
+- [x] status
 - **depends-on:** 1
 - **parallel-safe:** yes
 - **acceptance:**
@@ -90,6 +90,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **acceptance:**
   - Account CRUD over `accounts`; credential resolution via macOS Keychain (`security-framework`), `password_command`, and env — resolved lazily, never persisted in plaintext.
   - `AccountService` gRPC skeleton (`Create/List/Get/Delete/TestConnection` returning `UNIMPLEMENTED` where not yet wired) attached to the daemon.
+  - Server installs a `tower`/`tonic` layer that opens a `telemetry::request_span` (request-id/account/mailbox fields) per RPC — the first real RPCs land here, so the deferred request-trace layer from task 4 is wired now.
   - Redaction: credentials never appear in logs or `Debug`.
 - **verify:** `cargo nextest run -p rmail-core account:: credential::` · `cargo nextest run -p rmaild account_service`
 

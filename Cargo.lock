@@ -931,6 +931,8 @@ dependencies = [
  "tonic",
  "tonic-types",
  "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -956,7 +958,6 @@ dependencies = [
  "tonic-health",
  "tonic-reflection",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

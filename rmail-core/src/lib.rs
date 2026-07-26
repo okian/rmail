@@ -7,8 +7,10 @@
 
 pub mod config;
 pub mod error;
+pub mod telemetry;
 pub mod transport;
 
 pub use config::{Config, ConfigError};
 pub use error::{Error, ErrorReason, Result, ERROR_DOMAIN};
+pub use telemetry::{LogFormat, TelemetryError};
 pub use transport::{connect_uds, default_socket_path, socket_path_from_env, SOCKET_ENV};

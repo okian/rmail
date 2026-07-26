@@ -46,10 +46,19 @@ The daemon shuts down gracefully on SIGINT/SIGTERM and unlinks its socket.
 Environment knobs are documented in [`.env.example`](.env.example). Copy it to
 `.env` for local development. No secrets belong in that file.
 
-| Variable       | Meaning                                                     |
-|----------------|-------------------------------------------------------------|
-| `RMAIL_SOCKET` | Unix domain socket the daemon serves and the CLI dials.     |
-| `RUST_LOG`     | `tracing-subscriber` `EnvFilter` directive for daemon logs. |
+| Variable            | Meaning                                                       |
+|---------------------|---------------------------------------------------------------|
+| `RMAIL_SOCKET`      | Unix domain socket the daemon serves and the CLI dials.       |
+| `RUST_LOG`          | `tracing-subscriber` `EnvFilter` directive for daemon logs.   |
+| `RMAIL_LOG_FORMAT`  | Daemon log format: `text` (default) or `json`.                |
+
+Configuration file fields can also be overridden by environment variables of
+the form `RMAIL_<TABLE>__<FIELD>` (double underscore = nesting); see
+[`.env.example`](.env.example).
+
+All logs go through `tracing` — the daemon never writes to stdout/stderr
+directly. Set `RMAIL_LOG_FORMAT=json` for structured logs suitable for a log
+shipper.
 
 ## Quality gates
 

@@ -18,6 +18,8 @@ tokio.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 figment.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # Enable figment's `Jail` sandbox for isolated env/file config tests.
