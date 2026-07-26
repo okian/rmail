@@ -63,7 +63,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core telemetry::` · `! grep -rn 'println!\|eprintln!' rmail-core/src rmaild/src` (no matches outside tests)
 
 ## 5. SQLite storage foundation & migrations
-- [ ] status
+- [x] status
 - **depends-on:** 1, 2
 - **parallel-safe:** no
 - **acceptance:**
@@ -88,6 +88,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **depends-on:** 3, 6
 - **parallel-safe:** no
 - **acceptance:**
+  - `rmaild` (and `mail` where it opens local state) open the `Database` (task 5) at startup at a resolved data-dir path, running migrations idempotently — the first DB consumer wires this.
   - Account CRUD over `accounts`; credential resolution via macOS Keychain (`security-framework`), `password_command`, and env — resolved lazily, never persisted in plaintext.
   - `AccountService` gRPC skeleton (`Create/List/Get/Delete/TestConnection` returning `UNIMPLEMENTED` where not yet wired) attached to the daemon.
   - Server installs a `tower`/`tonic` layer that opens a `telemetry::request_span` (request-id/account/mailbox fields) per RPC — the first real RPCs land here, so the deferred request-trace layer from task 4 is wired now.
