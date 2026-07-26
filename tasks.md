@@ -43,7 +43,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core config::` (covers defaults, env override, missing-file, bad-value error path)
 
 ## 3. Error model & tonic Status mapping
-- [ ] status
+- [x] status
 - **depends-on:** 1
 - **parallel-safe:** yes
 - **acceptance:**

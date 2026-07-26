@@ -24,6 +24,7 @@ rmail-core = { path = "rmail-core" }
 rmaild = { path = "rmaild" }
 
 tonic = "0.12"
+tonic-types = "0.12"
 tonic-health = "0.12"
 tonic-reflection = "0.12"
 tonic-build = "0.12"
