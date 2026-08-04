@@ -7,8 +7,8 @@ use tracing::Instrument;
 
 use super::parse::{parse_message, ParsedAttachment};
 use crate::error::Error;
+use crate::imap::command_error;
 use crate::imap::conn::ImapStream;
-use crate::imap::map_imap_err;
 use crate::repo;
 use crate::storage::Database;
 use crate::thread;
@@ -91,7 +91,9 @@ pub async fn persist_fetched(
                 repo::get_message_by_identity(&tx, mailbox_id, uidvalidity, uid)?
             {
                 // Re-fetch of an already-stored message: no-op. Note flag/state
-                // reconciliation is the sync engine's job (task 12), not here.
+                // reconciliation belongs to the delta engine
+                // ([`crate::sync::delta`]), which knows what the server changed;
+                // a body re-fetch does not.
                 // The exception is a message stored before threading existed
                 // (or left unthreaded by an interrupted sync) — thread it now
                 // rather than leaving it out of every conversation forever.
@@ -199,11 +201,11 @@ pub async fn fetch_uids<T: ImapStream>(
     let mut stream = session
         .uid_fetch(uid_set, FETCH_QUERY)
         .await
-        .map_err(map_imap_err)?;
+        .map_err(|e| command_error("UID FETCH", e))?;
 
     let mut messages = Vec::new();
     while let Some(item) = stream.next().await {
-        let fetch = item.map_err(map_imap_err)?;
+        let fetch = item.map_err(|e| command_error("UID FETCH", e))?;
         match fetched_from(&fetch, uidvalidity) {
             Some(message) => messages.push(message),
             None => tracing::warn!("skipping FETCH item without a UID or body"),
@@ -261,10 +263,10 @@ pub async fn fetch_and_persist<T: ImapStream>(
     let mut stream = session
         .uid_fetch(uid_set, FETCH_QUERY)
         .await
-        .map_err(map_imap_err)?;
+        .map_err(|e| command_error("UID FETCH", e))?;
 
     while let Some(item) = stream.next().await {
-        let fetch = item.map_err(map_imap_err)?;
+        let fetch = item.map_err(|e| command_error("UID FETCH", e))?;
         let Some(message) = fetched_from(&fetch, uidvalidity) else {
             tracing::warn!("skipping FETCH item without a UID or body");
             continue;
@@ -299,7 +301,7 @@ fn to_new_attachment(message_id: i64, attachment: &ParsedAttachment) -> repo::Ne
 }
 
 /// Render an IMAP flag to its wire string (`\Seen`, or the custom keyword).
-fn flag_to_string(flag: &Flag<'_>) -> String {
+pub(crate) fn flag_to_string(flag: &Flag<'_>) -> String {
     match flag {
         Flag::Seen => "\\Seen".to_owned(),
         Flag::Answered => "\\Answered".to_owned(),

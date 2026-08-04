@@ -6,8 +6,10 @@ everything, and exposes every capability to both humans (CLI/TUI) and AI agents
 (MCP + a complete gRPC API). See [`prd.md`](prd.md) for the full product spec and
 [`tasks.md`](tasks.md) for the work breakdown.
 
-> Status: early scaffold. The workspace, toolchain gates, and a minimal gRPC
-> daemon (health + reflection over a Unix domain socket) are in place.
+> Status: in progress. The workspace, toolchain gates, gRPC daemon, typed
+> config, SQLite store, account/credential handling, IMAP connectivity, message
+> fetch/parse/persist, threading, and folder sync (initial + delta) are in
+> place. See [`tasks.md`](tasks.md) for what is done and what is next.
 
 ## Workspace layout
 
@@ -60,6 +62,37 @@ the form `RMAIL_<TABLE>__<FIELD>` (double underscore = nesting); see
 All logs go through `tracing` — the daemon never writes to stdout/stderr
 directly. Set `RMAIL_LOG_FORMAT=json` for structured logs suitable for a log
 shipper.
+
+## Mail sync
+
+Two engines share one folder model, keyed on `(mailbox, UIDVALIDITY, UID)` and
+checkpointing into the same `sync_state` row:
+
+- **Initial sync** (`rmail_core::sync::full`) walks a folder's UID space
+  downward from `UIDNEXT` in windows, so the newest mail lands first and a
+  mailbox is useful long before the download finishes. It is resumable by
+  construction — a crash costs at most one window.
+- **Delta sync** (`rmail_core::sync::delta`) is the steady state. It answers
+  "what changed?", which the UID walk cannot see: a flag flipped on another
+  device, or a message expunged elsewhere. It picks the cheapest question the
+  server can answer:
+
+  | Strategy | Requires | Cost |
+  |---|---|---|
+  | `Qresync` | `QRESYNC` + a stored modseq | one `UID FETCH … (CHANGEDSINCE n VANISHED)` — changes *and* expunges |
+  | `Condstore` | `CONDSTORE` + a stored modseq | that `FETCH`, plus a `UID SEARCH ALL` for expunges |
+  | `UidDiff` | nothing | `UID SEARCH ALL` plus a header-only flag sweep |
+  | `Full` | nothing | hands back to the initial walk |
+
+`HIGHESTMODSEQ` is a checkpoint of what has been *applied*, not a reading: a run
+that is interrupted leaves it where it was, so the next run re-asks rather than
+skipping past an unapplied change. A `UIDVALIDITY` change drops the stale local
+copy and rebuilds the folder.
+
+`sync.qresync = false` (or `RMAIL_SYNC__QRESYNC=false`) forces the enumeration
+diff on servers whose modseqs cannot be trusted. The engine honors it today via
+`ImapCapabilities::without_modseq`; the daemon-side scheduler that reads the
+setting lands with `SyncService` (task 15).
 
 ## Quality gates
 

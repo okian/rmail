@@ -8,6 +8,8 @@
 //! contact graph and sync checkpoints need. Richer queries land with the tasks
 //! that consume them (sync, threading, search).
 
+use std::collections::BTreeSet;
+
 use rusqlite::{named_params, Connection, OptionalExtension, Row};
 
 // ---------------------------------------------------------------------------
@@ -809,6 +811,68 @@ pub fn list_message_uids(
     rows.collect()
 }
 
+/// The `(uid, message id)` pairs stored for a mailbox at a UIDVALIDITY within
+/// `low..=high`, ascending by UID.
+///
+/// The delta sync needs the surrogate id to reconcile flags and to expunge, but
+/// not the row — [`get_message_by_identity`] would drag every raw RFC822 blob in
+/// the range through memory to answer the same question.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn list_message_uid_ids(
+    conn: &Connection,
+    mailbox_id: i64,
+    uidvalidity: i64,
+    low: i64,
+    high: i64,
+) -> rusqlite::Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT uid, id FROM messages
+         WHERE mailbox_id = ?1 AND uidvalidity = ?2 AND uid BETWEEN ?3 AND ?4
+         ORDER BY uid",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![mailbox_id, uidvalidity, low, high],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    rows.collect()
+}
+
+/// Replace a message's flag set with `flags`, returning whether it changed.
+///
+/// IMAP flags are a set the server owns outright, so a delta sync replaces
+/// rather than merges: a flag the server no longer reports has been cleared.
+/// The `false` return lets a caller distinguish a real flag change from a
+/// message the server merely re-reported.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn replace_flags(
+    conn: &Connection,
+    message_id: i64,
+    flags: &[String],
+) -> rusqlite::Result<bool> {
+    let current: BTreeSet<String> = list_flags(conn, message_id)?.into_iter().collect();
+    let desired: BTreeSet<&str> = flags.iter().map(String::as_str).collect();
+    if current
+        .iter()
+        .map(String::as_str)
+        .eq(desired.iter().copied())
+    {
+        return Ok(false);
+    }
+    conn.execute("DELETE FROM flags WHERE message_id = ?1", [message_id])?;
+    for flag in &desired {
+        add_flag(conn, message_id, flag)?;
+    }
+    conn.execute(
+        "UPDATE messages SET updated_at = unixepoch() WHERE id = ?1",
+        [message_id],
+    )?;
+    Ok(true)
+}
+
 /// Update a mailbox's server-reported UID state after a `SELECT`, so the
 /// `mailboxes` row and the sync checkpoint do not drift apart.
 ///
@@ -824,6 +888,26 @@ pub fn update_mailbox_uid_state(
         "UPDATE mailboxes SET uidvalidity = ?2, uidnext = ?3, updated_at = unixepoch()
          WHERE id = ?1",
         rusqlite::params![mailbox_id, uidvalidity, uidnext],
+    )?;
+    Ok(())
+}
+
+/// Record the `HIGHESTMODSEQ` a `SELECT` reported, mirroring what the server
+/// said. The authoritative *checkpoint* — how far a delta sync has actually
+/// applied — is [`SyncState::highestmodseq`]; this column is the server-state
+/// mirror alongside `uidvalidity`/`uidnext`, and a server that reports no
+/// modseq clears it rather than leaving a stale value behind.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn update_mailbox_highestmodseq(
+    conn: &Connection,
+    mailbox_id: i64,
+    highestmodseq: Option<i64>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mailboxes SET highestmodseq = ?2, updated_at = unixepoch() WHERE id = ?1",
+        rusqlite::params![mailbox_id, highestmodseq],
     )?;
     Ok(())
 }

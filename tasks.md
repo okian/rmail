@@ -136,7 +136,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core sync::full` (fresh sync, resume mid-window, re-run no-op)
 
 ## 12. CONDSTORE/QRESYNC delta sync
-- [ ] status
+- [x] status
 - **depends-on:** 11
 - **parallel-safe:** yes
 - **acceptance:**

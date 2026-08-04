@@ -37,7 +37,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
 use crate::imap::conn::ImapStream;
-use crate::imap::map_imap_err;
 use crate::message::fetch::fetch_and_persist;
 use crate::repo;
 use crate::storage::Database;
@@ -187,16 +186,10 @@ where
     let account_id = mailbox.account_id;
     tracing::Span::current().record("folder", tracing::field::display(&mailbox.name));
 
-    let selected = session.select(&mailbox.name).await.map_err(|e| {
-        // A tagged NO here means the folder is gone or unselectable — not that
-        // the credentials are bad, which is what the login-shaped mapper says.
-        match e {
-            async_imap::error::Error::No(msg) => {
-                Error::not_found(format!("cannot select folder {}: {msg}", mailbox.name))
-            }
-            other => map_imap_err(other),
-        }
-    })?;
+    let selected = session
+        .select(&mailbox.name)
+        .await
+        .map_err(|e| super::select_error(&mailbox.name, e))?;
 
     // Both are load-bearing: UIDVALIDITY keys the UID space, UIDNEXT bounds the
     // walk. A server reporting neither cannot be synced by UID window.
@@ -226,7 +219,8 @@ where
     // A UIDVALIDITY bump invalidates the whole UID space. The old rows are no
     // longer addressable and their UIDs may now belong to different messages,
     // so leaving them would show the user a mailbox with every message twice.
-    // Drop them and rebuild; task 12 adds the smarter in-place re-key.
+    // Drop them and rebuild — the same safe resync [`crate::sync::delta`]
+    // performs when it sees the bump first.
     let purged_stale = if uidvalidity_changed {
         tracing::warn!(
             from = stored_uidvalidity,
@@ -388,7 +382,7 @@ where
 ///
 /// Only storage errors reading the folder list; per-folder failures are
 /// collected into [`AccountSyncReport::failures`].
-#[tracing::instrument(skip(session, db, opts, cancel, on_progress), fields(account_id))]
+#[tracing::instrument(skip(session, db, opts, cancel, on_progress))]
 pub async fn sync_folders<T, F>(
     session: &mut Session<T>,
     db: &Database,
@@ -478,7 +472,7 @@ fn folder_rank(name: &str) -> u8 {
 
 /// Render a sorted, ascending UID list as a compact IMAP set (`1:3,7,10:12`),
 /// so a contiguous window is one range rather than hundreds of numbers.
-fn format_uid_set(uids: &[i64]) -> String {
+pub(crate) fn format_uid_set(uids: &[i64]) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut iter = uids.iter().copied();
     let Some(mut start) = iter.next() else {
@@ -508,29 +502,15 @@ fn render_range(start: i64, end: i64) -> String {
 
 /// Drop this mailbox's messages that belong to a superseded UID space, and
 /// repair the threads they were in.
-async fn purge_other_uidvalidity(db: &Database, mailbox_id: i64, keep: i64) -> Result<u64, Error> {
+pub(crate) async fn purge_other_uidvalidity(
+    db: &Database,
+    mailbox_id: i64,
+    keep: i64,
+) -> Result<u64, Error> {
     let deleted = db
         .write(move |conn| {
             let tx = conn.transaction()?;
-            let threads: Vec<i64> = {
-                let mut stmt = tx.prepare(
-                    "SELECT DISTINCT thread_id FROM messages
-                     WHERE mailbox_id = ?1 AND uidvalidity <> ?2 AND thread_id IS NOT NULL",
-                )?;
-                let rows = stmt.query_map(rusqlite::params![mailbox_id, keep], |row| row.get(0))?;
-                rows.collect::<rusqlite::Result<Vec<i64>>>()?
-            };
-            let deleted = tx.execute(
-                "DELETE FROM messages WHERE mailbox_id = ?1 AND uidvalidity <> ?2",
-                rusqlite::params![mailbox_id, keep],
-            )?;
-            for thread_id in threads {
-                crate::thread::recompute_thread(&tx, thread_id)?;
-                tx.execute(
-                    "DELETE FROM threads WHERE id = ?1 AND message_count = 0",
-                    [thread_id],
-                )?;
-            }
+            let deleted = super::purge_other_uidvalidity(&tx, mailbox_id, keep)?;
             tx.commit()?;
             Ok(deleted)
         })

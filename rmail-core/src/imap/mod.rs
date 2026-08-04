@@ -29,12 +29,32 @@ pub const IMAP_DEADLINE: Duration = Duration::from_secs(30);
 pub struct ImapCapabilities {
     /// `IDLE` — push notifications (task 13).
     pub idle: bool,
-    /// `CONDSTORE` — modseq-based change tracking (task 12).
+    /// `CONDSTORE` — modseq-based change tracking, used by
+    /// [`crate::sync::delta`].
     pub condstore: bool,
-    /// `QRESYNC` — quick resynchronization (task 12).
+    /// `QRESYNC` — quick resynchronization, used by [`crate::sync::delta`].
     pub qresync: bool,
     /// `MOVE` — atomic message move.
     pub move_: bool,
+}
+
+impl ImapCapabilities {
+    /// The same capabilities with the modseq extensions masked off.
+    ///
+    /// This is how `sync.qresync = false` reaches the delta engine: the engine
+    /// is told what it may use, not what the server happens to advertise, so
+    /// turning the setting off downgrades a run to the UID-enumeration diff
+    /// instead of being quietly ignored. Some servers advertise CONDSTORE and
+    /// then report modseqs that go backwards — being able to switch it off per
+    /// account is the difference between a workaround and a re-sync.
+    #[must_use]
+    pub fn without_modseq(self) -> Self {
+        Self {
+            condstore: false,
+            qresync: false,
+            ..self
+        }
+    }
 }
 
 /// One discovered folder.
@@ -71,6 +91,23 @@ pub(crate) fn map_imap_err(err: async_imap::error::Error) -> Error {
         // Bad/Parse/Append and any future non-exhaustive variant: treat as a
         // (retryable) server/protocol problem.
         other => Error::unavailable(format!("IMAP protocol error: {other}")),
+    }
+}
+
+/// Map a failure of a data command (`UID FETCH`, `UID SEARCH`) named by `op`.
+///
+/// [`map_imap_err`] is login-shaped — it reads a tagged `NO` as rejected
+/// credentials. On a fetch or a search a `NO` means something entirely
+/// different and entirely routine (`NO [LIMIT]`, `NO Server busy`, `NO Some
+/// messages could not be fetched`), and reporting it as `UNAUTHENTICATED`
+/// sends whoever is on call chasing an authentication problem that does not
+/// exist. It is a retryable server refusal: `UNAVAILABLE`.
+pub(crate) fn command_error(op: &str, err: async_imap::error::Error) -> Error {
+    match err {
+        async_imap::error::Error::No(msg) => {
+            Error::unavailable(format!("IMAP {op} refused: {msg}"))
+        }
+        other => map_imap_err(other),
     }
 }
 
