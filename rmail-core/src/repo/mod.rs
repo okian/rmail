@@ -783,6 +783,51 @@ pub fn list_messages(
     rows.collect()
 }
 
+/// The UIDs already stored for a mailbox at a given UIDVALIDITY within
+/// `low..=high`, ascending. A sync uses this to drop UIDs it already has from
+/// the window it is about to request; it is deliberately range-scoped so a
+/// million-message folder is never materialized at once.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn list_message_uids(
+    conn: &Connection,
+    mailbox_id: i64,
+    uidvalidity: i64,
+    low: i64,
+    high: i64,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT uid FROM messages
+         WHERE mailbox_id = ?1 AND uidvalidity = ?2 AND uid BETWEEN ?3 AND ?4
+         ORDER BY uid",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![mailbox_id, uidvalidity, low, high],
+        |row| row.get(0),
+    )?;
+    rows.collect()
+}
+
+/// Update a mailbox's server-reported UID state after a `SELECT`, so the
+/// `mailboxes` row and the sync checkpoint do not drift apart.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn update_mailbox_uid_state(
+    conn: &Connection,
+    mailbox_id: i64,
+    uidvalidity: i64,
+    uidnext: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE mailboxes SET uidvalidity = ?2, uidnext = ?3, updated_at = unixepoch()
+         WHERE id = ?1",
+        rusqlite::params![mailbox_id, uidvalidity, uidnext],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Flags
 // ---------------------------------------------------------------------------
@@ -933,8 +978,13 @@ pub struct SyncState {
     pub uidvalidity: Option<i64>,
     /// Last-synced HIGHESTMODSEQ.
     pub highestmodseq: Option<i64>,
-    /// Highest UID synced so far (resumable checkpoint).
+    /// **High** water mark: the highest UID the walk has covered. Everything
+    /// above it is new mail a later run must fetch.
     pub last_synced_uid: Option<i64>,
+    /// **Low** water mark: the lowest UID the walk has reached. The backlog
+    /// resumes just below it; `None` means the walk has not started. See
+    /// [`crate::sync::full`] for why the UID set alone cannot supply this.
+    pub walked_down_to: Option<i64>,
     /// Last sync time (unix seconds).
     pub last_sync_at: Option<i64>,
     /// Whether the initial full sync has completed.
@@ -948,6 +998,7 @@ impl SyncState {
             uidvalidity: row.get("uidvalidity")?,
             highestmodseq: row.get("highestmodseq")?,
             last_synced_uid: row.get("last_synced_uid")?,
+            walked_down_to: row.get("walked_down_to")?,
             last_sync_at: row.get("last_sync_at")?,
             full_sync_done: row.get("full_sync_done")?,
         })
@@ -961,13 +1012,16 @@ impl SyncState {
 pub fn upsert_sync_state(conn: &Connection, state: &SyncState) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO sync_state
-             (mailbox_id, uidvalidity, highestmodseq, last_synced_uid, last_sync_at, full_sync_done)
+             (mailbox_id, uidvalidity, highestmodseq, last_synced_uid, walked_down_to,
+              last_sync_at, full_sync_done)
          VALUES
-             (:mailbox_id, :uidvalidity, :highestmodseq, :last_synced_uid, :last_sync_at, :full_sync_done)
+             (:mailbox_id, :uidvalidity, :highestmodseq, :last_synced_uid, :walked_down_to,
+              :last_sync_at, :full_sync_done)
          ON CONFLICT(mailbox_id) DO UPDATE SET
              uidvalidity = excluded.uidvalidity,
              highestmodseq = excluded.highestmodseq,
              last_synced_uid = excluded.last_synced_uid,
+             walked_down_to = excluded.walked_down_to,
              last_sync_at = excluded.last_sync_at,
              full_sync_done = excluded.full_sync_done,
              updated_at = unixepoch()",
@@ -976,6 +1030,7 @@ pub fn upsert_sync_state(conn: &Connection, state: &SyncState) -> rusqlite::Resu
             ":uidvalidity": state.uidvalidity,
             ":highestmodseq": state.highestmodseq,
             ":last_synced_uid": state.last_synced_uid,
+            ":walked_down_to": state.walked_down_to,
             ":last_sync_at": state.last_sync_at,
             ":full_sync_done": state.full_sync_done,
         },
@@ -989,7 +1044,8 @@ pub fn upsert_sync_state(conn: &Connection, state: &SyncState) -> rusqlite::Resu
 /// Propagates any `rusqlite` error.
 pub fn get_sync_state(conn: &Connection, mailbox_id: i64) -> rusqlite::Result<Option<SyncState>> {
     conn.query_row(
-        "SELECT mailbox_id, uidvalidity, highestmodseq, last_synced_uid, last_sync_at, full_sync_done
+        "SELECT mailbox_id, uidvalidity, highestmodseq, last_synced_uid, walked_down_to,
+                last_sync_at, full_sync_done
          FROM sync_state WHERE mailbox_id = ?1",
         [mailbox_id],
         SyncState::from_row,

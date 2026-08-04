@@ -15,6 +15,7 @@ tonic-types.workspace = true
 tower.workspace = true
 hyper-util.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 figment.workspace = true

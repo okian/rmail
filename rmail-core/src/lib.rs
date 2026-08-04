@@ -13,6 +13,7 @@ pub mod imap;
 pub mod message;
 pub mod repo;
 pub mod storage;
+pub mod sync;
 pub mod telemetry;
 pub mod thread;
 pub mod transport;

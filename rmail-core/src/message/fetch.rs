@@ -3,6 +3,7 @@
 use async_imap::types::Flag;
 use async_imap::Session;
 use futures::StreamExt;
+use tracing::Instrument;
 
 use super::parse::{parse_message, ParsedAttachment};
 use crate::error::Error;
@@ -211,17 +212,31 @@ pub async fn fetch_uids<T: ImapStream>(
     Ok(messages)
 }
 
-/// Fetch a UID set and persist each message idempotently, streaming one message
-/// at a time so a full-mailbox fetch never materializes in memory.
+/// How many fetched messages may sit between the socket and the database.
 ///
-/// Callers driving a large or long-running fetch (the sync engine, task 11+)
-/// should bound this with a deadline/cancellation token appropriate to the
-/// mailbox size.
+/// This is the concurrency bound of the fetch pipeline: without it, persisting
+/// message N (parse + a write transaction) happens inline while the server's
+/// FETCH response stream sits idle, so a window of 200 messages serializes 200
+/// write transactions against a stalled socket. With it, downloading and
+/// persisting overlap and at most this many raw messages are ever in memory.
+const PIPELINE_DEPTH: usize = 8;
+
+/// Fetch a UID set and persist each message idempotently.
+///
+/// Downloading and persisting run concurrently across a bounded channel: the
+/// FETCH response is drained as fast as the socket delivers it while a separate
+/// task parses and writes, with never more than [`PIPELINE_DEPTH`] messages in
+/// flight. Nothing materializes the whole mailbox.
+///
+/// Callers driving a large or long-running fetch (the sync engine) should bound
+/// this with a deadline appropriate to the window size. Note a fetch abandoned
+/// mid-stream (dropped future or elapsed timeout) leaves the IMAP session with
+/// an unfinished command: the session must be dropped, not reused.
 ///
 /// # Errors
 ///
 /// A mapped IMAP or storage error.
-#[tracing::instrument(skip(session, db), fields(mailbox_id, uidvalidity))]
+#[tracing::instrument(skip(session, db), fields(uidvalidity))]
 pub async fn fetch_and_persist<T: ImapStream>(
     session: &mut Session<T>,
     db: &Database,
@@ -230,21 +245,43 @@ pub async fn fetch_and_persist<T: ImapStream>(
     uidvalidity: i64,
     uid_set: &str,
 ) -> Result<Vec<PersistOutcome>, Error> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<FetchedMessage>(PIPELINE_DEPTH);
+    let persist_db = db.clone();
+    let persister = tokio::spawn(
+        async move {
+            let mut outcomes = Vec::new();
+            while let Some(message) = rx.recv().await {
+                outcomes.push(persist_fetched(&persist_db, account_id, mailbox_id, message).await?);
+            }
+            Ok::<_, Error>(outcomes)
+        }
+        .instrument(tracing::Span::current()),
+    );
+
     let mut stream = session
         .uid_fetch(uid_set, FETCH_QUERY)
         .await
         .map_err(map_imap_err)?;
 
-    let mut outcomes = Vec::new();
     while let Some(item) = stream.next().await {
         let fetch = item.map_err(map_imap_err)?;
         let Some(message) = fetched_from(&fetch, uidvalidity) else {
             tracing::warn!("skipping FETCH item without a UID or body");
             continue;
         };
-        drop(fetch); // release the borrow of the stream buffer before persisting
-        outcomes.push(persist_fetched(db, account_id, mailbox_id, message).await?);
+        drop(fetch); // release the borrow of the stream buffer before handing off
+        if tx.send(message).await.is_err() {
+            // The persister stopped early; its error is the real one, so stop
+            // reading and let the join below report it.
+            break;
+        }
     }
+    drop(stream);
+    drop(tx);
+
+    let outcomes = persister
+        .await
+        .map_err(|e| Error::internal(format!("message persist task failed: {e}")))??;
     tracing::debug!(persisted = outcomes.len(), "fetch_and_persist complete");
     Ok(outcomes)
 }

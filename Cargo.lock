@@ -1792,6 +1792,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tonic",
  "tonic-types",
  "tower 0.5.3",

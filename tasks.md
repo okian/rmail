@@ -126,7 +126,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core thread::` (reference chains, subject fallback, out-of-order arrival)
 
 ## 11. Full folder sync (initial)
-- [ ] status
+- [x] status
 - **depends-on:** 9, 10
 - **parallel-safe:** no
 - **acceptance:**

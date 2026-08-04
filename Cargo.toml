@@ -39,6 +39,7 @@ tokio = { version = "1", features = [
     "time",
 ] }
 tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"

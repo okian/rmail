@@ -1,0 +1,18 @@
+-- V5: the initial sync's walk cursor.
+--
+-- A full sync walks a folder's UID space downward from UIDNEXT. Which UIDs are
+-- already in `messages` cannot tell it where to stop: a real folder's UID space
+-- is mostly holes (every expunge leaves one permanently), so "not stored" and
+-- "not yet fetched" are indistinguishable from the data alone. Without a
+-- low-water mark, a fully-synced mailbox re-walks its entire UID space on every
+-- run -- for a Gmail INBOX at UIDNEXT 400k that is thousands of pointless
+-- FETCHes forever.
+--
+-- So the walk carries two marks:
+--   last_synced_uid  (existing) -- HIGH water: everything above it is unwalked
+--                                  new mail, the only thing a completed sync
+--                                  needs to ask for.
+--   walked_down_to   (new)      -- LOW water: the backlog resumes just below
+--                                  it. NULL means the walk has not started.
+-- `full_sync_done` is then simply walked_down_to = 1.
+ALTER TABLE sync_state ADD COLUMN walked_down_to INTEGER;
