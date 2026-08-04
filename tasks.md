@@ -117,7 +117,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core message::fetch message::parse` (fixtures for multipart/encoded/HTML mail)
 
 ## 10. Threading model
-- [ ] status
+- [x] status
 - **depends-on:** 9
 - **parallel-safe:** no
 - **acceptance:**

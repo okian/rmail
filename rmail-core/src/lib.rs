@@ -14,6 +14,7 @@ pub mod message;
 pub mod repo;
 pub mod storage;
 pub mod telemetry;
+pub mod thread;
 pub mod transport;
 
 pub use config::{Config, ConfigError};

@@ -10,6 +10,7 @@ use crate::imap::conn::ImapStream;
 use crate::imap::map_imap_err;
 use crate::repo;
 use crate::storage::Database;
+use crate::thread;
 
 /// The IMAP attributes fetched per message.
 const FETCH_QUERY: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY[])";
@@ -32,12 +33,18 @@ pub struct FetchedMessage {
 }
 
 /// The outcome of persisting one fetched message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistOutcome {
     /// The stable message id.
     pub message_id: i64,
     /// Whether a new row was inserted (`false` = already present, a no-op).
     pub inserted: bool,
+    /// The thread the message belongs to.
+    pub thread_id: Option<i64>,
+    /// Threads that were absorbed into [`Self::thread_id`] because this message
+    /// linked two conversations. These ids no longer exist, so anything keyed
+    /// on a thread id (indexes, caches, watchers) must follow them across.
+    pub merged_threads: Vec<i64>,
 }
 
 /// Parse and persist a fetched message, idempotently by IMAP identity.
@@ -84,9 +91,22 @@ pub async fn persist_fetched(
             {
                 // Re-fetch of an already-stored message: no-op. Note flag/state
                 // reconciliation is the sync engine's job (task 12), not here.
+                // The exception is a message stored before threading existed
+                // (or left unthreaded by an interrupted sync) — thread it now
+                // rather than leaving it out of every conversation forever.
+                let (thread_id, merged_threads) = match existing.thread_id {
+                    Some(thread_id) => (Some(thread_id), Vec::new()),
+                    None => match thread::assign_thread(&tx, existing.id)? {
+                        Some(assignment) => (Some(assignment.thread_id), assignment.merged),
+                        None => (None, Vec::new()),
+                    },
+                };
+                tx.commit()?;
                 return Ok(PersistOutcome {
                     message_id: existing.id,
                     inserted: false,
+                    thread_id,
+                    merged_threads,
                 });
             }
 
@@ -121,10 +141,18 @@ pub async fn persist_fetched(
                 repo::add_flag(&tx, message_id, flag)?;
             }
 
+            // Thread in the same transaction: a message is never visible
+            // without a conversation.
+            let assignment = thread::assign_thread(&tx, message_id)?;
+            let thread_id = assignment.as_ref().map(|a| a.thread_id);
+            let merged_threads = assignment.map(|a| a.merged).unwrap_or_default();
+
             tx.commit()?;
             Ok(PersistOutcome {
                 message_id,
                 inserted: true,
+                thread_id,
+                merged_threads,
             })
         })
         .await?;

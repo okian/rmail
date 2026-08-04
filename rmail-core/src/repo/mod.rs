@@ -307,6 +307,8 @@ pub struct NewThread {
     pub subject_norm: Option<String>,
     /// Soft reference to the root message id.
     pub root_message_id: Option<i64>,
+    /// Timestamp of the earliest message (unix seconds).
+    pub first_message_at: Option<i64>,
     /// Timestamp of the most recent message (unix seconds).
     pub last_message_at: Option<i64>,
 }
@@ -322,10 +324,16 @@ pub struct Thread {
     pub subject_norm: Option<String>,
     /// Soft reference to the root message id.
     pub root_message_id: Option<i64>,
+    /// Timestamp of the earliest message — the anchor for the subject-fallback
+    /// window (see [`crate::thread`]).
+    pub first_message_at: Option<i64>,
     /// Timestamp of the most recent message.
     pub last_message_at: Option<i64>,
     /// Number of messages in the thread.
     pub message_count: i64,
+    /// Distinct participant addresses, lowercased, sorted, comma-joined.
+    /// Derived by [`crate::thread::recompute_thread`].
+    pub participants: Option<String>,
     /// Creation time (unix seconds).
     pub created_at: i64,
     /// Last-update time (unix seconds).
@@ -339,16 +347,29 @@ impl Thread {
             account_id: row.get("account_id")?,
             subject_norm: row.get("subject_norm")?,
             root_message_id: row.get("root_message_id")?,
+            first_message_at: row.get("first_message_at")?,
             last_message_at: row.get("last_message_at")?,
             message_count: row.get("message_count")?,
+            participants: row.get("participants")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         })
     }
+
+    /// The participant set as individual addresses.
+    #[must_use]
+    pub fn participant_list(&self) -> Vec<&str> {
+        self.participants
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .filter(|a| !a.is_empty())
+            .collect()
+    }
 }
 
-const THREAD_COLS: &str = "id, account_id, subject_norm, root_message_id, last_message_at, \
-     message_count, created_at, updated_at";
+const THREAD_COLS: &str = "id, account_id, subject_norm, root_message_id, first_message_at, \
+     last_message_at, message_count, participants, created_at, updated_at";
 
 /// Insert a thread, returning its new id.
 ///
@@ -356,12 +377,15 @@ const THREAD_COLS: &str = "id, account_id, subject_norm, root_message_id, last_m
 /// Propagates any `rusqlite` error.
 pub fn insert_thread(conn: &Connection, new: &NewThread) -> rusqlite::Result<i64> {
     conn.execute(
-        "INSERT INTO threads (account_id, subject_norm, root_message_id, last_message_at)
-         VALUES (:account_id, :subject_norm, :root_message_id, :last_message_at)",
+        "INSERT INTO threads
+             (account_id, subject_norm, root_message_id, first_message_at, last_message_at)
+         VALUES
+             (:account_id, :subject_norm, :root_message_id, :first_message_at, :last_message_at)",
         named_params! {
             ":account_id": new.account_id,
             ":subject_norm": new.subject_norm,
             ":root_message_id": new.root_message_id,
+            ":first_message_at": new.first_message_at,
             ":last_message_at": new.last_message_at,
         },
     )?;
@@ -379,6 +403,45 @@ pub fn get_thread(conn: &Connection, id: i64) -> rusqlite::Result<Option<Thread>
         Thread::from_row,
     )
     .optional()
+}
+
+/// List an account's threads, most-recently-active first (the conversation
+/// list view). Backed by `idx_threads_account_activity`, which covers both the
+/// account filter and the ordering.
+///
+/// A negative `limit` is clamped to 0 — in SQLite a negative LIMIT means "no
+/// limit", which would turn a bad page size into a full-table read.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn list_threads(
+    conn: &Connection,
+    account_id: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<Thread>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {THREAD_COLS} FROM threads WHERE account_id = ?1
+         ORDER BY last_message_at DESC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(
+        rusqlite::params![account_id, limit.max(0)],
+        Thread::from_row,
+    )?;
+    rows.collect()
+}
+
+/// List a thread's message ids, oldest first by `COALESCE(date, internaldate)`
+/// — the order a conversation reads in.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn list_thread_message_ids(conn: &Connection, thread_id: i64) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM messages WHERE thread_id = ?1
+         ORDER BY COALESCE(date, internaldate) ASC, id ASC",
+    )?;
+    let rows = stmt.query_map([thread_id], |row| row.get::<_, i64>(0))?;
+    rows.collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +762,9 @@ pub fn get_message_by_identity(
 /// (so mail with a missing/backdated Date header still sorts by arrival), with
 /// a limit. The ordering matches `idx_messages_mailbox_date`.
 ///
+/// A negative `limit` is clamped to 0 — in SQLite a negative LIMIT means "no
+/// limit", which would turn a bad page size into a full-table read.
+///
 /// # Errors
 /// Propagates any `rusqlite` error.
 pub fn list_messages(
@@ -710,7 +776,10 @@ pub fn list_messages(
         "SELECT {MESSAGE_COLS} FROM messages WHERE mailbox_id = ?1
          ORDER BY COALESCE(date, internaldate) DESC LIMIT ?2"
     ))?;
-    let rows = stmt.query_map(rusqlite::params![mailbox_id, limit], Message::from_row)?;
+    let rows = stmt.query_map(
+        rusqlite::params![mailbox_id, limit.max(0)],
+        Message::from_row,
+    )?;
     rows.collect()
 }
 

@@ -2,7 +2,8 @@
 //! plus tests asserting the migrations actually created them and the hot-path
 //! indexes.
 
-/// The core (non-feature) tables established by the baseline migrations.
+/// The core (non-feature) tables established by the baseline migrations plus
+/// the threading migration.
 pub const CORE_TABLES: &[&str] = &[
     "accounts",
     "mailboxes",
@@ -12,6 +13,7 @@ pub const CORE_TABLES: &[&str] = &[
     "flags",
     "attachments",
     "sync_state",
+    "thread_refs",
 ];
 
 #[cfg(test)]
@@ -82,6 +84,8 @@ mod tests {
             "idx_messages_in_reply_to",
             "idx_attachments_message",
             "idx_threads_last_message",
+            "idx_threads_subject_norm",
+            "idx_thread_refs_thread",
         ] {
             assert!(
                 object_exists(&tmp.db, "index", index),

@@ -210,6 +210,10 @@ impl Database {
     /// completion on the blocking pool. Queries here are bounded; interrupting
     /// long scans (via SQLite `interrupt()`) is a follow-up for the search path.
     ///
+    /// The calling span is carried onto the blocking thread, so spans the
+    /// closure opens stay attached to the request trace instead of rooting a
+    /// new one.
+    ///
     /// # Errors
     ///
     /// As [`Database::with_read`], plus [`StorageError::Task`] if the blocking
@@ -220,7 +224,9 @@ impl Database {
         T: Send + 'static,
     {
         let readers = self.readers.clone();
+        let span = tracing::Span::current();
         let join = tokio::task::spawn_blocking(move || -> Result<T, StorageError> {
+            let _entered = span.enter();
             let conn = readers.get()?;
             f(&conn).map_err(StorageError::from)
         })
@@ -234,6 +240,9 @@ impl Database {
     /// Run a **write** closure on a blocking thread so the async runtime is not
     /// blocked.
     ///
+    /// As with [`Database::read`], the calling span is carried onto the
+    /// blocking thread so the closure's spans join the request trace.
+    ///
     /// # Errors
     ///
     /// As [`Database::with_write`], plus [`StorageError::Task`] if the blocking
@@ -244,7 +253,9 @@ impl Database {
         T: Send + 'static,
     {
         let writer = Arc::clone(&self.writer);
+        let span = tracing::Span::current();
         let join = tokio::task::spawn_blocking(move || -> Result<T, StorageError> {
+            let _entered = span.enter();
             let mut guard = writer.lock().map_err(|_| StorageError::Poisoned)?;
             f(&mut guard).map_err(StorageError::from)
         })

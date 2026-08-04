@@ -30,6 +30,16 @@ Content-Transfer-Encoding: base64\r\n\
 aGVsbG8=\r\n\
 --b--\r\n";
 
+/// A reply to `RAW`, for the threading assertion below.
+const REPLY: &[u8] = b"From: Bob <bob@example.com>\r\n\
+To: alice@example.com\r\n\
+Subject: Re: Fetched\r\n\
+Message-ID: <reply@example.com>\r\n\
+In-Reply-To: <fetched@example.com>\r\n\
+References: <fetched@example.com>\r\n\
+\r\n\
+replying\r\n";
+
 struct Fixture {
     db: Database,
     path: PathBuf,
@@ -73,13 +83,17 @@ impl Fixture {
     }
 
     fn fetched(&self, uid: i64) -> FetchedMessage {
+        self.fetched_raw(uid, RAW)
+    }
+
+    fn fetched_raw(&self, uid: i64, raw: &[u8]) -> FetchedMessage {
         FetchedMessage {
             uid,
             uidvalidity: 10,
             internaldate: Some(1_700_000_000),
-            size: Some(RAW.len() as i64),
+            size: Some(raw.len() as i64),
             flags: vec!["\\Seen".to_owned(), "\\Flagged".to_owned()],
-            raw: RAW.to_vec(),
+            raw: raw.to_vec(),
         }
     }
 }
@@ -129,6 +143,84 @@ async fn persist_stores_raw_metadata_attachments_and_flags() {
     let mut flags = fx.db.read(move |c| repo::list_flags(c, id)).await.unwrap();
     flags.sort();
     assert_eq!(flags, vec!["\\Flagged".to_owned(), "\\Seen".to_owned()]);
+}
+
+#[tokio::test]
+async fn persist_threads_the_message_in_the_same_transaction() {
+    let fx = Fixture::open().await;
+    let root = persist_fetched(&fx.db, fx.account_id, fx.mailbox_id, fx.fetched(1))
+        .await
+        .unwrap();
+    let reply = persist_fetched(
+        &fx.db,
+        fx.account_id,
+        fx.mailbox_id,
+        fx.fetched_raw(2, REPLY),
+    )
+    .await
+    .unwrap();
+
+    let thread_id = root.thread_id.expect("root was threaded on persist");
+    assert_eq!(
+        reply.thread_id,
+        Some(thread_id),
+        "the reply joins its parent's thread"
+    );
+
+    let thread = fx
+        .db
+        .read(move |c| repo::get_thread(c, thread_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.message_count, 2);
+    assert_eq!(thread.root_message_id, Some(root.message_id));
+    assert_eq!(thread.subject_norm.as_deref(), Some("fetched"));
+    assert_eq!(
+        thread.participant_list(),
+        vec!["alice@example.com", "bob@example.com"]
+    );
+
+    // A re-fetch reports the same thread without re-threading.
+    let again = persist_fetched(&fx.db, fx.account_id, fx.mailbox_id, fx.fetched(1))
+        .await
+        .unwrap();
+    assert!(!again.inserted);
+    assert_eq!(again.thread_id, Some(thread_id));
+}
+
+#[tokio::test]
+async fn refetch_repairs_a_message_left_without_a_thread() {
+    let fx = Fixture::open().await;
+    let stored = persist_fetched(&fx.db, fx.account_id, fx.mailbox_id, fx.fetched(1))
+        .await
+        .unwrap();
+
+    // Simulate a row stored before threading existed: a re-fetch is otherwise
+    // a no-op, so without repair this message would never join a conversation.
+    fx.db
+        .write(|c| {
+            c.execute("UPDATE messages SET thread_id = NULL", [])?;
+            c.execute("DELETE FROM thread_refs", [])?;
+            c.execute("DELETE FROM threads", [])
+        })
+        .await
+        .unwrap();
+
+    let repaired = persist_fetched(&fx.db, fx.account_id, fx.mailbox_id, fx.fetched(1))
+        .await
+        .unwrap();
+    assert!(!repaired.inserted, "still a no-op for the message row");
+    let thread_id = repaired.thread_id.expect("re-fetch threaded it");
+
+    let thread = fx
+        .db
+        .read(move |c| repo::get_thread(c, thread_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.message_count, 1);
+    assert_eq!(thread.root_message_id, Some(stored.message_id));
 }
 
 #[tokio::test]
