@@ -256,7 +256,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmaild index_service` (status coverage, reindex stream, verify drift)
 
 ## 25. Query understanding — operator parser & grammar
-- [ ] status
+- [x] status
 - **depends-on:** 2, 3
 - **parallel-safe:** no
 - **acceptance:**
