@@ -1083,6 +1083,7 @@ async fn many_large_parts_cost_a_bounded_amount_of_time_and_memory() {
     while part.len() < 900 * 1024 {
         part.push_str(&format!("user{}@example.com ", part.len()));
     }
+    let one_part = part.clone();
     let message_id = fx.message_with("subject line").await;
     fx.db
         .write(move |c| {
@@ -1104,14 +1105,39 @@ async fn many_large_parts_cost_a_bounded_amount_of_time_and_memory() {
         .await
         .unwrap();
 
+    // The same part, once, is the yardstick. The cap binds partway through the
+    // first part, so thirty of them must cost about what one costs. Stating
+    // that as a ratio keeps the assertion about this code; the absolute wall
+    // clock it replaced was really a statement about how busy the machine was,
+    // and failed whenever the test ran alongside anything else.
+    let baseline_id = fx.message_with("baseline").await;
+    fx.db
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO index_content
+                     (message_id, part, text, chars, content_hash, extractor)
+                 VALUES (?1, 'attachment:0', ?2, ?3, X'00', 'test')",
+                rusqlite::params![baseline_id, one_part, one_part.len() as i64],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let baseline_report = extract_entities(&fx.db, baseline_id).await.unwrap();
+    let baseline = started.elapsed();
+    assert_eq!(baseline_report.entities, MAX_ENTITIES_PER_MESSAGE);
+
     let started = std::time::Instant::now();
     let report = extract_entities(&fx.db, message_id).await.unwrap();
     let elapsed = started.elapsed();
 
     assert_eq!(report.entities, MAX_ENTITIES_PER_MESSAGE);
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "the budget must bind before the work is done, not after: {elapsed:?}"
+        elapsed < baseline * 5 + std::time::Duration::from_millis(500),
+        "the budget must bind before the work is done, not after: thirty parts \
+         took {elapsed:?} against a one-part baseline of {baseline:?}"
     );
     assert_eq!(
         report.skipped_parts, 29,

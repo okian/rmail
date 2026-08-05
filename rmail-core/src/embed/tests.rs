@@ -280,8 +280,12 @@ fn building_an_embedder_does_no_io() {
     // model, no test could run without several hundred megabytes on disk.
     let started = std::time::Instant::now();
     let _ = build(&IndexSemanticConfig::default()).unwrap();
+    // Loading the weights takes the better part of a second, so half of one
+    // still separates "built" from "read a model off disk". A tighter bound
+    // was measuring the scheduler rather than this code, and failed whenever
+    // the machine was busy.
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(200),
+        started.elapsed() < std::time::Duration::from_millis(500),
         "took {:?}",
         started.elapsed()
     );

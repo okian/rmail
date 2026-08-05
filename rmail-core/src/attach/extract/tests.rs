@@ -419,10 +419,20 @@ async fn a_zip_with_an_absurd_number_of_entries_is_bounded() {
         .iter()
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
+    // Deflating twenty thousand entries is most of the cost of this test, and
+    // it is the harness's cost, not the extractor's. Timing it too meant a busy
+    // machine failed a bound the extractor never came close to spending.
+    let archive = zip_bytes(&borrowed);
+
     let started = std::time::Instant::now();
-    let (status, _) = extract(Format::Docx, zip_bytes(&borrowed)).await.unwrap();
+    let (status, _) = extract(Format::Docx, archive).await.unwrap();
+    let elapsed = started.elapsed();
+
     assert!(matches!(status, Status::Empty | Status::Ok));
-    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "took {elapsed:?}"
+    );
 }
 
 #[tokio::test]

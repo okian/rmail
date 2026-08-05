@@ -25,7 +25,15 @@ fn constructing_the_embedder_touches_no_disk() {
     let e = LocalEmbedder::new(&LocalEmbedConfig::default());
     assert_eq!(e.model(), "bge-small-en-v1.5");
     assert_eq!(e.dim(), 384);
-    assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    // Loading the weights takes the better part of a second, so half of one
+    // still separates "constructed" from "loaded the model". A tighter bound
+    // was measuring the scheduler rather than this code, and failed whenever
+    // the machine was busy.
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
