@@ -796,4 +796,4 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **acceptance:**
   - `cargo deny check` and `cargo audit` wired as the final CI gate; `buf breaking` runs against the committed baseline on proto changes; criterion perf benchmarks assert the key budgets (first search hit, full ranked search, fuzzy first batch); macOS release packaging script for `rmaild`+`mail`.
   - Deny/audit/breaking failures fail the build.
-- **verify:** `cargo deny check` · `cargo audit` · `buf breaking --against '.git#branch=main'` · `cargo bench -p rmail-core --no-run`
+- **verify:** `cargo deny check` · `cargo audit` · `buf breaking --against proto/buf-baseline.binpb` (this repo has no `main` branch or remote for `.git#branch=main` to resolve against — see `scripts/update-buf-baseline.sh`) · `cargo bench -p rmail-core --no-run`

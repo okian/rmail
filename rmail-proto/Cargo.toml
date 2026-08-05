@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Generated protobuf/gRPC types for the rmail service (rmail.v1)."
+# Not published to crates.io — an internal workspace crate. Lets
+# `deny.toml`'s `bans.allow-wildcard-paths` distinguish an unversioned
+# `path` dependency on a sibling crate (harmless, always local) from a real
+# external wildcard dependency (a supply-chain risk worth denying).
+publish = false
 
 [lints]
 workspace = true

@@ -1,0 +1,27 @@
+# `cargo audit` config (auto-discovered from `./.cargo/audit.toml`; no CLI
+# flags needed — CI and a local `cargo audit` run identically). Companion to
+# the `[advisories]` section of `deny.toml` at the repo root, which is where
+# the actual rationale for each ignored RUSTSEC id lives; kept here too
+# because `cargo deny` and `cargo audit` are two different tools with two
+# different config schemas; there's no single file both can read. Whichever
+# of the two you're updating, check the other before changing an ignore —
+# removing an id from only one leaves that advisory silently unenforced by
+# whichever tool still ignores it.
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0436", # paste, unmaintained — see deny.toml
+    "RUSTSEC-2026-0192", # ttf-parser, unmaintained — see deny.toml
+]
+
+[output]
+# Escalates "unmaintained"/"unsound"/"notice" advisories (informational by
+# default; `cargo audit` only fails the exit code on an actual vulnerability
+# without this) to real failures too — RUSTSEC-2026-0221 (event-listener,
+# "unsound") was caught and fixed this way during this task; without `deny =
+# ["warnings"]` it would only have printed, not failed the build.
+deny = ["warnings"]
+# Not actually quiet — `cargo-audit` 0.22.2's `[output]` table requires this
+# field once the table is present at all (unlike its siblings, it has no
+# `#[serde(default)]` in cargo-audit's own config schema); `false` keeps the
+# normal verbose report.
+quiet = false

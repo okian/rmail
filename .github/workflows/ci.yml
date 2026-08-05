@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # New RUSTSEC advisories land on their own schedule, not this repo's —
+    # without a periodic run, the supply-chain gate only ever re-checks
+    # `Cargo.lock` when a push/PR happens to touch this repo, so an advisory
+    # published the day after the last commit sits undetected indefinitely.
+    - cron: "0 6 * * 1"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -14,7 +20,7 @@ env:
 
 jobs:
   gate:
-    name: fmt · clippy · buf · test · build
+    name: fmt · clippy · buf · test · build · bench · supply-chain
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,8 +41,10 @@ jobs:
         with:
           github_token: ${{ github.token }}
 
-      - name: Install nextest
-        uses: taiki-e/install-action@nextest
+      - name: Install nextest, cargo-deny, cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,cargo-deny,cargo-audit
 
       # The local embedding backend reads its weights from here. Cached across
       # runs so the model is fetched once rather than on every job, and so the
@@ -52,13 +60,25 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: buf lint
         run: buf lint
 
+      # Compares the current proto tree against `proto/buf-baseline.binpb`, a
+      # committed `buf build` image snapshot — regenerate it via
+      # `scripts/update-buf-baseline.sh` once a breaking change is
+      # deliberately accepted (new `rmail.v2` package, etc.). There is no
+      # `main` branch or remote for `--against '.git#branch=main'` to resolve
+      # in this repo's history, so the committed-image form is the baseline
+      # that's actually available; it also has the advantage of working
+      # identically for a contributor running this locally with no network
+      # access to a registry.
+      - name: buf breaking
+        run: buf breaking --against proto/buf-baseline.binpb
+
       - name: test
-        run: cargo nextest run --all-features --workspace
+        run: cargo nextest run --locked --all-features --workspace
         env:
           # Allow the one-time weight download on a cold cache. Opt-in because
           # a unit test may not decide to pull a few hundred megabytes onto a
@@ -69,7 +89,42 @@ jobs:
       # deterministic hashed vectors. It has its own `#[cfg]` paths, so a build
       # that only ever compiles with every feature on does not cover it.
       - name: test without the local model backend
-        run: cargo nextest run --no-default-features --workspace
+        run: cargo nextest run --locked --no-default-features --workspace
 
       - name: build release
-        run: cargo build --release
+        run: cargo build --locked --release
+
+      # Compile-only: the search/fuzzy-finder pipelines these budgets target
+      # (tasks 25-33, 59) don't exist yet, so there's nothing to run a
+      # meaningful sample against on a shared, variably-loaded CI runner. The
+      # gate here is "the harness still compiles" — an actual perf run is a
+      # `cargo bench` a developer invokes locally; see `rmail-core/benches/
+      # search_budgets.rs` for what is and isn't wired to real code today.
+      - name: compile perf benchmarks
+        run: cargo bench -p rmail-core --bench search_budgets --locked --no-run
+
+      # macOS release packaging: builds rmaild + mail already happened above;
+      # this proves the packaging script actually turns them into a
+      # distributable bundle, not just that it parses.
+      - name: package macOS release (smoke test)
+        run: scripts/package-macos.sh --skip-build
+
+      # Supply-chain gate, last because it's the slowest external fetch (a
+      # fresh clone of the RustSec advisory DB) and everything above is cheap
+      # to fail on first. `deny.toml` documents every allowed license and
+      # every ignored advisory with a reason; nothing here is a blanket
+      # bypass. `--locked`: a supply-chain check is only meaningful against
+      # the lockfile this job actually built and tested with — without it,
+      # `cargo deny`'s own `cargo metadata` call could silently re-resolve a
+      # looser `Cargo.toml` constraint to a newer, unreviewed version and
+      # scan that instead.
+      - name: cargo deny check
+        run: cargo deny --all-features --locked check
+
+      # No CLI flags: `.cargo/audit.toml` carries the ignore list and
+      # `deny = ["warnings"]` (auto-discovered by `cargo audit`), so this runs
+      # identically here and on a contributor's machine. `cargo audit` always
+      # reads `Cargo.lock` as committed — no separate `--locked` flag exists
+      # because there is nothing here that would otherwise re-resolve it.
+      - name: cargo audit
+        run: cargo audit

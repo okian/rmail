@@ -1,0 +1,121 @@
+# Supply-chain gate: `cargo deny check` (advisories, licenses, bans, sources).
+# Wired as the final CI step (see `.github/workflows/ci.yml`) and callable
+# locally the same way. Every list below is derived from an actual
+# `cargo-deny --all-features check` run against this workspace's `Cargo.lock`,
+# not copied from a template — an unused entry here would just be a lie about
+# what the dependency tree contains.
+
+[graph]
+# rmail ships macOS only for now (`prd.md`: "Initial release: macOS. Future:
+# Linux."), and the CI runner is `macos-latest`. Scoping the graph to the two
+# Mac triples keeps the advisory/license/bans checks honest about what
+# actually ships — Windows-only transitive deps (a good chunk of `windows-sys`
+# and friends, pulled in by `hf-hub`/`indicatif`/`tempfile` on that platform)
+# never reach a built binary here and would otherwise just be noise a real
+# platform expansion should re-evaluate, not pre-approve today.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+# The gate runs `--all-features` explicitly (matching CLAUDE.md's clippy/test
+# invocations), so this only needs to match what CI passes on the command
+# line; leaving it false here avoids a second, easy-to-forget place that also
+# has to track feature flags.
+all-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# advisories — RUSTSEC vulnerabilities, unmaintained crates, yanked versions.
+# ---------------------------------------------------------------------------
+[advisories]
+ignore = [
+    # `tokenizers` (via `fastembed`, the local ONNX embedding backend) depends
+    # on `paste` for a compile-time macro. The crate is archived with no
+    # replacement upstream in `tokenizers` yet, and `paste`'s own advisory
+    # says "no safe upgrade is available" — there is nothing to bump to. It's
+    # a proc-macro helper with no runtime footprint, not a live attack
+    # surface. Revisit when `tokenizers` moves off it.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro helper pulled in transitively by tokenizers (via fastembed); no replacement released upstream, no runtime exposure" },
+    # `pdf-extract` (attachment text extraction) depends on `lopdf`, which
+    # depends on `ttf-parser` for embedded-font parsing. Same shape as above:
+    # the advisory is "unmaintained" with no CVE and no safe upgrade path:
+    # `lopdf` has not moved off it. `pdf-extract` already runs isolated font
+    # parsing per attachment on a task whose panic is caught (see the
+    # `pdf-extract` note in the root `Cargo.toml`), so a parsing bug here is
+    # already contained by that boundary. Revisit when `lopdf` moves off it.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained font-parsing crate pulled in transitively by lopdf (via pdf-extract); no replacement released upstream, parsing is already fault-isolated per attachment" },
+]
+
+# ---------------------------------------------------------------------------
+# licenses — every SPDX identifier below is one an actual crate in this
+# workspace's `--all-features` graph declares (or is ANDed with another one
+# below on the same crate). None are speculative.
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+    "Apache-2.0",
+    # `rustix` declares "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR
+    # MIT" — plain `Apache-2.0` above already satisfies that OR, so this
+    # entry is not load-bearing for the check to pass, but it's the license
+    # `rustix` actually leads with and dropping it would make the allow list
+    # describe less of what's really declared in the tree than it could.
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Unlicense",
+    "Zlib",
+    # `zerovec-derive`/`icu_*` (ICU4X, pulled in transitively by `idna` via
+    # `url` via `reqwest`/`refinery`). OSI-approved, permissive.
+    "Unicode-3.0",
+    # `option-ext` (pulled in by `dirs` via `hf-hub`) — a single-file, weak
+    # (file-level) copyleft crate with no linking obligations for the rest of
+    # the tree. OSI-approved and commonly allow-listed in Rust supply-chain
+    # policy for exactly this reason.
+    "MPL-2.0",
+    # `webpki-roots`'s bundled Mozilla CA certificate data (not code) is
+    # licensed CDLA-Permissive-2.0 — a permissive data license, not copyleft.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+# ---------------------------------------------------------------------------
+# bans — duplicate versions are visible in `cargo deny check bans` output as
+# warnings (default `multiple-versions = "warn"`, left at its default): they
+# come from ordinary transitive version skew (`webpki-roots` 0.26 direct vs.
+# 1.0 via `hyper-rustls`/`ureq`; `windows-sys` skew across `ring`/`tonic`/
+# `clap` etc.), none of it security- or license-relevant, and pinning exact
+# versions here would just bit-rot the next time any of those crates bumps a
+# transitive dep. Nothing to deny outright.
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+# A real gate on external wildcard dependencies (`foo = "*"`, a supply-chain
+# risk — no version pin means "whatever crates.io publishes next, sight
+# unseen"), without also flagging every workspace member's own unversioned
+# `path` dependency on a sibling crate (`rmail-core.workspace = true` etc.),
+# which is a completely different thing: always resolved to the local
+# checkout, never fetched from a registry. `allow-wildcard-paths` is what
+# tells cargo-deny apart the two — it only exempts a path dependency when the
+# crate declaring it is itself unpublished (`publish = false`, set on all
+# four workspace members precisely so this exemption applies to them).
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# ---------------------------------------------------------------------------
+# sources — everything in the graph resolves from crates.io; no git deps.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

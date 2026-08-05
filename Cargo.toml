@@ -120,3 +120,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Perf-budget benchmarks (`rmail-core/benches/`) only; not a runtime dep of
+# any shipped binary. `default-features = false`: the defaults pull in
+# `rayon` (parallel measurement, unused — this file benchmarks single-threaded
+# SQLite calls) and `plotters` (SVG/gnuplot report rendering this file's
+# assertions don't need) for roughly fifteen extra crates this task's actual
+# use doesn't touch. `cargo_bench_support` is the one default feature that is
+# load-bearing: without it, a `[[bench]] harness = false` target does not
+# integrate with the `cargo bench` CLI at all.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

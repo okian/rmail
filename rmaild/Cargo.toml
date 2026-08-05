@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "rmail daemon: background sync, indexing, ranking, AI, and the gRPC server."
+# Not published to crates.io — ships as a binary release (see
+# `scripts/package-macos.sh`), not a library. Lets `deny.toml`'s
+# `bans.allow-wildcard-paths` distinguish an unversioned `path` dependency on
+# a sibling crate (harmless, always local) from a real external wildcard
+# dependency (a supply-chain risk worth denying).
+publish = false
 
 [lib]
 name = "rmaild"

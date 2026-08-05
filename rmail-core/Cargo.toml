@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Core domain, storage, sync, index, search, and AI logic for rmail."
+# Not published to crates.io — an internal workspace crate. Lets
+# `deny.toml`'s `bans.allow-wildcard-paths` distinguish an unversioned
+# `path` dependency on a sibling crate (harmless, always local) from a real
+# external wildcard dependency (a supply-chain risk worth denying).
+publish = false
 
 [lints]
 workspace = true
@@ -64,3 +69,13 @@ security-framework.workspace = true
 [dev-dependencies]
 # Enable figment's `Jail` sandbox for isolated env/file config tests.
 figment = { workspace = true, features = ["test"] }
+# `benches/search_budgets.rs`. `async_tokio` lets a `Bencher` run an `async`
+# closure directly against a `&tokio::runtime::Runtime` instead of hand-rolled
+# `block_on` boilerplate at every `bench_function` call site.
+criterion = { workspace = true, features = ["async_tokio"] }
+
+[[bench]]
+name = "search_budgets"
+# criterion drives its own `main` (via `criterion_main!`) and reports its own
+# statistics; the default libtest harness would fight it for both.
+harness = false
