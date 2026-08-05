@@ -154,7 +154,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core sync::idle sync::poll_fallback`
 
 ## 14. Durable event log & in-process bus
-- [ ] status
+- [x] status
 - **depends-on:** 6
 - **parallel-safe:** yes
 - **acceptance:**
@@ -168,6 +168,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **parallel-safe:** no
 - **acceptance:**
   - `SyncService.SyncFolder`, `Status`, `Pause/Resume`, and `WatchEvents` (server-stream over the durable log) wired to the daemon; `mail sync [--full] [--watch]` CLI verb.
+  - Owns wiring task 14's `EventLog` into the daemon: construction from `[grpc.events]` config, the sync engines appending to it, and a scheduled `prune()`. Task 14 ships the engine; nothing calls it until here.
   - Sync emits `events` (NewMessage/FlagsChanged/SyncProgress) that downstream indexing/AI/rules consume.
   - Client cancellation stops the upstream stream promptly.
 - **verify:** `cargo nextest run -p rmaild sync_service` (in-process server: trigger sync, observe streamed events, resume)

@@ -16,6 +16,23 @@ use crate::config::ConfigError;
 /// The `ErrorInfo.domain` for every rmail error. Stable across a major version.
 pub const ERROR_DOMAIN: &str = "rmail.v1";
 
+/// `ErrorInfo` metadata key carrying the oldest still-available log position on
+/// an [`ErrorReason::OutOfRange`] resume gap.
+///
+/// This is an **event id**, not a cursor — reads are strictly-after, so passing
+/// it back as a cursor would skip the very event it names. Use
+/// [`RESUME_FROM_KEY`] for that.
+///
+/// Named as a constant because it is a wire contract: a client branches on it.
+pub const OLDEST_SEQ_KEY: &str = "oldest_seq";
+
+/// `ErrorInfo` metadata key carrying the **cursor** to resume from after an
+/// [`ErrorReason::OutOfRange`] resume gap.
+///
+/// Exactly one less than [`OLDEST_SEQ_KEY`], and separate from it because the
+/// difference between an id and a cursor is one silently dropped event.
+pub const RESUME_FROM_KEY: &str = "resume_from";
+
 /// A stable, machine-branchable error reason attached to every [`Status`] via
 /// `google.rpc.ErrorInfo`.
 ///
@@ -151,8 +168,18 @@ pub enum Error {
     AlreadyExists(String),
 
     /// A cursor is past retention (e.g. a `WatchEvents` resume gap).
-    #[error("out of range: {0}")]
-    OutOfRange(String),
+    ///
+    /// Carries the oldest still-available position when there is one, so a
+    /// client can resync from a real cursor instead of guessing or starting
+    /// over. It reaches the wire as `ErrorInfo` metadata, never as message
+    /// text — see [`Error::metadata`].
+    #[error("out of range: {message}")]
+    OutOfRange {
+        /// Client-safe description of the gap.
+        message: String,
+        /// The oldest position still retained, if the log has one.
+        oldest_seq: Option<i64>,
+    },
 
     /// Client input was malformed.
     #[error("invalid argument: {0}")]
@@ -203,7 +230,22 @@ impl Error {
     }
     /// Construct an [`Error::OutOfRange`].
     pub fn out_of_range(message: impl Into<String>) -> Self {
-        Self::OutOfRange(message.into())
+        Self::OutOfRange {
+            message: message.into(),
+            oldest_seq: None,
+        }
+    }
+
+    /// Construct an [`Error::OutOfRange`] that tells the client where to resume.
+    ///
+    /// A resume gap without a cursor leaves a client with nothing to do but
+    /// start from the beginning; with one it can resync exactly the span it
+    /// missed.
+    pub fn resume_gap(message: impl Into<String>, oldest_seq: i64) -> Self {
+        Self::OutOfRange {
+            message: message.into(),
+            oldest_seq: Some(oldest_seq),
+        }
     }
     /// Construct an [`Error::InvalidArgument`].
     pub fn invalid_argument(message: impl Into<String>) -> Self {
@@ -226,7 +268,7 @@ impl Error {
             Error::ResourceExhausted(_) => ErrorReason::ResourceExhausted,
             Error::DeadlineExceeded(_) => ErrorReason::DeadlineExceeded,
             Error::AlreadyExists(_) => ErrorReason::AlreadyExists,
-            Error::OutOfRange(_) => ErrorReason::OutOfRange,
+            Error::OutOfRange { .. } => ErrorReason::OutOfRange,
             Error::InvalidArgument(_) => ErrorReason::InvalidArgument,
             Error::Internal(_) => ErrorReason::Internal,
         }
@@ -240,13 +282,25 @@ impl Error {
 
     /// Structured key/value context attached to the `Status` `ErrorInfo`.
     ///
-    /// Empty today. Specific variants populate this as the contract grows — e.g.
-    /// `oldest_seq` for [`ErrorReason::OutOfRange`] resume gaps, or retry/budget
-    /// hints for [`ErrorReason::ResourceExhausted`] — so clients get structured
-    /// context, not parsed message text.
+    /// This is how a client gets actionable detail without parsing message
+    /// text — the one thing the error contract promises will never be stable.
+    /// Variants populate it as the contract grows; retry and budget hints for
+    /// [`ErrorReason::ResourceExhausted`] are the next candidates.
     #[must_use]
     fn metadata(&self) -> HashMap<String, String> {
-        HashMap::new()
+        match self {
+            Error::OutOfRange {
+                oldest_seq: Some(seq),
+                ..
+            } => HashMap::from([
+                (OLDEST_SEQ_KEY.to_owned(), seq.to_string()),
+                // The cursor whose strictly-after read begins with `seq`.
+                // Saturating because a caller could name position 0, though the
+                // log never assigns it.
+                (RESUME_FROM_KEY.to_owned(), (seq - 1).max(0).to_string()),
+            ]),
+            _ => HashMap::new(),
+        }
     }
 
     /// Convert into a [`tonic::Status`] carrying `google.rpc.ErrorInfo`.
@@ -350,6 +404,30 @@ mod tests {
             assert_eq!(info.reason, reason.as_str(), "wire reason for {reason:?}");
             assert_eq!(info.domain, ERROR_DOMAIN);
         }
+    }
+
+    #[test]
+    fn only_a_resume_gap_carries_metadata() {
+        // A future variant leaking a field onto every error would put
+        // implementation detail on the wire for all of them.
+        for reason in ErrorReason::ALL {
+            assert!(
+                sample(reason).metadata().is_empty(),
+                "{reason:?} should carry no metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resume_gap_carries_both_the_floor_and_the_cursor() {
+        // They differ by one, and the difference is a silently dropped event:
+        // reads are strictly-after, so resuming *at* the oldest id skips it.
+        let status = Status::from(Error::resume_gap("cursor past retention", 16));
+        assert_eq!(status.code(), Code::OutOfRange);
+        let details = status.get_error_details();
+        let info = details.error_info().expect("ErrorInfo attached");
+        assert_eq!(info.metadata.get(OLDEST_SEQ_KEY), Some(&"16".to_owned()));
+        assert_eq!(info.metadata.get(RESUME_FROM_KEY), Some(&"15".to_owned()));
     }
 
     #[test]
