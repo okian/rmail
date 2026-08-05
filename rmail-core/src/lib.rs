@@ -19,6 +19,7 @@ pub mod index;
 pub mod message;
 pub mod query;
 pub mod repo;
+pub mod retrieve;
 pub mod storage;
 pub mod sync;
 pub mod telemetry;

@@ -230,7 +230,15 @@ impl FtsIndex {
     }
 
     /// The weights as a `bm25()` argument list, in column order.
-    fn weight_list(&self) -> String {
+    ///
+    /// `pub(crate)` rather than private: `retrieve::lexical` builds its own
+    /// `bm25(fts_messages, ...)` SQL when a hard-filter mask has to be baked
+    /// into the same query this module's own [`FtsIndex::search`] cannot
+    /// express, and re-deriving the weight list there would risk exactly the
+    /// column-order drift this module's docs warn about. Reusing this method
+    /// keeps there being exactly one place that turns [`Bm25Weights`] into a
+    /// `bm25()` argument list.
+    pub(crate) fn weight_list(&self) -> String {
         self.column_weights()
             .iter()
             .map(|w| format!("{w}"))
@@ -305,7 +313,15 @@ fn fold(parts: &[(String, String)]) -> [String; 7] {
 /// the query. Corruption and I/O have codes of their own and keep their
 /// meaning, because telling a user their search was malformed when their disk
 /// is failing sends them somewhere useless.
-fn malformed_query(error: crate::storage::StorageError) -> Error {
+///
+/// `pub(crate)` rather than private: `retrieve::lexical` runs its own SQL
+/// (a hard-filter mask or a proximity bonus baked into the ranking, neither
+/// of which [`FtsIndex::search`] can express) whose `MATCH` argument is built
+/// the same structural way this module's is, and a bug in that construction
+/// should be reported to the caller the same way — `InvalidArgument`, not a
+/// generic `Internal` for one call site and a client-safe reason for the
+/// other.
+pub(crate) fn malformed_query(error: crate::storage::StorageError) -> Error {
     use rusqlite::ffi::ErrorCode;
 
     if let crate::storage::StorageError::Sqlite(rusqlite::Error::SqliteFailure(inner, _)) = &error {
