@@ -275,7 +275,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core query::plan` (intent labels, spellfix, expansion, plan shape)
 
 ## 27. Lexical BM25 retriever
-- [ ] status
+- [x] status
 - **depends-on:** 18, 25
 - **parallel-safe:** no
 - **acceptance:**
