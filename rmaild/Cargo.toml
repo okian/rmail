@@ -25,6 +25,7 @@ tonic-health.workspace = true
 tonic-reflection.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 tower.workspace = true
 http.workspace = true
 thiserror.workspace = true
@@ -32,4 +33,5 @@ anyhow.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+tonic-types.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

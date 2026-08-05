@@ -109,6 +109,27 @@ diff on servers whose modseqs cannot be trusted. The engine honors it today via
 `ImapCapabilities::without_modseq`; the daemon-side scheduler that reads the
 setting lands with `SyncService` (task 15).
 
+## Daemon surface
+
+| Service | RPCs |
+|---|---|
+| `grpc.health.v1.Health` | `Check` (reports `SERVING`) |
+| `rmail.v1.AccountService` | `Create` `List` `Get` `Delete` `TestConnection` |
+| `rmail.v1.SyncService` | `SyncFolder` `Status` `Pause` `Resume` `WatchEvents` |
+
+`WatchEvents` is a server-stream over the durable event log. It subscribes to
+the live tail *before* reading the backlog, so a client resuming from a cursor
+sees everything it missed and everything that follows with nothing falling
+between the two. A cursor older than retention fails with `OUT_OF_RANGE`
+carrying `oldest_seq` and `resume_from` in `ErrorInfo` metadata rather than
+silently returning an empty stream.
+
+```sh
+mail sync --account 1              # delta pass over every folder
+mail sync --account 1 --full       # force the initial UID-window walk
+mail sync --account 1 --watch      # sync, then follow the event stream
+```
+
 ## Quality gates
 
 All of these must pass (the CI workflow and the local `Stop` hook enforce them):

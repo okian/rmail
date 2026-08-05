@@ -15,12 +15,16 @@ workspace = true
 
 [dependencies]
 rmail-core.workspace = true
+rmail-proto.workspace = true
 tonic-health.workspace = true
 tokio.workspace = true
+tonic.workspace = true
+tokio-stream.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
 rmaild.workspace = true
 rmail-core.workspace = true
+rmail-proto.workspace = true
 tokio = { workspace = true, features = ["process"] }

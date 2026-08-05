@@ -1767,8 +1767,11 @@ dependencies = [
  "anyhow",
  "clap",
  "rmail-core",
+ "rmail-proto",
  "rmaild",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "tonic-health",
 ]
 
@@ -1822,9 +1825,11 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-health",
  "tonic-reflection",
+ "tonic-types",
  "tower 0.5.3",
  "tracing",
 ]
