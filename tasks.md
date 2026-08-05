@@ -194,7 +194,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core index::extract`
 
 ## 18. Lexical FTS5 index
-- [ ] status
+- [x] status
 - **depends-on:** 17
 - **parallel-safe:** yes
 - **acceptance:**

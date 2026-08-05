@@ -61,8 +61,10 @@ const MIN_LANG_CONFIDENCE: f64 = 0.6;
 pub enum Part {
     /// The subject line.
     Subject,
-    /// Participant names and addresses, as one searchable line.
-    Headers,
+    /// Who sent it: display name and address.
+    Sender,
+    /// Who received it: To and Cc.
+    Recipients,
     /// The message body.
     Body,
     /// Text extracted from an attachment, by its MIME part id.
@@ -80,14 +82,16 @@ impl Part {
     /// Notes, summaries and attachment text are written by other subsystems on
     /// their own schedules. A sweep that deleted everything it did not itself
     /// produce would wipe a user's note every time the message was re-synced.
-    pub const EXTRACTOR_OWNED: [Self; 3] = [Self::Subject, Self::Headers, Self::Body];
+    pub const EXTRACTOR_OWNED: [Self; 4] =
+        [Self::Subject, Self::Sender, Self::Recipients, Self::Body];
 
     /// The stable string stored in `index_content.part`.
     #[must_use]
     pub fn as_key(&self) -> String {
         match self {
             Self::Subject => "subject".to_owned(),
-            Self::Headers => "headers".to_owned(),
+            Self::Sender => "sender".to_owned(),
+            Self::Recipients => "recipients".to_owned(),
             Self::Body => "body".to_owned(),
             Self::Attachment(id) => format!("attachment:{id}"),
             Self::Note => "note".to_owned(),
@@ -103,7 +107,8 @@ impl Part {
     pub fn parse(key: &str) -> Result<Self, Error> {
         Ok(match key {
             "subject" => Self::Subject,
-            "headers" => Self::Headers,
+            "sender" => Self::Sender,
+            "recipients" => Self::Recipients,
             "body" => Self::Body,
             "note" => Self::Note,
             "summary" => Self::Summary,
@@ -424,9 +429,18 @@ fn extract_parts(message: &repo::MessageText) -> Vec<ExtractedPart> {
         }
     }
 
-    let headers = participants(message);
-    if !headers.is_empty() {
-        parts.push(build(Part::Headers, None, headers));
+    // Sender and recipients are separate parts because they rank differently:
+    // the PRD weights a From hit at 4.0 and a To/Cc hit at 2.0. Merging them
+    // into one line would be simpler and would throw that distinction away —
+    // mail *from* someone is a stronger match than mail merely addressed to
+    // them alongside forty other people.
+    let sender = join(&[message.from_name.as_deref(), message.from_addr.as_deref()]);
+    if !sender.is_empty() {
+        parts.push(build(Part::Sender, None, sender));
+    }
+    let recipients = join(&[message.to_addrs.as_deref(), message.cc_addrs.as_deref()]);
+    if !recipients.is_empty() {
+        parts.push(build(Part::Recipients, None, recipients));
     }
 
     // `body_text` is already the stripped projection of an HTML-only message
@@ -457,23 +471,14 @@ fn extract_parts(message: &repo::MessageText) -> Vec<ExtractedPart> {
     parts
 }
 
-/// Participants as one searchable line: display names and addresses together.
+/// Join present fields into one normalized line.
 ///
-/// One row rather than four because a search for a person should match whether
-/// they sent the mail or received it, and the ranker weights the line as a
-/// whole. Which field they appeared in is already a structured column on
-/// `messages` for anyone who needs to filter on it.
-fn participants(message: &repo::MessageText) -> String {
+/// A display name and an address belong together: a search for "Ada" and a
+/// search for "ada@example.com" should both find the same mail, and keeping
+/// them in one part means the ranker scores them once rather than twice.
+fn join(fields: &[Option<&str>]) -> String {
     let mut line = String::new();
-    for field in [
-        message.from_name.as_deref(),
-        message.from_addr.as_deref(),
-        message.to_addrs.as_deref(),
-        message.cc_addrs.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for field in fields.iter().copied().flatten() {
         if !line.is_empty() {
             line.push(' ');
         }

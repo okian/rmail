@@ -11,9 +11,11 @@
 //! the queue they will be driven from.
 
 pub mod extract;
+pub mod fts;
 pub mod queue;
 
 pub use extract::{extract_message, ExtractReport, ExtractedPart, Part};
+pub use fts::{FtsIndex, Hit};
 pub use queue::{
     DeadLetter, Failure, IndexKind, IndexQueue, JobState, Lease, NewJob, QueueOptions, QueueStats,
     PRIORITY_BACKFILL, PRIORITY_NORMAL, PRIORITY_RECENT,

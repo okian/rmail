@@ -151,18 +151,24 @@ async fn a_message_becomes_one_row_per_meaningful_part() {
 
     assert_eq!(
         report.written,
-        vec![Part::Subject, Part::Headers, Part::Body]
+        vec![Part::Subject, Part::Sender, Part::Recipients, Part::Body]
     );
     let content = fx.content(message_id);
-    assert_eq!(content.len(), 3);
+    assert_eq!(content.len(), 4);
     assert_eq!(
         fx.text_of(message_id, "subject").unwrap(),
         "Quarterly review"
     );
     assert_eq!(
-        fx.text_of(message_id, "headers").unwrap(),
-        "Ada Lovelace ada@example.com me@example.com",
-        "one searchable line, so a person matches whether they sent or received"
+        fx.text_of(message_id, "sender").unwrap(),
+        "Ada Lovelace ada@example.com",
+        "name and address together, so either query finds the mail"
+    );
+    assert_eq!(
+        fx.text_of(message_id, "recipients").unwrap(),
+        "me@example.com",
+        "separate from the sender, because mail *from* someone is a stronger \
+         match than mail merely addressed to them"
     );
     assert_eq!(
         fx.text_of(message_id, "body").unwrap(),
@@ -298,7 +304,7 @@ async fn an_empty_part_is_not_stored() {
 
     let report = fx.extract(message_id).await;
 
-    assert_eq!(report.written, vec![Part::Headers]);
+    assert_eq!(report.written, vec![Part::Sender]);
     assert_eq!(fx.content(message_id).len(), 1);
 }
 
@@ -568,7 +574,8 @@ fn normalization_is_stable_across_meaningless_reformatting() {
 fn part_keys_round_trip() {
     for part in [
         Part::Subject,
-        Part::Headers,
+        Part::Sender,
+        Part::Recipients,
         Part::Body,
         Part::Note,
         Part::Summary,
@@ -587,7 +594,8 @@ fn part_keys_are_stable() {
     // Stored in index_content and matched by the removal sweep; changing one
     // silently orphans every row that used it.
     assert_eq!(Part::Subject.as_key(), "subject");
-    assert_eq!(Part::Headers.as_key(), "headers");
+    assert_eq!(Part::Sender.as_key(), "sender");
+    assert_eq!(Part::Recipients.as_key(), "recipients");
     assert_eq!(Part::Body.as_key(), "body");
     assert_eq!(Part::Note.as_key(), "note");
     assert_eq!(Part::Summary.as_key(), "summary");
