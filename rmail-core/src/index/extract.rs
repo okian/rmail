@@ -578,7 +578,7 @@ const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
 /// stripper already failed — its fallback is empty text, and empty text is what
 /// sends the body here — so the pathological input is adversarially selected
 /// for. Use the fallible API and give up rather than take the process down.
-fn strip_html(html: &str) -> String {
+pub(crate) fn strip_html(html: &str) -> String {
     if html.len() > MAX_HTML_BYTES {
         tracing::warn!(
             bytes = html.len(),

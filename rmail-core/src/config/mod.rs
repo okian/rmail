@@ -768,7 +768,14 @@ impl Default for IndexExtractConfig {
             ocr: false,
             ocr_langs: vec!["eng".to_owned()],
             max_attachment_mb: 25,
-            formats: ["pdf", "docx", "xlsx", "pptx", "txt", "csv", "eml"]
+            // Exactly the names `attach::extract::Format::as_str` produces.
+            // `"eml"` used to be here and matches no format at all, while
+            // `"html"` was absent — so an HTML attachment was recorded
+            // `Unsupported` under the shipped configuration and, because that
+            // status is not retryable, stayed unsearchable for ever. The whole
+            // suite ran against a config that overrode this list, which is why
+            // nothing noticed.
+            formats: ["pdf", "docx", "xlsx", "pptx", "html", "csv", "txt"]
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),

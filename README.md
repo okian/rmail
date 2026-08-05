@@ -142,6 +142,27 @@ comparisons. `index verify` reconciles chunks, vectors and bookkeeping in both
 directions, because a `vec0` virtual table takes no foreign key and will not
 check it for us.
 
+### Attachments
+
+Attachment text lands in the same place a body does, so the lexical index, the
+entity extractor and the chunker reach it through paths they already have. PDF
+(with per-page offsets, so a citation can name the page), DOCX, XLSX, PPTX,
+HTML, CSV and plain text.
+
+Every input here is a file a stranger sent, so the extractors run on an isolated
+task whose panic is caught and whose runtime is bounded — `pdf-extract` alone
+has around a hundred panicking call sites, and taking the daemon down over one
+attachment takes mail down for every account. Cell counts, page counts,
+decompressed bytes, output size and concurrency are all capped: without them, a
+1.4 KB spreadsheet allocates gigabytes and a half-megabyte PDF burns a minute of
+CPU.
+
+Failure is recorded rather than retried. An encrypted PDF, an unreadable format,
+a file past `max_attachment_mb` — each legitimately yields no text, and a row
+saying so is what stops the pipeline re-opening the same archive on every pass.
+Only a hard extractor failure gets another attempt; a timeout does not, because
+a file that takes a minute takes a minute every time.
+
 ### Embeddings
 
 Three backends behind one trait, forming a ladder rather than a menu:
