@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// AdminService covers daemon-administration surfaces that require the
+// implicit trust of a local Unix-socket peer (or an existing `admin`-scoped
+// token) — see the `auth` interceptor. Capability-token lifecycle lands here
+// first (task 38); status/config/vacuum/reindex join in later tasks.
+service AdminService {
+  // Mint a new capability token. The bearer secret is returned exactly once,
+  // in this response — it is never reconstructible afterward, since only its
+  // argon2id hash is persisted.
+  rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
+  // Revoke a token by id. Revoking an already-revoked (or expired) token is
+  // not an error — only a token id that never existed is NOT_FOUND.
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+  // List tokens. Never returns the secret or its hash — metadata only.
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+}
+
+message MintTokenRequest {
+  // Human-readable label (e.g. "ci", "claude-agent"). Required, non-empty.
+  string name = 1;
+  // Scope strings: "mail.read" | "mail.write" | "mail.send" | "ai.invoke" |
+  // "ai.spend:<usd>" | "mailbox:<name>" | "automation" | "admin". At least
+  // one is required — a token minted with no scopes could never do anything,
+  // which is almost certainly not what was intended.
+  //
+  // "ai.spend:<usd>" and "mailbox:<name>" are accepted and stored, but not
+  // yet enforced by any RPC: the daemon's per-method scope table has no way
+  // to see a request's dollar amount or target mailbox, only which method is
+  // being called. A token minted with only "mailbox:INBOX" grants nothing at
+  // all today (fail-safe, but do not rely on it as an actual restriction).
+  repeated string scopes = 2;
+  // Time-to-live in seconds from mint time. Absent means no expiry; if
+  // present it must be positive — zero/negative is INVALID_ARGUMENT, not an
+  // alternate spelling of "never expires".
+  optional int64 ttl_secs = 3;
+}
+
+message MintTokenResponse {
+  int64 id = 1;
+  // The bearer secret. Shown here and only here — store it now.
+  string token = 2;
+  string name = 3;
+  repeated string scopes = 4;
+  int64 created_at = 5;
+  optional int64 expires_at = 6;
+}
+
+message RevokeTokenRequest {
+  int64 id = 1;
+}
+
+message RevokeTokenResponse {
+  // Always true on success (idempotent re-revoke does not error).
+  bool revoked = 1;
+}
+
+message ListTokensRequest {}
+
+message ListTokensResponse {
+  repeated TokenInfo tokens = 1;
+}
+
+// Token metadata — never the secret or its hash.
+message TokenInfo {
+  int64 id = 1;
+  string name = 2;
+  repeated string scopes = 3;
+  int64 created_at = 4;
+  optional int64 last_used_at = 5;
+  optional int64 expires_at = 6;
+  bool revoked = 7;
+}

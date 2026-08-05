@@ -8,6 +8,7 @@
 pub mod account;
 pub mod ai;
 pub mod attach;
+pub mod auth;
 pub mod config;
 pub mod credential;
 pub mod embed;

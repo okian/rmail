@@ -111,6 +111,9 @@ fastembed = { version = "5", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
 ] }
 sha2 = "0.10"
+# Capability-token secret hashing (task 38). `std` for the OS RNG the CLI/admin
+# service uses to mint tokens; default features otherwise (password-hash+rand).
+argon2 = { version = "0.5", features = ["std"] }
 whatlang = "0.16"
 unicode-normalization = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -6,8 +6,12 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rmail_core::socket_path_from_env;
+use rmail_proto::v1::admin_service_client::AdminServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
-use rmail_proto::v1::{EventKind, SyncFolderRequest, SyncMode, WatchEventsRequest};
+use rmail_proto::v1::{
+    EventKind, ListTokensRequest, MintTokenRequest, RevokeTokenRequest, SyncFolderRequest,
+    SyncMode, WatchEventsRequest,
+};
 use tokio_stream::StreamExt;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
@@ -44,6 +48,40 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// Manage capability tokens (`AdminService.MintToken/RevokeToken/ListTokens`).
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenAction {
+    /// Mint a new capability token. The bearer secret is printed exactly
+    /// once — it cannot be recovered later, only revoked.
+    Create {
+        /// Human-readable label (e.g. "ci", "claude-agent").
+        #[arg(long)]
+        name: String,
+        /// Scope(s) to grant: mail.read, mail.write, mail.send, ai.invoke,
+        /// ai.spend:<usd>, mailbox:<name>, automation, admin. Repeatable
+        /// and/or comma-separated, e.g. `--scope mail.read --scope
+        /// ai.invoke` or `--scope mail.read,ai.invoke`. NOTE: ai.spend and
+        /// mailbox are accepted and stored but not yet enforced by any RPC —
+        /// a mailbox-only token grants nothing today, it does not restrict.
+        #[arg(long = "scope", required = true, value_delimiter = ',')]
+        scopes: Vec<String>,
+        /// Time-to-live, e.g. "24h", "90d". Omit for no expiry.
+        #[arg(long)]
+        ttl: Option<String>,
+    },
+    /// List tokens (metadata only — never the secret or its hash).
+    List,
+    /// Revoke a token by id.
+    Revoke {
+        /// Token id (as printed by `mail token create`/`list`).
+        id: i64,
+    },
 }
 
 /// Deadline for the health-check RPC so a wedged daemon cannot hang the CLI.
@@ -62,6 +100,13 @@ async fn main() -> Result<()> {
             full,
             watch,
         } => sync(&socket, account, mailbox, full, watch).await,
+        Command::Token { action } => match action {
+            TokenAction::Create { name, scopes, ttl } => {
+                token_create(&socket, name, scopes, ttl).await
+            }
+            TokenAction::List => token_list(&socket).await,
+            TokenAction::Revoke { id } => token_revoke(&socket, id).await,
+        },
     }
 }
 
@@ -204,4 +249,96 @@ async fn ping(socket: &Path) -> Result<()> {
     } else {
         bail!("rmaild is not serving (status: {status:?})");
     }
+}
+
+/// Mint a capability token and print its bearer secret. This is the only
+/// moment the secret is ever visible — `ListTokens` returns metadata only.
+async fn token_create(
+    socket: &Path,
+    name: String,
+    scopes: Vec<String>,
+    ttl: Option<String>,
+) -> Result<()> {
+    let ttl_secs = ttl
+        .as_deref()
+        .map(|s| {
+            rmail_core::config::parse_human_duration(s)
+                .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        })
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid --ttl: {e}"))?;
+
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let mut client = AdminServiceClient::new(channel);
+    let response = client
+        .mint_token(MintTokenRequest {
+            name,
+            scopes,
+            ttl_secs,
+        })
+        .await
+        .context("MintToken RPC failed")?
+        .into_inner();
+
+    println!("id:      {}", response.id);
+    println!("name:    {}", response.name);
+    println!("scopes:  {}", response.scopes.join(","));
+    if let Some(expires_at) = response.expires_at {
+        println!("expires: {expires_at} (unix seconds)");
+    } else {
+        println!("expires: never");
+    }
+    println!();
+    println!("token:   {}", response.token);
+    println!();
+    println!(
+        "Store this now — it cannot be shown again. Revoke with `mail token revoke {}`.",
+        response.id
+    );
+    Ok(())
+}
+
+/// List tokens (metadata only).
+async fn token_list(socket: &Path) -> Result<()> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let mut client = AdminServiceClient::new(channel);
+    let response = client
+        .list_tokens(ListTokensRequest {})
+        .await
+        .context("ListTokens RPC failed")?
+        .into_inner();
+
+    if response.tokens.is_empty() {
+        println!("no tokens");
+        return Ok(());
+    }
+    for token in response.tokens {
+        let status = if token.revoked { "revoked" } else { "active" };
+        println!(
+            "{:<6} {:<20} {:<8} {}",
+            token.id,
+            token.name,
+            status,
+            token.scopes.join(",")
+        );
+    }
+    Ok(())
+}
+
+/// Revoke a token by id.
+async fn token_revoke(socket: &Path, id: i64) -> Result<()> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let mut client = AdminServiceClient::new(channel);
+    client
+        .revoke_token(RevokeTokenRequest { id })
+        .await
+        .context("RevokeToken RPC failed")?;
+    println!("revoked token {id}");
+    Ok(())
 }

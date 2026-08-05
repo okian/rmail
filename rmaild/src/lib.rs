@@ -1,21 +1,27 @@
 //! The rmail daemon library.
 //!
 //! [`serve_uds`] boots the tonic server on a Unix domain socket exposing gRPC
-//! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and
-//! `AccountService` — all wrapped in a [`RequestTraceLayer`] that opens a span
-//! per RPC. It is exposed as a library function so both the `rmaild` binary and
-//! integration tests drive the same code path.
+//! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and the
+//! `AccountService`/`SyncService`/`AdminService` handlers — all wrapped in a
+//! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
+//! per-method capability scope; see `auth::methods` for the table). It is
+//! exposed as a library function so both the `rmaild` binary and integration
+//! tests drive the same code path.
 
 mod account_service;
+mod admin_service;
+mod auth;
 mod sync_service;
 mod trace;
 
 pub use account_service::AccountApi;
+pub use admin_service::AdminApi;
+pub use auth::AuthLayer;
 pub use sync_service::SyncApi;
 pub use trace::RequestTraceLayer;
 
 use std::future::Future;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,6 +29,7 @@ use rmail_core::events::{EventLog, Retention};
 use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
+use rmail_proto::v1::admin_service_server::AdminServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -266,6 +273,21 @@ where
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e.into());
     }
+
+    // The daemon's own effective uid, read off `tmp_path` — the socket this
+    // process just bound under a name nothing else can predict — rather than
+    // `path` after the rename below, and rather than a raw `geteuid()` call.
+    // The auth layer grants implicit admin to a Unix-socket peer only when
+    // its *kernel-reported* uid (`getpeereid(2)` on Darwin, `SO_PEERCRED` on
+    // Linux — see `tokio::net::UnixStream::peer_cred`, surfaced per-request
+    // via `tonic::transport::server::UdsConnectInfo`) matches this value, so
+    // the `0600` permission set above is defense-in-depth, not the only gate
+    // — and reading it here, not after `path` is publicly reachable, closes
+    // the TOCTOU window a stat-after-rename would leave open if `path`'s
+    // parent were ever a pre-existing, not-owner-only directory (the one case
+    // this function deliberately does not chmod — see below).
+    let admin_uid = std::fs::metadata(&tmp_path)?.uid();
+
     if let Err(e) = std::fs::rename(&tmp_path, &path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e.into());
@@ -316,15 +338,20 @@ where
         }
     });
 
-    let account_service = AccountServiceServer::new(AccountApi::new(db));
+    let admin_service = AdminServiceServer::new(AdminApi::new(db.clone()));
+    let account_service = AccountServiceServer::new(AccountApi::new(db.clone()));
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
 
     let incoming = UnixListenerStream::new(listener);
     let serve_result = Server::builder()
-        // Every RPC runs inside a request-tracing span.
+        // Every RPC runs inside a request-tracing span; the auth layer sits
+        // inside it (so a denied request is still traced) and outside every
+        // service (so no service can be added later without it).
         .layer(RequestTraceLayer::new())
+        .layer(AuthLayer::new(db, admin_uid))
         .add_service(health_service)
         .add_service(reflection)
+        .add_service(admin_service)
         .add_service(account_service)
         .add_service(sync_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
