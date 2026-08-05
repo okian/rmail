@@ -84,6 +84,21 @@ checkpointing into the same `sync_state` row:
   | `UidDiff` | nothing | `UID SEARCH ALL` plus a header-only flag sweep |
   | `Full` | nothing | hands back to the initial walk |
 
+- **Watch** (`rmail_core::sync::idle`) decides *when* to ask. It parks a
+  long-lived connection on IMAP `IDLE` (RFC 2177) so the server speaks the
+  moment something happens, runs a delta pass on every wake-up, and reissues
+  `IDLE` on its own cadence so a server with an inactivity timeout does not log
+  it off. A server without `IDLE` gets interval polling instead — same loop,
+  same delta pass, worse latency. `watch_folders` gives connections to an
+  account's highest-priority folders up to a budget, because servers cap
+  concurrent connections per account.
+
+  A watch treats disconnection as routine: it reconnects with exponential
+  backoff and only gives up on failures that cannot improve with time (a
+  deleted folder, revoked credentials). A server that is merely down is
+  retried indefinitely at the backoff ceiling — a watch that gave up during an
+  outage is a mailbox that silently stops receiving mail.
+
 `HIGHESTMODSEQ` is a checkpoint of what has been *applied*, not a reading: a run
 that is interrupted leaves it where it was, so the next run re-asks rather than
 skipping past an unapplied change. A `UIDVALIDITY` change drops the stale local

@@ -19,10 +19,15 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 /// Capabilities advertised unless a test narrows them.
 const DEFAULT_CAPABILITIES: &[&str] = &["IMAP4rev1", "IDLE", "CONDSTORE", "QRESYNC", "MOVE"];
@@ -56,6 +61,8 @@ pub(crate) struct MockConfig {
     empty_search: bool,
     /// Answer every `UID` command with a tagged `NO`.
     refuse_uid: bool,
+    /// How often to volunteer `* OK Still here` while idling.
+    idle_keepalive: Duration,
 }
 
 /// A canned message the mock returns for `UID FETCH`.
@@ -85,6 +92,8 @@ impl Default for MockConfig {
             omit_uidnext: false,
             empty_search: false,
             refuse_uid: false,
+            // Effectively never, unless a test asks for it.
+            idle_keepalive: Duration::from_secs(86_400),
         }
     }
 }
@@ -200,6 +209,15 @@ impl MockConfig {
         self
     }
 
+    /// Volunteer `* OK Still here` this often while idling, as Dovecot, Cyrus
+    /// and Gmail all do. A client that treats every server response as a reason
+    /// to restart its own timer will never reissue `IDLE` against such a
+    /// server — which is the failure this exists to catch.
+    pub(crate) fn idle_keepalive(mut self, every: Duration) -> Self {
+        self.idle_keepalive = every;
+        self
+    }
+
     /// Answer every `UID` command with a tagged `NO`, the way a real server
     /// refuses one it cannot serve right now (`NO [LIMIT]`, `NO Server busy`).
     /// Nothing to do with credentials — which is the whole point.
@@ -268,6 +286,12 @@ pub(crate) struct MockImap {
     pub(crate) addr: SocketAddr,
     /// Every command line the server received, tag stripped.
     command_log: Arc<Mutex<Vec<String>>>,
+    /// Untagged lines a test wants pushed to every idling connection.
+    pushes: broadcast::Sender<String>,
+    /// Connections currently parked on `IDLE`.
+    idling: Arc<AtomicUsize>,
+    /// Cancelled on drop, which closes every live connection.
+    shutdown: CancellationToken,
     _handle: tokio::task::JoinHandle<()>,
 }
 
@@ -278,20 +302,53 @@ impl MockImap {
         let addr = listener.local_addr().unwrap();
         let command_log = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&command_log);
+        let (pushes, _) = broadcast::channel(64);
+        let push_tx = pushes.clone();
+        let shutdown = CancellationToken::new();
+        let serve_shutdown = shutdown.clone();
+        let idling = Arc::new(AtomicUsize::new(0));
+        let serve_idling = Arc::clone(&idling);
         let handle = tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
                 let config = config.clone();
                 let log = Arc::clone(&log);
+                let pushes = push_tx.subscribe();
+                let shutdown = serve_shutdown.clone();
+                let idling = Arc::clone(&serve_idling);
                 tokio::spawn(async move {
-                    let _ = serve(sock, config, log).await;
+                    let _ = serve(sock, config, log, pushes, shutdown, idling).await;
                 });
             }
         });
         Self {
             addr,
             command_log,
+            pushes,
+            idling,
+            shutdown,
             _handle: handle,
         }
+    }
+
+    /// Push an untagged line to every connection currently idling.
+    ///
+    /// This is how a test plays the part of "someone else touched the mailbox"
+    /// — the server volunteering `* 4 EXISTS` is exactly what IDLE exists to
+    /// deliver, and nothing about it is observable from the client's commands.
+    pub(crate) fn push(&self, line: &str) {
+        // An error means nobody is subscribed yet; the test's own assertions
+        // cover that case far better than a panic here would.
+        let _ = self.pushes.send(line.to_owned());
+    }
+
+    /// Whether any connection is parked on `IDLE` right now.
+    ///
+    /// Counted where `+ idling` is actually written, not where a connection is
+    /// accepted — a gate that means "someone connected" would let a test claim
+    /// to have cancelled a parked watch when it had only cancelled a connected
+    /// one.
+    pub(crate) fn idling(&self) -> bool {
+        self.idling.load(Ordering::SeqCst) > 0
     }
 
     /// Every command received so far, in order, without its tag.
@@ -319,6 +376,11 @@ impl MockImap {
 
 impl Drop for MockImap {
     fn drop(&mut self) {
+        // Aborting the accept loop stops *new* connections; the ones already
+        // being served are separate tasks and would otherwise keep answering
+        // long after the server they belong to is gone. A test that drops a
+        // mock to simulate an outage needs the sockets to actually die.
+        self.shutdown.cancel();
         // A dropped JoinHandle detaches rather than aborts, which would leak the
         // listener task for the life of the test binary.
         self._handle.abort();
@@ -418,9 +480,31 @@ async fn serve(
     sock: TcpStream,
     config: MockConfig,
     command_log: Arc<Mutex<Vec<String>>>,
+    mut pushes: broadcast::Receiver<String>,
+    shutdown: CancellationToken,
+    idling: Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
     let (read_half, mut write) = sock.into_split();
-    let mut reader = BufReader::new(read_half);
+    // Lines are read by a dedicated task and delivered over a channel, because
+    // `AsyncBufReadExt::read_line` is not cancellation safe: dropping it
+    // mid-line — which any `select!` will do — loses the bytes it had already
+    // consumed. `mpsc::Receiver::recv` is safe to race, so every wait below can
+    // be.
+    let (line_tx, mut lines) = tokio::sync::mpsc::channel::<String>(16);
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(read_half);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if line_tx.send(line).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 
     let capabilities = config.capabilities.join(" ");
     write
@@ -431,12 +515,14 @@ async fn serve(
     // distinction ENABLE depends on.
     let mut selected: Option<String> = None;
     let mut qresync_enabled = false;
-    let mut line = String::new();
     loop {
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
+        let line = tokio::select! {
+            line = lines.recv() => line,
+            () = shutdown.cancelled() => return Ok(()),
+        };
+        let Some(line) = line else {
             break;
-        }
+        };
         let trimmed = line.trim_end_matches(['\r', '\n']);
         let mut parts = trimmed.splitn(2, ' ');
         let tag = parts.next().unwrap_or("");
@@ -619,6 +705,34 @@ async fn serve(
                     .write_all(format!("{tag} OK UID {sub} completed\r\n").as_bytes())
                     .await?;
             }
+            "IDLE" => {
+                if !config.advertises("IDLE") {
+                    write
+                        .write_all(format!("{tag} BAD IDLE not supported\r\n").as_bytes())
+                        .await?;
+                    continue;
+                }
+                write.write_all(b"+ idling\r\n").await?;
+                idling.fetch_add(1, Ordering::SeqCst);
+                // Until DONE arrives, the connection belongs to the server:
+                // it may volunteer untagged responses at any moment, and the
+                // client may say exactly one thing back.
+                let outcome = serve_idle(
+                    &mut write,
+                    &mut lines,
+                    &mut pushes,
+                    &shutdown,
+                    &command_log,
+                    &config,
+                    tag,
+                )
+                .await;
+                idling.fetch_sub(1, Ordering::SeqCst);
+                match outcome? {
+                    IdleExit::Done => {}
+                    IdleExit::Closed => return Ok(()),
+                }
+            }
             "LOGOUT" => {
                 write.write_all(b"* BYE logging out\r\n").await?;
                 write
@@ -632,6 +746,73 @@ async fn serve(
         }
     }
     Ok(())
+}
+
+/// How an `IDLE` ended.
+enum IdleExit {
+    /// The client sent `DONE`; the connection carries on.
+    Done,
+    /// The connection went away.
+    Closed,
+}
+
+/// Hold an `IDLE` open, volunteering whatever a test pushes, until `DONE`.
+///
+/// Every wait here is cancellation safe, so the `select!` cannot lose a line.
+#[allow(clippy::too_many_arguments)]
+async fn serve_idle<W: AsyncWriteExt + Unpin>(
+    write: &mut W,
+    lines: &mut tokio::sync::mpsc::Receiver<String>,
+    pushes: &mut broadcast::Receiver<String>,
+    shutdown: &CancellationToken,
+    command_log: &Arc<Mutex<Vec<String>>>,
+    config: &MockConfig,
+    tag: &str,
+) -> std::io::Result<IdleExit> {
+    // A real server volunteers `* OK Still here` on a timer so intermediaries
+    // do not reap the connection. It is also the response that makes a naive
+    // client's re-IDLE cadence never fire, so the mock has to send it.
+    let mut keepalive = tokio::time::interval(config.idle_keepalive);
+    keepalive.tick().await;
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(IdleExit::Closed),
+            line = lines.recv() => {
+                let Some(line) = line else {
+                    return Ok(IdleExit::Closed);
+                };
+                // DONE is untagged, so the main loop never sees it; log it here
+                // or a test cannot tell a clean IDLE teardown from an abandoned
+                // connection.
+                if let Ok(mut log) = command_log.lock() {
+                    log.push(line.trim().to_owned());
+                }
+                if line.trim().eq_ignore_ascii_case("DONE") {
+                    write
+                        .write_all(format!("{tag} OK IDLE terminated\r\n").as_bytes())
+                        .await?;
+                    return Ok(IdleExit::Done);
+                }
+            }
+            _ = keepalive.tick(), if config.idle_keepalive < Duration::MAX => {
+                write.write_all(b"* OK Still here\r\n").await?;
+            }
+            pushed = pushes.recv() => {
+                match pushed {
+                    Ok(line) => {
+                        write.write_all(line.as_bytes()).await?;
+                        write.write_all(b"\r\n").await?;
+                    }
+                    // Lagged past the buffer, or the sender is gone: keep
+                    // idling either way.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Serve the untagged part of a `UID FETCH`, honoring `CHANGEDSINCE` and

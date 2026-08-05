@@ -9,14 +9,17 @@
 //!   diff where the server has neither). It answers "what changed?", which the
 //!   UID walk structurally cannot see: a flag flipped on a message already
 //!   stored, or a message expunged out from under it.
+//! - [`idle`] decides *when* to ask. It parks a long-lived connection on IMAP
+//!   `IDLE` so the server can speak the moment something happens, and falls
+//!   back to interval polling where it cannot.
 //!
 //! Both key on `(mailbox, UIDVALIDITY, UID)` and checkpoint into the same
 //! `sync_state` row, so a delta run over a folder with no usable baseline hands
-//! straight back to the full walk. The IDLE push engine lands alongside them in
-//! task 13.
+//! straight back to the full walk.
 
 pub mod delta;
 pub mod full;
+pub mod idle;
 
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::BTreeSet;
@@ -29,15 +32,22 @@ pub use delta::{delta_sync, delta_sync_folders, AccountDeltaReport, DeltaReport,
 pub use full::{
     prioritize, sync_folder, sync_folders, SyncOptions, SyncProgress, SyncReport, DEFAULT_WINDOW,
 };
+pub use idle::{
+    watch_folder, watch_folders, AccountWatchReport, IdleOptions, WatchCycle, WatchOutcome,
+    WatchReport, WatchTrigger,
+};
 
-// The delta-sync test suites live beside the engines rather than inside
-// `delta.rs`, so each path is addressable on its own: `sync::qresync` covers
-// the modseq engines and `sync::uiddiff_fallback` covers the server that has
-// neither extension. `tasks.md` names both filters as this task's proof.
+// The sync test suites live beside the engines rather than inside them, so each
+// path is addressable on its own — `sync::qresync` for the modseq engines,
+// `sync::uiddiff_fallback` for a server with neither extension, `sync::idle`
+// and `sync::poll_fallback` for the push engine. `tasks.md` names those filters
+// as the proof for each task.
 #[cfg(test)]
 mod account;
 #[cfg(test)]
 mod harness;
+#[cfg(test)]
+mod poll_fallback;
 #[cfg(test)]
 mod qresync;
 #[cfg(test)]

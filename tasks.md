@@ -145,7 +145,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core sync::qresync sync::uiddiff_fallback`
 
 ## 13. IMAP IDLE push engine
-- [ ] status
+- [x] status
 - **depends-on:** 11
 - **parallel-safe:** yes
 - **acceptance:**

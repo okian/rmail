@@ -8,6 +8,8 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_imap::Session;
 use tokio::net::TcpStream;
@@ -18,7 +20,7 @@ use crate::imap::mock::{MockConfig, MockImap};
 use crate::imap::ImapCapabilities;
 use crate::repo;
 use crate::storage::Database;
-use crate::sync::{full, SyncOptions};
+use crate::sync::{full, IdleOptions, SyncOptions, WatchCycle, WatchTrigger};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -54,16 +56,24 @@ pub(super) fn mock_config(count: u32) -> MockConfig {
 pub(super) struct Fixture {
     pub(super) db: Database,
     pub(super) mailbox_id: i64,
+    pub(super) account_id: i64,
     path: PathBuf,
 }
 
 impl Fixture {
     pub(super) async fn open() -> Self {
+        Self::open_with_folders(&["INBOX"]).await
+    }
+
+    /// A fixture whose account has several mailboxes, for the account-wide
+    /// paths. `mailbox_id` is the first one named.
+    pub(super) async fn open_with_folders(names: &[&str]) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         let path = std::env::temp_dir().join(format!("rmail-syncdelta-{pid}-{n}.db"));
         let db = Database::open(&path).unwrap();
-        let mailbox_id = db
+        let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+        let (account_id, mailbox_id) = db
             .write(move |c| {
                 let account_id = repo::insert_account(
                     c,
@@ -72,20 +82,28 @@ impl Fixture {
                         ..Default::default()
                     },
                 )?;
-                repo::insert_mailbox(
-                    c,
-                    &repo::NewMailbox {
-                        account_id,
-                        name: "INBOX".to_owned(),
-                        ..Default::default()
-                    },
-                )
+                let mut first = 0;
+                for name in &names {
+                    let id = repo::insert_mailbox(
+                        c,
+                        &repo::NewMailbox {
+                            account_id,
+                            name: name.clone(),
+                            ..Default::default()
+                        },
+                    )?;
+                    if first == 0 {
+                        first = id;
+                    }
+                }
+                Ok((account_id, first))
             })
             .await
             .unwrap();
         Self {
             db,
             mailbox_id,
+            account_id,
             path,
         }
     }
@@ -271,4 +289,85 @@ pub(super) fn commands_starting(mock: &MockImap, prefix: &str) -> Vec<String> {
         .into_iter()
         .filter(|command| command.to_ascii_uppercase().starts_with(&prefix))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Watch scaffolding (shared by `sync::idle` and `sync::poll_fallback`)
+// ---------------------------------------------------------------------------
+
+/// Options with everything scaled down to test time.
+pub(super) fn fast_watch() -> IdleOptions {
+    IdleOptions {
+        re_idle: Duration::from_millis(200),
+        poll_interval: Duration::from_millis(20),
+        backoff_min: Duration::from_millis(5),
+        backoff_max: Duration::from_millis(20),
+        sync: SyncOptions::default(),
+        watch_limit: crate::sync::idle::DEFAULT_WATCH_LIMIT,
+    }
+}
+
+/// Collects the cycles a watch emits, so a test can await a specific one
+/// instead of sleeping and hoping.
+#[derive(Clone, Default)]
+pub(super) struct Cycles(Arc<Mutex<Vec<WatchCycle>>>);
+
+impl Cycles {
+    pub(super) fn sink(&self) -> impl FnMut(WatchCycle) {
+        let inner = Arc::clone(&self.0);
+        move |cycle| {
+            if let Ok(mut cycles) = inner.lock() {
+                cycles.push(cycle);
+            }
+        }
+    }
+
+    pub(super) fn all(&self) -> Vec<WatchCycle> {
+        self.0.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.0.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    pub(super) fn triggers(&self) -> Vec<WatchTrigger> {
+        self.all().into_iter().map(|c| c.trigger).collect()
+    }
+}
+
+/// Wait until `predicate` holds, or fail the test.
+///
+/// Polls rather than sleeps a fixed span: a watch that is working takes
+/// milliseconds, and one that is broken should fail the assertion rather than
+/// pass because the sleep happened to be long enough.
+pub(super) async fn until<F: FnMut() -> bool>(what: &str, mut predicate: F) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // One last look before failing, so a predicate that flipped inside the
+    // final sleep is not reported as a timeout.
+    assert!(predicate(), "timed out waiting for {what}");
+}
+
+/// Seed a folder so the watch's first pass takes a delta path rather than
+/// handing back to the initial walk.
+pub(super) async fn with_baseline(fx: &Fixture, mock: &MockImap, modseq: Option<i64>) {
+    fx.full_sync(mock).await;
+    let mailbox_id = fx.mailbox_id;
+    fx.db
+        .write(move |c| {
+            let mut state = repo::get_sync_state(c, mailbox_id)?.unwrap_or(repo::SyncState {
+                mailbox_id,
+                ..Default::default()
+            });
+            state.uidvalidity = Some(UIDVALIDITY);
+            state.highestmodseq = modseq;
+            repo::upsert_sync_state(c, &state)
+        })
+        .await
+        .unwrap();
 }
