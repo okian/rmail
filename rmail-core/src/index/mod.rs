@@ -10,8 +10,10 @@
 //! The stages themselves land in the tasks after this one; this module ships
 //! the queue they will be driven from.
 
+pub mod extract;
 pub mod queue;
 
+pub use extract::{extract_message, ExtractReport, ExtractedPart, Part};
 pub use queue::{
     DeadLetter, Failure, IndexKind, IndexQueue, JobState, Lease, NewJob, QueueOptions, QueueStats,
     PRIORITY_BACKFILL, PRIORITY_NORMAL, PRIORITY_RECENT,

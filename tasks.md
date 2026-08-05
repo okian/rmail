@@ -185,7 +185,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core index::queue` (dedup, lease reclaim, content-hash short-circuit, poison quarantine)
 
 ## 17. Text extraction stage
-- [ ] status
+- [x] status
 - **depends-on:** 16
 - **parallel-safe:** no
 - **acceptance:**

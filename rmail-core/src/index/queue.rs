@@ -365,12 +365,9 @@ impl IndexQueue {
             .db
             .write(move |conn| {
                 let tx = conn.transaction()?;
-                let mut seen = std::collections::HashSet::new();
                 let mut queued = 0u64;
                 for job in jobs {
-                    if enqueue_one(&tx, &job, model.as_deref())?
-                        && seen.insert((job.message_id, job.kind))
-                    {
+                    if enqueue_one(&tx, &job, model.as_deref())? {
                         queued += 1;
                     }
                 }
@@ -826,8 +823,19 @@ fn enqueue_one(conn: &Connection, job: &NewJob, model: Option<&str>) -> rusqlite
              -- above can never short-circuit it — and the queue burns
              -- `max_attempts` on the same broken message forever. New content
              -- is a different question and does earn a fresh attempt.
-             index_queue.state <> 'dead'
-             OR index_queue.content_hash IS NOT excluded.content_hash",
+             (index_queue.state <> 'dead'
+              OR index_queue.content_hash IS NOT excluded.content_hash)
+             -- And a row that already asks for exactly this work, at no worse a
+             -- priority and with nothing to reset, is not a change. Counting it
+             -- as one would make an enqueue sweep report a queue full of work
+             -- when every job in it was already queued.
+             AND NOT (
+                 index_queue.state = 'pending'
+                 AND index_queue.attempts = 0
+                 AND index_queue.next_attempt_at = 0
+                 AND index_queue.content_hash IS excluded.content_hash
+                 AND index_queue.priority <= excluded.priority
+             )",
         rusqlite::params![job.message_id, kind, job.priority, job.content_hash],
     )?;
     Ok(changed > 0)

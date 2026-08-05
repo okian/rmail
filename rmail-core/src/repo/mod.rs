@@ -760,6 +760,56 @@ pub fn get_message_by_identity(
     .optional()
 }
 
+/// The parsed text fields of a message, without its raw RFC822 blob.
+///
+/// [`get_message`] selects every column, `raw` included. A full-mailbox
+/// extraction sweep that used it would read the entire mail corpus off disk to
+/// look at six strings.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn get_message_text(conn: &Connection, id: i64) -> rusqlite::Result<Option<MessageText>> {
+    conn.query_row(
+        "SELECT id, subject, from_name, from_addr, to_addrs, cc_addrs, body_text, body_html
+         FROM messages WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(MessageText {
+                id: row.get(0)?,
+                subject: row.get(1)?,
+                from_name: row.get(2)?,
+                from_addr: row.get(3)?,
+                to_addrs: row.get(4)?,
+                cc_addrs: row.get(5)?,
+                body_text: row.get(6)?,
+                body_html: row.get(7)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// A message's indexable text, without the raw blob.
+#[derive(Debug, Clone, Default)]
+pub struct MessageText {
+    /// Stable message id.
+    pub id: i64,
+    /// Subject.
+    pub subject: Option<String>,
+    /// From display name.
+    pub from_name: Option<String>,
+    /// Primary From address.
+    pub from_addr: Option<String>,
+    /// To addresses (serialized).
+    pub to_addrs: Option<String>,
+    /// Cc addresses (serialized).
+    pub cc_addrs: Option<String>,
+    /// Extracted plain-text body.
+    pub body_text: Option<String>,
+    /// HTML body.
+    pub body_html: Option<String>,
+}
+
 /// List a mailbox's messages, newest first by `COALESCE(date, internaldate)`
 /// (so mail with a missing/backdated Date header still sorts by arrival), with
 /// a limit. The ordering matches `idx_messages_mailbox_date`.

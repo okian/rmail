@@ -32,6 +32,9 @@ webpki-roots.workspace = true
 futures.workspace = true
 mail-parser.workspace = true
 html2text.workspace = true
+sha2.workspace = true
+whatlang.workspace = true
+unicode-normalization.workspace = true
 chrono.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
