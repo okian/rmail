@@ -790,7 +790,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-cli tui::overlays` (search stream render, palette resolve, ask-pane citations, outbox undo)
 
 ## 86. Supply-chain & release gates
-- [ ] status
+- [x] status
 - **depends-on:** 1
 - **parallel-safe:** yes
 - **acceptance:**
