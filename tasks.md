@@ -369,7 +369,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core eval::` · `mail search eval` on the fixture corpus meets threshold
 
 ## 38. Capability tokens & auth interceptor
-- [ ] status
+- [x] status
 - **depends-on:** 6, 3
 - **parallel-safe:** no
 - **acceptance:**
