@@ -53,6 +53,7 @@ async fn a_push_wakes_the_watch_and_syncs_within_millis() {
                     crate::imap::conn::login(stream, "user", "pw").await
                 },
                 sink,
+                &mut (),
             )
             .await
         }
@@ -125,6 +126,7 @@ async fn a_pushed_message_lands_in_the_database() {
                     crate::imap::conn::login(stream, "user", "pw").await
                 },
                 sink,
+                &mut (),
             )
             .await
         }
@@ -184,6 +186,7 @@ async fn the_idle_is_reissued_on_cadence() {
                     crate::imap::conn::login(stream, "user", "pw").await
                 },
                 sink,
+                &mut (),
             )
             .await
         }
@@ -251,6 +254,7 @@ async fn a_dropped_connection_reconnects_and_keeps_watching() {
                     }
                 },
                 sink,
+                &mut (),
             )
             .await
         }
@@ -307,6 +311,7 @@ async fn a_permanently_broken_watch_gives_up_instead_of_spinning() {
             }
         },
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -355,6 +360,7 @@ async fn cancelling_a_parked_watch_terminates_the_idle_cleanly() {
                     crate::imap::conn::login(stream, "user", "pw").await
                 },
                 sink,
+                &mut (),
             )
             .await
         }
@@ -412,6 +418,7 @@ async fn a_watch_cancelled_before_it_starts_makes_no_connection() {
             }
         },
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -508,6 +515,7 @@ async fn keepalives_do_not_postpone_the_re_idle_cadence() {
                     crate::imap::conn::login(stream, "user", "pw").await
                 },
                 sink,
+                &mut (),
             )
             .await
         }
@@ -567,6 +575,7 @@ async fn a_pushed_flag_change_is_reflected() {
                     crate::imap::conn::login(stream, "user", "pw").await
                 },
                 sink,
+                &mut (),
             )
             .await
         }
@@ -622,6 +631,7 @@ async fn a_pushed_expunge_is_reflected() {
                     crate::imap::conn::login(stream, "user", "pw").await
                 },
                 sink,
+                &mut (),
             )
             .await
         }
@@ -680,6 +690,7 @@ async fn an_account_watches_its_highest_priority_folders_up_to_the_limit() {
                     crate::imap::conn::login(stream, "user", "pw").await
                 },
                 |_| {},
+                (),
             )
             .await
         }

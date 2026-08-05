@@ -38,6 +38,8 @@ pub struct FetchedMessage {
 pub struct PersistOutcome {
     /// The stable message id.
     pub message_id: i64,
+    /// The IMAP UID it was fetched as.
+    pub uid: i64,
     /// Whether a new row was inserted (`false` = already present, a no-op).
     pub inserted: bool,
     /// The thread the message belongs to.
@@ -107,6 +109,7 @@ pub async fn persist_fetched(
                 tx.commit()?;
                 return Ok(PersistOutcome {
                     message_id: existing.id,
+                    uid,
                     inserted: false,
                     thread_id,
                     merged_threads,
@@ -153,6 +156,7 @@ pub async fn persist_fetched(
             tx.commit()?;
             Ok(PersistOutcome {
                 message_id,
+                uid,
                 inserted: true,
                 thread_id,
                 merged_threads,

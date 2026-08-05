@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// SyncService drives mailbox synchronization and streams what it changed.
+//
+// Sync is a background activity, not a request/response one: the daemon keeps
+// folders current on its own. These RPCs are the controls around that —
+// trigger a pass, ask where it got to, stop it, and watch what it does.
+service SyncService {
+  // Sync one folder, or every folder of an account, now.
+  //
+  // Returns when the pass finishes. Callers wanting progress rather than a
+  // summary should watch the event stream instead.
+  rpc SyncFolder(SyncFolderRequest) returns (SyncFolderResponse);
+
+  // Per-folder sync state: how far the initial walk got, where the delta
+  // checkpoint stands, and when the folder was last checked.
+  rpc Status(SyncStatusRequest) returns (SyncStatusResponse);
+
+  // Stop syncing an account until Resume. In-flight passes stop at their next
+  // safe boundary rather than being abandoned mid-command.
+  rpc Pause(PauseRequest) returns (PauseResponse);
+
+  // Resume a paused account.
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+
+  // Stream domain events from the durable log, oldest first, continuing live.
+  //
+  // `since_seq` resumes from a cursor: the stream replays everything after it
+  // and then follows the tail with no gap between the two. A cursor older than
+  // retention fails with OUT_OF_RANGE carrying `oldest_seq` and `resume_from`
+  // in ErrorInfo metadata, so the client knows where to resync from.
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+}
+
+// What a sync pass should do.
+enum SyncMode {
+  // Treated as SYNC_MODE_AUTO.
+  SYNC_MODE_UNSPECIFIED = 0;
+  // Let the engine choose: the initial walk for a folder without a baseline,
+  // the cheapest delta strategy for one that has it. The normal mode.
+  SYNC_MODE_AUTO = 1;
+  // Force the full UID-window walk even where a delta would do.
+  SYNC_MODE_FULL = 2;
+}
+
+message SyncFolderRequest {
+  int64 account_id = 1;
+  // Sync just this folder. Absent means every folder of the account, in
+  // priority order.
+  optional int64 mailbox_id = 2;
+  SyncMode mode = 3;
+}
+
+// What one folder's pass did.
+message FolderSyncResult {
+  int64 mailbox_id = 1;
+  string mailbox_name = 2;
+  // How the server was asked: "qresync" | "condstore" | "uiddiff" | "full".
+  string strategy = 3;
+  int64 new_messages = 4;
+  int64 flag_updates = 5;
+  int64 expunged = 6;
+  // Set when the folder failed; the other folders still ran.
+  optional string error = 7;
+}
+
+message SyncFolderResponse {
+  repeated FolderSyncResult folders = 1;
+  // The log position after this pass, for a client that wants to watch from
+  // exactly here rather than from wherever the stream happens to start.
+  int64 latest_seq = 2;
+}
+
+message SyncStatusRequest {
+  int64 account_id = 1;
+}
+
+// One folder's durable sync state.
+message FolderStatus {
+  int64 mailbox_id = 1;
+  string name = 2;
+  optional int64 uidvalidity = 3;
+  optional int64 uidnext = 4;
+  // The delta checkpoint: what the next pass will ask CHANGEDSINCE.
+  optional int64 highestmodseq = 5;
+  // High-water mark of the initial walk; everything above it is new mail.
+  optional int64 last_synced_uid = 6;
+  // Low-water mark; the backlog resumes just below it.
+  optional int64 walked_down_to = 7;
+  // Whether the initial walk reached the bottom of the UID space.
+  bool full_sync_done = 8;
+  // Unix seconds.
+  optional int64 last_sync_at = 9;
+  // Messages stored locally for this folder.
+  int64 message_count = 10;
+}
+
+message SyncStatusResponse {
+  repeated FolderStatus folders = 1;
+  // Whether the account is currently paused.
+  bool paused = 2;
+}
+
+message PauseRequest {
+  int64 account_id = 1;
+}
+
+message PauseResponse {
+  bool paused = 1;
+}
+
+message ResumeRequest {
+  int64 account_id = 1;
+}
+
+message ResumeResponse {
+  bool paused = 1;
+}
+
+// Kinds of domain event. Values match the durable log's wire strings.
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_NEW_MAIL = 1;
+  EVENT_KIND_FLAG_CHANGED = 2;
+  EVENT_KIND_MOVED = 3;
+  EVENT_KIND_DELETED = 4;
+  EVENT_KIND_SYNC_STATE = 5;
+  EVENT_KIND_SEND_RESULT = 6;
+  EVENT_KIND_RULE_FIRED = 7;
+  EVENT_KIND_AI_SUMMARY = 8;
+}
+
+message WatchEventsRequest {
+  // Restrict to one account. Absent or 0 means every account.
+  int64 account_id = 1;
+  // Resume after this position. 0 starts from the oldest retained event.
+  int64 since_seq = 2;
+  // Restrict to these kinds. Empty means every kind.
+  repeated EventKind kinds = 3;
+}
+
+// One domain event.
+message Event {
+  // Monotonic position. The cursor to resume from.
+  int64 seq = 1;
+  EventKind kind = 2;
+  // Unix seconds.
+  int64 at = 3;
+  optional int64 account_id = 4;
+  optional int64 mailbox_id = 5;
+  optional int64 message_id = 6;
+  // Kind-specific detail, JSON-encoded.
+  string payload = 7;
+}

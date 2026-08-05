@@ -87,6 +87,7 @@ use crate::repo;
 use crate::storage::Database;
 
 use super::full::{self, format_uid_set, SyncOptions};
+use super::{Change, ChangeSink};
 
 /// The IMAP attributes a change probe fetches: identity, the flag set, and the
 /// modseq that made it change. Deliberately no `BODY[]` — the point of a delta
@@ -254,7 +255,7 @@ impl Changes {
 ///   be dropped.
 /// - A mapped storage error if persistence fails.
 #[tracing::instrument(
-    skip(session, db, capabilities, opts, cancel),
+    skip(session, db, capabilities, opts, cancel, sink),
     fields(folder, strategy, uidvalidity)
 )]
 pub async fn delta_sync<T: ImapStream>(
@@ -264,6 +265,7 @@ pub async fn delta_sync<T: ImapStream>(
     capabilities: ImapCapabilities,
     opts: SyncOptions,
     cancel: &CancellationToken,
+    sink: &mut impl ChangeSink,
 ) -> Result<DeltaReport, Error> {
     let mailbox = db
         .read(move |c| repo::get_mailbox(c, mailbox_id))
@@ -349,6 +351,7 @@ pub async fn delta_sync<T: ImapStream>(
             server_modseq,
             opts,
             cancel,
+            sink,
         )
         .await;
     };
@@ -509,23 +512,23 @@ pub async fn delta_sync<T: ImapStream>(
         // an expunge, so none is applied.
         (None, _) => Vec::new(),
     };
-    let expunged = expunge_local(db, mailbox_id, uidvalidity, &gone).await?;
+    let expunged = expunge_local(db, mailbox_id, uidvalidity, &gone, sink).await?;
     if expunged > 0 {
         tracing::info!(expunged, "removed messages the server no longer has");
     }
 
     // ---- flags -----------------------------------------------------------
     let stored: BTreeMap<i64, i64> = load_uid_ids(db, mailbox_id, uidvalidity, &changes).await?;
-    let updates: Vec<(i64, Vec<String>)> = changes
+    let updates: Vec<(i64, i64, Vec<String>)> = changes
         .changed
         .iter()
         .filter_map(|(uid, flags)| {
             stored
                 .get(uid)
-                .map(|message_id| (*message_id, flags.clone()))
+                .map(|message_id| (*message_id, *uid, flags.clone()))
         })
         .collect();
-    let flag_updates = apply_flags(db, updates).await?;
+    let flag_updates = apply_flags(db, updates, sink).await?;
     if flag_updates > 0 {
         tracing::info!(flag_updates, "reconciled flags the server changed");
     }
@@ -582,7 +585,15 @@ pub async fn delta_sync<T: ImapStream>(
                 opts.window_timeout
             ))
         })??;
-        new_messages += outcomes.iter().filter(|outcome| outcome.inserted).count() as u64;
+        for outcome in &outcomes {
+            if outcome.inserted {
+                new_messages += 1;
+                sink.changed(Change::Added {
+                    message_id: outcome.message_id,
+                    uid: outcome.uid,
+                });
+            }
+        }
     }
 
     // ---- checkpoint ------------------------------------------------------
@@ -671,7 +682,7 @@ pub async fn delta_sync<T: ImapStream>(
 ///
 /// Only storage errors reading the folder list; per-folder failures are
 /// collected into [`AccountDeltaReport::failures`].
-#[tracing::instrument(skip(session, db, capabilities, opts, cancel))]
+#[tracing::instrument(skip(session, db, capabilities, opts, cancel, sink))]
 pub async fn delta_sync_folders<T: ImapStream>(
     session: &mut Session<T>,
     db: &Database,
@@ -679,6 +690,7 @@ pub async fn delta_sync_folders<T: ImapStream>(
     capabilities: ImapCapabilities,
     opts: SyncOptions,
     cancel: &CancellationToken,
+    sink: &mut impl ChangeSink,
 ) -> Result<AccountDeltaReport, Error> {
     let mailboxes = db
         .read(move |c| repo::list_mailboxes(c, account_id))
@@ -692,7 +704,7 @@ pub async fn delta_sync_folders<T: ImapStream>(
         if cancel.is_cancelled() {
             break;
         }
-        match delta_sync(session, db, mailbox.id, capabilities, opts, cancel).await {
+        match delta_sync(session, db, mailbox.id, capabilities, opts, cancel, sink).await {
             Ok(report) => out.reports.push(report),
             Err(error) => {
                 tracing::warn!(folder = %mailbox.name, %error, "folder delta sync failed; continuing");
@@ -937,6 +949,7 @@ async fn resync<T: ImapStream>(
     server_modseq: Option<i64>,
     opts: SyncOptions,
     cancel: &CancellationToken,
+    sink: &mut impl ChangeSink,
 ) -> Result<DeltaReport, Error> {
     let purged_stale = if uidvalidity_changed {
         tracing::warn!(
@@ -962,7 +975,7 @@ async fn resync<T: ImapStream>(
     })
     .await?;
 
-    let report = full::sync_folder(session, db, mailbox_id, opts, cancel, |_| {}).await?;
+    let report = full::sync_folder(session, db, mailbox_id, opts, cancel, |_| {}, sink).await?;
 
     // A walk that did not reach the bottom of the UID space has not seen
     // everything the modseq covers, so it is not a baseline; leaving it unset
@@ -1033,24 +1046,39 @@ async fn load_uid_ids(
 
 /// Apply flag replacements in one transaction, returning how many messages
 /// actually differed.
-async fn apply_flags(db: &Database, updates: Vec<(i64, Vec<String>)>) -> Result<u64, Error> {
+async fn apply_flags(
+    db: &Database,
+    updates: Vec<(i64, i64, Vec<String>)>,
+    sink: &mut impl ChangeSink,
+) -> Result<u64, Error> {
     if updates.is_empty() {
         return Ok(0);
     }
+    // Report only what actually differed. A server re-stating a flag set it
+    // already sent is not a change, and an event stream that said otherwise
+    // would make every delta pass look like activity.
     let changed = db
         .write(move |conn| {
             let tx = conn.transaction()?;
-            let mut changed = 0u64;
-            for (message_id, flags) in &updates {
-                if repo::replace_flags(&tx, *message_id, flags)? {
-                    changed += 1;
+            let mut changed = Vec::new();
+            for (message_id, uid, flags) in updates {
+                if repo::replace_flags(&tx, message_id, &flags)? {
+                    changed.push((message_id, uid, flags));
                 }
             }
             tx.commit()?;
             Ok(changed)
         })
         .await?;
-    Ok(changed)
+    let count = changed.len() as u64;
+    for (message_id, uid, flags) in changed {
+        sink.changed(Change::FlagsChanged {
+            message_id,
+            uid,
+            flags,
+        });
+    }
+    Ok(count)
 }
 
 /// Delete the local rows for UIDs the server no longer has.
@@ -1059,36 +1087,53 @@ async fn expunge_local(
     mailbox_id: i64,
     uidvalidity: i64,
     uids: &[i64],
+    sink: &mut impl ChangeSink,
 ) -> Result<u64, Error> {
     if uids.is_empty() {
         return Ok(0);
     }
     let uids = uids.to_vec();
-    let deleted = db
+    // The ids are collected inside the transaction and reported after it
+    // commits: they do not survive the delete, and reporting them before would
+    // announce a removal that a rollback then undid.
+    let removed = db
         .write(move |conn| {
             let tx = conn.transaction()?;
-            let ids: Vec<i64> = {
+            let pairs: Vec<(i64, i64)> = {
                 let mut stmt = tx.prepare(
                     "SELECT id FROM messages
                      WHERE mailbox_id = ?1 AND uidvalidity = ?2 AND uid = ?3",
                 )?;
-                let mut ids = Vec::with_capacity(uids.len());
+                let mut pairs = Vec::with_capacity(uids.len());
                 for uid in &uids {
                     let id: Option<i64> = stmt
                         .query_row(rusqlite::params![mailbox_id, uidvalidity, uid], |row| {
                             row.get(0)
                         })
                         .optional()?;
-                    ids.extend(id);
+                    if let Some(id) = id {
+                        pairs.push((id, *uid));
+                    }
                 }
-                ids
+                pairs
             };
+            let ids: Vec<i64> = pairs.iter().map(|(id, _)| *id).collect();
             let deleted = super::remove_messages(&tx, &ids)?;
             tx.commit()?;
-            Ok(deleted)
+            Ok(if deleted == pairs.len() {
+                pairs
+            } else {
+                // A row that vanished between the lookup and the delete was not
+                // removed by this pass, so it is not this pass's event.
+                Vec::new()
+            })
         })
         .await?;
-    Ok(deleted as u64)
+    let count = removed.len() as u64;
+    for (message_id, uid) in removed {
+        sink.changed(Change::Removed { message_id, uid });
+    }
+    Ok(count)
 }
 
 /// Rewrite the checkpoint's timestamp without moving any mark, so "last

@@ -62,6 +62,7 @@ use crate::storage::Database;
 
 use super::delta::{self, DeltaReport};
 use super::full::SyncOptions;
+use super::ChangeSink;
 
 /// RFC 2177 §3: re-issue `IDLE` at least every 29 minutes so a server with an
 /// inactivity timeout does not log the client off mid-park.
@@ -256,8 +257,11 @@ fn is_permanent(error: &Error) -> bool {
 /// error reading it. Both are checked before the first connection, so a watch
 /// that returns `Err` never started; everything after that is handled inside
 /// the loop and surfaced through [`WatchReport`].
+// Every one of these is load-bearing and none groups naturally with
+// another; a struct here would trade an honest signature for indirection.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
-    skip(db, connect, capabilities, opts, cancel, on_cycle),
+    skip(db, connect, capabilities, opts, cancel, on_cycle, sink),
     fields(folder, account_id)
 )]
 pub async fn watch_folder<T, C, Fut, F>(
@@ -268,6 +272,7 @@ pub async fn watch_folder<T, C, Fut, F>(
     cancel: &CancellationToken,
     mut connect: C,
     mut on_cycle: F,
+    sink: &mut impl ChangeSink,
 ) -> Result<WatchReport, Error>
 where
     T: ImapStream,
@@ -371,6 +376,7 @@ where
                 capabilities,
                 opts.sync,
                 cancel,
+                sink,
             )
             .await;
             match &outcome {
@@ -519,8 +525,9 @@ pub struct AccountWatchReport {
 ///
 /// Only a storage error reading the folder list; per-folder failures are
 /// collected into the report.
-#[tracing::instrument(skip(db, capabilities, opts, cancel, connect, on_cycle))]
-pub async fn watch_folders<T, C, Fut, F>(
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(db, capabilities, opts, cancel, connect, on_cycle, sink))]
+pub async fn watch_folders<T, C, Fut, F, S>(
     db: &Database,
     account_id: i64,
     capabilities: ImapCapabilities,
@@ -528,12 +535,14 @@ pub async fn watch_folders<T, C, Fut, F>(
     cancel: &CancellationToken,
     connect: C,
     on_cycle: F,
+    sink: S,
 ) -> Result<AccountWatchReport, Error>
 where
     T: ImapStream,
     C: Fn() -> Fut + Clone,
     Fut: std::future::Future<Output = Result<Session<T>, Error>>,
     F: Fn(WatchCycle) + Clone,
+    S: ChangeSink + Clone,
 {
     let mailboxes = db
         .read(move |c| repo::list_mailboxes(c, account_id))
@@ -548,7 +557,10 @@ where
         "watching account folders"
     );
 
-    let running = watched.iter().map(|mailbox| {
+    // A clone per watch: they run concurrently, so they cannot share one
+    // exclusive borrow of the sink.
+    let mut sinks: Vec<S> = watched.iter().map(|_| sink.clone()).collect();
+    let running = watched.iter().zip(sinks.iter_mut()).map(|(mailbox, sink)| {
         watch_folder(
             db,
             mailbox.id,
@@ -557,6 +569,7 @@ where
             cancel,
             connect.clone(),
             on_cycle.clone(),
+            sink,
         )
     });
     let results = futures::future::join_all(running).await;

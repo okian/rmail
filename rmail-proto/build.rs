@@ -6,7 +6,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let proto_root = manifest_dir.join("..").join("proto");
     let v1 = proto_root.join("rmail").join("v1");
-    let protos = [v1.join("health.proto"), v1.join("account.proto")];
+    let protos = [
+        v1.join("health.proto"),
+        v1.join("account.proto"),
+        v1.join("sync.proto"),
+    ];
     let descriptor_path = out_dir.join("rmail_descriptor.bin");
 
     tonic_build::configure()

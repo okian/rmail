@@ -48,6 +48,57 @@ pub async fn connect_tls(host: &str, port: u16) -> Result<TlsClientStream, Error
     Ok(tls)
 }
 
+/// Connect to an account's IMAP server, log in, and probe capabilities.
+///
+/// The one place credentials are resolved for a sync: [`crate::imap::test_connection`]
+/// does the same handshake but exists to *verify* configuration and logs out
+/// afterwards. This hands the live session back so the caller can work with it.
+///
+/// The credential is resolved on a blocking thread — a `password_command` or a
+/// keychain prompt can block for a long time — and never leaves this scope.
+///
+/// # Errors
+///
+/// - [`Error::FailedPrecondition`] if the account has no IMAP server or no
+///   credential configured.
+/// - [`Error::NotFound`] if the account does not exist.
+/// - [`Error::Unauthenticated`] if the server rejects the login.
+/// - [`Error::Unavailable`] if the server is unreachable.
+/// - [`Error::DeadlineExceeded`] if the handshake exceeds
+///   [`crate::imap::IMAP_DEADLINE`].
+#[tracing::instrument(skip(db), err)]
+pub async fn connect_account(
+    db: &crate::storage::Database,
+    account_id: i64,
+) -> Result<(Session<TlsClientStream>, super::ImapCapabilities), Error> {
+    let account = crate::account::get(db, account_id).await?;
+    let host = account
+        .imap_server
+        .clone()
+        .ok_or_else(|| Error::failed_precondition("account has no IMAP server configured"))?;
+    let port = account.imap_port.unwrap_or(993);
+    let username = account.username.clone().unwrap_or_default();
+
+    let credential = account.credential.clone();
+    let username_for_resolve = account.username.clone();
+    let secret =
+        tokio::task::spawn_blocking(move || credential.resolve(username_for_resolve.as_deref()))
+            .await
+            .map_err(|e| Error::internal(format!("credential resolution task failed: {e}")))??
+            .ok_or_else(|| Error::failed_precondition("account has no credential configured"))?;
+
+    // Bound the handshake so a wedged server cannot hang a sync before it has
+    // even started.
+    tokio::time::timeout(super::IMAP_DEADLINE, async {
+        let stream = connect_tls(&host, port).await?;
+        let mut session = login(stream, &username, secret.expose()).await?;
+        let capabilities = probe_capabilities(&mut session).await?;
+        Ok((session, capabilities))
+    })
+    .await
+    .map_err(|_| Error::deadline_exceeded("IMAP connection timed out"))?
+}
+
 /// Read the server greeting and log in, returning an authenticated session.
 ///
 /// Generic over the stream so production (TLS) and tests (plain TCP) share the

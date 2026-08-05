@@ -35,6 +35,7 @@ use std::time::Duration;
 use async_imap::Session;
 use tokio_util::sync::CancellationToken;
 
+use super::{Change, ChangeSink};
 use crate::error::Error;
 use crate::imap::conn::ImapStream;
 use crate::message::fetch::fetch_and_persist;
@@ -164,7 +165,7 @@ pub struct AccountSyncReport {
 ///   be dropped.
 /// - A mapped storage error if persistence fails.
 #[tracing::instrument(
-    skip(session, db, opts, cancel, on_progress),
+    skip(session, db, opts, cancel, on_progress, sink),
     fields(folder, uidvalidity)
 )]
 pub async fn sync_folder<T, F>(
@@ -174,6 +175,7 @@ pub async fn sync_folder<T, F>(
     opts: SyncOptions,
     cancel: &CancellationToken,
     mut on_progress: F,
+    sink: &mut impl ChangeSink,
 ) -> Result<SyncReport, Error>
 where
     T: ImapStream,
@@ -304,6 +306,10 @@ where
                 for outcome in &outcomes {
                     if outcome.inserted {
                         fetched += 1;
+                        sink.changed(Change::Added {
+                            message_id: outcome.message_id,
+                            uid: outcome.uid,
+                        });
                     }
                 }
                 windows_fetched += 1;
@@ -382,7 +388,7 @@ where
 ///
 /// Only storage errors reading the folder list; per-folder failures are
 /// collected into [`AccountSyncReport::failures`].
-#[tracing::instrument(skip(session, db, opts, cancel, on_progress))]
+#[tracing::instrument(skip(session, db, opts, cancel, on_progress, sink))]
 pub async fn sync_folders<T, F>(
     session: &mut Session<T>,
     db: &Database,
@@ -390,6 +396,7 @@ pub async fn sync_folders<T, F>(
     opts: SyncOptions,
     cancel: &CancellationToken,
     mut on_progress: F,
+    sink: &mut impl ChangeSink,
 ) -> Result<AccountSyncReport, Error>
 where
     T: ImapStream,
@@ -403,7 +410,17 @@ where
         if cancel.is_cancelled() {
             break;
         }
-        match sync_folder(session, db, mailbox.id, opts, cancel, &mut on_progress).await {
+        match sync_folder(
+            session,
+            db,
+            mailbox.id,
+            opts,
+            cancel,
+            &mut on_progress,
+            sink,
+        )
+        .await
+        {
             Ok(report) => out.reports.push(report),
             Err(error) => {
                 tracing::warn!(folder = %mailbox.name, %error, "folder sync failed; continuing");

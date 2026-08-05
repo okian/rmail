@@ -109,6 +109,7 @@ impl AccountFixture {
             capabilities,
             SyncOptions::default(),
             cancel,
+            &mut (),
         )
         .await
         .unwrap();
@@ -272,6 +273,7 @@ async fn a_vanished_report_does_not_cross_folders() {
             SyncOptions::default(),
             &CancellationToken::new(),
             |_| {},
+            &mut (),
         )
         .await
         .unwrap();

@@ -541,6 +541,7 @@ async fn delta_syncing_an_unknown_mailbox_is_not_found() {
         capabilities,
         crate::sync::SyncOptions::default(),
         &CancellationToken::new(),
+        &mut (),
     )
     .await
     .expect_err("an unknown mailbox has nothing to sync");

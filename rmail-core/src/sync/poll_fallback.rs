@@ -61,6 +61,7 @@ fn spawn_watch(
                 crate::imap::conn::login(stream, "user", "pw").await
             },
             sink,
+            &mut (),
         )
         .await
     })
@@ -266,6 +267,7 @@ async fn a_connection_that_fails_intermittently_backs_off_and_recovers() {
                     }
                 },
                 sink,
+                &mut (),
             )
             .await
         }
@@ -320,6 +322,7 @@ async fn a_server_that_stays_down_retries_forever_rather_than_giving_up() {
                     }
                 },
                 |_| {},
+                &mut (),
             )
             .await
         }
@@ -381,6 +384,7 @@ async fn a_persistent_post_connect_failure_backs_off_instead_of_hammering() {
                     }
                 },
                 sink,
+                &mut (),
             )
             .await
         }

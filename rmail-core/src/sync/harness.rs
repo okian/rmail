@@ -164,6 +164,7 @@ impl Fixture {
             SyncOptions::default(),
             &CancellationToken::new(),
             |_| {},
+            &mut (),
         )
         .await
         .unwrap();
@@ -233,6 +234,7 @@ impl Fixture {
             capabilities,
             SyncOptions::default(),
             cancel,
+            &mut (),
         )
         .await
     }
@@ -340,8 +342,13 @@ impl Cycles {
 /// Polls rather than sleeps a fixed span: a watch that is working takes
 /// milliseconds, and one that is broken should fail the assertion rather than
 /// pass because the sleep happened to be long enough.
+///
+/// The deadline is generous on purpose. These are liveness assertions — *does
+/// the watch reconnect at all* — not latency ones, and every watch here runs on
+/// a spawned task that a fully loaded test binary can starve for a while. A
+/// tight bound turns "the machine was busy" into a failing suite.
 pub(super) async fn until<F: FnMut() -> bool>(what: &str, mut predicate: F) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while tokio::time::Instant::now() < deadline {
         if predicate() {
             return;

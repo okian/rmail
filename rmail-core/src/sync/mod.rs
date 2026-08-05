@@ -18,6 +18,7 @@
 //! straight back to the full walk.
 
 pub mod delta;
+pub mod engine;
 pub mod full;
 pub mod idle;
 
@@ -29,6 +30,7 @@ use crate::error::Error;
 pub(crate) use crate::imap::command_error;
 
 pub use delta::{delta_sync, delta_sync_folders, AccountDeltaReport, DeltaReport, DeltaStrategy};
+pub use engine::{FolderOutcome, PassReport, SyncEngine, SyncMode};
 pub use full::{
     prioritize, sync_folder, sync_folders, SyncOptions, SyncProgress, SyncReport, DEFAULT_WINDOW,
 };
@@ -52,6 +54,60 @@ mod poll_fallback;
 mod qresync;
 #[cfg(test)]
 mod uiddiff_fallback;
+
+/// Something a sync pass changed in the local store.
+///
+/// Reported as it happens rather than accumulated into the report, because a
+/// first delta over a busy folder can touch tens of thousands of messages and
+/// the consumer — the durable event log — wants to see them as they land, not
+/// after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// A message was downloaded and stored.
+    Added {
+        /// Stable local id.
+        message_id: i64,
+        /// IMAP UID.
+        uid: i64,
+    },
+    /// A stored message's flag set was replaced with the server's.
+    FlagsChanged {
+        /// Stable local id.
+        message_id: i64,
+        /// IMAP UID.
+        uid: i64,
+        /// The flags the message now has.
+        flags: Vec<String>,
+    },
+    /// A stored message was removed because the server no longer has it.
+    Removed {
+        /// Stable local id, now gone.
+        message_id: i64,
+        /// IMAP UID, now gone.
+        uid: i64,
+    },
+}
+
+/// Where a sync pass reports what it changed.
+///
+/// A trait rather than a closure so `&mut ()` is a valid "nobody is watching" —
+/// the engines are useful without an event log attached, and every test that
+/// does not care about events should not have to name a callback.
+pub trait ChangeSink {
+    /// Record one change.
+    fn changed(&mut self, change: Change);
+}
+
+/// The null sink: syncing with nothing listening.
+impl ChangeSink for () {
+    fn changed(&mut self, _change: Change) {}
+}
+
+impl<F: FnMut(Change)> ChangeSink for F {
+    fn changed(&mut self, change: Change) {
+        self(change);
+    }
+}
 
 /// Map a `SELECT` failure for `folder`.
 ///

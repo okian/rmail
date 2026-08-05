@@ -163,6 +163,7 @@ async fn fresh_sync_walks_the_whole_folder_newest_first() {
         },
         &CancellationToken::new(),
         progress.sink(),
+        &mut (),
     )
     .await
     .unwrap();
@@ -220,6 +221,7 @@ async fn the_newest_window_lands_before_the_rest() {
                 .borrow_mut()
                 .push((p.cursor_uid, fx.stored_uids()));
         },
+        &mut (),
     )
     .await
     .unwrap();
@@ -248,6 +250,7 @@ async fn an_interrupted_sync_resumes_without_refetching() {
         let cancel = CancellationToken::new();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut tx = Some(tx);
+        let mut sink = ();
         tokio::select! {
             biased;
             _ = rx => {}
@@ -262,6 +265,7 @@ async fn an_interrupted_sync_resumes_without_refetching() {
                         let _ = tx.send(());
                     }
                 },
+                &mut sink,
             ) => panic!("the run should have been interrupted before finishing"),
         }
     }
@@ -290,6 +294,7 @@ async fn an_interrupted_sync_resumes_without_refetching() {
         },
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -343,6 +348,7 @@ async fn a_completed_sync_reruns_without_touching_the_network() {
         },
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -360,6 +366,7 @@ async fn a_completed_sync_reruns_without_touching_the_network() {
         },
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -392,6 +399,7 @@ async fn new_mail_arriving_after_a_full_sync_is_picked_up() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -407,6 +415,7 @@ async fn new_mail_arriving_after_a_full_sync_is_picked_up() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -436,6 +445,7 @@ async fn an_empty_folder_completes_and_checkpoints() {
         SyncOptions::default(),
         &CancellationToken::new(),
         progress.sink(),
+        &mut (),
     )
     .await
     .unwrap();
@@ -480,6 +490,7 @@ async fn a_changed_uidvalidity_is_reported_and_the_new_space_walked() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -507,6 +518,7 @@ async fn syncing_an_unknown_mailbox_is_not_found() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap_err();
@@ -532,6 +544,7 @@ async fn sync_folders_visits_the_inbox_first() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -629,6 +642,7 @@ async fn a_sparse_uid_space_still_converges_to_a_true_no_op() {
         opts,
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -644,6 +658,7 @@ async fn a_sparse_uid_space_still_converges_to_a_true_no_op() {
         opts,
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -670,6 +685,7 @@ async fn a_uidvalidity_bump_replaces_the_folder_instead_of_duplicating_it() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -686,6 +702,7 @@ async fn a_uidvalidity_bump_replaces_the_folder_instead_of_duplicating_it() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -727,6 +744,7 @@ async fn cancellation_stops_the_walk_at_a_window_boundary() {
         },
         &cancel,
         |_| cancel.cancel(),
+        &mut (),
     )
     .await
     .unwrap();
@@ -757,6 +775,7 @@ async fn an_unselectable_folder_is_not_found_not_unauthenticated() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap_err();
@@ -779,6 +798,7 @@ async fn a_server_without_uid_response_codes_is_unavailable() {
             SyncOptions::default(),
             &CancellationToken::new(),
             |_| {},
+            &mut (),
         )
         .await
         .unwrap_err();
@@ -811,6 +831,7 @@ async fn one_broken_folder_does_not_stop_the_others() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
@@ -844,6 +865,7 @@ async fn each_folder_syncs_its_own_messages() {
         SyncOptions::default(),
         &CancellationToken::new(),
         |_| {},
+        &mut (),
     )
     .await
     .unwrap();
