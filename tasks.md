@@ -415,7 +415,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-cli format:: api_call::` (format stability, generic call via reflection, exit codes)
 
 ## 43. Anthropic provider & Provider trait
-- [ ] status
+- [x] status
 - **depends-on:** 2, 3, 4
 - **parallel-safe:** no
 - **acceptance:**

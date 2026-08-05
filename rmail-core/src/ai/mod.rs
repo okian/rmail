@@ -36,7 +36,10 @@
 //! configured backend today, and a local implementation is a second arm away
 //! from wiring in, not a redesign.
 
+pub mod audit;
+pub mod policy;
 pub mod provider;
+pub mod redact;
 
 pub use provider::{
     build, ChatMessage, ChatRequest, ChatResponse, ClaudeProvider, OutputFormat, Provider,
