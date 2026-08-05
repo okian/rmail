@@ -10,10 +10,12 @@
 //! The stages themselves land in the tasks after this one; this module ships
 //! the queue they will be driven from.
 
+pub mod chunk;
 pub mod entities;
 pub mod extract;
 pub mod fts;
 pub mod queue;
+pub mod semantic;
 
 pub use entities::{collect_orphans, extract_entities, EntityKind, EntityReport, Mention};
 pub use extract::{extract_message, ExtractReport, ExtractedPart, Part};

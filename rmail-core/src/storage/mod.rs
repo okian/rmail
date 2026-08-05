@@ -145,6 +145,12 @@ impl Database {
             }
         }
 
+        // Before any connection is opened: `sqlite3_auto_extension` registers
+        // the extension for connections created *after* the call, so a
+        // connection opened first would not have `vec0` and the migration that
+        // creates the vector table would fail with a bare "no such module".
+        register_vector_extension()?;
+
         // Writer first: it establishes WAL mode (persistent on the file) and
         // runs migrations before any reader opens.
         let mut writer = Connection::open(&path)?;
@@ -264,6 +270,65 @@ impl Database {
             Ok(result) => result,
             Err(e) => Err(StorageError::Task(e.to_string())),
         }
+    }
+}
+
+/// Register `sqlite-vec` so every connection this process opens has `vec0`.
+///
+/// Returns whether the extension is registered. Discarding the result gets the
+/// exact bare "no such module: vec0" this exists to prevent, except later and
+/// from a reader.
+///
+/// # Why a process-global auto-extension
+///
+/// The alternative is loading it per connection, which means every future
+/// connection site has to remember — including the r2d2 pool's, which creates
+/// connections lazily and on other threads. A `vec0` table read through a
+/// connection that lacks the module fails at query time, in the reader, long
+/// after the mistake. Registering once at the only place connections are
+/// created makes forgetting impossible.
+///
+/// Idempotent: the [`Once`] runs it once per process and the result is
+/// remembered, so a later `open` gets the same answer rather than a silent one.
+fn register_vector_extension() -> Result<(), StorageError> {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    static CODE: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(libsqlite3_sys::SQLITE_OK);
+    ONCE.call_once(|| {
+        // SAFETY: `sqlite3_vec_init` has the signature SQLite expects of an
+        // extension entry point; the transmute is the cast the C API requires
+        // and the one `sqlite-vec` documents. `sqlite3_auto_extension` mutates
+        // a global list and is documented as callable while other connections
+        // exist — which it must be, since `open_with_pool_size` is public and
+        // another `Database`'s pool may already be live — and the `Once` means
+        // the mutation happens exactly once.
+        let code = unsafe {
+            libsqlite3_sys::sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut libsqlite3_sys::sqlite3,
+                    *mut *mut std::os::raw::c_char,
+                    *const libsqlite3_sys::sqlite3_api_routines,
+                ) -> std::os::raw::c_int,
+            >(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )))
+        };
+        CODE.store(code, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let code = CODE.load(std::sync::atomic::Ordering::Relaxed);
+    if code == libsqlite3_sys::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some(
+                "could not register the sqlite-vec extension; the semantic index \
+                 would fail later, from a reader, as a bare \"no such module\""
+                    .to_owned(),
+            ),
+        )))
     }
 }
 

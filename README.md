@@ -122,7 +122,25 @@ thing the others do not:
 |---|---|---|
 | Lexical | the words you remember | contentless FTS5, field-weighted BM25 |
 | Entity | the invoice number, the address, the parcel | `entities` + co-occurrence graph |
-| Semantic | the message whose words you *don't* remember | dense vectors, cosine |
+| Semantic | the message whose words you *don't* remember | `sqlite-vec` kNN over chunk and message vectors |
+
+Text is split into overlapping chunks at the strongest separator inside the
+size budget — blank line, then line break, then sentence end, then word — so a
+vector describes a passage rather than the average of a whole thread, and a
+result can quote the paragraph that matched. Every chunk carries a byte span
+into the source text, so citations quote the message rather than a copy.
+
+Each chunk gets a vector; each message gets the normalized mean of its chunks',
+which is what `mail similar` searches. Chunk vectors answer "which passage is
+about this"; a message vector answers "which message is like this one", and
+ranking chunks and deduplicating afterwards cannot answer the second — a long
+thread wins simply by having more chances to match.
+
+Work is keyed on content: a chunk whose text hash and model are both unchanged
+is not re-embedded, so re-indexing an unchanged mailbox costs a few hash
+comparisons. `index verify` reconciles chunks, vectors and bookkeeping in both
+directions, because a `vec0` virtual table takes no foreign key and will not
+check it for us.
 
 ### Embeddings
 

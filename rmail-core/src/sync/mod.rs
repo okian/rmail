@@ -159,6 +159,11 @@ pub(crate) fn remove_messages(conn: &Connection, ids: &[i64]) -> rusqlite::Resul
     // co-occurrence weights they supported do not, and mail a user expunged
     // must stop influencing what search ranks first.
     crate::index::entities::withdraw_messages(conn, ids)?;
+    // `chunks` cascades from `messages`, but `vec_chunks` is a virtual table
+    // and cascades from nothing. An orphaned vector is not merely wasted space:
+    // kNN returns it, the join to `chunks` drops it, and it has silently
+    // consumed one of the k slots a user asked for.
+    crate::index::semantic::drop_vectors(conn, ids)?;
 
     let mut deleted = 0usize;
     {
@@ -218,6 +223,7 @@ pub(crate) fn purge_other_uidvalidity(
     // entity set is not worth naming. The mentions are already gone by cascade;
     // one set-based pass restores every weight from what is left.
     crate::index::entities::reconcile_edges(conn)?;
+    crate::index::semantic::sweep_orphan_vectors(conn)?;
     repair_threads(conn, threads)?;
     Ok(deleted)
 }

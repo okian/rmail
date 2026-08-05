@@ -221,7 +221,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core embed::local` (embed batch, stable dim, offline)
 
 ## 21. Chunking & semantic vector index
-- [ ] status
+- [x] status
 - **depends-on:** 17, 20
 - **parallel-safe:** no
 - **acceptance:**
