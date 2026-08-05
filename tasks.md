@@ -212,7 +212,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core index::entities` (fixtures per entity kind, normalization, dedup)
 
 ## 20. Embedder trait & local embeddings
-- [ ] status
+- [x] status
 - **depends-on:** 2
 - **parallel-safe:** yes
 - **acceptance:**
