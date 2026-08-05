@@ -175,7 +175,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmaild sync_service` (in-process server: trigger sync, observe streamed events, resume)
 
 ## 16. Index job queue & state
-- [ ] status
+- [x] status
 - **depends-on:** 6, 14
 - **parallel-safe:** no
 - **acceptance:**
