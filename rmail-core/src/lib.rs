@@ -25,6 +25,6 @@ pub use error::{Error, ErrorReason, Result, ERROR_DOMAIN};
 pub use storage::{Database, StorageError};
 pub use telemetry::{LogFormat, TelemetryError};
 pub use transport::{
-    connect_uds, db_path_from_env, default_db_path, default_socket_path, socket_path_from_env,
-    DB_ENV, SOCKET_ENV,
+    config_path_from_env, connect_uds, db_path_from_env, default_config_path, default_db_path,
+    default_socket_path, socket_path_from_env, DB_ENV, SOCKET_ENV,
 };

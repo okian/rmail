@@ -181,7 +181,22 @@ pub(crate) fn purge_other_uidvalidity(
     conn: &Connection,
     mailbox_id: i64,
     keep: i64,
+    removed: &mut Vec<(i64, i64)>,
 ) -> rusqlite::Result<usize> {
+    // Collect identities before the delete: a purge removes messages just as
+    // surely as an expunge does, and a consumer that indexed them needs to know
+    // which ones to drop. Reporting only a count would leave every downstream
+    // index holding documents for mail that is gone.
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, uid FROM messages WHERE mailbox_id = ?1 AND uidvalidity <> ?2")?;
+        let rows = stmt.query_map(rusqlite::params![mailbox_id, keep], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        for row in rows {
+            removed.push(row?);
+        }
+    }
     let threads: BTreeSet<i64> = {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT thread_id FROM messages

@@ -107,7 +107,11 @@ where
     let events = EventLog::new(
         db.clone(),
         Retention {
-            max_rows: i64::try_from(config.grpc.events.retention_rows).ok(),
+            // Saturating, not `.ok()`: an out-of-range value mapping to
+            // `None` would read as *unlimited*, turning a config typo into
+            // unbounded disk growth — the exact failure the zero case is
+            // guarded against.
+            max_rows: Some(i64::try_from(config.grpc.events.retention_rows).unwrap_or(i64::MAX)),
             max_age: Some(Duration::from_secs(
                 u64::from(config.grpc.events.retention_days) * 24 * 60 * 60,
             )),
@@ -208,14 +212,15 @@ where
         let stopping = stopping.clone();
         async move {
             loop {
+                // Prune once at startup before sleeping. A daemon restarted
+                // more often than the interval would otherwise never prune at
+                // all, which is exactly the machine that most needs it.
+                if let Err(error) = events.prune().await {
+                    tracing::warn!(%error, "event log prune failed");
+                }
                 tokio::select! {
                     () = stopping.cancelled() => return,
                     () = tokio::time::sleep(PRUNE_INTERVAL) => {}
-                }
-                if let Err(error) = events.prune().await {
-                    // Retention falling behind is a disk problem, not a
-                    // correctness one: the log stays gapless either way.
-                    tracing::warn!(%error, "event log prune failed");
                 }
             }
         }

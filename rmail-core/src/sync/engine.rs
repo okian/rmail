@@ -24,6 +24,7 @@
 //! nothing new", which is what a user pressing pause actually wants.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -155,13 +156,41 @@ pub struct SyncEngine {
     /// Cancellation tokens for accounts currently paused, plus the token any
     /// in-flight pass for that account is running under.
     state: Arc<Mutex<HashMap<i64, AccountState>>>,
+    /// Hands each pass a distinct registration key.
+    generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
 struct AccountState {
     paused: bool,
-    /// Cancels whatever pass is running for this account.
-    running: Option<CancellationToken>,
+    /// Every pass currently running for this account, keyed by a generation id.
+    ///
+    /// A single slot would be wrong in both directions once two passes overlap:
+    /// the second registration would make the first uncancellable, and the
+    /// first's completion would deregister the second. Keyed entries let each
+    /// pass clean up exactly its own.
+    running: HashMap<u64, CancellationToken>,
+}
+
+/// Deregisters a pass when it ends, however it ends.
+///
+/// `finish`-at-the-end is not enough: a dropped RPC future — which is what a
+/// client disconnecting produces — never reaches it, and the entry would sit in
+/// the map for the life of the process.
+struct PassGuard {
+    state: Arc<Mutex<HashMap<i64, AccountState>>>,
+    account_id: i64,
+    id: u64,
+}
+
+impl Drop for PassGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(entry) = state.get_mut(&self.account_id) {
+                entry.running.remove(&self.id);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -179,6 +208,7 @@ impl SyncEngine {
             events,
             opts,
             state: Arc::new(Mutex::new(HashMap::new())),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -190,32 +220,60 @@ impl SyncEngine {
 
     /// Stop syncing `account_id` until [`Self::resume`].
     ///
-    /// Cancels any pass already running, which stops it at its next safe
+    /// Cancels every pass already running, which stops them at their next safe
     /// boundary rather than abandoning an IMAP command mid-flight.
-    pub fn pause(&self, account_id: i64) {
-        let Ok(mut state) = self.state.lock() else {
-            // A poisoned lock means a panic while holding it. Refusing to pause
-            // is worse than the alternative here: leave the flag alone and let
-            // the caller see the unchanged state from `is_paused`.
-            tracing::error!(account_id, "sync state lock poisoned; pause ignored");
-            return;
-        };
-        let entry = state.entry(account_id).or_default();
-        entry.paused = true;
-        if let Some(token) = entry.running.take() {
-            token.cancel();
-        }
-        tracing::info!(account_id, "sync paused");
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if the account does not exist — otherwise any id off
+    /// the wire would create a map entry, and an unbounded map keyed by
+    /// unvalidated client input is a slow leak with a friendly name.
+    /// [`Error::Internal`] if the state lock is poisoned: a pause that silently
+    /// did nothing would be indistinguishable from one that worked.
+    pub async fn pause(&self, account_id: i64) -> Result<(), Error> {
+        self.require_account(account_id).await?;
+        self.set_paused(account_id, true)
     }
 
     /// Allow `account_id` to sync again.
-    pub fn resume(&self, account_id: i64) {
-        let Ok(mut state) = self.state.lock() else {
-            tracing::error!(account_id, "sync state lock poisoned; resume ignored");
-            return;
-        };
-        state.entry(account_id).or_default().paused = false;
-        tracing::info!(account_id, "sync resumed");
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pause`].
+    pub async fn resume(&self, account_id: i64) -> Result<(), Error> {
+        self.require_account(account_id).await?;
+        self.set_paused(account_id, false)
+    }
+
+    async fn require_account(&self, account_id: i64) -> Result<(), Error> {
+        if self
+            .db
+            .read(move |c| repo::get_account(c, account_id))
+            .await?
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(Error::not_found(format!("account {account_id} not found")))
+        }
+    }
+
+    fn set_paused(&self, account_id: i64, paused: bool) -> Result<(), Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::internal("sync state lock poisoned"))?;
+        let entry = state.entry(account_id).or_default();
+        entry.paused = paused;
+        if paused {
+            // Cancel every pass in flight, not just the most recent: two
+            // overlapping passes both belong to the account being paused.
+            for token in entry.running.values() {
+                token.cancel();
+            }
+        }
+        tracing::info!(account_id, paused, "sync pause state changed");
+        Ok(())
     }
 
     /// Whether `account_id` is paused.
@@ -229,7 +287,8 @@ impl SyncEngine {
 
     /// Register a cancellation token as this account's in-flight pass, refusing
     /// if the account is paused.
-    fn begin(&self, account_id: i64, token: &CancellationToken) -> Result<(), Error> {
+    fn begin(&self, account_id: i64, token: &CancellationToken) -> Result<PassGuard, Error> {
+        let id = self.generation.fetch_add(1, AtomicOrdering::Relaxed);
         let mut state = self
             .state
             .lock()
@@ -240,16 +299,12 @@ impl SyncEngine {
                 "account {account_id} is paused"
             )));
         }
-        entry.running = Some(token.clone());
-        Ok(())
-    }
-
-    fn finish(&self, account_id: i64) {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(entry) = state.get_mut(&account_id) {
-                entry.running = None;
-            }
-        }
+        entry.running.insert(id, token.clone());
+        Ok(PassGuard {
+            state: Arc::clone(&self.state),
+            account_id,
+            id,
+        })
     }
 
     /// Sync one folder, or every folder of an account when `mailbox_id` is
@@ -279,10 +334,11 @@ impl SyncEngine {
         // and the account's pause switch, so a Pause RPC stops work already in
         // flight rather than only the next thing to start.
         let token = cancel.child_token();
-        self.begin(account_id, &token)?;
-        let outcome = self.run_pass(account_id, mailbox_id, mode, &token).await;
-        self.finish(account_id);
-        outcome
+        // The guard deregisters on drop, so a client that disconnects mid-pass
+        // does not leave a token behind that a later Pause would cancel by
+        // mistake.
+        let _guard = self.begin(account_id, &token)?;
+        self.run_pass(account_id, mailbox_id, mode, &token).await
     }
 
     async fn run_pass(
@@ -342,7 +398,16 @@ impl SyncEngine {
         // Best-effort logout; the session is dropped regardless.
         let _ = session.logout().await;
 
-        report.latest_seq = self.events.latest_seq().await?.unwrap_or(0);
+        // Best-effort: this is a convenience for a client that wants to watch
+        // from exactly here. Losing every folder's outcome because the last
+        // read hiccupped would be a poor trade.
+        report.latest_seq = match self.events.latest_seq().await {
+            Ok(seq) => seq.unwrap_or(0),
+            Err(error) => {
+                tracing::warn!(%error, "could not read the log position after the pass");
+                0
+            }
+        };
         Ok(report)
     }
 

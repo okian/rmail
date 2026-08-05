@@ -229,7 +229,7 @@ where
             to = uidvalidity,
             "UIDVALIDITY changed; dropping the stale local copy of this folder"
         );
-        purge_other_uidvalidity(db, mailbox_id, uidvalidity).await?
+        purge_other_uidvalidity(db, mailbox_id, uidvalidity, sink).await?
     } else {
         0
     };
@@ -523,15 +523,22 @@ pub(crate) async fn purge_other_uidvalidity(
     db: &Database,
     mailbox_id: i64,
     keep: i64,
+    sink: &mut impl ChangeSink,
 ) -> Result<u64, Error> {
-    let deleted = db
+    let (deleted, removed) = db
         .write(move |conn| {
             let tx = conn.transaction()?;
-            let deleted = super::purge_other_uidvalidity(&tx, mailbox_id, keep)?;
+            let mut removed = Vec::new();
+            let deleted = super::purge_other_uidvalidity(&tx, mailbox_id, keep, &mut removed)?;
             tx.commit()?;
-            Ok(deleted)
+            Ok((deleted, removed))
         })
         .await?;
+    // Reported after the commit, for the same reason an expunge is: a rollback
+    // would otherwise have announced a removal that did not happen.
+    for (message_id, uid) in removed {
+        sink.changed(Change::Removed { message_id, uid });
+    }
     Ok(deleted as u64)
 }
 

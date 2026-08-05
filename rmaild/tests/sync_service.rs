@@ -49,6 +49,12 @@ impl TestServer {
     }
 
     async fn with_retention(retention: Retention) -> Self {
+        Self::with_capacity(retention, 1024).await
+    }
+
+    /// A server whose event channel has an explicit capacity, so a test can
+    /// make a subscriber lag on purpose.
+    async fn with_capacity(retention: Retention, capacity: usize) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         let socket = PathBuf::from("/tmp").join(format!("rmail-sync-{pid}-{n}.sock"));
@@ -57,7 +63,7 @@ impl TestServer {
             let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", db_path.display())));
         }
         let db = rmail_core::Database::open(&db_path).unwrap();
-        let log = EventLog::new(db.clone(), retention);
+        let log = EventLog::with_capacity(db.clone(), retention, capacity);
         let engine = rmail_core::sync::SyncEngine::new(
             db.clone(),
             log.clone(),
@@ -567,4 +573,128 @@ async fn a_shutdown_closes_open_streams_rather_than_holding_them() {
     // And the stream ends rather than hanging.
     let ended = tokio::time::timeout(STREAM_TIMEOUT, stream.next()).await;
     assert!(ended.is_ok(), "the stream should end when the server does");
+}
+
+#[tokio::test]
+async fn a_multi_page_backlog_streams_completely() {
+    // REPLAY_PAGE is 500, so anything larger exercises the paging loop's seams.
+    let server = TestServer::start().await;
+    let (account_id, mailbox_id) = server.account("Personal").await;
+    let log = server.log();
+
+    const TOTAL: i64 = 1200;
+    for chunk in 0..12 {
+        log.append_all(
+            (0..100)
+                .map(|i| {
+                    NewEvent::new(CoreKind::NewMail)
+                        .account(account_id)
+                        .mailbox(mailbox_id)
+                        .message(chunk * 100 + i)
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut client = server.client().await;
+    let mut stream = client
+        .watch_events(WatchEventsRequest {
+            account_id,
+            since_seq: 0,
+            kinds: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut seen = Vec::with_capacity(TOTAL as usize);
+    for _ in 0..TOTAL {
+        seen.push(next_event(&mut stream).await.seq);
+    }
+    assert_eq!(
+        seen,
+        (1..=TOTAL).collect::<Vec<i64>>(),
+        "the multi-page replay is gapless and does not repeat"
+    );
+
+    // And the stream is still live afterwards.
+    log.append(
+        NewEvent::new(CoreKind::FlagChanged)
+            .account(account_id)
+            .mailbox(mailbox_id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next_event(&mut stream).await.seq, TOTAL + 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_filter_of_only_unknown_kinds_is_rejected_not_widened() {
+    // An unresolvable filter list collapsing to the empty set would read as
+    // "no preference" and hand a narrow subscription the firehose.
+    let server = TestServer::start().await;
+    let (account_id, _) = server.account("Personal").await;
+    let mut client = server.client().await;
+
+    let status = client
+        .watch_events(WatchEventsRequest {
+            account_id,
+            since_seq: 0,
+            kinds: vec![9_999],
+        })
+        .await
+        .expect_err("nothing in that filter is a kind this build knows");
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_negative_cursor_is_rejected_at_the_boundary() {
+    let server = TestServer::start().await;
+    let (account_id, _) = server.account("Personal").await;
+    let mut client = server.client().await;
+
+    let status = client
+        .watch_events(WatchEventsRequest {
+            account_id,
+            since_seq: -1,
+            kinds: Vec::new(),
+        })
+        .await
+        .expect_err("a negative cursor is not a position");
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn pausing_an_unknown_account_is_not_found() {
+    // Otherwise any id off the wire creates a state entry, and a map keyed by
+    // unvalidated client input grows without bound.
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    assert_eq!(
+        client
+            .pause(PauseRequest { account_id: 9_999 })
+            .await
+            .expect_err("no such account")
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        client
+            .resume(ResumeRequest { account_id: 9_999 })
+            .await
+            .expect_err("no such account")
+            .code(),
+        Code::NotFound
+    );
+
+    server.stop().await;
 }

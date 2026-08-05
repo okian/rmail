@@ -76,7 +76,7 @@ async fn a_paused_account_refuses_to_start_a_pass() {
     let fx = Fixture::open().await;
     assert!(!fx.engine.is_paused(fx.account_id));
 
-    fx.engine.pause(fx.account_id);
+    fx.engine.pause(fx.account_id).await.unwrap();
     assert!(fx.engine.is_paused(fx.account_id));
 
     let err = fx
@@ -91,7 +91,7 @@ async fn a_paused_account_refuses_to_start_a_pass() {
         .expect_err("a paused account does not sync");
     assert_eq!(err.reason(), ErrorReason::FailedPrecondition);
 
-    fx.engine.resume(fx.account_id);
+    fx.engine.resume(fx.account_id).await.unwrap();
     assert!(!fx.engine.is_paused(fx.account_id));
     // And now it gets as far as trying to connect, which fails for a different
     // reason — the fixture account has no server configured.
@@ -118,10 +118,10 @@ async fn pause_cancels_a_pass_already_running() {
     // running for hours after the user asked it to stop.
     let fx = Fixture::open().await;
     let token = CancellationToken::new();
-    fx.engine.begin(fx.account_id, &token).unwrap();
+    let _guard = fx.engine.begin(fx.account_id, &token).unwrap();
     assert!(!token.is_cancelled());
 
-    fx.engine.pause(fx.account_id);
+    fx.engine.pause(fx.account_id).await.unwrap();
 
     assert!(
         token.is_cancelled(),
@@ -279,7 +279,7 @@ async fn pause_and_resume_are_per_account() {
         .await
         .unwrap();
 
-    fx.engine.pause(fx.account_id);
+    fx.engine.pause(fx.account_id).await.unwrap();
 
     assert!(fx.engine.is_paused(fx.account_id));
     assert!(

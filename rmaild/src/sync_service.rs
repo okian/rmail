@@ -24,10 +24,18 @@
 //! nobody is listening to.
 //!
 //! Backpressure is deliberate too: the channel is bounded, so a slow client
-//! slows its own stream rather than growing a queue in the daemon. If it falls
-//! far enough behind that the broadcast tail laps it, it is told
-//! `OUT_OF_RANGE` with a cursor to resume from rather than silently skipping
-//! events.
+//! slows its own stream rather than growing a queue in the daemon. A client
+//! lapped by the broadcast tail has not lost data — every event is still in the
+//! durable log — so the handler goes back and re-reads from its cursor rather
+//! than failing the stream. That matters more than it sounds: the subscription
+//! is held across the whole replay, so any backlog larger than the channel
+//! laps it before the tail is even reached, and a handler that treated lag as
+//! fatal would kill exactly the busy streams that most need to keep running.
+//!
+//! **Untested path.** That recovery branch is reached only by lapping the
+//! broadcast channel from outside, which the integration suite has not managed
+//! to provoke deterministically in-process — the multi-page replay is covered,
+//! the lag recovery is not. It is reasoned, not proven.
 //
 // `tonic::Status` is intentionally the error type throughout a gRPC service
 // boundary; its size makes `result_large_err` fire on every `Result<_, Status>`
@@ -46,9 +54,11 @@ use rmail_proto::v1::{
     PauseResponse, ResumeRequest, ResumeResponse, SyncFolderRequest, SyncFolderResponse, SyncMode,
     SyncStatusRequest, SyncStatusResponse, WatchEventsRequest,
 };
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 
 /// How many events may sit between the log and a client before the stream
 /// applies backpressure.
@@ -146,7 +156,7 @@ impl SyncService for SyncApi {
         request: Request<PauseRequest>,
     ) -> Result<Response<PauseResponse>, Status> {
         let account_id = request.into_inner().account_id;
-        self.engine.pause(account_id);
+        self.engine.pause(account_id).await?;
         Ok(Response::new(PauseResponse {
             paused: self.engine.is_paused(account_id),
         }))
@@ -157,7 +167,7 @@ impl SyncService for SyncApi {
         request: Request<ResumeRequest>,
     ) -> Result<Response<ResumeResponse>, Status> {
         let account_id = request.into_inner().account_id;
-        self.engine.resume(account_id);
+        self.engine.resume(account_id).await?;
         Ok(Response::new(ResumeResponse {
             paused: self.engine.is_paused(account_id),
         }))
@@ -172,7 +182,13 @@ impl SyncService for SyncApi {
     ) -> Result<Response<Self::WatchEventsStream>, Status> {
         let cancel = rpc_cancel(&self.shutdown);
         let req = request.into_inner();
-        let filter = Filter::new(req.account_id, &req.kinds);
+        let filter = Filter::new(req.account_id, &req.kinds)?;
+
+        if req.since_seq < 0 {
+            return Err(Status::from(Error::invalid_argument(
+                "since_seq must not be negative",
+            )));
+        }
 
         // Subscribe before reading the backlog. The other order leaves a window
         // — empty on a quiet mailbox, wide open on a busy one — in which an
@@ -181,75 +197,89 @@ impl SyncService for SyncApi {
         let mut catchup = log.catch_up(req.since_seq, REPLAY_PAGE).await?;
 
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BUFFER);
-        tokio::spawn(async move {
-            let mut cursor = req.since_seq;
-            let mut page = std::mem::take(&mut catchup.backlog);
-            let mut scanned_to = catchup.next_seq;
+        tokio::spawn(
+            async move {
+                let mut cursor = req.since_seq;
+                let mut page = std::mem::take(&mut catchup.backlog);
+                let mut scanned_to = catchup.next_seq;
 
-            // Replay the durable backlog, paging until it is exhausted. A
-            // client that was away for a week is caught up a page at a time
-            // rather than in one allocation.
-            loop {
-                let drained = page.is_empty();
-                for event in page {
-                    cursor = cursor.max(event.seq);
-                    if filter.admits(&event) && tx.send(Ok(to_proto(&event))).await.is_err() {
-                        return;
+                'stream: loop {
+                    // Replay the durable backlog, paging until it is exhausted.
+                    // A client that was away for a week is caught up a page at
+                    // a time rather than in one allocation.
+                    loop {
+                        let drained = page.is_empty();
+                        for event in std::mem::take(&mut page) {
+                            cursor = cursor.max(event.seq);
+                            if !filter.admits(&event) {
+                                continue;
+                            }
+                            if send(&tx, &cancel, Ok(to_proto(&event))).await.is_break() {
+                                return;
+                            }
+                        }
+                        // Advance past what the read *scanned*, not merely what
+                        // it returned: a filtered subscription would otherwise
+                        // re-read the same unmatched span forever.
+                        cursor = cursor.max(scanned_to);
+                        if drained {
+                            break;
+                        }
+                        match log.since(cursor, REPLAY_PAGE).await {
+                            Ok(next) => {
+                                page = next.events;
+                                scanned_to = next.next_seq;
+                            }
+                            Err(error) => {
+                                let _ = send(&tx, &cancel, Err(Status::from(error))).await;
+                                return;
+                            }
+                        }
                     }
-                }
-                // Advance past what the read *scanned*, not merely what it
-                // returned: a filtered subscription would otherwise re-read the
-                // same unmatched span forever.
-                cursor = cursor.max(scanned_to);
-                if drained {
-                    break;
-                }
-                match log.since(cursor, REPLAY_PAGE).await {
-                    Ok(next) => {
-                        page = next.events;
-                        scanned_to = next.next_seq;
-                    }
-                    Err(error) => {
-                        let _ = tx.send(Err(Status::from(error))).await;
-                        return;
+
+                    // Then follow the tail, discarding what the backlog already
+                    // delivered.
+                    loop {
+                        let received = tokio::select! {
+                            () = cancel.cancelled() => return,
+                            received = catchup.live.recv() => received,
+                        };
+                        match received {
+                            Ok(event) => {
+                                if event.seq <= cursor {
+                                    continue;
+                                }
+                                cursor = event.seq;
+                                if !filter.admits(&event) {
+                                    continue;
+                                }
+                                if send(&tx, &cancel, Ok(to_proto(&event))).await.is_break() {
+                                    return;
+                                }
+                            }
+                            // Lagged past the broadcast buffer. The client has
+                            // not lost data — every event is still in the
+                            // durable log — so the right answer is to go back
+                            // and read it, not to fail the stream. This is
+                            // routine rather than exceptional: the subscription
+                            // is held across the whole replay, so any backlog
+                            // larger than the channel guarantees a lag before
+                            // the tail is even reached.
+                            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                                tracing::debug!(
+                                    missed,
+                                    cursor,
+                                    "event stream lagged; re-reading from the log"
+                                );
+                                continue 'stream;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => return,
+                        }
                     }
                 }
             }
-
-            // Then follow the tail, discarding what the backlog already
-            // delivered.
-            loop {
-                let received = tokio::select! {
-                    () = cancel.cancelled() => return,
-                    received = catchup.live.recv() => received,
-                };
-                match received {
-                    Ok(event) => {
-                        if event.seq <= cursor {
-                            continue;
-                        }
-                        cursor = event.seq;
-                        if filter.admits(&event) && tx.send(Ok(to_proto(&event))).await.is_err() {
-                            return;
-                        }
-                    }
-                    // Lagged past the broadcast buffer: the client has not lost
-                    // data, it has lost its place. Telling it so with a cursor
-                    // is the only honest answer — silently skipping ahead would
-                    // leave it believing it had seen everything.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                        tracing::warn!(missed, cursor, "event stream subscriber lagged");
-                        let error = Error::resume_gap(
-                            format!("stream fell {missed} events behind; resume from the cursor"),
-                            cursor + 1,
-                        );
-                        let _ = tx.send(Err(Status::from(error))).await;
-                        return;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        });
+            .instrument(tracing::Span::current()),
+        );
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
@@ -262,16 +292,27 @@ struct Filter {
 }
 
 impl Filter {
-    fn new(account_id: i64, kinds: &[i32]) -> Self {
+    fn new(account_id: i64, kinds: &[i32]) -> Result<Self, Status> {
         // 0 is the proto default for an unset int64, and no account has id 0,
         // so it is unambiguous as "every account".
         let account_id = (account_id != 0).then_some(account_id);
-        let kinds: HashSet<EventKind> = kinds
+        let resolved: HashSet<EventKind> = kinds
             .iter()
             .filter_map(|k| ProtoEventKind::try_from(*k).ok())
             .filter_map(from_proto_kind)
             .collect();
-        Self { account_id, kinds }
+        // An empty set means "every kind", so a filter list this build cannot
+        // resolve would silently turn a narrow subscription into the firehose.
+        // Saying so is better than quietly sending everything.
+        if !kinds.is_empty() && resolved.is_empty() {
+            return Err(Status::from(Error::invalid_argument(
+                "no recognised event kinds in the filter",
+            )));
+        }
+        Ok(Self {
+            account_id,
+            kinds: resolved,
+        })
     }
 
     fn admits(&self, event: &CoreEvent) -> bool {
@@ -283,6 +324,30 @@ impl Filter {
         // An empty set means every kind, not no kinds — an unset repeated field
         // is how a client says "no preference".
         self.kinds.is_empty() || self.kinds.contains(&event.kind)
+    }
+}
+
+/// Send one stream item, giving up if the client went away or the daemon is
+/// stopping.
+///
+/// `tx.send` parks when the client stops reading — normal HTTP/2 flow control —
+/// and shutdown is invisible from inside it. Racing the two is what keeps a
+/// parked stream from holding a graceful shutdown open until its connection
+/// times out.
+async fn send(
+    tx: &tokio::sync::mpsc::Sender<Result<ProtoEvent, Status>>,
+    cancel: &CancellationToken,
+    item: Result<ProtoEvent, Status>,
+) -> std::ops::ControlFlow<()> {
+    tokio::select! {
+        () = cancel.cancelled() => std::ops::ControlFlow::Break(()),
+        sent = tx.send(item) => {
+            if sent.is_ok() {
+                std::ops::ControlFlow::Continue(())
+            } else {
+                std::ops::ControlFlow::Break(())
+            }
+        }
     }
 }
 

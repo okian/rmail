@@ -163,12 +163,13 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core events::` (append, resume-from-cursor, retention gap signal)
 
 ## 15. SyncService gRPC (sync/status/pause + WatchEvents)
-- [ ] status
+- [x] status
 - **depends-on:** 12, 13, 14
 - **parallel-safe:** no
 - **acceptance:**
   - `SyncService.SyncFolder`, `Status`, `Pause/Resume`, and `WatchEvents` (server-stream over the durable log) wired to the daemon; `mail sync [--full] [--watch]` CLI verb.
   - Owns wiring task 14's `EventLog` into the daemon: construction from `[grpc.events]` config, the sync engines appending to it, and a scheduled `prune()`. Task 14 ships the engine; nothing calls it until here.
+  - **Deferred to task 13's follow-up / the background scheduler:** the IDLE watcher is not spawned by the daemon, so events are produced only by an explicit `SyncFolder` RPC. `SyncEngine::sync` has no injection seam for a mock IMAP server, so its success path (connect → pass → drain → report) is covered by the engines beneath it rather than end to end. `SyncFolder` carries no server-side deadline.
   - Sync emits `events` (NewMessage/FlagsChanged/SyncProgress) that downstream indexing/AI/rules consume.
   - Client cancellation stops the upstream stream promptly.
 - **verify:** `cargo nextest run -p rmaild sync_service` (in-process server: trigger sync, observe streamed events, resume)

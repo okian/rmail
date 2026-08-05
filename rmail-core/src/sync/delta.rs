@@ -956,7 +956,7 @@ async fn resync<T: ImapStream>(
             uidvalidity,
             "UIDVALIDITY changed; dropping the stale local copy and resyncing"
         );
-        full::purge_other_uidvalidity(db, mailbox_id, uidvalidity).await?
+        full::purge_other_uidvalidity(db, mailbox_id, uidvalidity, sink).await?
     } else {
         0
     };
@@ -1120,20 +1120,18 @@ async fn expunge_local(
             let ids: Vec<i64> = pairs.iter().map(|(id, _)| *id).collect();
             let deleted = super::remove_messages(&tx, &ids)?;
             tx.commit()?;
-            Ok(if deleted == pairs.len() {
-                pairs
-            } else {
-                // A row that vanished between the lookup and the delete was not
-                // removed by this pass, so it is not this pass's event.
-                Vec::new()
-            })
+            // A row that vanished between the lookup and the delete was not
+            // removed by this pass — but the ones that *were* still happened,
+            // and reporting none of them would both understate `expunged` and
+            // leave downstream indexes holding deleted mail.
+            Ok((pairs, deleted))
         })
         .await?;
-    let count = removed.len() as u64;
-    for (message_id, uid) in removed {
+    let (pairs, deleted) = removed;
+    for (message_id, uid) in pairs {
         sink.changed(Change::Removed { message_id, uid });
     }
-    Ok(count)
+    Ok(deleted as u64)
 }
 
 /// Rewrite the checkpoint's timestamp without moving any mark, so "last

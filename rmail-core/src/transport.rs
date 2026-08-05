@@ -13,6 +13,30 @@ pub const SOCKET_ENV: &str = "RMAIL_SOCKET";
 /// Environment variable naming the rmail SQLite database file.
 pub const DB_ENV: &str = "RMAIL_DB";
 
+/// Environment variable naming the master TOML config file.
+pub const CONFIG_ENV: &str = "RMAIL_CONFIG";
+
+/// Default config path when [`CONFIG_ENV`] is unset.
+#[must_use]
+pub fn default_config_path() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join(".config")
+            .join("rmail")
+            .join("config.toml"),
+        None => std::env::temp_dir().join("rmail").join("config.toml"),
+    }
+}
+
+/// Config path resolved from [`CONFIG_ENV`], falling back to
+/// [`default_config_path`].
+#[must_use]
+pub fn config_path_from_env() -> PathBuf {
+    std::env::var_os(CONFIG_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(default_config_path)
+}
+
 /// Default socket path when [`SOCKET_ENV`] is unset.
 ///
 /// Prefers `$HOME/.local/state/rmail/rmaild.sock`, falling back to a path under
