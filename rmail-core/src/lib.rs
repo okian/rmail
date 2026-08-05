@@ -15,6 +15,7 @@ pub mod events;
 pub mod imap;
 pub mod index;
 pub mod message;
+pub mod query;
 pub mod repo;
 pub mod storage;
 pub mod sync;
