@@ -6,6 +6,7 @@
 //! in later tasks.
 
 pub mod account;
+pub mod ai;
 pub mod attach;
 pub mod config;
 pub mod credential;

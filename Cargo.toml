@@ -99,6 +99,9 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
+    # `Response::bytes_stream()`, for decoding the Anthropic Messages API's
+    # SSE stream as it arrives instead of buffering the whole response.
+    "stream",
 ] }
 # The local embedding backend. `ort-download-binaries-rustls-tls` keeps the
 # ONNX Runtime fetch on the same TLS stack as the rest of the workspace rather
