@@ -112,3 +112,49 @@ pub async fn connect_uds(path: impl AsRef<Path>) -> Result<Channel, tonic::trans
         }))
         .await
 }
+
+/// Install the process-wide rustls crypto provider.
+///
+/// # Why this is explicit
+///
+/// rustls picks a provider from *crate features* when none is installed, and
+/// that inference fails as soon as anything in the dependency graph enables a
+/// second one — which happened here the moment an HTTP client was added
+/// alongside the IMAP client. The failure is a panic on the first handshake, at
+/// runtime, in whichever code path happens to reach TLS first. Choosing the
+/// provider in one place removes a whole class of dependency-ordering surprise
+/// and makes the choice reviewable.
+///
+/// Idempotent and safe to call from anywhere: a second call finds a provider
+/// already installed and leaves it alone, because whatever is installed is
+/// already serving live connections.
+pub fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if rustls::crypto::ring::default_provider()
+            .install_default()
+            .is_err()
+        {
+            tracing::debug!("a rustls crypto provider was already installed");
+        }
+    });
+}
+
+#[cfg(test)]
+mod crypto_tests {
+    use super::install_crypto_provider;
+
+    #[test]
+    fn installing_the_provider_twice_is_harmless() {
+        // Called from every TLS entry point rather than from one startup path,
+        // precisely so no future entry point can forget. That is only safe if
+        // repeating it cannot fail — and the second call must leave the
+        // installed provider alone, because it is already serving connections.
+        install_crypto_provider();
+        install_crypto_provider();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "a provider must be installed once anything has asked for one"
+        );
+    }
+}

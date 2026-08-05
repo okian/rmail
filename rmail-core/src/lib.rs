@@ -8,6 +8,7 @@
 pub mod account;
 pub mod config;
 pub mod credential;
+pub mod embed;
 pub mod error;
 pub mod events;
 pub mod imap;

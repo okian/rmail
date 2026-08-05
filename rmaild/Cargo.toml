@@ -17,6 +17,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = ["onnx"]
+# Forwarded so `--workspace --no-default-features` actually builds the degraded
+# daemon. Without it, this crate's default-features dependency on `rmail-core`
+# re-enables ONNX and the "no model" path is never compiled, let alone tested.
+onnx = ["rmail-core/onnx"]
+
 [dependencies]
 rmail-proto.workspace = true
 rmail-core.workspace = true

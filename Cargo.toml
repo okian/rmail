@@ -20,8 +20,16 @@ unimplemented = "deny"
 
 [workspace.dependencies]
 rmail-proto = { path = "rmail-proto" }
-rmail-core = { path = "rmail-core" }
-rmaild = { path = "rmaild" }
+# `default-features = false` here, not only at the use sites: cargo *ignores*
+# a member's `default-features = false` when the workspace declaration does not
+# set it, so without this the `onnx` feature can never actually be turned off
+# and the degraded build is never compiled.
+rmail-core = { path = "rmail-core", default-features = false }
+# As with `rmail-core`: cargo ignores a member's `default-features = false`
+# unless the workspace declaration sets it, and this one is a dev-dependency of
+# `rmail-cli`, where default features are enabled regardless of the command
+# line — which quietly re-enabled `onnx` for the whole workspace.
+rmaild = { path = "rmaild", default-features = false }
 
 tonic = "0.12"
 tonic-types = "0.12"
@@ -55,12 +63,38 @@ r2d2_sqlite = "0.25"
 refinery = { version = "0.8", features = ["rusqlite"] }
 security-framework = "3"
 async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
-tokio-rustls = "0.26"
+# `default-features = false`: the default pulls `aws-lc-rs`, and with `ring`
+# also in the tree (via reqwest and via hf-hub's client) rustls has two
+# providers to choose from and refuses — at runtime, on the first handshake.
+# Naming one provider here removes the ambiguity structurally and drops a large
+# C/asm cmake build from the tree; `install_crypto_provider` is belt-and-braces.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+# A direct dependency so the process can install a provider explicitly rather
+# than relying on rustls inferring one from crate features — inference fails as
+# soon as anything in the tree enables a second provider, and it fails at
+# runtime on the first handshake.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
 futures = "0.3"
 mail-parser = "0.9"
 html2text = "0.12"
 regex = "1"
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+# The local embedding backend. `ort-download-binaries-rustls-tls` keeps the
+# ONNX Runtime fetch on the same TLS stack as the rest of the workspace rather
+# than dragging in a second one.
+fastembed = { version = "5", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+] }
 sha2 = "0.10"
 whatlang = "0.16"
 unicode-normalization = "0.1"

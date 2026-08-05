@@ -27,6 +27,10 @@ everything, and exposes every capability to both humans (CLI/TUI) and AI agents
 - [`buf`](https://buf.build/) for proto lint/breaking checks
 - [`cargo-nextest`](https://nexte.st/) (preferred test runner)
 
+The `onnx` feature (on by default) builds the local embedding backend, which
+links ONNX Runtime. `cargo build --no-default-features -p rmail-core` skips it;
+semantic search then degrades to deterministic hashed vectors.
+
 ## Build & run
 
 ```sh
@@ -108,6 +112,47 @@ copy and rebuilds the folder.
 diff on servers whose modseqs cannot be trusted. The engine honors it today via
 `ImapCapabilities::without_modseq`; the daemon-side scheduler that reads the
 setting lands with `SyncService` (task 15).
+
+## Search index
+
+Extraction (`index_content`) feeds three retrievers, each of which knows one
+thing the others do not:
+
+| Retriever | Finds | Backing |
+|---|---|---|
+| Lexical | the words you remember | contentless FTS5, field-weighted BM25 |
+| Entity | the invoice number, the address, the parcel | `entities` + co-occurrence graph |
+| Semantic | the message whose words you *don't* remember | dense vectors, cosine |
+
+### Embeddings
+
+Three backends behind one trait, forming a ladder rather than a menu:
+
+| `index.semantic.provider` | Backend | Egress |
+|---|---|---|
+| `local` (default) | `bge-small-en-v1.5` via ONNX Runtime, 384d | none |
+| `voyage` | Voyage AI, key from `api_key_command` | every indexed body |
+| `none` | deterministic hashed features | none |
+
+The local model is the default because mail is the most sensitive corpus most
+people own, and a hosted embedding API sees effectively all of it. The hashed
+fallback is not semantic and does not pretend to be — it exists so that a daemon
+with no model still produces vectors of the right shape, and the retrieval
+pipeline above it has one code path instead of two.
+
+Provisioning the weights is an explicit act. `index.semantic.local.allow_download`
+is **off** by default: a backend whose whole point is that nothing leaves the
+host must not contact Hugging Face the first time somebody searches, and the
+downloader ignores `HF_HUB_OFFLINE`, so the check has to live here. Turn it on
+once to fetch, or populate the cache out of band and point `RMAIL_MODEL_CACHE`
+(or `index.semantic.local.cache_dir`) at it.
+
+The daemon warms the model in the background at start and holds it for its
+lifetime, so the first user query does not pay for the load. A warm-up failure
+degrades search rather than stopping the daemon.
+
+Every vector leaves the boundary unit-normalized, so cosine similarity is a dot
+product and nothing downstream carries a normalization step it could skip.
 
 ## Daemon surface
 

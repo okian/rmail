@@ -84,7 +84,13 @@ pub async fn serve_uds<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    serve_uds_with_config(socket_path, db, Config::default(), shutdown).await
+    // Semantic indexing off: this is the short form the tests use, and warming
+    // an embedder here would make every one of them load — or, on a cold cache,
+    // *download* — a several-hundred-megabyte model. Callers that want the real
+    // thing pass their own config.
+    let mut config = Config::default();
+    config.index.semantic.enabled = false;
+    serve_uds_with_config(socket_path, db, config, shutdown).await
 }
 
 /// [`serve_uds`] with an explicit configuration.
@@ -118,7 +124,91 @@ where
         },
     );
     let engine = SyncEngine::new(db.clone(), events, SyncOptions::default());
-    serve_uds_with_engine(socket_path, db, engine, shutdown).await
+
+    // Held for the lifetime of the server, not just for the warm-up. A model
+    // loaded into an `Arc` that the warming task then drops is a model that is
+    // immediately freed — the load happens, the log line claims success, and
+    // the first query pays for it all over again. Retention *is* the warm-up.
+    let embedder = warm_embedder(&config);
+
+    let result = serve_uds_with_engine(socket_path, db, engine, shutdown).await;
+    drop(embedder);
+    result
+}
+
+/// Build the configured embedder and start loading its model in the background.
+///
+/// Returns the embedder so the caller can keep it alive; the returned guard also
+/// stops the warming task when it is dropped, so a shutdown during a model load
+/// does not wait on it. Warming is deliberately not awaited: loading is hundreds
+/// of megabytes of work, and a daemon that accepts no connection until it
+/// finishes is worse than one whose first semantic query is slow.
+#[must_use = "the returned guard is what keeps the loaded model alive; dropping it immediately frees the weights the warm-up just paid for"]
+fn warm_embedder(config: &Config) -> Option<WarmEmbedder> {
+    if !config.index.semantic.enabled {
+        tracing::debug!("semantic indexing is disabled; no embedder will be loaded");
+        return None;
+    }
+    let embedder = match rmail_core::embed::build(&config.index.semantic) {
+        Ok(embedder) => embedder,
+        Err(error) => {
+            tracing::warn!(%error, "no embedder configured; search will be lexical only");
+            return None;
+        }
+    };
+    let warming = tokio::spawn({
+        let embedder = std::sync::Arc::clone(&embedder);
+        async move {
+            let started = std::time::Instant::now();
+            match embedder.warm().await {
+                Ok(()) => tracing::info!(
+                    model = embedder.model(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "embedder warm"
+                ),
+                // Not fatal: a daemon whose other twenty features do not need
+                // embeddings should not fail to start because a model cache is
+                // unprovisioned. The cost is that semantic search loads the
+                // model on first use, or degrades to lexical.
+                Err(error) => tracing::warn!(
+                    %error,
+                    "could not warm the embedder; semantic search will load it \
+                     on first use or degrade to lexical"
+                ),
+            }
+        }
+    });
+    Some(WarmEmbedder {
+        embedder,
+        warming: Some(warming),
+    })
+}
+
+/// Keeps a warmed embedder loaded and its warming task bounded by the server's
+/// lifetime.
+struct WarmEmbedder {
+    #[allow(dead_code, reason = "held so the loaded model is not dropped")]
+    embedder: std::sync::Arc<dyn rmail_core::embed::Embedder>,
+    warming: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl WarmEmbedder {
+    /// The embedder being kept loaded.
+    #[cfg(test)]
+    fn model(&self) -> &str {
+        self.embedder.model()
+    }
+}
+
+impl Drop for WarmEmbedder {
+    fn drop(&mut self) {
+        // A detached warm-up outlives the server that asked for it, and the
+        // runtime waits on blocking tasks at drop — so a shutdown arriving
+        // during a model load would block on it.
+        if let Some(warming) = self.warming.take() {
+            warming.abort();
+        }
+    }
 }
 
 /// [`serve_uds`] over a caller-supplied [`SyncEngine`].
@@ -271,5 +361,33 @@ pub async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::{warm_embedder, Config};
+
+    #[tokio::test]
+    async fn a_disabled_semantic_index_loads_no_model() {
+        // The daemon's default path is also every integration test's path, so
+        // an unconditional load here made each of them pay for — and on a cold
+        // cache *download* — a hundred and thirty megabytes of weights. Worse,
+        // for a product whose claim is that nothing leaves the host, it made
+        // contacting Hugging Face at start-up unconditional and unswitchable.
+        let mut config = Config::default();
+        config.index.semantic.enabled = false;
+        assert!(warm_embedder(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_enabled_semantic_index_keeps_its_embedder_alive() {
+        // Retention *is* the warm-up: an embedder moved into the warming task
+        // and dropped when it finishes has loaded a model that is immediately
+        // freed, so the log claims success and the first query pays again.
+        let config = Config::default();
+        let warm = warm_embedder(&config).expect("an embedder for the default config");
+        assert!(!warm.model().is_empty());
+        drop(warm);
     }
 }

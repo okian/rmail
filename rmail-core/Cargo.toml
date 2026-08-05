@@ -9,6 +9,13 @@ description = "Core domain, storage, sync, index, search, and AI logic for rmail
 [lints]
 workspace = true
 
+[features]
+default = ["onnx"]
+# The local ONNX embedding backend. Off, `provider = "local"` degrades to the
+# deterministic hashing embedder rather than failing: the PRD's rule is that
+# search works offline and without a model, only less well.
+onnx = ["dep:fastembed"]
+
 [dependencies]
 tonic.workspace = true
 tonic-types.workspace = true
@@ -28,11 +35,15 @@ r2d2_sqlite.workspace = true
 refinery.workspace = true
 async-imap.workspace = true
 tokio-rustls.workspace = true
+rustls.workspace = true
 webpki-roots.workspace = true
 futures.workspace = true
 mail-parser.workspace = true
 html2text.workspace = true
 regex.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+fastembed = { workspace = true, optional = true }
 sha2.workspace = true
 whatlang.workspace = true
 unicode-normalization.workspace = true

@@ -28,6 +28,10 @@ pub async fn connect_tls(host: &str, port: u16) -> Result<TlsClientStream, Error
     use tokio_rustls::rustls::pki_types::ServerName;
     use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
+    // Before the first handshake, and idempotent: rustls otherwise infers a
+    // provider from crate features and panics when more than one is present.
+    crate::transport::install_crypto_provider();
+
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = ClientConfig::builder()

@@ -846,6 +846,22 @@ pub struct LocalEmbedConfig {
     pub model: String,
     /// Embedding dimensionality.
     pub dim: u32,
+    /// Where model weights live.
+    ///
+    /// Empty means the default: `$RMAIL_MODEL_CACHE`, else
+    /// `$XDG_CACHE_HOME/rmail/models`, else `~/.cache/rmail/models`. Settable
+    /// here so the path is part of the validated configuration rather than only
+    /// an environment variable the daemon happens to read.
+    pub cache_dir: String,
+    /// Whether the daemon may fetch missing model weights itself.
+    ///
+    /// Off by default. The point of the local backend is that nothing leaves
+    /// the host, and a daemon that silently contacts Hugging Face the first
+    /// time somebody searches does not honor that — nor is the fetch
+    /// suppressible from outside, because the downloader ignores
+    /// `HF_HUB_OFFLINE`. Provisioning is therefore an explicit act: turn this
+    /// on once, or populate the cache directory out of band.
+    pub allow_download: bool,
 }
 
 impl Default for LocalEmbedConfig {
@@ -853,6 +869,8 @@ impl Default for LocalEmbedConfig {
         Self {
             model: "bge-small-en-v1.5".to_owned(),
             dim: 384,
+            cache_dir: String::new(),
+            allow_download: false,
         }
     }
 }

@@ -38,6 +38,16 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
+      # The local embedding backend reads its weights from here. Cached across
+      # runs so the model is fetched once rather than on every job, and so the
+      # tests that exercise the real model actually run — without it they
+      # detect an empty cache and skip, which is the same as not having them.
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/rmail/models
+          key: rmail-models-bge-small-en-v1.5
+
       - name: rustfmt
         run: cargo fmt --all -- --check
 
@@ -49,6 +59,17 @@ jobs:
 
       - name: test
         run: cargo nextest run --all-features --workspace
+        env:
+          # Allow the one-time weight download on a cold cache. Opt-in because
+          # a unit test may not decide to pull a few hundred megabytes onto a
+          # developer's metered connection.
+          RMAIL_ONNX_TESTS: "1"
+
+      # The documented degraded build: no ONNX, semantic search falls back to
+      # deterministic hashed vectors. It has its own `#[cfg]` paths, so a build
+      # that only ever compiles with every feature on does not cover it.
+      - name: test without the local model backend
+        run: cargo nextest run --no-default-features --workspace
 
       - name: build release
         run: cargo build --release
