@@ -8,25 +8,30 @@ land cleanly alongside theirs.
 Read `CLAUDE.md` (project constitution) and the relevant section of `prd.md` before you
 start. `tasks.md` holds your task's acceptance criteria and its `verify` command.
 
-## Build commands — use these exact prefixes
+## Build commands
 
-Disk is tight and sibling agents share one build cache. **Every** cargo invocation must be:
+Build in **your own worktree's** `target/` — that is cargo's default, so just run `cargo`
+normally. Prefix with `CARGO_INCREMENTAL=0` to keep the directory small:
 
 ```
-CARGO_TARGET_DIR=/Users/kianostad/projects/kian/rmail/target CARGO_INCREMENTAL=0 cargo <...>
+CARGO_INCREMENTAL=0 cargo <...>
 ```
 
-Never run a bare `cargo` command — a private target directory costs ~10 GB and there is
-not room for it. Because the cache is shared, cargo may print
-`Blocking waiting for file lock on build directory` while a sibling builds. That is
-normal: wait it out. Pass `timeout: 900000` to the Bash tool on cargo commands.
+**Do not point `CARGO_TARGET_DIR` at another checkout's `target/`.** Sharing a build
+directory across worktrees is not safe: cargo uplifts the final binaries to
+`target/debug/<name>`, that path is *not* keyed by source path, and `CARGO_BIN_EXE_<name>`
+— which the `rmail-cli` integration tests use to exec the `mail` binary — resolves to it.
+Two worktrees building `rmail-cli` therefore overwrite each other's binary, and a test can
+silently run a sibling's build. Your own `target/` costs a few GB and there is room.
+
+A full first build takes a while. Pass `timeout: 900000` to the Bash tool on cargo commands.
 
 ## The gate — you must run it yourself and it must be green
 
 ```
-CARGO_TARGET_DIR=... CARGO_INCREMENTAL=0 cargo fmt --all -- --check
-CARGO_TARGET_DIR=... CARGO_INCREMENTAL=0 cargo clippy --all-targets --all-features -- -D warnings
-CARGO_TARGET_DIR=... CARGO_INCREMENTAL=0 cargo nextest run --all-features --workspace
+CARGO_INCREMENTAL=0 cargo fmt --all -- --check
+CARGO_INCREMENTAL=0 cargo clippy --all-targets --all-features -- -D warnings
+CARGO_INCREMENTAL=0 cargo nextest run --all-features --workspace
 buf lint
 ```
 
