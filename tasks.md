@@ -203,7 +203,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core index::fts` (BM25 field weighting, phrase query, delete/update sync)
 
 ## 19. Entity extraction (regex)
-- [ ] status
+- [x] status
 - **depends-on:** 17
 - **parallel-safe:** yes
 - **acceptance:**

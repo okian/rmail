@@ -10,10 +10,12 @@
 //! The stages themselves land in the tasks after this one; this module ships
 //! the queue they will be driven from.
 
+pub mod entities;
 pub mod extract;
 pub mod fts;
 pub mod queue;
 
+pub use entities::{collect_orphans, extract_entities, EntityKind, EntityReport, Mention};
 pub use extract::{extract_message, ExtractReport, ExtractedPart, Part};
 pub use fts::{FtsIndex, Hit};
 pub use queue::{

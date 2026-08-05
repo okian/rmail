@@ -155,6 +155,11 @@ pub(crate) fn remove_messages(conn: &Connection, ids: &[i64]) -> rusqlite::Resul
         }
     }
 
+    // Before the delete: the mentions cascade away on their own, but the
+    // co-occurrence weights they supported do not, and mail a user expunged
+    // must stop influencing what search ranks first.
+    crate::index::entities::withdraw_messages(conn, ids)?;
+
     let mut deleted = 0usize;
     {
         let mut delete = conn.prepare("DELETE FROM messages WHERE id = ?1")?;
@@ -209,6 +214,10 @@ pub(crate) fn purge_other_uidvalidity(
         "DELETE FROM messages WHERE mailbox_id = ?1 AND uidvalidity <> ?2",
         rusqlite::params![mailbox_id, keep],
     )?;
+    // A `UIDVALIDITY` bump can invalidate a six-figure folder, so the affected
+    // entity set is not worth naming. The mentions are already gone by cascade;
+    // one set-based pass restores every weight from what is left.
+    crate::index::entities::reconcile_edges(conn)?;
     repair_threads(conn, threads)?;
     Ok(deleted)
 }
