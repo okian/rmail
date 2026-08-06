@@ -1,52 +1,61 @@
 # Resume state — parallel build
 
-Written when a session usage limit terminated ten in-flight agents at once.
-`tasks.md` remains the definitive progress tracker; this file only records the
-part that is not derivable from it — which worktree branch holds which task's
-unfinished work.
+`tasks.md` is the definitive progress tracker. This file records only what it
+does not carry: which worktree branch holds unfinished work, and the
+orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-Tasks 25, 27, 38, 43, 86 are on `docs/tasks-breakdown`, each verified on the
-combined tree (not just in its own worktree): 757/757 tests, clippy clean,
-`cargo deny`/`cargo audit` clean, `buf lint` + `buf breaking` clean, gitleaks
-clean across all commits.
+Tasks **24 is not done**; merged so far are **25, 26, 27, 28, 38, 39, 43, 44,
+45, 46, 47, 86**. Each was verified on the *combined* tree after merge, not
+merely in its own worktree: 1080/1080 tests, clippy clean, `cargo deny` and
+`cargo audit` clean, `buf lint` + `buf breaking` clean, gitleaks clean.
 
 ## Unfinished work preserved on branches
 
-Each branch below has a `wip(...)` commit holding the working tree exactly as
-the agent left it. **None of these passed the gate and none were reviewed.**
-Resume from the branch rather than restarting the task — several were close to
-done.
-
-| Task | Branch | State when interrupted |
+| Task | Branch | State |
 |---|---|---|
-| 26 QueryPlan assembly | `worktree-agent-a6a741ecfa7b46c3f` | Implementation complete, gate green, about to run the reviewer |
-| 44 PII redaction firewall | `worktree-agent-a8f26c0144fe769bf` | Implementation complete, about to run the reviewer |
-| 23 OCR path | `worktree-agent-a92770680c94c9608` | Implementation largely complete (Vision + Tesseract backends, migration, config) |
-| 45 AI audit ledger | `worktree-agent-acc659bc3822f8b59` | Core + proto + service + migration written, untested |
-| 46 AI policy engine | `worktree-agent-aa5abdb61ba5c430f` | Mid-edit on the resolver |
-| 39 MailService | `worktree-agent-a4179a6fb64b7fc4d` | Compiling, tests not yet run |
+| 23 OCR path | `worktree-agent-a92770680c94c9608` | Vision + Tesseract backends, migration and config written; untested, unreviewed |
 
-Tasks 24, 56, 67, 71, 79 were launched but died early enough that nothing is
-worth keeping; start them fresh.
+Tasks 24 (IndexService), 29 (fusion), 48 (triage) were dispatched and died to a
+usage limit before writing anything — start them fresh or resume the agent.
 
-## Reserved migration numbers
+## Migration numbering — assign at MERGE, not at dispatch
 
-`V14` api_tokens (merged) · `V15` OCR provenance (task 23) · `V16` query vocab
-(task 26) · `V17` unused (task 27 needed none) · `V18` ai_ledger (task 45) ·
-`V19` ai_policy (task 46) · `V20` redaction (task 44, likely unused) ·
-`V21` mail service (task 39) · `V22` index service (task 24) · `V23` notes
-(task 56) · `V24` oauth (task 79) · `V25` hooks (task 67) · `V26` response
-times (task 71). Next free: `V27`.
+Numbers were originally reserved when a task was dispatched. That is broken:
+tasks land out of order, and refinery only applies migrations *above* the
+last-applied version, so a lower-numbered latecomer is **silently skipped** and
+its table is never created. Two collisions had already been produced this way.
+
+The rule now is: whatever number a branch used, rename it at merge to
+`max_merged + 1` and fix any `-- Vnn:` references inside the file. Never
+reference a migration version from Rust.
+
+Merged: V1–V14, V16, V18 (ai_ledger), V19 (retrievers), V20 (ai_queue).
+V15 and V17 are permanently unused, which costs nothing. **Next free: V21.**
 
 ## Orchestration notes worth not relearning
 
-- **Each worktree must build in its own `target/`.** Sharing one build
-  directory across worktrees corrupts results: cargo uplifts binaries to
-  `target/debug/<name>`, that path is not keyed by source path, and
-  `CARGO_BIN_EXE_<name>` — which the `rmail-cli` tests use to exec `mail` —
-  resolves to it. See `.claude/BUILD_BRIEF.md`.
-- A worktree `target/` costs 3–8 GB. Delete it after merging the branch.
-- Ten concurrent agents exhausted the session usage limit. Fewer, longer-lived
-  agents get further per unit of quota than many short ones.
+- **Each worktree builds in its own `target/`.** Sharing one build directory
+  corrupts results: cargo uplifts binaries to `target/debug/<name>`, that path
+  is not keyed by source path, and `CARGO_BIN_EXE_<name>` — which the
+  `rmail-cli` tests use to exec `mail` — resolves to it. See
+  `.claude/BUILD_BRIEF.md`. A worktree `target/` costs 3–8 GB; delete it after
+  merging the branch.
+- **Quota is the binding constraint, not the machine.** Ten concurrent agents
+  exhausted the session limit twice. Each agent costs roughly 0.5–0.9M tokens
+  including its reviewer pass. Three or four long-lived agents get further per
+  unit of quota than ten short ones.
+- **Verify agent reports against the code.** One agent reported fixes it had
+  not made, twice. Read the diff, not the summary.
+- **Check that a new test actually bites.** Revert the fix and confirm the test
+  fails. A regression guard written for the tracing bug initially passed
+  against the broken build, because the value it asserted on also appeared in
+  an unrelated error string.
+- `rmaild/src/auth/methods.rs` fails closed, and
+  `every_rpc_in_the_descriptor_set_has_a_scope_row` now reconciles it against
+  the compiled protos. Any new RPC needs a row or that test fails by name.
+  `AuditService` shipped denying every call before this existed.
+- Bare `cargo nextest run -p rmaild <name>` filters match test *names*, not
+  integration-binary ids; use `--test <name>`. Several `tasks.md` verify lines
+  are written in the form that matches nothing.
