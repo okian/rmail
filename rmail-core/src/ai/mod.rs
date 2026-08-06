@@ -49,3 +49,8 @@ pub use provider::{
     build, ChatMessage, ChatRequest, ChatResponse, ClaudeProvider, OutputFormat, Provider,
     ProviderStream, Role, StopReason, StreamFrame, Usage,
 };
+
+pub use policy::{
+    AiPolicyMode, PolicyDecision, PolicyEngine, PolicyExplanation, PolicyTarget, PolicyTier,
+    RuleMatch,
+};

@@ -124,6 +124,45 @@ pub enum OnCap {
     Drop,
 }
 
+/// A data-residency/AI-eligibility classification for an account, folder, or
+/// pattern, resolved by [`crate::ai::policy::PolicyEngine`].
+///
+/// Declared in ascending order of restrictiveness — [`Ord`]/[`PartialOrd`] are
+/// derived from that order deliberately, so `a.max(b)` picks the more
+/// restrictive of two conflicting classifications. The policy engine relies on
+/// exactly this ordering to break ties between same-specificity rules (its
+/// "deny wins" rule; see the `ai::policy` module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiPolicyMode {
+    /// May be sent to the configured cloud provider (subject to the
+    /// redaction firewall, task 44) and may be used for on-device inference.
+    Allowed,
+    /// May only be processed by the on-device inference path; must never
+    /// reach a cloud provider.
+    LocalOnly,
+    /// Invisible to every AI feature: not analyzed, not listed in an
+    /// AI-facing query, not embedded, not retrieved. See the `ai::policy`
+    /// module docs for what "invisible" means structurally, not just as a
+    /// denial.
+    Forbidden,
+}
+
+impl AiPolicyMode {
+    /// The wire/TOML form of this mode (`"allowed"`, `"local_only"`,
+    /// `"forbidden"`) — what `ai.policy.rules[].mode` accepts in the config
+    /// file and what a log line should show, rather than Rust's `Debug`
+    /// capitalization.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AiPolicyMode::Allowed => "allowed",
+            AiPolicyMode::LocalOnly => "local_only",
+            AiPolicyMode::Forbidden => "forbidden",
+        }
+    }
+}
+
 /// Semantic-index embedding provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -960,6 +999,8 @@ pub struct AiConfig {
     pub retry: AiRetry,
     /// Privacy/redaction settings.
     pub privacy: AiPrivacy,
+    /// Data-residency / per-account/folder/pattern AI eligibility rules.
+    pub policy: AiPolicyConfig,
 }
 
 impl Default for AiConfig {
@@ -975,6 +1016,7 @@ impl Default for AiConfig {
             prompt_cache: AiPromptCache::default(),
             retry: AiRetry::default(),
             privacy: AiPrivacy::default(),
+            policy: AiPolicyConfig::default(),
         }
     }
 }
@@ -1149,6 +1191,70 @@ impl Default for AiPrivacy {
             max_body_chars: 40000,
         }
     }
+}
+
+/// Data-residency / AI-eligibility policy settings — the declarative rule
+/// table [`crate::ai::policy::PolicyEngine`] resolves against.
+///
+/// `default_mode` and `default_residency` govern any account/folder no rule
+/// below names explicitly; see the `ai::policy` module docs for why
+/// [`AiPolicyMode::Allowed`] is the shipped default and how that stays safe.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AiPolicyConfig {
+    /// Classification applied when no rule below names the account/folder.
+    pub default_mode: AiPolicyMode,
+    /// Residency tag applied when no rule below (or the matching rule
+    /// itself) names one.
+    pub default_residency: String,
+    /// Declarative account/folder/pattern rules, most specific match wins;
+    /// see the `ai::policy` module docs for the exact precedence order.
+    pub rules: Vec<AiPolicyRule>,
+}
+
+impl Default for AiPolicyConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: AiPolicyMode::Allowed,
+            default_residency: "unspecified".to_owned(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// One declarative AI-policy rule.
+///
+/// Exactly one of `account`/`folder` may be omitted, never both — a rule
+/// naming neither would be indistinguishable from `ai.policy.default_mode`
+/// and is rejected by [`crate::ai::policy::PolicyEngine`] rather than
+/// silently accepted as a no-op. `mode` carries no default: a rule that does
+/// not say what it classifies its target as is a configuration mistake, not
+/// something to paper over with an implicit fallback.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiPolicyRule {
+    /// Account this rule applies to. `None` matches every account — only
+    /// meaningful paired with `folder`, since an account-less,
+    /// folder-less rule is rejected (see above).
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Folder/mailbox this rule applies to. A glob (`*` = any run of
+    /// characters, `?` = exactly one — no `[...]` character classes) makes
+    /// this a pattern rule; a plain string makes it an exact-folder rule
+    /// (more specific than a pattern, see the `ai::policy` module docs).
+    /// `None` makes this an account-wide rule.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// The classification this rule assigns.
+    pub mode: AiPolicyMode,
+    /// Residency tag this rule assigns; falls back to
+    /// `ai.policy.default_residency` when unset.
+    #[serde(default)]
+    pub residency: Option<String>,
+    /// Free-text justification surfaced by `PolicyEngine::explain` (e.g. "
+    /// attorney-client privileged correspondence").
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

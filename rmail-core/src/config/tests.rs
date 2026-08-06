@@ -62,6 +62,13 @@ fn defaults_match_prd() {
             cfg.ai.prompt_cache.ttl.as_duration(),
             Duration::from_secs(3_600)
         );
+        // ai.policy — the safe default is documented in `ai::policy`'s module
+        // docs: `Allowed` matches the shipped default of AI processing new
+        // mail automatically, since the redaction firewall (task 44) already
+        // protects anything that resolution actually sends outbound.
+        assert_eq!(cfg.ai.policy.default_mode, AiPolicyMode::Allowed);
+        assert_eq!(cfg.ai.policy.default_residency, "unspecified");
+        assert!(cfg.ai.policy.rules.is_empty());
 
         // tags / notes
         assert_eq!(cfg.tags.default_sync_mode, TagSyncMode::Auto);
@@ -166,6 +173,93 @@ auth = "token"
         assert_eq!(cfg.ai.models.deep, "claude-sonnet-5");
         assert!((cfg.ai.limits.daily_cost_cap_usd - 12.5).abs() < f64::EPSILON);
         assert_eq!(cfg.ai.models.triage, "claude-haiku-4-5");
+        Ok(())
+    });
+}
+
+#[test]
+fn ai_policy_mode_as_str_matches_the_snake_case_wire_form() {
+    // `as_str` is what a log line shows and is documented as matching the
+    // serde `rename_all = "snake_case"` values `ai.policy.rules[].mode`
+    // parses — pin all three explicitly, not just the one a log-capture test
+    // happens to exercise.
+    assert_eq!(AiPolicyMode::Allowed.as_str(), "allowed");
+    assert_eq!(AiPolicyMode::LocalOnly.as_str(), "local_only");
+    assert_eq!(AiPolicyMode::Forbidden.as_str(), "forbidden");
+
+    // Every `Config::from_toml_str` parse runs inside a `Jail` (see the file
+    // header) — un-jailed, a concurrent test that sets a bad `RMAIL_*` env
+    // var (e.g. `bad_env_value_is_rejected`) could make this parse fail
+    // under threaded `cargo test`, even though nextest's process-per-test
+    // isolation would never surface it.
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        for (mode, wire) in [
+            (AiPolicyMode::Allowed, "allowed"),
+            (AiPolicyMode::LocalOnly, "local_only"),
+            (AiPolicyMode::Forbidden, "forbidden"),
+        ] {
+            let toml = format!("[[ai.policy.rules]]\nfolder = \"X\"\nmode = \"{wire}\"\n");
+            let cfg = Config::from_toml_str(&toml).map_err(fe)?;
+            assert_eq!(cfg.ai.policy.rules[0].mode, mode);
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn ai_policy_rules_parse_with_defaults_for_optional_fields() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let toml = r#"
+[ai.policy]
+default_mode = "local_only"
+default_residency = "on-device"
+
+[[ai.policy.rules]]
+account = "Work"
+folder = "Legal/*"
+mode = "forbidden"
+residency = "us"
+reason = "privileged correspondence"
+
+[[ai.policy.rules]]
+folder = "Newsletters"
+mode = "allowed"
+"#;
+        let cfg = Config::from_toml_str(toml).map_err(fe)?;
+
+        assert_eq!(cfg.ai.policy.default_mode, AiPolicyMode::LocalOnly);
+        assert_eq!(cfg.ai.policy.default_residency, "on-device");
+        assert_eq!(cfg.ai.policy.rules.len(), 2);
+
+        let first = &cfg.ai.policy.rules[0];
+        assert_eq!(first.account.as_deref(), Some("Work"));
+        assert_eq!(first.folder.as_deref(), Some("Legal/*"));
+        assert_eq!(first.mode, AiPolicyMode::Forbidden);
+        assert_eq!(first.residency.as_deref(), Some("us"));
+        assert_eq!(first.reason.as_deref(), Some("privileged correspondence"));
+
+        // Optional fields default when omitted.
+        let second = &cfg.ai.policy.rules[1];
+        assert_eq!(second.account, None);
+        assert_eq!(second.residency, None);
+        assert_eq!(second.reason, None);
+        Ok(())
+    });
+}
+
+#[test]
+fn ai_policy_rule_without_mode_is_rejected() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let err =
+            Config::from_toml_str("[[ai.policy.rules]]\naccount = \"Work\"\nfolder = \"Legal\"\n")
+                .expect_err("mode is required on every rule");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
         Ok(())
     });
 }
