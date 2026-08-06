@@ -1,0 +1,20 @@
+-- V27: an index the remaining Stage 1 retrievers (task 28) need that V2's
+-- baseline schema does not provide.
+--
+-- `idx_messages_mailbox_date` (V2) is `(mailbox_id, COALESCE(date,
+-- internaldate) DESC)` -- built for the mailbox-scoped list view, whose
+-- `WHERE` always pins `mailbox_id` first. `retrieve::fuzzy`, `retrieve::
+-- recency`, and `retrieve::structured` (when a query has no `in:`/`account:`
+-- filter -- the common case) instead run `ORDER BY COALESCE(date,
+-- internaldate) DESC LIMIT ?` over the *whole* table, unconstrained by
+-- mailbox: a composite index whose leading column they never bind is not
+-- usable for that ordering (`EXPLAIN QUERY PLAN` on the pre-V27 schema shows
+-- `SCAN messages` + `USE TEMP B-TREE FOR ORDER BY` -- the query pays for a
+-- full sort of the filtered set every time, `LIMIT` bounding only what is
+-- *returned*, not the work done getting there). A single-column expression
+-- index matching the `ORDER BY` exactly turns that into `SCAN messages USING
+-- COVERING INDEX`, so each retriever's `LIMIT` becomes a real bound on cost,
+-- not just on result size -- the difference between the <25ms Stage 1
+-- candidate-generation budget (prd.md) being achievable at mailbox scale or
+-- not.
+CREATE INDEX idx_messages_date_only ON messages(COALESCE(date, internaldate) DESC);

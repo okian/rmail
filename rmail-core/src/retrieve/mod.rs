@@ -26,10 +26,66 @@
 //! reimplementing seven times. Everything specific to *how* a source finds
 //! its candidates (FTS5 `MATCH` construction, kNN, trigram, ...) stays in
 //! that source's own module.
+//!
+//! # `hard_filters`, not `scope` — the integration decision task 26 left open
+//!
+//! [`QueryPlan::scope`](crate::query::QueryPlan::scope) and
+//! [`QueryPlan::hard_filters`](crate::query::QueryPlan::hard_filters) both
+//! describe `account:`/`in:` constraints, and task 26's own docs flag the
+//! overlap: `hard_filters` is "authoritative for matching", `scope` is "a
+//! routing convenience" for a caller that wants to pick a shard/connection
+//! without scanning filters for two specific operators. This build has no
+//! such caller — [`crate::storage::Database`] is one SQLite file with no
+//! per-account or per-mailbox routing — so every retriever in this task
+//! ([`filtermask`], and through it [`dense`], [`entity`], [`fuzzy`],
+//! [`prefix`], [`recency`], [`structured`]) reads **only** `hard_filters`.
+//! `scope` is not read anywhere in `retrieve::`. This is the one place that
+//! matters: had two retrievers each applied `account:`/`in:` their own way —
+//! one from `scope`, another from `hard_filters` — a negated `-in:Spam` would
+//! silently disagree between them (`scope` only ever holds the *positive*
+//! `in:`/`account:` filters — see its doc comment — so a retriever reading it
+//! for exclusion would get the wrong answer, or none at all). Reading
+//! `hard_filters` uniformly means negation, and every other operator, is
+//! handled in exactly one place per retriever family: [`filtermask::compile`].
+//!
+//! # One filter compiler, six retrievers
+//!
+//! [`dense`], [`entity`], [`fuzzy`], [`prefix`], [`recency`], and
+//! [`structured`] all gate on the same hard-filter mask, so
+//! [`filtermask::compile`] exists to compute it once per retriever call
+//! rather than seven times differently. It duplicates a fair amount of
+//! [`lexical::classify`](lexical) — see [`filtermask`]'s own docs for why
+//! that duplication is the smaller risk than the alternatives.
+//!
+//! # Cancellation
+//!
+//! Every retriever's database work runs through [`cancel::interruptible_read`],
+//! which turns a superseded query's [`CancellationToken`](tokio_util::sync::CancellationToken)
+//! into a real SQLite `interrupt()` call rather than merely walking away from
+//! an unread future — see that module's docs for why a plain `spawn_blocking`
+//! future is not enough. [`fanout::Fanout`] is what threads one token through
+//! every source concurrently and degrades a disabled or failing source to no
+//! candidates instead of failing the whole query.
 
+pub mod cancel;
+pub mod dense;
+pub mod entity;
+pub mod fanout;
+pub mod filtermask;
+pub mod fuzzy;
 pub mod lexical;
+pub mod prefix;
+pub mod recency;
+pub mod structured;
 
+pub use dense::DenseRetriever;
+pub use entity::EntityRetriever;
+pub use fanout::Fanout;
+pub use fuzzy::FuzzyRetriever;
 pub use lexical::LexicalRetriever;
+pub use prefix::PrefixRetriever;
+pub use recency::RecencyRetriever;
+pub use structured::StructuredRetriever;
 
 /// Which retriever produced a [`Candidate`].
 ///
@@ -70,10 +126,25 @@ pub struct Candidate {
     pub message_id: i64,
     /// Which retriever produced this candidate.
     pub source: Source,
-    /// This source's own relevance score, oriented higher-is-better.
+    /// This source's own relevance score, oriented higher-is-better. For
+    /// [`Source::Dense`] this is the **max** chunk cosine similarity — the
+    /// value the candidate is ranked by — mirroring prd.md's Stage 3 feature
+    /// table, where `cos_max_chunk` (not the mean) is the primary semantic
+    /// signal.
     pub score: f64,
     /// 1-based rank within this source's result list (1 = best).
     pub rank: u32,
+    /// The **mean** chunk cosine similarity, alongside `score`'s max —
+    /// prd.md's dense retriever keeps both ("chunk-level dense retrieval...
+    /// kNN returns chunks, deduped to their parent message keeping `max` and
+    /// `mean` chunk similarity as separate features"). `None` for every
+    /// source except [`Source::Dense`]: no other retriever produces more
+    /// than one number per candidate, and threading an always-`None` field
+    /// through six retrievers that have nothing to put in it would be a
+    /// worse shape than one retriever-specific field on the shared type.
+    /// Task 30's feature extraction is what reads this back out as
+    /// `cos_mean_chunk`.
+    pub mean_score: Option<f64>,
 }
 
 /// Assign 1-based ranks to a list already sorted best-first, pairing each
@@ -83,6 +154,10 @@ pub struct Candidate {
 /// step: sort by source score, then number the result 1, 2, 3, .... Fusion
 /// (task 29) needs the number, not just the order, so it is computed once
 /// here rather than re-derived (`position + 1`) at every call site.
+/// `mean_score` is always `None` — the only source that has one
+/// ([`Source::Dense`]) computes candidates itself rather than through this
+/// helper, since it needs to attach a second number this function's
+/// `(id, score)` pairs have no room for.
 #[must_use]
 pub fn rank_by_score(source: Source, scored: Vec<(i64, f64)>) -> Vec<Candidate> {
     scored
@@ -97,6 +172,7 @@ pub fn rank_by_score(source: Source, scored: Vec<(i64, f64)>) -> Vec<Candidate> 
             // keeps a future, larger page from becoming a panic instead of a
             // merely-suspicious rank number.
             rank: u32::try_from(i + 1).unwrap_or(u32::MAX),
+            mean_score: None,
         })
         .collect()
 }

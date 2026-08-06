@@ -43,6 +43,13 @@ fn defaults_match_prd() {
         assert!((cfg.search.fusion_weights.navigational.lexical - 1.0).abs() < f64::EPSILON);
         assert!((cfg.search.fusion_weights.exploratory.dense - 1.0).abs() < f64::EPSILON);
         assert!((cfg.search.rank_weights.is_newsletter + 0.40).abs() < f64::EPSILON);
+        assert!(cfg.search.retrievers.dense);
+        assert!(cfg.search.retrievers.fuzzy);
+        assert!(cfg.search.retrievers.entity);
+        assert!(cfg.search.retrievers.structured);
+        assert!(cfg.search.retrievers.prefix);
+        assert!(cfg.search.retrievers.recency);
+        assert!((cfg.search.retrievers.recency_half_life_days - 30.0).abs() < f64::EPSILON);
 
         // index — privacy default is local embeddings
         assert_eq!(cfg.index.workers, 4);
@@ -359,6 +366,41 @@ fn partial_nested_intent_table_fills_neutral() {
         assert!((cfg.search.fusion_weights.navigational.lexical - 2.0).abs() < f64::EPSILON);
         assert!((cfg.search.fusion_weights.navigational.dense - 1.0).abs() < f64::EPSILON);
         assert!((cfg.search.fusion_weights.navigational.recency - 1.0).abs() < f64::EPSILON);
+        Ok(())
+    });
+}
+
+#[test]
+fn a_retriever_can_be_disabled_by_file_and_the_rest_default() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let cfg = Config::from_toml_str("[search.retrievers]\ndense = false\n").map_err(fe)?;
+        assert!(!cfg.search.retrievers.dense);
+        // Every other retriever, and the half-life, still default.
+        assert!(cfg.search.retrievers.fuzzy);
+        assert!(cfg.search.retrievers.entity);
+        assert!(cfg.search.retrievers.structured);
+        assert!(cfg.search.retrievers.prefix);
+        assert!(cfg.search.retrievers.recency);
+        assert!((cfg.search.retrievers.recency_half_life_days - 30.0).abs() < f64::EPSILON);
+        Ok(())
+    });
+}
+
+#[test]
+fn a_retriever_toggle_is_env_settable() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        jail.set_env("RMAIL_SEARCH__RETRIEVERS__FUZZY", "false");
+        jail.set_env("RMAIL_SEARCH__RETRIEVERS__RECENCY_HALF_LIFE_DAYS", "14");
+
+        let cfg = Config::from_toml_str("").map_err(fe)?;
+        assert!(!cfg.search.retrievers.fuzzy);
+        assert!(
+            cfg.search.retrievers.dense,
+            "an unrelated toggle is unaffected"
+        );
+        assert!((cfg.search.retrievers.recency_half_life_days - 14.0).abs() < f64::EPSILON);
         Ok(())
     });
 }

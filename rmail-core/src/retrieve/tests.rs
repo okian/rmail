@@ -14,18 +14,21 @@ fn ranks_are_one_based_and_follow_input_order() {
                 source: Source::Lexical,
                 score: 9.5,
                 rank: 1,
+                mean_score: None,
             },
             Candidate {
                 message_id: 20,
                 source: Source::Lexical,
                 score: 4.0,
                 rank: 2,
+                mean_score: None,
             },
             Candidate {
                 message_id: 30,
                 source: Source::Lexical,
                 score: 1.0,
                 rank: 3,
+                mean_score: None,
             },
         ]
     );

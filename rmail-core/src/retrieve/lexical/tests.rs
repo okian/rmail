@@ -8,12 +8,21 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use tokio_util::sync::CancellationToken;
+
 use super::*;
 use crate::config::Bm25Weights;
 use crate::index::{extract_message, IndexQueue, QueueOptions, PRIORITY_NORMAL};
 use crate::query::{self, Mode, Term};
 use crate::repo;
 use crate::ErrorReason;
+
+/// A token that is never cancelled, for tests that only care about ranking
+/// behavior — `retrieve::cancel`'s own tests are what prove the cancellation
+/// contract itself.
+fn no_cancel() -> CancellationToken {
+    CancellationToken::new()
+}
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -183,7 +192,10 @@ impl Fixture {
     }
 
     async fn retrieve(&self, parsed: &query::ParsedQuery) -> Vec<Candidate> {
-        self.retriever.retrieve(parsed, 100).await.unwrap()
+        self.retriever
+            .retrieve(parsed, 100, &no_cancel())
+            .await
+            .unwrap()
     }
 
     /// Parse `raw` with the real operator parser and retrieve, returning just
@@ -261,13 +273,31 @@ async fn limit_is_clamped_like_fts_index_search() {
     }
     let parsed = query::parse("hedgehog");
 
-    assert_eq!(fx.retriever.retrieve(&parsed, 2).await.unwrap().len(), 2);
     assert_eq!(
-        fx.retriever.retrieve(&parsed, 0).await.unwrap().len(),
+        fx.retriever
+            .retrieve(&parsed, 2, &no_cancel())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        fx.retriever
+            .retrieve(&parsed, 0, &no_cancel())
+            .await
+            .unwrap()
+            .len(),
         5,
         "zero means the server default"
     );
-    assert_eq!(fx.retriever.retrieve(&parsed, -1).await.unwrap().len(), 5);
+    assert_eq!(
+        fx.retriever
+            .retrieve(&parsed, -1, &no_cancel())
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
 }
 
 #[tokio::test]
@@ -516,7 +546,7 @@ async fn a_query_that_still_fails_to_parse_after_quoting_is_invalid_argument_on_
     };
     let err = fx
         .retriever
-        .retrieve(&unmasked, 10)
+        .retrieve(&unmasked, 10, &no_cancel())
         .await
         .expect_err("an embedded NUL must not silently succeed");
     assert_eq!(err.reason(), ErrorReason::InvalidArgument);
@@ -528,9 +558,9 @@ async fn a_query_that_still_fails_to_parse_after_quoting_is_invalid_argument_on_
     };
     let err = fx
         .retriever
-        .retrieve(&masked, 10)
+        .retrieve(&masked, 10, &no_cancel())
         .await
-        .expect_err("same NUL byte, forced through search_ranked by the filter");
+        .expect_err("same NUL byte, this time with a hard filter present too");
     assert_eq!(
         err.reason(),
         ErrorReason::InvalidArgument,
@@ -1117,7 +1147,11 @@ async fn the_hard_filter_mask_is_applied_before_the_limit_not_after() {
         .await;
 
     let parsed = query::parse("budget is:unread");
-    let hits = fx.retriever.retrieve(&parsed, 1).await.unwrap();
+    let hits = fx
+        .retriever
+        .retrieve(&parsed, 1, &no_cancel())
+        .await
+        .unwrap();
     assert_eq!(
         hits.into_iter().map(|c| c.message_id).collect::<Vec<_>>(),
         vec![target]
@@ -1167,6 +1201,30 @@ async fn an_unresolvable_date_value_does_not_gate_the_results() {
         vec![msg],
         "a relative date this stage cannot resolve is skipped, not treated as excluding everything"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_cancelled_token_degrades_to_no_candidates_without_erroring() {
+    // Lexical is the one retriever every query runs — task 28 threads
+    // cancellation through it too (both the unmasked and the masked/
+    // proximity path go through the same `search_ranked`, so one test
+    // covers both).
+    let fx = Fixture::open().await;
+    fx.index(repo::NewMessage {
+        body_text: Some("invoice".to_owned()),
+        ..Default::default()
+    })
+    .await;
+
+    let parsed = query::parse("invoice");
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let hits = fx.retriever.retrieve(&parsed, 100, &cancel).await.unwrap();
+    assert!(hits.is_empty());
 }
 
 // ---------------------------------------------------------------------------

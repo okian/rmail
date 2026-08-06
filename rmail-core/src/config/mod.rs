@@ -468,6 +468,8 @@ pub struct SearchConfig {
     pub reranker: RerankerConfig,
     /// Query-expansion settings.
     pub expansion: ExpansionConfig,
+    /// Candidate-generation retriever toggles (task 28).
+    pub retrievers: RetrieversConfig,
 }
 
 impl Default for SearchConfig {
@@ -487,6 +489,54 @@ impl Default for SearchConfig {
             rank_weights: RankWeights::default(),
             reranker: RerankerConfig::default(),
             expansion: ExpansionConfig::default(),
+            retrievers: RetrieversConfig::default(),
+        }
+    }
+}
+
+/// Which Stage 1 candidate-generation retrievers run, and their tunables.
+///
+/// prd.md, Stage 1: "Each is individually skippable (config/degradation)."
+/// `retrieve::lexical` is not toggleable — it is the baseline recall every
+/// intent depends on, and disabling it would leave a plain keyword query with
+/// nothing to rank on at all. The six retrievers named here are exactly
+/// prd.md's own list for this task ("Dense kNN..., fuzzy..., entity match,
+/// structured filter..., prefix/autocomplete, and recency-prior
+/// retrievers... individually skippable").
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RetrieversConfig {
+    /// Dense-vector kNN retriever.
+    pub dense: bool,
+    /// nucleo subsequence fuzzy retriever.
+    pub fuzzy: bool,
+    /// Entity/entity_mentions exact-match retriever.
+    pub entity: bool,
+    /// Structured hard-filter (pass/fail) retriever.
+    pub structured: bool,
+    /// FTS5 prefix/autocomplete retriever.
+    pub prefix: bool,
+    /// Recency-decay prior retriever.
+    pub recency: bool,
+    /// Half-life, in days, for the recency retriever's
+    /// `exp(-age_days/half_life)` decay score.
+    pub recency_half_life_days: f64,
+}
+
+impl Default for RetrieversConfig {
+    fn default() -> Self {
+        Self {
+            dense: true,
+            fuzzy: true,
+            entity: true,
+            structured: true,
+            prefix: true,
+            recency: true,
+            // Matches `[finder.ranking].half_life_days`'s own default
+            // (prd.md, Part III) — prd.md gives Part I's recency prior no
+            // distinct default of its own, and finder's is the same decay
+            // shape over the same underlying signal (message recency).
+            recency_half_life_days: 30.0,
         }
     }
 }

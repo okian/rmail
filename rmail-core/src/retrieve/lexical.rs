@@ -104,7 +104,9 @@
 
 use rusqlite::types::Value;
 use rusqlite::ToSql;
+use tokio_util::sync::CancellationToken;
 
+use super::cancel::interruptible_read;
 use super::{rank_by_score, Candidate, Source};
 use crate::error::Error;
 use crate::index::fts::{self, FtsIndex};
@@ -172,7 +174,10 @@ impl LexicalRetriever {
     /// retriever can rank: no free-text terms/phrases at all (or none left
     /// once punctuation/emoji-only tokens and `~`-forced-semantic ones are
     /// set aside — see [`MatchExpr::build`]), or a hard filter that provably
-    /// excludes every message (see the module docs).
+    /// excludes every message (see the module docs). Also returns an empty
+    /// list — rather than a partial or stale one — when `cancel` fires before
+    /// the scan completes: a cancelled read means a newer query superseded
+    /// this one, not a fault (see [`super::cancel`]).
     ///
     /// # Errors
     ///
@@ -181,7 +186,7 @@ impl LexicalRetriever {
     /// known way user text can still do this — see the module docs).
     /// Otherwise a mapped storage error.
     #[tracing::instrument(
-        skip(self, query),
+        skip(self, query, cancel),
         fields(
             terms = query.terms.len(),
             phrases = query.phrases.len(),
@@ -192,7 +197,12 @@ impl LexicalRetriever {
             hits
         )
     )]
-    pub async fn retrieve(&self, query: &ParsedQuery, limit: i64) -> Result<Vec<Candidate>, Error> {
+    pub async fn retrieve(
+        &self,
+        query: &ParsedQuery,
+        limit: i64,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Candidate>, Error> {
         let mask = match compile_filters(&query.filters) {
             FilterMask::ExcludesEverything => {
                 tracing::debug!("a hard filter provably excludes every message; skipping the scan");
@@ -211,19 +221,20 @@ impl LexicalRetriever {
         span.record("masked", mask.is_some());
         span.record("proximity", expr.proximity.is_some());
 
-        // The common case — no filter, no proximity probe needed — is
-        // exactly what `FtsIndex::search` already does; reuse it rather than
-        // routing everything through this module's own SQL.
-        let scored: Vec<(i64, f64)> = if mask.is_none() && expr.proximity.is_none() {
-            self.fts
-                .search(&expr.full, page)
-                .await?
-                .into_iter()
-                .map(|hit| (hit.message_id, hit.score))
-                .collect()
-        } else {
-            self.search_ranked(&expr, mask.as_ref(), page).await?
-        };
+        // Always routed through `search_ranked` — including the common case
+        // `FtsIndex::search` alone could serve — rather than branching
+        // between the two: `search_ranked` produces byte-identical SQL to
+        // `FtsIndex::search` when there is no mask and no proximity probe
+        // (same `MATCH`/`ORDER BY bm25(...)`/`LIMIT`, just built locally
+        // instead of delegated), and unlike `FtsIndex::search` it runs
+        // through `cancel::interruptible_read`. Lexical is the one retriever
+        // every query runs regardless of intent — task 28's "a query-
+        // generation token cancels superseded scans" would be true for six
+        // sources and silently false for the busiest one if this path kept
+        // going through `Database::read` instead.
+        let scored = self
+            .search_ranked(&expr, mask.as_ref(), page, cancel)
+            .await?;
 
         let candidates = rank_by_score(Source::Lexical, scored);
         span.record("hits", candidates.len());
@@ -232,19 +243,14 @@ impl LexicalRetriever {
 
     /// Run `expr` — optionally gated by `mask`, optionally boosted by
     /// `expr.proximity` — and return up to `limit` `(message_id, score)`
-    /// pairs, best first.
-    ///
-    /// The query this module falls back to whenever [`FtsIndex::search`]
-    /// cannot express what's being asked: a hard-filter mask, or a proximity
-    /// bonus computed as part of the same `ORDER BY` rather than a second
-    /// pass over an already-paged result (see the module docs on why both
-    /// must be pre-hoc, not post-hoc).
-    #[tracing::instrument(skip(self, expr, mask))]
+    /// pairs, best first, honoring `cancel`.
+    #[tracing::instrument(skip(self, expr, mask, cancel))]
     async fn search_ranked(
         &self,
         expr: &MatchExpr,
         mask: Option<&Mask>,
         limit: i64,
+        cancel: &CancellationToken,
     ) -> Result<Vec<(i64, f64)>, Error> {
         let weights = self.fts.weight_list();
         // `bm25()` is negative-is-better (see `index::fts`'s "BM25 signs"
@@ -286,38 +292,36 @@ impl LexicalRetriever {
         let proximity = expr.proximity.clone();
         let full = expr.full.clone();
         let mask_params = mask.map(|m| m.params.clone()).unwrap_or_default();
-        let hits = self
-            .db
-            .read(move |conn| {
-                let mut stmt = conn.prepare(&sql)?;
-                let mut params: Vec<&dyn ToSql> = Vec::with_capacity(mask_params.len() + 3);
-                // Binding order must match the `?` placeholders' order of
-                // *appearance in the SQL text*, not any semantic ordering:
-                // the proximity probe's `?` (if present) is textually first
-                // (inside the `SELECT` list), then the main `MATCH`
-                // argument, then the mask's own parameters (inside the
-                // `EXISTS` subquery), then `LIMIT`.
-                if let Some(near) = &proximity {
-                    params.push(near);
-                }
-                params.push(&full);
-                for value in &mask_params {
-                    params.push(value);
-                }
-                params.push(&limit);
-                let rows = stmt
-                    .query_map(params.as_slice(), |row| {
-                        // Same sign flip as `FtsIndex::search`: bm25() is
-                        // negative-is-better, every score leaving this module
-                        // is higher-is-better.
-                        Ok((row.get::<_, i64>(0)?, -row.get::<_, f64>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
-            .await
-            .map_err(fts::malformed_query)?;
-        Ok(hits)
+        let hits = interruptible_read(&self.db, cancel, move |conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params: Vec<&dyn ToSql> = Vec::with_capacity(mask_params.len() + 3);
+            // Binding order must match the `?` placeholders' order of
+            // *appearance in the SQL text*, not any semantic ordering:
+            // the proximity probe's `?` (if present) is textually first
+            // (inside the `SELECT` list), then the main `MATCH`
+            // argument, then the mask's own parameters (inside the
+            // `EXISTS` subquery), then `LIMIT`.
+            if let Some(near) = &proximity {
+                params.push(near);
+            }
+            params.push(&full);
+            for value in &mask_params {
+                params.push(value);
+            }
+            params.push(&limit);
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    // Same sign flip as `FtsIndex::search`: bm25() is
+                    // negative-is-better, every score leaving this module
+                    // is higher-is-better.
+                    Ok((row.get::<_, i64>(0)?, -row.get::<_, f64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(fts::malformed_query)?;
+        Ok(hits.unwrap_or_default())
     }
 }
 

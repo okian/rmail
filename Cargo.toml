@@ -58,7 +58,12 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 figment = { version = "0.10", features = ["toml", "env"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+# `functions`: application-defined SQL scalar functions. Used by
+# `retrieve::cancel`'s own test (task 28) to make cross-thread
+# `sqlite3_interrupt()` cancellation observable — a custom `tick()` function
+# is the row counter that proves a cancelled scan was genuinely interrupted
+# mid-flight rather than merely abandoned by its caller.
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 r2d2 = "0.8"
 sqlite-vec = "0.1"
 # For `sqlite3_auto_extension`. Version-locked to whatever `rusqlite` resolves
@@ -117,6 +122,11 @@ sha2 = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
 whatlang = "0.16"
 unicode-normalization = "0.1"
+# The fuzzy retriever's subsequence scorer (task 28) — skim/fzf-style
+# matching with the same bonus/penalty shape prd.md's Part III fuzzy-finder
+# spec describes, without re-deriving that DP by hand for Part I's much
+# narrower use (subject/sender fields only, see `retrieve::fuzzy`).
+nucleo-matcher = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
