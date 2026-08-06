@@ -292,7 +292,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core retrieve::` (each retriever + parallel fan-out + cancellation)
 
 ## 29. Fusion & dedup (RRF + SimHash)
-- [ ] status
+- [x] status
 - **depends-on:** 28
 - **parallel-safe:** no
 - **acceptance:**

@@ -352,8 +352,16 @@ async fn running_every_source_concurrently_beats_running_them_one_after_another(
     // the fairest possible comparison, since it is the same work either way,
     // only the scheduling differs. Summed over several iterations (rather
     // than judged on one) to average out scheduler noise on a loaded box.
-    let mut sequential = Duration::ZERO;
-    for _ in 0..5 {
+    // The *minimum* across trials, not the sum. Summing accumulates every
+    // scheduler hiccup either side happened to catch, so on a machine running
+    // other work — several build agents, say — noise can swamp the overlap
+    // this is trying to observe and the comparison flips for reasons unrelated
+    // to the code. A minimum converges on the uncontended cost instead: load
+    // can only ever make a trial slower, so the fastest of several is the one
+    // least contaminated by it, and it is the honest estimate of what the
+    // scheduling actually buys.
+    let mut sequential = Duration::MAX;
+    for _ in 0..7 {
         let start = Instant::now();
         let _ = fanout.run_lexical(&plan, 50, &cancel).await;
         let _ = fanout.run_dense(&plan, 50, &cancel).await;
@@ -362,15 +370,15 @@ async fn running_every_source_concurrently_beats_running_them_one_after_another(
         let _ = fanout.run_structured(&plan, 50, &cancel).await;
         let _ = fanout.run_prefix(&plan, 50, &cancel).await;
         let _ = fanout.run_recency(&plan, 50, &cancel).await;
-        sequential += start.elapsed();
+        sequential = sequential.min(start.elapsed());
     }
 
-    let mut concurrent = Duration::ZERO;
+    let mut concurrent = Duration::MAX;
     let mut candidates = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..7 {
         let start = Instant::now();
         candidates = fanout.generate(&plan, 50, &cancel).await;
-        concurrent += start.elapsed();
+        concurrent = concurrent.min(start.elapsed());
     }
 
     assert!(!candidates.is_empty());
@@ -383,9 +391,9 @@ async fn running_every_source_concurrently_beats_running_them_one_after_another(
     // overhead), never less.
     assert!(
         concurrent < sequential,
-        "expected `tokio::join!` to overlap the retrievers' work: 5x sequential took \
-         {sequential:?}, 5x concurrent took {concurrent:?} (concurrent should be less than \
-         sequential, not merely equal to it — that would mean the sources ran one after \
+        "expected `tokio::join!` to overlap the retrievers' work: best-of-7 sequential took \
+         {sequential:?}, best-of-7 concurrent took {concurrent:?} (concurrent should be less \
+         than sequential, not merely equal to it — that would mean the sources ran one after \
          another instead of together)"
     );
 }
