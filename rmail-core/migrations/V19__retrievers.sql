@@ -1,4 +1,4 @@
--- V27: an index the remaining Stage 1 retrievers (task 28) need that V2's
+-- V19: an index the remaining Stage 1 retrievers (task 28) need that V2's
 -- baseline schema does not provide.
 --
 -- `idx_messages_mailbox_date` (V2) is `(mailbox_id, COALESCE(date,
@@ -8,7 +8,7 @@
 -- filter -- the common case) instead run `ORDER BY COALESCE(date,
 -- internaldate) DESC LIMIT ?` over the *whole* table, unconstrained by
 -- mailbox: a composite index whose leading column they never bind is not
--- usable for that ordering (`EXPLAIN QUERY PLAN` on the pre-V27 schema shows
+-- usable for that ordering (`EXPLAIN QUERY PLAN` on the pre-V19 schema shows
 -- `SCAN messages` + `USE TEMP B-TREE FOR ORDER BY` -- the query pays for a
 -- full sort of the filtered set every time, `LIMIT` bounding only what is
 -- *returned*, not the work done getting there). A single-column expression

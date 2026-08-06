@@ -283,7 +283,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core retrieve::lexical`
 
 ## 28. Candidate generation — remaining retrievers
-- [ ] status
+- [x] status
 - **depends-on:** 19, 21, 26, 27
 - **parallel-safe:** no
 - **acceptance:**
