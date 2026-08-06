@@ -175,6 +175,26 @@ impl Fixture {
             .unwrap()
     }
 
+    /// Insert an `ai_summaries` row directly (task 48, migration V21) — this
+    /// module is proving `ai:` composes with the lexical `MATCH`, not
+    /// re-proving the AI pipeline writes the row (`ai::triage::tests` does
+    /// that against the real `AiWorkerPool`).
+    async fn ai_summary(&self, message_id: i64, needs_reply: bool) {
+        let account_id = self.account_id;
+        self.db
+            .write(move |c| {
+                c.execute(
+                    "INSERT INTO ai_summaries (
+                         message_id, account_id, model, pass, schema_version,
+                         tl_dr, needs_reply, created_at
+                     ) VALUES (?1, ?2, 'claude-haiku-4-5', 'triage', 1, 'tl;dr', ?3, unixepoch())",
+                    rusqlite::params![message_id, account_id, needs_reply],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
     async fn thread(&self) -> i64 {
         let account_id = self.account_id;
         self.db
@@ -1185,6 +1205,40 @@ async fn a_filter_for_an_unbuilt_subsystem_excludes_everything_but_its_negation_
             "negating it is vacuously true: nothing has it, so nothing is excluded"
         );
     }
+}
+
+#[tokio::test]
+async fn an_ai_predicate_conjoins_with_free_text_instead_of_dropping_every_hit() {
+    // Regression: `ai:` used to fall through this module's own copy of
+    // `classify` to the "unbuilt subsystem" arm (`RawEffect::Never`), which
+    // `compile_filters` turns into `FilterMask::ExcludesEverything` for any
+    // *positive* filter — silently discarding the entire BM25 arm for any
+    // query mixing free text with an `ai:` operator, even though
+    // `retrieve::structured`/`dense`/`fuzzy`/... all honored it correctly.
+    // `ai:` is now backed by `ai_summaries` (task 48) via the same
+    // `ai_predicate_sql` classifier `retrieve::filtermask` uses.
+    let fx = Fixture::open().await;
+    let flagged = fx
+        .index(repo::NewMessage {
+            body_text: Some("roadmap review needed".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let not_flagged = fx
+        .index(repo::NewMessage {
+            body_text: Some("roadmap review complete".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    fx.ai_summary(flagged, true).await;
+    fx.ai_summary(not_flagged, false).await;
+
+    assert_eq!(
+        fx.ids("roadmap ai:needs-reply").await,
+        vec![flagged],
+        "the lexical arm must still rank the free text, gated by ai:needs-reply, \
+         not drop every candidate"
+    );
 }
 
 #[tokio::test]

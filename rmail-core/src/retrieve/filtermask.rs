@@ -39,7 +39,7 @@
 
 use rusqlite::types::Value;
 
-use crate::query::{DateRange, Filter, HardFilter, HasTarget, IsFlag, Operator};
+use crate::query::{AiPredicate, DateRange, Filter, HardFilter, HasTarget, IsFlag, Operator};
 
 /// A hard-filter mask compiled to SQL: a boolean expression over `messages`
 /// (and, via `EXISTS`/`IN` subqueries, `flags`/`attachments`/`mailboxes`/
@@ -237,7 +237,14 @@ fn classify(op: &Operator) -> RawEffect {
         Operator::Is(IsFlag::Replied) => flag_predicate("\\Answered", true),
         Operator::Is(IsFlag::Pinned | IsFlag::Muted) => RawEffect::Never,
         Operator::Is(IsFlag::Other(value)) => is_other_flag(value),
-        Operator::Tag(_) | Operator::Note(_) | Operator::Ai(_) => RawEffect::Never,
+        // `tag:`/`note:` have no backing table yet (tasks 55/56); `ai:` is
+        // backed by `ai_summaries` (task 48, migration V21) and has its own
+        // classifier below.
+        Operator::Tag(_) | Operator::Note(_) => RawEffect::Never,
+        Operator::Ai(predicate) => match ai_predicate_sql(predicate) {
+            Some((sql, params)) => RawEffect::Sql(sql, params),
+            None => RawEffect::Never,
+        },
         Operator::In(name) => RawEffect::Sql(
             "mailbox_id IN (SELECT id FROM mailboxes WHERE name = ? COLLATE NOCASE)".to_owned(),
             vec![Value::Text(name.clone())],
@@ -251,6 +258,112 @@ fn classify(op: &Operator) -> RawEffect {
             Err(_) => RawEffect::Never,
         },
     }
+}
+
+/// Resolve an `ai:` predicate ([`crate::query::AiPredicate`], task 25's
+/// parser) into a SQL fragment against `ai_summaries` (task 48, migration
+/// V21) plus its bound parameters, or `None` if the key/value combination
+/// is not recognized.
+///
+/// `pub(crate)`, and returning a plain `(String, Vec<Value>)` rather than
+/// this module's own [`RawEffect`], on purpose: [`super::lexical`] carries
+/// an independent, differently-typed `RawEffect` and, per that module's own
+/// docs, does not reuse this module's *filter compiler* (`compile` vs
+/// `compile_filters` — different input shapes, `HardFilter` vs `Filter`).
+/// But classifying one already-parsed `AiPredicate` into SQL needs no
+/// `QueryPlan` and no `HardFilter`/`Filter` distinction — there is nothing
+/// about it that should differ between the two call sites — so this
+/// function is the one place both `classify` below and
+/// `lexical::classify` turn a predicate into SQL, and a future field added
+/// to `ai_summaries` only has to be taught to match here once.
+///
+/// A message can carry more than one `ai_summaries` row (one per `pass` —
+/// triage today, a deep row from task 49 later), so every shape below is an
+/// `EXISTS` gate: "does *some* row for this message satisfy the predicate",
+/// not a join that would multiply a message into one candidate row per
+/// `ai_summaries` row it has.
+///
+/// A key or value this classifier does not recognize returns `None`, which
+/// both callers turn into their own `RawEffect::Never` — the same choice
+/// each already makes for a non-numeric `thread:` id or an `is:`-flag it
+/// cannot resolve: a filter that cannot be evaluated with confidence must
+/// exclude everything rather than silently match everything.
+pub(crate) fn ai_predicate_sql(predicate: &AiPredicate) -> Option<(String, Vec<Value>)> {
+    match predicate {
+        AiPredicate::Flag(name) => ai_flag_sql(name),
+        AiPredicate::Equals(key, value) => ai_equals_sql(key, value),
+        AiPredicate::GreaterThan(key, value) => ai_threshold_sql(key, value),
+    }
+}
+
+/// `ai:needs-reply` and friends — bare boolean flags. `needs_reply` is the
+/// only one the PRD's grammar names; anything else is unrecognized.
+fn ai_flag_sql(name: &str) -> Option<(String, Vec<Value>)> {
+    match name.to_ascii_lowercase().as_str() {
+        "needs-reply" | "needs_reply" => ai_exists("needs_reply = 1", Vec::new()),
+        _ => None,
+    }
+}
+
+/// `ai:category:invoice`, `ai:sentiment:negative`, `ai:priority:high` — exact
+/// (case-insensitive) equality against one of `ai_summaries`' enum columns.
+fn ai_equals_sql(key: &str, value: &str) -> Option<(String, Vec<Value>)> {
+    let column = match key.to_ascii_lowercase().as_str() {
+        "category" => "category",
+        "sentiment" => "sentiment",
+        "priority" => "priority",
+        _ => return None,
+    };
+    ai_exists(
+        &format!("{column} = ? COLLATE NOCASE"),
+        vec![Value::Text(value.to_owned())],
+    )
+}
+
+/// `ai:priority>high` — an ordinal comparison. `priority` is the only
+/// `ai_summaries` column with a meaningful order (`category`/`sentiment` are
+/// categorical, not ranked), so it is the only key this accepts; an
+/// unrecognized key or an unrecognized priority level both return `None`
+/// rather than guess at an ordering that was never defined.
+fn ai_threshold_sql(key: &str, value: &str) -> Option<(String, Vec<Value>)> {
+    if !key.eq_ignore_ascii_case("priority") {
+        return None;
+    }
+    let rank = priority_rank(value)?;
+    ai_exists(
+        &format!("({PRIORITY_RANK_SQL}) > ?"),
+        vec![Value::Integer(rank)],
+    )
+}
+
+/// `low < normal < high < critical` as SQL, so a threshold comparison can be
+/// pushed down without a scalar function. `ELSE -1`: a priority value this
+/// build does not recognize (should not happen — `ai::triage::TriageResult::parse`
+/// validates the enum before the row is ever written) sorts below every real
+/// level rather than matching a threshold comparison it should not.
+const PRIORITY_RANK_SQL: &str = "CASE priority \
+     WHEN 'low' THEN 0 WHEN 'normal' THEN 1 WHEN 'high' THEN 2 WHEN 'critical' THEN 3 ELSE -1 END";
+
+/// [`PRIORITY_RANK_SQL`]'s mapping, evaluated in Rust for the *comparison
+/// value* a user typed (`ai:priority>high`'s `high`) — the column's own rank
+/// is computed in SQL by the same table above so the two never drift apart.
+fn priority_rank(value: &str) -> Option<i64> {
+    match value.to_ascii_lowercase().as_str() {
+        "low" => Some(0),
+        "normal" => Some(1),
+        "high" => Some(2),
+        "critical" => Some(3),
+        _ => None,
+    }
+}
+
+/// `sql` (referencing `ai_summaries`' own unqualified columns), wrapped as a
+/// correlated `EXISTS` against `ai_summaries.message_id = messages.id`.
+fn ai_exists(sql: &str, params: Vec<Value>) -> Option<(String, Vec<Value>)> {
+    Some((
+        format!("EXISTS (SELECT 1 FROM ai_summaries WHERE ai_summaries.message_id = messages.id AND {sql})"),
+        params,
+    ))
 }
 
 fn size_cmp(cmp: &str, bytes: u64) -> RawEffect {

@@ -44,6 +44,7 @@ pub mod policy;
 pub mod provider;
 pub mod queue;
 pub mod redact;
+pub mod triage;
 
 pub use audit::{
     estimate_cost_usd, query_calls, record_call, record_call_priced, usage_for_day, AuditFilter,
@@ -67,3 +68,4 @@ pub use queue::{
 pub use redact::{
     guard, preview, rehydrate, GuardedRequest, RedactPreview, RedactionKind, TokenMap,
 };
+pub use triage::TriagePassHandler;

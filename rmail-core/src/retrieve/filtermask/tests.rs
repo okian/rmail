@@ -8,7 +8,7 @@
 use rusqlite::types::Value;
 
 use super::*;
-use crate::query::{parse, Operator};
+use crate::query::{parse, AiPredicate, Operator};
 
 fn other(op: Operator, negated: bool) -> HardFilter {
     HardFilter::Other(Filter { op, negated })
@@ -146,6 +146,130 @@ fn exists_clause_correlates_on_the_given_message_id_expression() {
         mask.exists_clause("c.message_id"),
         "EXISTS (SELECT 1 FROM messages WHERE messages.id = c.message_id AND account_id = ?)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ai: -- decisions only; `ai::triage::tests` proves these select the right
+// messages against a real database.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_needs_reply_flag_compiles_to_an_exists_gate() {
+    let filter = other(
+        Operator::Ai(AiPredicate::Flag("needs-reply".to_owned())),
+        false,
+    );
+    let FilterMask::Sql(mask) = compile(&[filter]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert_eq!(
+        mask.sql,
+        "(EXISTS (SELECT 1 FROM ai_summaries WHERE ai_summaries.message_id = messages.id AND needs_reply = 1))"
+    );
+    assert!(mask.params.is_empty());
+}
+
+#[test]
+fn an_unrecognized_ai_flag_excludes_everything() {
+    let filter = other(Operator::Ai(AiPredicate::Flag("bogus".to_owned())), false);
+    assert!(matches!(compile(&[filter]), FilterMask::ExcludesEverything));
+}
+
+#[test]
+fn ai_category_equals_binds_the_value_case_insensitively() {
+    let filter = other(
+        Operator::Ai(AiPredicate::Equals(
+            "category".to_owned(),
+            "Invoice".to_owned(),
+        )),
+        false,
+    );
+    let FilterMask::Sql(mask) = compile(&[filter]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert_eq!(
+        mask.sql,
+        "(EXISTS (SELECT 1 FROM ai_summaries WHERE ai_summaries.message_id = messages.id AND category = ? COLLATE NOCASE))"
+    );
+    assert_eq!(mask.params, vec![Value::Text("Invoice".to_owned())]);
+}
+
+#[test]
+fn ai_sentiment_equals_binds_the_value() {
+    let filter = other(
+        Operator::Ai(AiPredicate::Equals(
+            "sentiment".to_owned(),
+            "negative".to_owned(),
+        )),
+        false,
+    );
+    let FilterMask::Sql(mask) = compile(&[filter]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert!(mask.sql.contains("sentiment = ? COLLATE NOCASE"));
+    assert_eq!(mask.params, vec![Value::Text("negative".to_owned())]);
+}
+
+#[test]
+fn an_unrecognized_ai_equals_key_excludes_everything() {
+    let filter = other(
+        Operator::Ai(AiPredicate::Equals("bogus".to_owned(), "x".to_owned())),
+        false,
+    );
+    assert!(matches!(compile(&[filter]), FilterMask::ExcludesEverything));
+}
+
+#[test]
+fn ai_priority_threshold_binds_the_resolved_ordinal() {
+    let filter = other(
+        Operator::Ai(AiPredicate::GreaterThan(
+            "priority".to_owned(),
+            "high".to_owned(),
+        )),
+        false,
+    );
+    let FilterMask::Sql(mask) = compile(&[filter]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert!(mask.sql.contains("CASE priority"));
+    assert!(mask.sql.contains("> ?"));
+    assert_eq!(mask.params, vec![Value::Integer(2)], "'high' ranks 2");
+}
+
+#[test]
+fn an_unrecognized_ai_priority_level_excludes_everything() {
+    let filter = other(
+        Operator::Ai(AiPredicate::GreaterThan(
+            "priority".to_owned(),
+            "urgent".to_owned(),
+        )),
+        false,
+    );
+    assert!(matches!(compile(&[filter]), FilterMask::ExcludesEverything));
+}
+
+#[test]
+fn an_ai_threshold_on_a_non_priority_key_excludes_everything() {
+    let filter = other(
+        Operator::Ai(AiPredicate::GreaterThan(
+            "sentiment".to_owned(),
+            "negative".to_owned(),
+        )),
+        false,
+    );
+    assert!(matches!(compile(&[filter]), FilterMask::ExcludesEverything));
+}
+
+#[test]
+fn negating_an_ai_predicate_wraps_it_null_safely() {
+    let filter = other(
+        Operator::Ai(AiPredicate::Flag("needs-reply".to_owned())),
+        true,
+    );
+    let FilterMask::Sql(mask) = compile(&[filter]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert!(mask.sql.starts_with("NOT COALESCE((EXISTS"));
 }
 
 #[test]

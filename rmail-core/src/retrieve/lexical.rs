@@ -107,6 +107,7 @@ use rusqlite::ToSql;
 use tokio_util::sync::CancellationToken;
 
 use super::cancel::interruptible_read;
+use super::filtermask::ai_predicate_sql;
 use super::{rank_by_score, Candidate, Source};
 use crate::error::Error;
 use crate::index::fts::{self, FtsIndex};
@@ -470,8 +471,9 @@ enum RawEffect {
     Sql(String, Vec<Value>),
     /// The positive form is false for every message today — either the value
     /// cannot denote any real row (a `thread:` id that is not an integer,
-    /// which no `threads.id` can ever equal) or the operator names a
-    /// subsystem this build has no table for yet (`tag:`, `note:`, `ai:`,
+    /// which no `threads.id` can ever equal; an `ai:` key/value
+    /// [`ai_predicate_sql`] does not recognize) or the operator names a
+    /// subsystem this build has no table for yet (`tag:`, `note:`,
     /// `has:note`, `has:tag`, `is:pinned`, `is:muted`). See the module docs
     /// for why this degrades to "excludes everything" rather than "no
     /// constraint".
@@ -641,7 +643,16 @@ fn classify(op: &Operator) -> RawEffect {
         Operator::Is(IsFlag::Replied) => flag_predicate("\\Answered", true),
         Operator::Is(IsFlag::Pinned | IsFlag::Muted) => RawEffect::Never,
         Operator::Is(IsFlag::Other(value)) => is_other_flag(value),
-        Operator::Tag(_) | Operator::Note(_) | Operator::Ai(_) => RawEffect::Never,
+        // `tag:`/`note:` have no backing table yet (tasks 55/56); `ai:` is
+        // backed by `ai_summaries` (task 48) and resolved through the same
+        // classifier `retrieve::filtermask` uses — see [`RawEffect::Never`]'s
+        // docs and [`ai_predicate_sql`] for why this is shared rather than a
+        // second, independently-drifting copy.
+        Operator::Tag(_) | Operator::Note(_) => RawEffect::Never,
+        Operator::Ai(predicate) => match ai_predicate_sql(predicate) {
+            Some((sql, params)) => RawEffect::Sql(sql, params),
+            None => RawEffect::Never,
+        },
         Operator::In(name) => RawEffect::Sql(
             "mailbox_id IN (SELECT id FROM mailboxes WHERE name = ? COLLATE NOCASE)".to_owned(),
             vec![Value::Text(name.clone())],
