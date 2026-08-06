@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// AuditService gives read access to the append-only AI call audit ledger:
+// every request made to a model provider, what it cost, and a hash proving
+// what actually left the machine to produce it. The ledger itself cannot be
+// edited or erased through this or any other surface — see `ai::audit` in
+// rmail-core for how that is enforced.
+service AuditService {
+  // List ledger entries matching a filter, newest first, paginated.
+  rpc QueryAiCalls(QueryAiCallsRequest) returns (QueryAiCallsResponse);
+
+  // Stream every ledger entry matching a filter, for bulk export (e.g. a
+  // compliance archive or `mail ai audit export`). Unlike QueryAiCalls this
+  // is not paginated by the caller — the server streams until the filter is
+  // exhausted.
+  rpc ExportLedger(ExportLedgerRequest) returns (stream AuditEntry);
+}
+
+// How a recorded call ended. Owned entirely by this service (unlike
+// `redaction_level`, whose vocabulary belongs to the redaction pass), so it
+// is a closed enum rather than a string — changing it later without breaking
+// existing clients would need a new package version.
+enum CallStatus {
+  CALL_STATUS_UNSPECIFIED = 0;
+  CALL_STATUS_OK = 1;
+  CALL_STATUS_ERROR = 2;
+}
+
+// One append-only ledger row: everything recorded about a single call to a
+// model provider.
+message AuditEntry {
+  int64 id = 1;
+  // Unix seconds.
+  int64 created_at = 2;
+  optional int64 account_id = 3;
+  optional int64 message_id = 4;
+  // The provider's id for the response, absent if the call never got one
+  // (a pre-flight rejection, or an error before the provider replied).
+  optional string request_id = 5;
+  string model = 6;
+  // Caller-supplied context tag, e.g. "triage" | "deep". Absent for calls
+  // outside the two-pass summarization pipeline (search rerank, ask_mailbox).
+  optional string pass = 7;
+  int64 input_tokens = 8;
+  int64 output_tokens = 9;
+  int64 cache_creation_input_tokens = 10;
+  int64 cache_read_input_tokens = 11;
+  double cost_usd = 12;
+  // What the redaction pass (task 44) did to this payload before it left the
+  // machine, e.g. "none" | "redacted". This service does not define the
+  // vocabulary — it echoes whatever label was recorded.
+  string redaction_level = 13;
+  int64 latency_ms = 14;
+  // SHA-256 of the exact bytes transmitted, post-redaction — proof of what
+  // left the machine, not what the caller intended to send.
+  bytes payload_sha256 = 15;
+  CallStatus status = 16;
+  optional string error = 17;
+}
+
+// Every set field is AND-ed; an unset field is unfiltered on that dimension.
+message AuditFilter {
+  optional int64 account_id = 1;
+  optional int64 message_id = 2;
+  optional string model = 3;
+  // Inclusive range, unix seconds.
+  optional int64 since = 4;
+  optional int64 until = 5;
+  // Unset (or CALL_STATUS_UNSPECIFIED) means unfiltered on this dimension.
+  optional CallStatus status = 6;
+}
+
+message QueryAiCallsRequest {
+  AuditFilter filter = 1;
+  // Max rows to return; the server clamps this to a sane ceiling. Zero or
+  // absent falls back to a server-chosen default page size.
+  int32 limit = 2;
+  // Pagination cursor: resume just after the smallest id already seen.
+  // Absent (or 0) starts from the newest entry.
+  optional int64 before_id = 3;
+}
+
+message QueryAiCallsResponse {
+  repeated AuditEntry entries = 1;
+  // Whether entries exist before the last entry in this page — pass its id
+  // as the next request's `before_id` to continue.
+  bool has_more = 2;
+}
+
+message ExportLedgerRequest {
+  AuditFilter filter = 1;
+}

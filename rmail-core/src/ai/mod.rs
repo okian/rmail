@@ -41,6 +41,10 @@ pub mod policy;
 pub mod provider;
 pub mod redact;
 
+pub use audit::{
+    estimate_cost_usd, query_calls, record_call, usage_for_day, AuditFilter, CallOutcome,
+    CallRecord, CallStatus, DayUsage, LedgerEntry,
+};
 pub use provider::{
     build, ChatMessage, ChatRequest, ChatResponse, ClaudeProvider, OutputFormat, Provider,
     ProviderStream, Role, StopReason, StreamFrame, Usage,

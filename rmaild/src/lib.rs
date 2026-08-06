@@ -10,12 +10,14 @@
 
 mod account_service;
 mod admin_service;
+mod audit_service;
 mod auth;
 mod sync_service;
 mod trace;
 
 pub use account_service::AccountApi;
 pub use admin_service::AdminApi;
+pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
 pub use sync_service::SyncApi;
 pub use trace::RequestTraceLayer;
@@ -30,6 +32,7 @@ use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
+use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -340,6 +343,7 @@ where
 
     let admin_service = AdminServiceServer::new(AdminApi::new(db.clone()));
     let account_service = AccountServiceServer::new(AccountApi::new(db.clone()));
+    let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
 
     let incoming = UnixListenerStream::new(listener);
@@ -352,6 +356,7 @@ where
         .add_service(health_service)
         .add_service(reflection)
         .add_service(admin_service)
+        .add_service(audit_service)
         .add_service(account_service)
         .add_service(sync_service)
         .serve_with_incoming_shutdown(incoming, shutdown)

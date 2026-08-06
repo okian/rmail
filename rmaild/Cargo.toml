@@ -48,3 +48,6 @@ tracing.workspace = true
 [dev-dependencies]
 tonic-types.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+# Only used by the AuditService integration test, to verify a ledger entry's
+# `payload_sha256` against an independently computed hash.
+sha2.workspace = true
