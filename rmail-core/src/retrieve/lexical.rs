@@ -419,7 +419,7 @@ impl MatchExpr {
 /// the *entire* query for a reason no user typing `budget 🎉` or `report -`
 /// intended (a lone `-` survives `query::parse` as literal text — see its
 /// "bare modifier" rule — rather than being dropped as empty).
-fn has_indexable_content(text: &str) -> bool {
+pub(crate) fn has_indexable_content(text: &str) -> bool {
     text.chars().any(char::is_alphanumeric)
 }
 
@@ -434,7 +434,13 @@ fn has_indexable_content(text: &str) -> bool {
 /// since the embedded quote is not a word character to `unicode61`), but it
 /// can never restructure the boolean query the way concatenating it
 /// unescaped would.
-fn quote_fts_literal(text: &str) -> String {
+///
+/// `pub(crate)` rather than private: `features::extract` builds its own,
+/// narrower required-terms `MATCH` expression (no proximity probe — see that
+/// module's docs) for the per-field `bm25()` breakdown prd.md's Stage 3
+/// wants, and reuses this exact quoting rather than re-deriving the same
+/// injection defense a second time.
+pub(crate) fn quote_fts_literal(text: &str) -> String {
     format!("\"{}\"", text.replace('"', "\"\""))
 }
 

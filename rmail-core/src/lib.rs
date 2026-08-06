@@ -14,6 +14,7 @@ pub mod credential;
 pub mod embed;
 pub mod error;
 pub mod events;
+pub mod features;
 pub mod fuse;
 pub mod imap;
 pub mod index;
