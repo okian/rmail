@@ -178,7 +178,7 @@ impl LiveImapMutator {
 
 #[async_trait::async_trait]
 impl ImapMutator for LiveImapMutator {
-    #[tracing::instrument(skip(self), fields(mailbox, uid), err)]
+    #[tracing::instrument(skip(self), fields(mailbox = mailbox, uid = uid), err)]
     async fn set_flags(
         &self,
         account_id: i64,
@@ -193,7 +193,7 @@ impl ImapMutator for LiveImapMutator {
         result
     }
 
-    #[tracing::instrument(skip(self), fields(mailbox, uid, dest), err)]
+    #[tracing::instrument(skip(self), fields(mailbox = mailbox, uid = uid, dest = dest), err)]
     async fn move_message(
         &self,
         account_id: i64,
@@ -208,7 +208,7 @@ impl ImapMutator for LiveImapMutator {
         result
     }
 
-    #[tracing::instrument(skip(self), fields(mailbox, uid, dest), err)]
+    #[tracing::instrument(skip(self), fields(mailbox = mailbox, uid = uid, dest = dest), err)]
     async fn copy_message(
         &self,
         account_id: i64,
@@ -223,7 +223,7 @@ impl ImapMutator for LiveImapMutator {
         result
     }
 
-    #[tracing::instrument(skip(self), fields(mailbox, uid), err)]
+    #[tracing::instrument(skip(self), fields(mailbox = mailbox, uid = uid), err)]
     async fn delete_message(
         &self,
         account_id: i64,
@@ -688,7 +688,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_copy_destination_is_not_found() {
+    async fn only_a_trycreate_refusal_means_the_destination_is_missing() {
+        // `[TRYCREATE]` is the one refusal RFC 3501 defines as "the
+        // destination does not exist", so it is the only one that may map to
+        // NOT_FOUND.
+        let mock = MockImap::start(
+            MockConfig::default()
+                .password("pw")
+                .fetch(5, &[], b"body")
+                .refusing_uid_commands_with_trycreate(),
+        )
+        .await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+        let err = copy_via(&mut session, "INBOX", UIDVALIDITY, 5, "Nonexistent")
+            .await
+            .expect_err("a refused UID COPY must surface as an error");
+        assert_eq!(
+            err.reason(),
+            crate::ErrorReason::NotFound,
+            "a [TRYCREATE] refusal names a destination that does not exist"
+        );
+        let _ = session.logout().await;
+    }
+
+    #[tokio::test]
+    async fn a_transient_copy_refusal_stays_retryable() {
+        // `[LIMIT]`, `[OVERQUOTA]` and `NO Server busy` all refuse a COPY the
+        // server could otherwise serve. Mapping these to NOT_FOUND — as an
+        // earlier version of `mailbox_not_found_error` did for every `NO` —
+        // tells the client to stop retrying, stranding the move permanently
+        // over a full mailbox or a busy server.
         let mock = MockImap::start(
             MockConfig::default()
                 .password("pw")
@@ -698,14 +728,14 @@ mod tests {
         .await;
         let stream = connect_mock(mock.addr).await;
         let mut session = login(stream, "user", "pw").await.unwrap();
-
-        let err = copy_via(&mut session, "INBOX", UIDVALIDITY, 5, "Nonexistent")
+        let err = copy_via(&mut session, "INBOX", UIDVALIDITY, 5, "Archive")
             .await
             .expect_err("a refused UID COPY must surface as an error");
         assert_eq!(
             err.reason(),
-            crate::ErrorReason::NotFound,
-            "a refused destination should not read as generically retryable"
+            crate::ErrorReason::Unavailable,
+            "a transient refusal must stay retryable, not read as a missing \
+             destination"
         );
         let _ = session.logout().await;
     }

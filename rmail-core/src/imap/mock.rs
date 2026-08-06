@@ -61,6 +61,9 @@ pub(crate) struct MockConfig {
     empty_search: bool,
     /// Answer every `UID` command with a tagged `NO`.
     refuse_uid: bool,
+    /// Answer every `UID` command with a tagged `NO [TRYCREATE]` — the one
+    /// refusal RFC 3501 defines as "the destination does not exist".
+    refuse_uid_trycreate: bool,
     /// How often to volunteer `* OK Still here` while idling.
     idle_keepalive: Duration,
 }
@@ -92,6 +95,7 @@ impl Default for MockConfig {
             omit_uidnext: false,
             empty_search: false,
             refuse_uid: false,
+            refuse_uid_trycreate: false,
             // Effectively never, unless a test asks for it.
             idle_keepalive: Duration::from_secs(86_400),
         }
@@ -223,6 +227,19 @@ impl MockConfig {
     /// Nothing to do with credentials — which is the whole point.
     pub(crate) fn refusing_uid_commands(mut self) -> Self {
         self.refuse_uid = true;
+        self
+    }
+
+    /// Refuse every `UID` command with `NO [TRYCREATE]`.
+    ///
+    /// The counterpart to [`Self::refusing_uid_commands`]: that one emulates a
+    /// server declining work it could otherwise do (`[LIMIT]`, `Server busy`),
+    /// which is transient; this one emulates the single refusal RFC 3501
+    /// defines as meaning the destination mailbox does not exist, which is
+    /// permanent. `COPY`/`MOVE` error mapping has to tell them apart, so the
+    /// mock has to be able to produce both.
+    pub(crate) fn refusing_uid_commands_with_trycreate(mut self) -> Self {
+        self.refuse_uid_trycreate = true;
         self
     }
 
@@ -670,6 +687,15 @@ async fn serve(
             "UID" => {
                 let mut args = command.splitn(3, ' ').skip(1);
                 let sub = args.next().unwrap_or("").to_ascii_uppercase();
+                if config.refuse_uid_trycreate {
+                    write
+                        .write_all(
+                            format!("{tag} NO [TRYCREATE] no such destination mailbox\r\n")
+                                .as_bytes(),
+                        )
+                        .await?;
+                    continue;
+                }
                 if config.refuse_uid {
                     write
                         .write_all(format!("{tag} NO [LIMIT] too many requests\r\n").as_bytes())

@@ -130,17 +130,24 @@ pub(crate) fn select_error(folder: &str, err: async_imap::error::Error) -> Error
 
 /// Map a `COPY`/`MOVE` failure naming `dest` as the destination.
 ///
-/// Same reasoning as [`select_error`], applied to the destination-mailbox
-/// argument rather than the selected one: a `NO` here (often carrying
-/// `[TRYCREATE]`) means the named mailbox does not exist, which is
-/// [`crate::ErrorReason::NotFound`], not the generic retryable
-/// [`command_error`] a caller might otherwise get stuck retrying forever.
+/// Unlike [`select_error`], a bare `NO` is **not** enough to conclude the
+/// destination is missing. `SELECT` has only one way to fail on the mailbox
+/// argument, but a server refuses `COPY`/`MOVE` for several unrelated reasons —
+/// `[OVERQUOTA]`, `[LIMIT]`, `NO Server busy`, or a source UID that vanished
+/// between the scan and the command. Every one of those is transient, and
+/// [`crate::ErrorReason::NotFound`] tells a client to stop retrying: reporting
+/// a full mailbox as a missing one strands the move permanently.
+///
+/// RFC 3501 supplies the discriminator. `[TRYCREATE]` is defined to mean
+/// exactly "the destination does not exist, create it and try again", so that
+/// is what this gates on; every other refusal falls through to the retryable
+/// [`command_error`].
 pub(crate) fn mailbox_not_found_error(dest: &str, err: async_imap::error::Error) -> Error {
     match err {
-        async_imap::error::Error::No(msg) => {
-            Error::not_found(format!("cannot use {dest} as a destination mailbox: {msg}"))
+        async_imap::error::Error::No(ref msg) if msg.to_ascii_uppercase().contains("TRYCREATE") => {
+            Error::not_found(format!("destination mailbox {dest} does not exist: {msg}"))
         }
-        other => map_imap_err(other),
+        other => command_error("UID COPY/MOVE", other),
     }
 }
 

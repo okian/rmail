@@ -1059,3 +1059,81 @@ async fn list_never_returns_more_than_the_cap() {
     let capped = fx.store.list(inbox_id, 2).await.unwrap();
     assert_eq!(capped.len(), 2);
 }
+
+/// A span field declared by `#[tracing::instrument]` actually carries a value.
+///
+/// This is a regression guard for a real bug, not a smoke test. Under
+/// `tracing-attributes` 0.1.31 the bare-identifier form — `fields(message_id)`
+/// with no `= value` — does two things at once: it declares the field as
+/// `tracing::field::Empty`, and it suppresses the automatic recording of the
+/// argument that shares its name. The result is a span whose field is
+/// guaranteed to be empty, which is strictly less information than writing no
+/// `fields(..)` at all. Every handler in this module carried that form, so the
+/// instrumentation added for observability recorded nothing.
+///
+/// Asserting on the value rather than the field name is what makes this bite:
+/// the name is present in the output either way, so a test looking only for
+/// `"message_id"` would pass against the broken version.
+#[tokio::test]
+async fn an_instrumented_handler_records_its_field_values() {
+    use std::io;
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut guard = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("log buffer poisoned"))?;
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let fx = Fixture::new();
+    // A message that does not exist: `get` is instrumented with `err`, so the
+    // miss is enough to close the span with its field recorded.
+    let missing: i64 = 987_654;
+
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(BufWriter(buf.clone())),
+    );
+
+    // `get` is instrumented with `err`, so a miss closes the span with the
+    // field recorded — no successful fixture read needed.
+    let guard = tracing::subscriber::set_default(subscriber);
+    let _ = fx.store.get(missing).await;
+    drop(guard);
+
+    let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(!captured.is_empty(), "nothing reached the subscriber");
+    // Assert on the span field carrying the value — `"message_id":987654` —
+    // not on the bare number. The number also appears in the `err`-recorded
+    // message ("not found: message 987654"), so a `contains("987654")` check
+    // passes against the broken build and proves nothing. An `Empty` field is
+    // omitted from the JSON entirely, so this is what tells the two apart.
+    assert!(
+        captured.contains(&format!("\"message_id\":{missing}")),
+        "message_id was declared on the span but never given a value — the \
+         bare `fields(message_id)` form declares it Empty and suppresses the \
+         auto-recorded argument. Captured: {captured}"
+    );
+}

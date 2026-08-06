@@ -198,7 +198,7 @@ impl MailStore {
     ///
     /// # Errors
     /// A mapped storage error.
-    #[tracing::instrument(skip(self), fields(mailbox_id), err)]
+    #[tracing::instrument(skip(self), fields(mailbox_id = mailbox_id), err)]
     pub async fn list(
         &self,
         mailbox_id: i64,
@@ -224,7 +224,7 @@ impl MailStore {
     /// # Errors
     /// [`Error::NotFound`] if no such message; otherwise a mapped storage
     /// error.
-    #[tracing::instrument(skip(self), fields(message_id), err)]
+    #[tracing::instrument(skip(self), fields(message_id = message_id), err)]
     pub async fn get(&self, message_id: i64) -> Result<FullMessage, Error> {
         let found = self
             .db
@@ -248,7 +248,7 @@ impl MailStore {
     /// # Errors
     /// [`Error::NotFound`] if no such thread; otherwise a mapped storage
     /// error.
-    #[tracing::instrument(skip(self), fields(thread_id), err)]
+    #[tracing::instrument(skip(self), fields(thread_id = thread_id), err)]
     pub async fn get_thread(&self, thread_id: i64) -> Result<ThreadView, Error> {
         let found = self
             .db
@@ -287,7 +287,7 @@ impl MailStore {
     /// [`Error::NotFound`] if the message or the part does not exist;
     /// [`Error::FailedPrecondition`] if the message has no stored body;
     /// otherwise a mapped storage error.
-    #[tracing::instrument(skip(self), fields(message_id, part_id), err)]
+    #[tracing::instrument(skip(self), fields(message_id = message_id, part_id = part_id), err)]
     pub async fn attachment_bytes(
         &self,
         message_id: i64,
@@ -337,7 +337,7 @@ impl MailStore {
     /// [`Error::InvalidArgument`] if any flag is not a safe IMAP flag atom
     /// (see [`is_safe_flag`]); [`Error::NotFound`] if no such message;
     /// otherwise the IMAP mutator's error, or a mapped storage error.
-    #[tracing::instrument(skip(self, flags), fields(message_id), err)]
+    #[tracing::instrument(skip(self, flags), fields(message_id = message_id), err)]
     pub async fn set_flags(&self, message_id: i64, flags: Vec<String>) -> Result<bool, Error> {
         for flag in &flags {
             if !is_safe_flag(flag) {
@@ -405,7 +405,7 @@ impl MailStore {
     /// exist; [`Error::InvalidArgument`] if the destination is on a different
     /// account or is the message's current mailbox; otherwise the IMAP
     /// mutator's error, or a mapped storage error.
-    #[tracing::instrument(skip(self), fields(message_id, dest_mailbox_id), err)]
+    #[tracing::instrument(skip(self), fields(message_id = message_id, dest_mailbox_id = dest_mailbox_id), err)]
     pub async fn move_message(&self, message_id: i64, dest_mailbox_id: i64) -> Result<(), Error> {
         let target = self.resolve_target(message_id).await?;
         let dest = self.resolve_mailbox(dest_mailbox_id).await?;
@@ -478,7 +478,7 @@ impl MailStore {
     /// [`Error::NotFound`] if the message or destination mailbox does not
     /// exist; [`Error::InvalidArgument`] if the destination is on a different
     /// account; otherwise the IMAP mutator's error.
-    #[tracing::instrument(skip(self), fields(message_id, dest_mailbox_id), err)]
+    #[tracing::instrument(skip(self), fields(message_id = message_id, dest_mailbox_id = dest_mailbox_id), err)]
     pub async fn copy_message(&self, message_id: i64, dest_mailbox_id: i64) -> Result<(), Error> {
         let target = self.resolve_target(message_id).await?;
         let dest = self.resolve_mailbox(dest_mailbox_id).await?;
@@ -506,7 +506,7 @@ impl MailStore {
     /// # Errors
     /// [`Error::NotFound`] if no such message; otherwise the IMAP mutator's
     /// error, or a mapped storage error.
-    #[tracing::instrument(skip(self), fields(message_id), err)]
+    #[tracing::instrument(skip(self), fields(message_id = message_id), err)]
     pub async fn delete_message(&self, message_id: i64) -> Result<(), Error> {
         let target = self.resolve_target(message_id).await?;
         self.imap
