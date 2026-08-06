@@ -221,10 +221,32 @@ All of these must pass (the CI workflow and the local `Stop` hook enforce them):
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo nextest run --all-features --workspace
+scripts/docker-test.sh                  # the test suite — see below
 buf lint
 cargo build --release
 ```
+
+### Tests run in a container
+
+`scripts/docker-test.sh` builds `Dockerfile.test` and runs
+`cargo nextest run --locked --all-features --workspace` inside a container that is
+destroyed on exit. Run it instead of `cargo test`/`cargo nextest`; extra cargo
+arguments pass straight through:
+
+```sh
+scripts/docker-test.sh                        # the whole suite
+scripts/docker-test.sh -p rmail-core config:: # narrow it
+scripts/docker-test.sh --no-default-features  # the degraded, no-ONNX build
+scripts/docker-test.sh --shell                # a shell in the same environment
+scripts/docker-test.sh --clean                # drop the cache volumes and image
+```
+
+The container is disposable; the cargo registry and the Linux `target/` directory are
+not — they persist in named `rmail-test-*` volumes so runs stay incremental, since a
+cold rebuild (ort, bundled SQLite, tonic codegen) costs minutes. The host's model cache
+is mounted read-only at the path the embedder resolves by default, so the real-model
+ONNX tests run here rather than detecting an empty cache and skipping. Requires a
+running Docker daemon: the `Stop` hook blocks rather than falling back to the host.
 
 Production code must not use `unwrap()`, `expect()`, `panic!`, or `todo!()` —
 these are denied via workspace clippy lints (test code is exempt).

@@ -1,0 +1,84 @@
+# Test image for the rmail workspace.
+#
+# Only ever used by `scripts/docker-test.sh` (and, through it, the Stop gate)
+# to run the suite inside a throwaway container. It is deliberately not the
+# deployment image: it carries the whole toolchain — clippy, nextest, protoc —
+# because the point is to reproduce the gate, not to ship something small.
+#
+# `rust:1-slim-trixie` carries the same 1.97.x the host runs — the tests must
+# fail here for the same reasons they would fail locally, so a toolchain skew
+# between the two would defeat the exercise.
+#
+# Trixie, not bookworm, because of ort. The prebuilt ONNX Runtime that ort
+# downloads for aarch64-unknown-linux-gnu is built against a newer platform
+# than Debian 12 provides, and linking every test binary in the workspace
+# fails there with hundreds of undefined references:
+#   - `__isoc23_strtol` / `__isoc23_strtoll` / `__isoc23_strtoull` → glibc 2.38+
+#     (bookworm has 2.36)
+#   - `std::__cxx11::basic_string::_M_replace_cold`,
+#     `std::__try_use_facet<std::__timepunct<char>>` → libstdc++ from GCC 13+
+#     (bookworm has GCC 12)
+# Trixie ships glibc 2.41 and GCC 14, which satisfies both. Downgrading this
+# base image resurrects that link failure.
+FROM rust:1-slim-trixie
+
+# - protobuf-compiler: `rmail-proto/build.rs` shells out to `protoc` through
+#   tonic-build. prost-build 0.13 no longer vendors one, so without this the
+#   very first crate in the workspace fails to build.
+# - libprotobuf-dev: the well-known types. Debian splits these out of
+#   `protobuf-compiler`, unlike Homebrew's protobuf, which is why this is
+#   needed here and not on the host. `mail.proto` imports
+#   `google/protobuf/empty.proto`, and build.rs passes only `proto/` as an
+#   include path, so protoc has to find it on its default `/usr/include`
+#   search path or the build fails with "File not found".
+# - libgomp1: ONNX Runtime (pulled in by the `onnx` feature via fastembed/ort)
+#   links against OpenMP at runtime. Missing it turns every real-model test
+#   into a loader error rather than a test result.
+# - g++: for `-lstdc++`, which ort's prebuilt runtime needs at *link* time. The
+#   base image carries libstdc++6 (the shared object) but not the development
+#   symlink `ld` resolves `-l` against, so without this every binary in the
+#   workspace fails to link with "cannot find -lstdc++" after a full compile.
+# - pkg-config/libssl-dev/cmake: the usual -sys crate build prerequisites.
+# - ca-certificates/curl: ort downloads its prebuilt runtime at build time.
+#
+# `rusqlite` is `bundled`, so SQLite compiles from source with the C toolchain
+# already present in the rust image — no libsqlite3-dev needed.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      protobuf-compiler \
+      libprotobuf-dev \
+      pkg-config \
+      libssl-dev \
+      libgomp1 \
+      g++ \
+      cmake \
+      ca-certificates \
+      curl \
+      git \
+ && rm -rf /var/lib/apt/lists/*
+
+# The official rust images use rustup's minimal profile, so clippy and rustfmt
+# are absent. The gate runs both, and it has to be able to run them in here.
+RUN rustup component add clippy rustfmt
+
+# nextest, from the prebuilt tarball rather than `cargo install` — the latter
+# costs several minutes of image build for a binary that ships ready-made.
+# `.config/nextest.toml` in the repo is what configures it.
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) url=https://get.nexte.st/latest/linux ;; \
+      arm64) url=https://get.nexte.st/latest/linux-arm ;; \
+      *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl -LsSf "$url" | tar zxf - -C "${CARGO_HOME}/bin"; \
+    cargo nextest --version
+
+# Written to by the container, so it lives outside the bind-mounted source
+# tree: the host's ./target holds macOS artifacts and the two must not share
+# a directory. `docker-test.sh` backs this with a named volume so incremental
+# rebuilds survive the container being destroyed.
+ENV CARGO_TARGET_DIR=/target
+ENV CARGO_TERM_COLOR=always
+RUN mkdir -p /target
+
+WORKDIR /w

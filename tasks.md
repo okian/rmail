@@ -11,9 +11,13 @@ Crates (established in task 1): `rmail-proto` (generated protos), `rmail-core`
 `rmail-cli` (the `mail` binary — thin gRPC client).
 
 Global gate (Stop hook enforces on every task): `cargo fmt --all -- --check` ·
-`cargo clippy --all-targets --all-features -- -D warnings` ·
-`cargo nextest run --workspace` (fallback `cargo test --all-features --workspace`).
+`cargo clippy --all-targets --all-features -- -D warnings` · `scripts/docker-test.sh`.
 Per-task **verify** lists the *targeted* proof in addition to the global gate.
+
+**Tests only ever run in a container.** The per-task `verify` lines below are written
+as `cargo nextest run …` for readability; run them as
+`scripts/docker-test.sh <same args>` — the wrapper passes cargo arguments straight
+through. Do not run `cargo test`/`cargo nextest` on the host.
 
 ---
 

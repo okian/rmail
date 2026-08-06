@@ -29,12 +29,23 @@ gate() {
   fi
 }
 
-TEST_CMD=(cargo test --all-features --workspace)
-command -v cargo-nextest >/dev/null 2>&1 && TEST_CMD=(cargo nextest run --all-features --workspace)
-
 gate "cargo fmt"    cargo fmt --all -- --check
 gate "cargo clippy" cargo clippy --all-targets --all-features -- -D warnings
-gate "tests"        "${TEST_CMD[@]}"
+
+# Tests run in a disposable container, never on the host — see
+# `scripts/docker-test.sh`. fmt and clippy stay local on purpose: they are
+# fast, they touch nothing outside the source tree, and paying container
+# startup for them would slow every turn for no isolation gained.
+#
+# No host fallback. If the daemon is down this blocks with an explanation
+# instead of quietly running the suite locally, because a fallback that fires
+# silently is how "tests always run in a container" stops being true.
+if docker info >/dev/null 2>&1; then
+  gate "tests (docker)" "$PWD/scripts/docker-test.sh"
+else
+  fail=1
+  report+=$'\n'"### tests (docker) could not run"$'\n'"The Docker daemon is unreachable, and tests for this repo only run in a container (scripts/docker-test.sh). Start Docker Desktop and try again."$'\n'
+fi
 
 if command -v buf >/dev/null 2>&1 && { [ -f buf.yaml ] || [ -f buf.gen.yaml ]; }; then
   gate "buf lint" buf lint
