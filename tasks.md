@@ -265,7 +265,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core query::parse` (each operator, negation, phrase, unknown-key passthrough)
 
 ## 26. Query understanding — QueryPlan assembly
-- [ ] status
+- [x] status
 - **depends-on:** 25, 19
 - **parallel-safe:** no
 - **acceptance:**
