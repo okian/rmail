@@ -82,9 +82,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Honors an already-set CARGO_TARGET_DIR (this repo's dev loop shares one
-# across parallel worktrees; a plain release build does not need to know
-# that, it just needs to agree with whatever already built the binaries).
+# Defaults to cargo's own default (`target`, relative to the repo root) —
+# the right answer for a plain checkout with no other cargo state around.
+# Honors `CARGO_TARGET_DIR` when a caller has set one (e.g. pointing at
+# wherever a prior build step in the same invocation already placed the
+# binaries), but never assumes one: a target directory shared *across*
+# concurrent checkouts is not safe to begin with — cargo uplifts final
+# binaries to `<target>/release/<name>` by a name-only path, not one keyed by
+# source checkout, so two checkouts building the same binary name into a
+# shared target directory can overwrite each other's output mid-build. Each
+# checkout of this repo should have its own target directory.
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 command -v cargo >/dev/null 2>&1 || { echo "cargo not found" >&2; exit 1; }
