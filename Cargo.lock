@@ -2938,6 +2938,7 @@ name = "rmaild"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "http",
  "prost",
  "prost-types",

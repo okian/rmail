@@ -130,7 +130,12 @@ fn join_ids(value: &mail_parser::HeaderValue<'_>) -> Option<String> {
 }
 
 /// `type/subtype`, lowercased by mail-parser.
-fn format_content_type(content_type: &ContentType<'_>) -> String {
+///
+/// `pub(crate)`: `mail::attachment_bytes` (task 39) reads a single attachment
+/// straight off `messages.raw` for streaming and needs the same
+/// `type/subtype` formatting `parse_message` uses, rather than a second,
+/// possibly-drifting copy of it.
+pub(crate) fn format_content_type(content_type: &ContentType<'_>) -> String {
     match content_type.subtype() {
         Some(subtype) => format!("{}/{}", content_type.ctype(), subtype),
         None => content_type.ctype().to_owned(),

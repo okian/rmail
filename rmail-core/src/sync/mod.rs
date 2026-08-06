@@ -25,9 +25,7 @@ pub mod idle;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::BTreeSet;
 
-use crate::error::Error;
-
-pub(crate) use crate::imap::command_error;
+pub(crate) use crate::imap::{command_error, select_error};
 
 pub use delta::{delta_sync, delta_sync_folders, AccountDeltaReport, DeltaReport, DeltaStrategy};
 pub use engine::{FolderOutcome, PassReport, SyncEngine, SyncMode};
@@ -106,21 +104,6 @@ impl ChangeSink for () {
 impl<F: FnMut(Change)> ChangeSink for F {
     fn changed(&mut self, change: Change) {
         self(change);
-    }
-}
-
-/// Map a `SELECT` failure for `folder`.
-///
-/// A tagged `NO` here means the folder is gone or unselectable — not that the
-/// credentials are bad, which is what the login-shaped
-/// [`crate::imap::map_imap_err`] would say, and which would send a client
-/// chasing an authentication problem it does not have.
-pub(crate) fn select_error(folder: &str, err: async_imap::error::Error) -> Error {
-    match err {
-        async_imap::error::Error::No(msg) => {
-            Error::not_found(format!("cannot select folder {folder}: {msg}"))
-        }
-        other => crate::imap::map_imap_err(other),
     }
 }
 

@@ -16,14 +16,22 @@
 //!
 //! # Extending this table
 //!
-//! Add one `(method, Requirement)` row per new RPC below. The `MailService`
-//! and `AiService` rows are **provisional**: those services do not exist yet
-//! (they land in tasks 39/50), so these rows exist only to prove the table's
+//! Add one `(method, Requirement)` row per new RPC below. The `AiService` rows
+//! are still **provisional**, and so — despite sitting in the `MailService`
+//! section below, next to `Send`'s acceptance case — is `OutboxService/Send`:
+//! neither service exists yet (they land in tasks 50 and, for `OutboxService`,
+//! not yet assigned), so their rows exist only to prove the table's
 //! *mechanism* — including the acceptance case that a `mail.read`-only token
 //! is physically denied a send/delete-shaped call — against a shape close to
 //! what they will actually need. When a real service lands, treat its rows as
 //! a starting point to confirm against the real proto, not as settled fact:
 //! rename/add/remove rather than assuming these are exactly right.
+//!
+//! The `MailService` rows below were provisional the same way until task 39
+//! landed the real `proto/rmail/v1/mail.proto`; they turned out to need no
+//! changes — every RPC the real service exposes (`List`, `Get`, `GetThread`,
+//! `Move`, `Copy`, `SetFlags`, `Delete`, `GetAttachment`, `WatchEvents`) is
+//! named here with the scope its handler actually needs.
 use rmail_core::auth::Scope;
 
 /// What a method needs from the caller.
@@ -127,7 +135,10 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AuditService/ExportLedger",
         Requirement::Scope(Scope::Admin),
     ),
-    // -- MailService (task 39, provisional) ----------------------------------
+    // -- MailService (task 39) -----------------------------------------------
+    // Reads (list/get/thread/attachment/watch) are local-mirror lookups, so
+    // `mail.read` suffices; every mutation reflects to the live IMAP server
+    // (see rmail-core::mail's module docs), so those sit behind `mail.write`.
     (
         "/rmail.v1.MailService/List",
         Requirement::Scope(Scope::MailRead),
@@ -166,6 +177,11 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.MailService/Delete",
         Requirement::Scope(Scope::MailWrite),
     ),
+    // -- OutboxService (provisional; no task owns it yet) ---------------------
+    // Still a forward declaration, unlike the `MailService` rows above it:
+    // no `OutboxService` proto exists. Kept here (rather than filed with
+    // `AiService` below) because it is part of the same acceptance case —
+    // a `mail.read`-only token must be denied a send, not just a delete.
     (
         "/rmail.v1.OutboxService/Send",
         Requirement::Scope(Scope::MailSend),
@@ -316,6 +332,7 @@ mod tests {
         for method in [
             "/rmail.v1.MailService/Delete",
             "/rmail.v1.MailService/Move",
+            "/rmail.v1.MailService/Copy",
             "/rmail.v1.MailService/SetFlags",
             "/rmail.v1.OutboxService/Send",
         ] {

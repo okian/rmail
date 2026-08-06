@@ -55,3 +55,8 @@ tokio = { workspace = true, features = ["test-util"] }
 # Only used by the AuditService integration test, to verify a ledger entry's
 # `payload_sha256` against an independently computed hash.
 sha2.workspace = true
+# `mail_service.rs`'s integration test implements `rmail_core::imap::mutate::
+# ImapMutator` with a fake, so `MailService`'s IMAP-reflection ordering is
+# testable without a live server — the trait is `#[async_trait::async_trait]`
+# for dyn-compatibility, so implementing it needs the same macro.
+async-trait.workspace = true

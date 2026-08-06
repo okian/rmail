@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+import "google/protobuf/empty.proto";
+import "rmail/v1/sync.proto";
+
+// MailService is the read/write surface over synced mail: list and read
+// messages and threads, mutate them (move/copy/flag/delete), pull attachment
+// bytes, and watch the same durable event log SyncService does.
+//
+// Reads never reach IMAP — they answer entirely from what sync (SyncService)
+// has already mirrored locally, so `List`/`Get`/`GetThread`/`GetAttachment`
+// are as fast and as available as the local database. Mutations do reach the
+// server; see each RPC's comment, and rmail-core's `mail` module docs, for the
+// exact ordering and what happens when the local mirror and the server
+// disagree.
+service MailService {
+  // List a mailbox's messages, newest first. The response is streamed and
+  // the page is server-capped (see ListMessagesRequest), so a client never
+  // buffers a whole folder — the daemon currently holds one capped page in
+  // memory before the first frame goes out, not a true incremental read.
+  rpc List(ListMessagesRequest) returns (stream Message);
+
+  // Fetch one message, with its body and attachment metadata.
+  rpc Get(GetMessageRequest) returns (FullMessage);
+
+  // Fetch a thread and every message in it, oldest first — the order a
+  // conversation reads in.
+  rpc GetThread(GetThreadRequest) returns (Thread);
+
+  // Move a message to another mailbox on the same account.
+  //
+  // Reflects to IMAP first; the local row is then dropped rather than
+  // re-pointed at a guessed identity, because this client has no way to learn
+  // the UID the server assigns the message in its new mailbox. The
+  // destination mailbox's next sync discovers it fresh and re-threads it
+  // normally. See rmail-core's `mail` module docs for the full reasoning.
+  rpc Move(MoveRequest) returns (google.protobuf.Empty);
+
+  // Copy a message to another mailbox on the same account, leaving the
+  // source untouched. Reflects to IMAP only — the copy is discovered by the
+  // destination mailbox's next sync, the same as any other new mail.
+  rpc Copy(CopyRequest) returns (google.protobuf.Empty);
+
+  // Replace a message's flag set. A full replace (IMAP's own `STORE FLAGS`
+  // semantics), not an add/remove delta — send the complete desired set.
+  rpc SetFlags(SetFlagsRequest) returns (google.protobuf.Empty);
+
+  // Delete a message: mark it \Deleted and expunge it on the server, then
+  // remove the local row.
+  rpc Delete(DeleteRequest) returns (google.protobuf.Empty);
+
+  // Stream an attachment's bytes, chunked well under the gRPC frame cap so
+  // no single frame is ever large enough for the transport to reject. The
+  // attachment itself is decoded into daemon memory for the life of the
+  // stream (the frame cap bounds wire size, not daemon memory).
+  rpc GetAttachment(GetAttachmentRequest) returns (stream AttachmentChunk);
+
+  // Stream domain events from the durable log — the same feed
+  // SyncService.WatchEvents serves, exposed here too so a mail-focused client
+  // never needs to import SyncService just to watch new mail arrive. See
+  // SyncService.WatchEvents for the resume/gap contract (`since_seq`,
+  // OUT_OF_RANGE on a retention gap).
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+}
+
+message ListMessagesRequest {
+  int64 mailbox_id = 1;
+  // Server-capped; 0 means the server default. Opaque `page_token` pagination
+  // lands in task 40 — this is a plain newest-first page for now.
+  int32 page_size = 2;
+}
+
+// One message as it appears in a listing. Body and attachment metadata are on
+// FullMessage, not here — a list view should never pull a body across the
+// wire per row.
+message Message {
+  int64 id = 1;
+  int64 account_id = 2;
+  int64 mailbox_id = 3;
+  optional int64 thread_id = 4;
+  optional string message_id = 5;
+  optional string subject = 6;
+  optional string from_addr = 7;
+  optional string from_name = 8;
+  optional string to_addrs = 9;
+  optional string cc_addrs = 10;
+  // Unix seconds.
+  optional int64 date = 11;
+  optional int64 internaldate = 12;
+  optional int64 size = 13;
+  bool has_attachments = 14;
+  repeated string flags = 15;
+  int64 created_at = 16;
+  int64 updated_at = 17;
+}
+
+message GetMessageRequest {
+  int64 id = 1;
+}
+
+message FullMessage {
+  Message message = 1;
+  optional string body_text = 2;
+  optional string body_html = 3;
+  repeated Attachment attachments = 4;
+}
+
+message Attachment {
+  int64 id = 1;
+  // Matches attachments.part_id and the part_id GetAttachment takes — the
+  // MIME part's positional index within the message.
+  string part_id = 2;
+  optional string filename = 3;
+  optional string content_type = 4;
+  optional int64 size = 5;
+  optional string content_id = 6;
+  bool is_inline = 7;
+}
+
+message GetThreadRequest {
+  int64 id = 1;
+}
+
+message Thread {
+  int64 id = 1;
+  int64 account_id = 2;
+  optional string subject_norm = 3;
+  optional int64 root_message_id = 4;
+  optional int64 first_message_at = 5;
+  optional int64 last_message_at = 6;
+  int64 message_count = 7;
+  repeated string participants = 8;
+  // Oldest first — the order a conversation reads in.
+  repeated Message messages = 9;
+  int64 created_at = 10;
+  int64 updated_at = 11;
+}
+
+message MoveRequest {
+  int64 message_id = 1;
+  int64 dest_mailbox_id = 2;
+}
+
+message CopyRequest {
+  int64 message_id = 1;
+  int64 dest_mailbox_id = 2;
+}
+
+message SetFlagsRequest {
+  int64 message_id = 1;
+  // The complete desired flag set (e.g. "\Seen", "\Flagged") — replaces
+  // whatever is currently set, both locally and on the server.
+  repeated string flags = 2;
+}
+
+message DeleteRequest {
+  int64 message_id = 1;
+}
+
+message GetAttachmentRequest {
+  int64 message_id = 1;
+  string part_id = 2;
+}
+
+// One chunk of an attachment's byte stream. filename/content_type/total_size
+// are only populated on the first chunk.
+message AttachmentChunk {
+  optional string filename = 1;
+  optional string content_type = 2;
+  optional int64 total_size = 3;
+  bytes data = 4;
+}

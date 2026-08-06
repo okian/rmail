@@ -11,6 +11,7 @@
 
 pub mod conn;
 pub mod folders;
+pub mod mutate;
 
 #[cfg(test)]
 pub(crate) mod mock;
@@ -106,6 +107,38 @@ pub(crate) fn command_error(op: &str, err: async_imap::error::Error) -> Error {
     match err {
         async_imap::error::Error::No(msg) => {
             Error::unavailable(format!("IMAP {op} refused: {msg}"))
+        }
+        other => map_imap_err(other),
+    }
+}
+
+/// Map a `SELECT` failure for `folder`.
+///
+/// A tagged `NO` here means the folder is gone or unselectable — not that the
+/// credentials are bad, which is what the login-shaped [`map_imap_err`] would
+/// say (and which would send a client chasing an authentication problem it
+/// does not have), and not the generic retryable [`command_error`] either: a
+/// folder that is not there will not become selectable on retry.
+pub(crate) fn select_error(folder: &str, err: async_imap::error::Error) -> Error {
+    match err {
+        async_imap::error::Error::No(msg) => {
+            Error::not_found(format!("cannot select folder {folder}: {msg}"))
+        }
+        other => map_imap_err(other),
+    }
+}
+
+/// Map a `COPY`/`MOVE` failure naming `dest` as the destination.
+///
+/// Same reasoning as [`select_error`], applied to the destination-mailbox
+/// argument rather than the selected one: a `NO` here (often carrying
+/// `[TRYCREATE]`) means the named mailbox does not exist, which is
+/// [`crate::ErrorReason::NotFound`], not the generic retryable
+/// [`command_error`] a caller might otherwise get stuck retrying forever.
+pub(crate) fn mailbox_not_found_error(dest: &str, err: async_imap::error::Error) -> Error {
+    match err {
+        async_imap::error::Error::No(msg) => {
+            Error::not_found(format!("cannot use {dest} as a destination mailbox: {msg}"))
         }
         other => map_imap_err(other),
     }

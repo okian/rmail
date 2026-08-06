@@ -2,7 +2,8 @@
 //!
 //! [`serve_uds`] boots the tonic server on a Unix domain socket exposing gRPC
 //! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and the
-//! `AccountService`/`SyncService`/`AdminService` handlers — all wrapped in a
+//! `AccountService`/`SyncService`/`AdminService`/`MailService` handlers — all
+//! wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -12,6 +13,7 @@ mod account_service;
 mod admin_service;
 mod audit_service;
 mod auth;
+mod mail_service;
 mod sync_service;
 mod trace;
 
@@ -19,6 +21,7 @@ pub use account_service::AccountApi;
 pub use admin_service::AdminApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
+pub use mail_service::MailApi;
 pub use sync_service::SyncApi;
 pub use trace::RequestTraceLayer;
 
@@ -28,11 +31,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rmail_core::events::{EventLog, Retention};
+use rmail_core::imap::mutate::LiveImapMutator;
+use rmail_core::mail::MailStore;
 use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
+use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -229,6 +235,12 @@ impl Drop for WarmEmbedder {
 /// events the server's stream will see must therefore hand in the same engine
 /// the server uses, which is what this exists for.
 ///
+/// The `MailService` handler is built here over a [`LiveImapMutator`] — a
+/// real (if test-scale) IMAP client. Tests exercising `MailService`'s
+/// IMAP-reflection ordering want a fake instead (there is no live server to
+/// dial in-process); see [`serve_uds_with_engine_and_mail_store`] for the
+/// entry point that takes a caller-built [`MailStore`].
+///
 /// # Errors
 ///
 /// As [`serve_uds`].
@@ -236,6 +248,40 @@ pub async fn serve_uds_with_engine<F>(
     socket_path: impl AsRef<Path>,
     db: Database,
     engine: SyncEngine,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    // A fresh IMAP connection per mutation (see `LiveImapMutator`'s docs) —
+    // cheap to construct, since it is only ever `Arc`-cloned, not pooled.
+    let mail_store = MailStore::new(
+        db.clone(),
+        engine.events().clone(),
+        std::sync::Arc::new(LiveImapMutator::new(db.clone())),
+    );
+    serve_uds_with_engine_and_mail_store(socket_path, db, engine, mail_store, shutdown).await
+}
+
+/// [`serve_uds_with_engine`] over a caller-supplied [`MailStore`] as well —
+/// for tests that need `MailService`'s IMAP calls to go through a fake
+/// [`rmail_core::imap::mutate::ImapMutator`] rather than
+/// [`LiveImapMutator`]'s real (dial-out) one. Production code has no reason
+/// to call this directly; [`serve_uds_with_engine`] builds the same
+/// `MailStore` `serve_uds`/`serve_uds_with_config` would.
+///
+/// `mail_store` should be built over the *same* `EventLog` instance as
+/// `engine` (i.e. `engine.events().clone()`) — see [`serve_uds_with_engine`]'s
+/// docs for why a second `EventLog` over the same database is not equivalent.
+///
+/// # Errors
+///
+/// As [`serve_uds`].
+pub async fn serve_uds_with_engine_and_mail_store<F>(
+    socket_path: impl AsRef<Path>,
+    db: Database,
+    engine: SyncEngine,
+    mail_store: MailStore,
     shutdown: F,
 ) -> Result<(), ServeError>
 where
@@ -345,6 +391,7 @@ where
     let account_service = AccountServiceServer::new(AccountApi::new(db.clone()));
     let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
+    let mail_service = MailServiceServer::new(MailApi::new(mail_store, stopping.clone()));
 
     let incoming = UnixListenerStream::new(listener);
     let serve_result = Server::builder()
@@ -359,6 +406,7 @@ where
         .add_service(audit_service)
         .add_service(account_service)
         .add_service(sync_service)
+        .add_service(mail_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 

@@ -215,8 +215,14 @@ async fn a_read_only_token_is_physically_denied_delete_and_send() {
     .await
     .expect("mint");
 
+    // The acceptance case task 39 names explicitly: a read-only token must be
+    // physically denied every mutating MailService RPC, not merely the two
+    // originally exercised here ahead of the real service landing.
     for method in [
         "/rmail.v1.MailService/Delete",
+        "/rmail.v1.MailService/Move",
+        "/rmail.v1.MailService/Copy",
+        "/rmail.v1.MailService/SetFlags",
         "/rmail.v1.OutboxService/Send",
     ] {
         let req = with_bearer(synthetic_request(method), &minted.secret);

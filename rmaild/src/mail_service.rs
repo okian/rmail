@@ -1,0 +1,523 @@
+//! The `MailService` gRPC implementation.
+//!
+//! `List`/`Get`/`GetThread` and the mutations (`Move`/`Copy`/`SetFlags`/
+//! `Delete`) are thin translations over [`rmail_core::mail::MailStore`] —
+//! MailStore owns the local-mirror reads and the IMAP-reflection/event/
+//! ordering logic (see its module docs for the "IMAP first, local mirror
+//! second" contract and why `Move` drops the local row rather than
+//! re-pointing it). This file's own design lives in its two streaming RPCs:
+//!
+//! # `List` is bounded, not (yet) truly streamed
+//!
+//! `List` fetches its whole (capped — see
+//! [`rmail_core::mail::MAX_LIST_LIMIT`]) page from [`MailStore::list`] before
+//! wrapping it in [`tokio_stream::iter`]. That is a streamed *response*, in
+//! the gRPC-framing sense the client sees — but not a streamed *read*: the
+//! daemon holds the whole page in memory before the first frame goes out.
+//! Bounded at 500 rows, this is not a leak; it is a real difference from
+//! `GetAttachment`/`WatchEvents`, which genuinely produce their frames
+//! incrementally.
+//!
+//! # `GetAttachment`: chunked well under the frame cap
+//!
+//! [`ATTACHMENT_CHUNK_BYTES`] (256 KiB) is small relative to
+//! `grpc.limits.max_message_bytes`'s 16 MiB default, so an attachment of any
+//! size streams as a sequence of frames the transport never has to reject for
+//! being oversized — see `attachment_larger_than_one_chunk_streams_correctly`
+//! in the integration tests for proof an attachment spanning several chunks
+//! reassembles byte-for-byte. This bounds *frame* size, not daemon memory: the
+//! whole attachment is decoded into memory by [`MailStore::attachment_bytes`]
+//! before chunking starts (roughly the raw RFC822 blob plus the decoded copy,
+//! held for the life of the stream), and there is no concurrency cap on
+//! `GetAttachment` today — many concurrent, slowly-read streams hold that much
+//! each. Fine for interactive use; a limit worth adding before this is opened
+//! to many unauthenticated-by-content-size callers.
+//!
+//! # `WatchEvents`: the same replay-then-follow contract as `SyncService`
+//!
+//! This mirrors `SyncApi::watch_events` exactly — subscribe to the live tail
+//! *before* reading the durable backlog, replay the backlog, then follow the
+//! tail discarding anything at or below the cursor the backlog reached, with
+//! lag recovery re-reading from the log rather than failing the stream. See
+//! `rmaild::sync_service`'s module docs for the full reasoning; it is not
+//! reproduced here beyond what differs. The two implementations are
+//! deliberately not shared: they are independent gRPC surfaces bound to
+//! independent core services (`SyncEngine` vs `MailStore`), and the ~100
+//! lines in common are exactly the kind of thing worth revisiting behind a
+//! shared helper in `rmail_core::events` if a third consumer ever needs it —
+//! not worth the coupling for two.
+//!
+//! # Cancellation and deadlines
+//!
+//! Both streaming RPCs drive their work from a spawned task feeding a bounded
+//! channel, exactly like `SyncApi::watch_events`. A client that drops the
+//! response stream — whether it disconnected, or its local deadline elapsed
+//! and it cancelled the call — closes the channel, and the producer notices
+//! on its next send and exits; nothing polls a stream nobody is reading. The
+//! producer's cancellation token is a child of the daemon's shutdown token, so
+//! a producer blocked on a full channel (a slow-but-still-connected client)
+//! also unwinds when the daemon shuts down, rather than holding graceful
+//! shutdown open indefinitely — see
+//! `a_shutdown_closes_an_open_attachment_stream_rather_than_holding_it` in
+//! the integration tests.
+//!
+//! This project has no server-side deadline-enforcement layer today (no
+//! `Timeout` `tower` layer is installed in `rmaild::serve_uds_with_engine`),
+//! so "honoring the request deadline" and "honoring cancellation" are the
+//! same mechanism from this file's side: a deadline that elapses is enforced
+//! *client-side*, which cancels the call, which the server observes as the
+//! response stream closing — precisely the path already covered above.
+//!
+//! The four unary mutations (`Move`/`Copy`/`SetFlags`/`Delete`) do *not*
+//! thread the daemon's shutdown token into their IMAP call, unlike the two
+//! streams above — matching `AccountApi::test_connection`'s existing
+//! precedent (also an IMAP round trip behind a unary RPC, also not wired to
+//! shutdown). This is a bounded gap, not an unbounded one: every command
+//! `rmail_core::imap::mutate` issues is itself capped by
+//! `rmail_core::imap::IMAP_DEADLINE` (30s), so the daemon's own graceful
+//! shutdown can be delayed by at most that long waiting for an in-flight
+//! mutation against a wedged server, never held open indefinitely the way an
+//! un-cancelled stream would be.
+//
+// `tonic::Status` is intentionally the error type throughout a gRPC service
+// boundary; its size makes `result_large_err` fire on every `Result<_, Status>`
+// helper, so the lint is allowed for this module.
+#![allow(clippy::result_large_err)]
+
+use std::pin::Pin;
+
+use rmail_core::events::{Event as CoreEvent, EventKind as CoreEventKind};
+use rmail_core::mail::{FullMessage, MailStore, MessageWithFlags, ThreadView};
+use rmail_core::repo::Attachment as CoreAttachment;
+use rmail_core::Error;
+use rmail_proto::v1::mail_service_server::MailService;
+use rmail_proto::v1::{
+    Attachment as ProtoAttachment, AttachmentChunk, CopyRequest, DeleteRequest,
+    Event as ProtoEvent, EventKind as ProtoEventKind, FullMessage as ProtoFullMessage,
+    GetAttachmentRequest, GetMessageRequest, GetThreadRequest, ListMessagesRequest,
+    Message as ProtoMessage, MoveRequest, SetFlagsRequest, Thread as ProtoThread,
+    WatchEventsRequest,
+};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
+use tonic::{Request, Response, Status};
+use tracing::Instrument;
+
+/// Size of one `AttachmentChunk`'s `data`, well under the 16 MiB default
+/// `grpc.limits.max_message_bytes` frame cap.
+const ATTACHMENT_CHUNK_BYTES: usize = 256 * 1024;
+
+/// How many chunks may sit between the producer and a client before
+/// `GetAttachment` applies backpressure.
+///
+/// Small on purpose: the whole attachment is already resident in memory (see
+/// [`rmail_core::mail::MailStore::attachment_bytes`]) by the time streaming
+/// starts, so there is nothing to pipeline — this bound exists only to give a
+/// slow client's backpressure somewhere to land instead of an unbounded queue
+/// of pre-sliced chunks.
+const ATTACHMENT_STREAM_BUFFER: usize = 4;
+
+/// How many events may sit between the log and a client before `WatchEvents`
+/// applies backpressure. See `rmaild::sync_service::STREAM_BUFFER` — the same
+/// reasoning, duplicated because the two streams are independent.
+const STREAM_BUFFER: usize = 256;
+
+/// How many backlog events one durable read fetches while catching a client
+/// up. See `rmaild::sync_service::REPLAY_PAGE`.
+const REPLAY_PAGE: i64 = 500;
+
+/// The `MailService` handler.
+#[derive(Clone)]
+pub struct MailApi {
+    store: MailStore,
+    /// Cancelled when the daemon shuts down, so open streams stop with it
+    /// rather than holding shutdown open.
+    shutdown: CancellationToken,
+}
+
+impl MailApi {
+    /// Create a handler over a mail store.
+    #[must_use]
+    pub fn new(store: MailStore, shutdown: CancellationToken) -> Self {
+        Self { store, shutdown }
+    }
+}
+
+#[tonic::async_trait]
+impl MailService for MailApi {
+    type ListStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ProtoMessage, Status>> + Send + 'static>>;
+
+    async fn list(
+        &self,
+        request: Request<ListMessagesRequest>,
+    ) -> Result<Response<Self::ListStream>, Status> {
+        let req = request.into_inner();
+        let messages = self
+            .store
+            .list(req.mailbox_id, i64::from(req.page_size))
+            .await?;
+        let items: Vec<Result<ProtoMessage, Status>> =
+            messages.iter().map(|m| Ok(message_to_proto(m))).collect();
+        Ok(Response::new(Box::pin(tokio_stream::iter(items))))
+    }
+
+    async fn get(
+        &self,
+        request: Request<GetMessageRequest>,
+    ) -> Result<Response<ProtoFullMessage>, Status> {
+        let id = request.into_inner().id;
+        let full = self.store.get(id).await?;
+        Ok(Response::new(full_message_to_proto(full)))
+    }
+
+    async fn get_thread(
+        &self,
+        request: Request<GetThreadRequest>,
+    ) -> Result<Response<ProtoThread>, Status> {
+        let id = request.into_inner().id;
+        let view = self.store.get_thread(id).await?;
+        Ok(Response::new(thread_to_proto(view)))
+    }
+
+    async fn r#move(&self, request: Request<MoveRequest>) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.store
+            .move_message(req.message_id, req.dest_mailbox_id)
+            .await?;
+        Ok(Response::new(()))
+    }
+
+    async fn copy(&self, request: Request<CopyRequest>) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.store
+            .copy_message(req.message_id, req.dest_mailbox_id)
+            .await?;
+        Ok(Response::new(()))
+    }
+
+    async fn set_flags(&self, request: Request<SetFlagsRequest>) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.store.set_flags(req.message_id, req.flags).await?;
+        Ok(Response::new(()))
+    }
+
+    async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<()>, Status> {
+        let id = request.into_inner().message_id;
+        self.store.delete_message(id).await?;
+        Ok(Response::new(()))
+    }
+
+    type GetAttachmentStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<AttachmentChunk, Status>> + Send + 'static>>;
+
+    async fn get_attachment(
+        &self,
+        request: Request<GetAttachmentRequest>,
+    ) -> Result<Response<Self::GetAttachmentStream>, Status> {
+        let cancel = rpc_cancel(&self.shutdown);
+        let req = request.into_inner();
+        // Loaded once, up front — chunking below is pure slicing of an
+        // already-resident buffer, not a reason to hold a database read open
+        // for the life of the stream.
+        let attachment = self
+            .store
+            .attachment_bytes(req.message_id, &req.part_id)
+            .await?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(ATTACHMENT_STREAM_BUFFER);
+        tokio::spawn(
+            async move {
+                let total_size = i64::try_from(attachment.bytes.len()).unwrap_or(i64::MAX);
+                let mut offset = 0usize;
+                let mut first = true;
+                loop {
+                    let end = (offset + ATTACHMENT_CHUNK_BYTES).min(attachment.bytes.len());
+                    let chunk = AttachmentChunk {
+                        filename: first.then(|| attachment.filename.clone()).flatten(),
+                        content_type: first.then(|| attachment.content_type.clone()).flatten(),
+                        total_size: first.then_some(total_size),
+                        data: attachment.bytes[offset..end].to_vec(),
+                    };
+                    first = false;
+                    offset = end;
+                    if send(&tx, &cancel, Ok(chunk)).await.is_break() {
+                        return;
+                    }
+                    // A zero-byte attachment still gets exactly one chunk (the
+                    // metadata one, with empty data) — this checks *after*
+                    // sending so `offset == len == 0` still emits it.
+                    if offset >= attachment.bytes.len() {
+                        return;
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    type WatchEventsStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ProtoEvent, Status>> + Send + 'static>>;
+
+    async fn watch_events(
+        &self,
+        request: Request<WatchEventsRequest>,
+    ) -> Result<Response<Self::WatchEventsStream>, Status> {
+        let cancel = rpc_cancel(&self.shutdown);
+        let req = request.into_inner();
+        let filter = Filter::new(req.account_id, &req.kinds)?;
+
+        if req.since_seq < 0 {
+            return Err(Status::from(Error::invalid_argument(
+                "since_seq must not be negative",
+            )));
+        }
+
+        let log = self.store.events().clone();
+        let mut catchup = log.catch_up(req.since_seq, REPLAY_PAGE).await?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BUFFER);
+        tokio::spawn(
+            async move {
+                let mut cursor = req.since_seq;
+                let mut page = std::mem::take(&mut catchup.backlog);
+                let mut scanned_to = catchup.next_seq;
+
+                'stream: loop {
+                    loop {
+                        let drained = page.is_empty();
+                        for event in std::mem::take(&mut page) {
+                            cursor = cursor.max(event.seq);
+                            if !filter.admits(&event) {
+                                continue;
+                            }
+                            if send(&tx, &cancel, Ok(to_proto(&event))).await.is_break() {
+                                return;
+                            }
+                        }
+                        cursor = cursor.max(scanned_to);
+                        if drained {
+                            break;
+                        }
+                        match log.since(cursor, REPLAY_PAGE).await {
+                            Ok(next) => {
+                                page = next.events;
+                                scanned_to = next.next_seq;
+                            }
+                            Err(error) => {
+                                let _ = send(&tx, &cancel, Err(Status::from(error))).await;
+                                return;
+                            }
+                        }
+                    }
+
+                    loop {
+                        let received = tokio::select! {
+                            () = cancel.cancelled() => return,
+                            received = catchup.live.recv() => received,
+                        };
+                        match received {
+                            Ok(event) => {
+                                if event.seq <= cursor {
+                                    continue;
+                                }
+                                cursor = event.seq;
+                                if !filter.admits(&event) {
+                                    continue;
+                                }
+                                if send(&tx, &cancel, Ok(to_proto(&event))).await.is_break() {
+                                    return;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                                tracing::debug!(
+                                    missed,
+                                    cursor,
+                                    "event stream lagged; re-reading from the log"
+                                );
+                                continue 'stream;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => return,
+                        }
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+/// Which events a subscription wants. Identical to
+/// `rmaild::sync_service::Filter` — see that module for the reasoning behind
+/// each rule; duplicated rather than shared for the same reason the two
+/// `watch_events` implementations are (see this module's docs).
+struct Filter {
+    account_id: Option<i64>,
+    kinds: std::collections::HashSet<CoreEventKind>,
+}
+
+impl Filter {
+    fn new(account_id: i64, kinds: &[i32]) -> Result<Self, Status> {
+        let account_id = (account_id != 0).then_some(account_id);
+        let resolved: std::collections::HashSet<CoreEventKind> = kinds
+            .iter()
+            .filter_map(|k| ProtoEventKind::try_from(*k).ok())
+            .filter_map(from_proto_kind)
+            .collect();
+        if !kinds.is_empty() && resolved.is_empty() {
+            return Err(Status::from(Error::invalid_argument(
+                "no recognised event kinds in the filter",
+            )));
+        }
+        Ok(Self {
+            account_id,
+            kinds: resolved,
+        })
+    }
+
+    fn admits(&self, event: &CoreEvent) -> bool {
+        if let Some(account_id) = self.account_id {
+            if event.account_id != Some(account_id) {
+                return false;
+            }
+        }
+        self.kinds.is_empty() || self.kinds.contains(&event.kind)
+    }
+}
+
+/// Send one stream item, giving up if the client went away or the daemon is
+/// stopping. See `rmaild::sync_service::send` — identical reasoning.
+async fn send<T>(
+    tx: &tokio::sync::mpsc::Sender<Result<T, Status>>,
+    cancel: &CancellationToken,
+    item: Result<T, Status>,
+) -> std::ops::ControlFlow<()> {
+    tokio::select! {
+        () = cancel.cancelled() => std::ops::ControlFlow::Break(()),
+        sent = tx.send(item) => {
+            if sent.is_ok() {
+                std::ops::ControlFlow::Continue(())
+            } else {
+                std::ops::ControlFlow::Break(())
+            }
+        }
+    }
+}
+
+/// The cancellation token an RPC's work runs under — a child of the daemon's
+/// shutdown token. See `rmaild::sync_service::rpc_cancel`.
+fn rpc_cancel(shutdown: &CancellationToken) -> CancellationToken {
+    shutdown.child_token()
+}
+
+fn to_proto(event: &CoreEvent) -> ProtoEvent {
+    ProtoEvent {
+        seq: event.seq,
+        kind: to_proto_kind(event.kind) as i32,
+        at: event.at,
+        account_id: event.account_id,
+        mailbox_id: event.mailbox_id,
+        message_id: event.message_id,
+        payload: event.payload.to_string(),
+    }
+}
+
+fn to_proto_kind(kind: CoreEventKind) -> ProtoEventKind {
+    match kind {
+        CoreEventKind::NewMail => ProtoEventKind::NewMail,
+        CoreEventKind::FlagChanged => ProtoEventKind::FlagChanged,
+        CoreEventKind::Moved => ProtoEventKind::Moved,
+        CoreEventKind::Deleted => ProtoEventKind::Deleted,
+        CoreEventKind::SyncState => ProtoEventKind::SyncState,
+        CoreEventKind::SendResult => ProtoEventKind::SendResult,
+        CoreEventKind::RuleFired => ProtoEventKind::RuleFired,
+        CoreEventKind::AiSummary => ProtoEventKind::AiSummary,
+    }
+}
+
+fn from_proto_kind(kind: ProtoEventKind) -> Option<CoreEventKind> {
+    Some(match kind {
+        ProtoEventKind::Unspecified => return None,
+        ProtoEventKind::NewMail => CoreEventKind::NewMail,
+        ProtoEventKind::FlagChanged => CoreEventKind::FlagChanged,
+        ProtoEventKind::Moved => CoreEventKind::Moved,
+        ProtoEventKind::Deleted => CoreEventKind::Deleted,
+        ProtoEventKind::SyncState => CoreEventKind::SyncState,
+        ProtoEventKind::SendResult => CoreEventKind::SendResult,
+        ProtoEventKind::RuleFired => CoreEventKind::RuleFired,
+        ProtoEventKind::AiSummary => CoreEventKind::AiSummary,
+    })
+}
+
+fn message_to_proto(m: &MessageWithFlags) -> ProtoMessage {
+    let msg = &m.message;
+    ProtoMessage {
+        id: msg.id,
+        account_id: msg.account_id,
+        mailbox_id: msg.mailbox_id,
+        thread_id: msg.thread_id,
+        message_id: msg.message_id.clone(),
+        subject: msg.subject.clone(),
+        from_addr: msg.from_addr.clone(),
+        from_name: msg.from_name.clone(),
+        to_addrs: msg.to_addrs.clone(),
+        cc_addrs: msg.cc_addrs.clone(),
+        date: msg.date,
+        internaldate: msg.internaldate,
+        size: msg.size,
+        has_attachments: msg.has_attachments,
+        flags: m.flags.clone(),
+        created_at: msg.created_at,
+        updated_at: msg.updated_at,
+    }
+}
+
+fn attachment_to_proto(a: &CoreAttachment) -> ProtoAttachment {
+    ProtoAttachment {
+        id: a.id,
+        part_id: a.part_id.clone().unwrap_or_default(),
+        filename: a.filename.clone(),
+        content_type: a.content_type.clone(),
+        size: a.size,
+        content_id: a.content_id.clone(),
+        is_inline: a.is_inline,
+    }
+}
+
+fn full_message_to_proto(full: FullMessage) -> ProtoFullMessage {
+    let body_text = full.message.message.body_text.clone();
+    let body_html = full.message.message.body_html.clone();
+    let attachments = full.attachments.iter().map(attachment_to_proto).collect();
+    ProtoFullMessage {
+        message: Some(message_to_proto(&full.message)),
+        body_text,
+        body_html,
+        attachments,
+    }
+}
+
+fn thread_to_proto(view: ThreadView) -> ProtoThread {
+    let t = &view.thread;
+    ProtoThread {
+        id: t.id,
+        account_id: t.account_id,
+        subject_norm: t.subject_norm.clone(),
+        root_message_id: t.root_message_id,
+        first_message_at: t.first_message_at,
+        last_message_at: t.last_message_at,
+        message_count: t.message_count,
+        participants: t
+            .participant_list()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        messages: view.messages.iter().map(message_to_proto).collect(),
+        created_at: t.created_at,
+        updated_at: t.updated_at,
+    }
+}
