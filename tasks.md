@@ -301,7 +301,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core fuse::` (RRF math, intent weights, dedup, near-dup collapse)
 
 ## 30. Feature extraction
-- [ ] status
+- [x] status
 - **depends-on:** 29
 - **parallel-safe:** no
 - **acceptance:**
