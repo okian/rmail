@@ -20,8 +20,8 @@
 //! position in a date-sorted list. A raw date is not comparable across
 //! queries and is not a *relevance* score in the sense fusion needs (bounded,
 //! higher-is-better, meaningful in isolation); a decay curve is both, and it
-//! is the same shape [`crate::config::RankWeights::recency_decay`] later
-//! multiplies as an L1 ranking feature — this retriever computes the
+//! is the same shape [`crate::rank::l1::Weights`]'s `recency_decay` entry
+//! later multiplies as an L1 ranking feature — this retriever computes the
 //! feature's raw ingredient, not a value already scaled by that weight.
 
 use chrono::{DateTime, Utc};

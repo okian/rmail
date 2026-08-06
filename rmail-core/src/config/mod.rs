@@ -5,7 +5,11 @@
 //! can be produced at any time for hot reload. Unknown keys are rejected
 //! (`deny_unknown_fields`) rather than silently ignored, and secret material is
 //! never inlined: accounts reference credentials via `password_command`,
-//! `password_env`, or `keychain` only.
+//! `password_env`, or `keychain` only. [`RankWeights`] is this rule's one
+//! deliberate exception — see its own doc comment for why an *open*
+//! feature-name-keyed table, validated one layer up in
+//! [`crate::rank::l1::Weights::from_config`] rather than here, is correct
+//! for that specific field.
 //!
 //! # Environment overlay
 //!
@@ -18,6 +22,7 @@
 
 mod duration;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use figment::providers::{Env, Format, Toml};
@@ -462,7 +467,8 @@ pub struct SearchConfig {
     pub bm25_weights: Bm25Weights,
     /// Intent-dependent fusion source weights.
     pub fusion_weights: FusionWeights,
-    /// Cold-start deterministic ranker weights.
+    /// Cold-start deterministic ranker weight *overrides* — see
+    /// [`RankWeights`]'s own doc comment.
     pub rank_weights: RankWeights,
     /// L2 reranker settings.
     pub reranker: RerankerConfig,
@@ -647,42 +653,34 @@ impl Default for FusionSourceWeights {
     }
 }
 
-/// Cold-start deterministic ranker weights.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct RankWeights {
-    /// RRF fused score weight.
-    pub rrf_score: f64,
-    /// Subject BM25 weight.
-    pub bm25_subject: f64,
-    /// Max chunk cosine weight.
-    pub cos_max_chunk: f64,
-    /// Exact-phrase-hit weight.
-    pub exact_phrase_hit: f64,
-    /// Sender-affinity weight.
-    pub sender_affinity: f64,
-    /// Recency-decay weight.
-    pub recency_decay: f64,
-    /// AI-priority weight.
-    pub ai_priority: f64,
-    /// Newsletter down-weight (negative).
-    pub is_newsletter: f64,
-}
-
-impl Default for RankWeights {
-    fn default() -> Self {
-        Self {
-            rrf_score: 1.0,
-            bm25_subject: 0.9,
-            cos_max_chunk: 0.8,
-            exact_phrase_hit: 0.6,
-            sender_affinity: 0.5,
-            recency_decay: 0.45,
-            ai_priority: 0.25,
-            is_newsletter: -0.40,
-        }
-    }
-}
+/// Cold-start deterministic ranker (prd.md Stage 4) weight *overrides* —
+/// "All weights are TOML-overridable" (prd.md). Keyed by the same stable
+/// strings [`crate::features::FeatureName::as_str`] produces (`"bm25_subject"`,
+/// `"is_newsletter"`, ...), not by a fixed set of Rust field names: `config`
+/// has no dependency on `features`/`rank` (the opposite dependency direction
+/// holds already — `features::extract` reads [`Bm25Weights`] from this very
+/// module), so a key here cannot be validated against the real
+/// `FeatureName` enum at this layer. [`crate::rank::l1::Weights::from_config`]
+/// does that validation one layer up, rejecting a key that names no real
+/// feature (or a `NaN`/`±inf` value) with a clear error. **This crate does
+/// not call it automatically anywhere yet** — no gRPC service builds a
+/// `Ranker` from a loaded [`Config`] today, since that wiring belongs to a
+/// `SearchService` this workspace does not have until a later task. A
+/// successful [`Config::load`] is therefore *not* proof that
+/// `[search.rank_weights]` is well-formed; whatever eventually builds the
+/// live `Ranker` must call [`crate::rank::l1::Weights::from_config`] itself
+/// and handle its `Result`, the same way [`Config::load`]'s own callers
+/// already have to handle a [`ConfigError`].
+///
+/// Empty (the default, `[search.rank_weights]` omitted entirely) means "use
+/// [`crate::rank::l1::Weights::default`]'s built-in PRD cold-start table
+/// unmodified." A key present here overrides just that one feature's weight
+/// — this table is a *sparse* patch on top of the built-in seventeen, not a
+/// replacement for them, so tuning one weight in `rmail.toml` never requires
+/// restating the other sixteen.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(transparent)]
+pub struct RankWeights(pub BTreeMap<String, f64>);
 
 /// L2 reranker settings.
 #[derive(Debug, Clone, Deserialize)]

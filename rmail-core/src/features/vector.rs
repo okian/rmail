@@ -312,10 +312,10 @@ impl FeatureVector {
     /// typed field itself stays `Option` rather than pre-collapsing this
     /// here); [`MatchField`]/[`Source`] become a fixed ordinal — meaningless
     /// to a linear model's dot product (which is exactly why
-    /// [`crate::config::RankWeights`] assigns no weight to `best_match_field`
-    /// or `best_source`; an absent weight contributes `0.0` regardless of
-    /// this ordinal's value) but a real, useful split feature for task 65's
-    /// tree-based model.
+    /// [`crate::rank::l1::Weights::cold_start`] assigns no weight to
+    /// `best_match_field` or `best_source`; an absent weight contributes
+    /// `0.0` regardless of this ordinal's value) but a real, useful split
+    /// feature for task 65's tree-based model.
     #[must_use]
     pub fn as_pairs(&self) -> [(FeatureName, f64); 34] {
         [

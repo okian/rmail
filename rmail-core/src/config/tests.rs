@@ -42,7 +42,11 @@ fn defaults_match_prd() {
         assert!((cfg.search.bm25_weights.subject - 8.0).abs() < f64::EPSILON);
         assert!((cfg.search.fusion_weights.navigational.lexical - 1.0).abs() < f64::EPSILON);
         assert!((cfg.search.fusion_weights.exploratory.dense - 1.0).abs() < f64::EPSILON);
-        assert!((cfg.search.rank_weights.is_newsletter + 0.40).abs() < f64::EPSILON);
+        // `rank_weights` carries only *overrides* now — the PRD cold-start
+        // table itself lives in `rank::l1::Weights::default` (see
+        // `RankWeights`'s doc comment), so an unconfigured mailbox has no
+        // overrides at all.
+        assert!(cfg.search.rank_weights.0.is_empty());
         assert!(cfg.search.retrievers.dense);
         assert!(cfg.search.retrievers.fuzzy);
         assert!(cfg.search.retrievers.entity);
@@ -351,6 +355,41 @@ fn loads_from_file_with_partial_tables() {
         // A present-but-partial [ai] table still fills every other field.
         assert_eq!(cfg.ai.models.triage, "claude-haiku-4-5");
         assert_eq!(cfg.ai.limits.on_cap, OnCap::Pause);
+        Ok(())
+    });
+}
+
+#[test]
+fn rank_weights_table_parses_as_open_overrides() {
+    // `config` has no notion of which strings are real `FeatureName`s (see
+    // `RankWeights`'s doc comment) — it just collects whatever table
+    // `[search.rank_weights]` holds. Validation against the real feature set
+    // is `rank::l1::Weights::from_config`'s job, exercised by that module's
+    // own tests, not this one's.
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let toml = "[search.rank_weights]\nbm25_subject = 1.5\nis_newsletter = -0.9\n";
+        let cfg = Config::from_toml_str(toml).map_err(fe)?;
+        assert_eq!(cfg.search.rank_weights.0.len(), 2);
+        assert!((cfg.search.rank_weights.0["bm25_subject"] - 1.5).abs() < f64::EPSILON);
+        assert!((cfg.search.rank_weights.0["is_newsletter"] + 0.9).abs() < f64::EPSILON);
+        Ok(())
+    });
+}
+
+#[test]
+fn rank_weights_table_is_env_settable() {
+    // The env overlay (see the module docs) is generic over any nested
+    // table, not hand-wired per known field — but `RankWeights` is the one
+    // field in this file whose keys are not fixed Rust identifiers, so this
+    // is worth proving rather than assuming figment's `Env` provider treats
+    // an open `BTreeMap<String, f64>` the same as a struct's named fields.
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        jail.set_env("RMAIL_SEARCH__RANK_WEIGHTS__BM25_SUBJECT", "1.5");
+        let cfg = Config::from_toml_str("").map_err(fe)?;
+        assert_eq!(cfg.search.rank_weights.0.len(), 1);
+        assert!((cfg.search.rank_weights.0["bm25_subject"] - 1.5).abs() < f64::EPSILON);
         Ok(())
     });
 }
