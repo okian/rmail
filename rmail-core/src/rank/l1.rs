@@ -280,6 +280,14 @@ impl Default for Weights {
 /// `features::name`'s module docs on the "fusion" feature group for the
 /// precedent of naming the discrepancy rather than silently picking a side).
 ///
+/// prd.md settles the direction elsewhere, which is the citation worth having
+/// when this comes up again: its Stage 3 feature table describes the whole
+/// `sender_reputation`/`is_newsletter`/`is_automated` group as
+/// "**down-weight bulk/automated unless asked**". The penalty is the default
+/// and suppression is the exception, granted when the user *asked* — which is
+/// what a named, known-item query is. A review pass read the Stage 4
+/// parenthetical the other way round; that line is why it does not hold.
+///
 /// The product reasoning behind the chosen direction: [`Intent::Navigational`]
 /// is prd.md's own "known item" intent — Stage 0's worked example is
 /// literally "the invoice Acme sent last week," a *specific, named* target.

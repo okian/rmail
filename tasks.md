@@ -313,7 +313,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core features::` (vector completeness, serialization round-trip)
 
 ## 31. L1 deterministic ranker
-- [ ] status
+- [x] status
 - **depends-on:** 30
 - **parallel-safe:** no
 - **acceptance:**
