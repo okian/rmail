@@ -54,3 +54,6 @@ pub use policy::{
     AiPolicyMode, PolicyDecision, PolicyEngine, PolicyExplanation, PolicyTarget, PolicyTier,
     RuleMatch,
 };
+pub use redact::{
+    guard, preview, rehydrate, GuardedRequest, RedactPreview, RedactionKind, TokenMap,
+};
