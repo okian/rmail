@@ -6,13 +6,21 @@
 //! parsing with no ranking, no natural-language handling, and no I/O. It
 //! turns `from:alice -tag:newsletter "office move"` into the operators that
 //! must gate the result set and the free text that should rank it, and
-//! nothing more. Intent classification, spelling correction, alias
-//! resolution, query expansion, and embedding — the rest of Stage 0 — build
-//! on top of [`ParsedQuery`] in a later task; this module does not attempt
-//! any of them.
+//! nothing more.
+//!
+//! [`plan`] builds on top of [`ParsedQuery`]: intent classification, spelling
+//! correction against the corpus vocabulary, contact/alias resolution, PMI
+//! synonym expansion, date resolution, and the query embedding — the rest of
+//! Stage 0 — to produce the [`plan::QueryPlan`] every retriever downstream
+//! consumes.
 
 pub mod parse;
+pub mod plan;
 
 pub use parse::{
     parse, AiPredicate, Filter, HasTarget, IsFlag, Mode, Operator, ParsedQuery, Phrase, Term,
+};
+pub use plan::{
+    DateRange, EntityRef, EntityRefKind, HardFilter, Intent, PlanTerm, QueryPlan, QueryPlanner,
+    Scope, SortSpec, TermOrigin,
 };

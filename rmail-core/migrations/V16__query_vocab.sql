@@ -1,0 +1,16 @@
+-- V16: the corpus vocabulary query understanding (task 26) spell-fix and
+-- synonym expansion both read.
+--
+-- `fts5vocab` is a read-only virtual table SQLite derives live from an
+-- existing FTS5 table -- it is part of the FTS5 extension itself, not a
+-- separate feature, so it is available anywhere `fts_messages` (V9) already
+-- works. `'row'` mode reports one row per distinct term with `doc` (documents
+-- containing it) and `cnt` (total occurrences): exactly the frequency signal
+-- SymSpell/trigram-style correction and PMI co-occurrence both need, and
+-- "terms that actually appear in this mailbox" by construction.
+--
+-- Deliberately not a table this module populates: a copy would need its own
+-- rebuild-on-reindex and delete-on-expunge paths, both of which `fts_messages`
+-- (task 18's indexer) already has. A view can't drift from what it is a view
+-- of.
+CREATE VIRTUAL TABLE fts_messages_vocab USING fts5vocab(fts_messages, 'row');
