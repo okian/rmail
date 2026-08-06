@@ -74,10 +74,15 @@
 //! precedent (also an IMAP round trip behind a unary RPC, also not wired to
 //! shutdown). This is a bounded gap, not an unbounded one: every command
 //! `rmail_core::imap::mutate` issues is itself capped by
-//! `rmail_core::imap::IMAP_DEADLINE` (30s), so the daemon's own graceful
-//! shutdown can be delayed by at most that long waiting for an in-flight
-//! mutation against a wedged server, never held open indefinitely the way an
-//! un-cancelled stream would be.
+//! `rmail_core::imap::IMAP_DEADLINE` (30s) — but the cap is per *command*, not
+//! per RPC, and a mutation is several commands. `Move` on the fallback path
+//! (no `MOVE` capability) is handshake, SELECT, COPY, STORE, EXPUNGE and
+//! LOGOUT, so the true bound on graceful shutdown is a low multiple of
+//! `IMAP_DEADLINE` — up to roughly six times it — not `IMAP_DEADLINE` itself.
+//! Still bounded, and never held open indefinitely the way an un-cancelled
+//! stream would be, but worth stating accurately: an operator reading "30s"
+//! and seeing a three-minute shutdown would reasonably conclude the bound had
+//! failed.
 //
 // `tonic::Status` is intentionally the error type throughout a gRPC service
 // boundary; its size makes `result_large_err` fire on every `Result<_, Status>`

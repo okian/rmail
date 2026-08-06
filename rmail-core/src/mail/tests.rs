@@ -1030,10 +1030,12 @@ fn normalize_limit_clamps_a_pathological_request_to_the_cap() {
 }
 
 #[tokio::test]
-async fn list_never_returns_more_than_the_cap() {
-    // The unit tests above prove the clamp function; this proves `list`
-    // actually applies it rather than passing the raw request straight to
-    // `repo::list_messages`.
+async fn list_applies_the_requested_limit_not_the_full_mailbox() {
+    // Named for what it actually proves. It seeds six messages and asks for
+    // two, so it shows the requested limit reaches the SQL — it does not
+    // exercise `MAX_LIST_LIMIT` at all, which would need 500+ rows. The clamp
+    // itself is proven by the pure `normalize_limit` unit tests above; calling
+    // this one "the cap" implied a bound nothing here checks.
     let fx = Fixture::new();
     let (account_id, inbox_id, _archive_id, _message_id) = fx.seed(&[]);
     for uid in 1..=5 {

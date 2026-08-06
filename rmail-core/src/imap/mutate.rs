@@ -242,6 +242,13 @@ impl ImapMutator for LiveImapMutator {
 /// to [`Error::DeadlineExceeded`] — every command in this module goes through
 /// this, including the best-effort logout, so a wedged server after a
 /// committed mutation cannot hang the caller. See the module docs.
+///
+/// A timeout drops the command future mid-protocol, which leaves the session
+/// with an unread reply still in flight and therefore in an undefined
+/// read/write state. Callers must treat a timed-out session as spent and
+/// discard it rather than issuing another command on it; the only thing this
+/// module does with one afterwards is the best-effort logout, itself bounded,
+/// so the worst case is one further `IMAP_DEADLINE` before the socket closes.
 async fn bounded<T, F>(op: &str, fut: F) -> Result<T, Error>
 where
     F: std::future::Future<Output = Result<T, Error>>,

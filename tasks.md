@@ -379,7 +379,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmaild auth::` (scope allow/deny matrix, peer-uid path, revoked token rejected)
 
 ## 39. MailService
-- [ ] status
+- [x] status
 - **depends-on:** 9, 10, 14, 38
 - **parallel-safe:** no
 - **acceptance:**
