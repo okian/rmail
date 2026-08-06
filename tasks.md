@@ -425,7 +425,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core ai::provider` (against a mock Anthropic server: structured decode, streaming frames, cache headers, retry/backoff, cancel)
 
 ## 44. PII redaction firewall
-- [ ] status
+- [x] status
 - **depends-on:** 43
 - **parallel-safe:** no
 - **acceptance:**
@@ -434,7 +434,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core ai::redact` (tokenize/rehydrate round-trip, Luhn, no raw PII in outbound payload)
 
 ## 45. AI audit ledger + usage/cost accounting
-- [ ] status
+- [x] status
 - **depends-on:** 6, 43
 - **parallel-safe:** yes
 - **acceptance:**
@@ -443,7 +443,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core ai::audit` (append-only invariant, payload hash, cost rollup)
 
 ## 46. AI policy & data-residency engine
-- [ ] status
+- [x] status
 - **depends-on:** 2, 6
 - **parallel-safe:** yes
 - **acceptance:**
