@@ -31,9 +31,21 @@ A full first build takes a while. Pass `timeout: 900000` to the Bash tool on car
 ```
 CARGO_INCREMENTAL=0 cargo fmt --all -- --check
 CARGO_INCREMENTAL=0 cargo clippy --all-targets --all-features -- -D warnings
-CARGO_INCREMENTAL=0 cargo nextest run --all-features --workspace
+scripts/docker-test.sh
 buf lint
 ```
+
+**Tests only ever run in a container.** `scripts/docker-test.sh` wraps
+`cargo nextest run --locked --all-features --workspace` and passes extra cargo arguments
+straight through, so your task's `verify` line runs as
+`scripts/docker-test.sh -p rmail-core some::filter`. The `verify` lines in `tasks.md` are
+written as `cargo nextest run …` for readability — translate them. **Never run
+`cargo test` or `cargo nextest` on the host**; the Stop hook enforces this and there is no
+fallback. The script is worktree-aware and keeps a per-worktree target volume, so your
+first run is slow and later ones are incremental.
+
+`cargo fmt` and `cargo clippy` still run on the host — they are fast and touch nothing
+outside the source tree.
 
 Plus your task's own `verify` line. Do not finish on a red gate. If a *pre-existing*
 failure is unrelated to your task, say so explicitly in your report rather than papering
