@@ -460,7 +460,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core ai::queue` (dedup, lease reclaim, RPM/cost gate, batch flip, retry→dead)
 
 ## 48. Triage pass (Haiku)
-- [ ] status
+- [x] status
 - **depends-on:** 47
 - **parallel-safe:** no
 - **acceptance:**
@@ -483,6 +483,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **acceptance:**
   - `AiService.GetSummary`, `AnalyzeMessage(stream)`, `StreamEnrichments(stream, resume-by-message_id)`, `SuggestReply`, `GetUsage`, `SetPaused`; token-streaming RPCs abort upstream on cancel.
   - `mail ai status|process|summary|reply|retry|pause|resume|cost` verbs.
+  - **Daemon dispatch loop — carried over from task 48.** Task 48 built the triage `PassHandler` and task 47 the queue, but *nothing enqueues a triage job when a message syncs*: the PRD's "every newly synced message runs one Haiku call" has no wiring. This task owns it — subscribe the daemon to the sync event bus (`rmail-core/src/events/`), enqueue via `AiQueue::enqueue`, and run `AiWorkerPool::dispatch_pending` / `BatchCoordinator::maybe_submit`+`poll` on a schedule. Without this the whole AI pipeline is inert in production however green its unit tests are, so cover it with a test that syncs a message and asserts a job appears.
 - **verify:** `cargo nextest run -p rmaild ai_service` (cached get, force analyze stream, enrichment resume)
 
 ## 51. Semantic/hybrid retrieval + L2 rerank
