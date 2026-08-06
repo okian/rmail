@@ -1,4 +1,4 @@
--- V19: the durable AI work queue (task 47).
+-- V20: the durable AI work queue (task 47).
 --
 -- Sibling of `index_queue` (V7), same discipline: what still needs doing and
 -- what went wrong last time, a lease that survives the worker holding it, and

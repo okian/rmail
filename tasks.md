@@ -451,7 +451,7 @@ Per-task **verify** lists the *targeted* proof in addition to the global gate.
 - **verify:** `cargo nextest run -p rmail-core ai::policy` (allow/deny/local-only resolution, forbidden invisibility, explain trace)
 
 ## 47. AI queue & worker pool
-- [ ] status
+- [x] status
 - **depends-on:** 16, 43, 44, 45, 46
 - **parallel-safe:** no
 - **acceptance:**
