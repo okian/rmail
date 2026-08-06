@@ -328,10 +328,34 @@ pub fn estimate_cost_usd(model: &str, usage: Usage) -> f64 {
 /// # Errors
 ///
 /// A mapped storage error.
-#[tracing::instrument(skip(db, record), fields(model = %record.model, cost_usd, id))]
 pub async fn record_call(db: &Database, record: CallRecord<'_>) -> Result<i64> {
+    record_call_priced(db, record, 1.0).await
+}
+
+/// As [`record_call`], but scales the computed cost by `price_multiplier`
+/// before it is stored. The Message Batches API's 50% discount
+/// ([`crate::ai::queue::BatchCoordinator`], task 47) is the motivating case,
+/// applied at `0.5` — `record_call` itself stays the `1.0` common path so
+/// every call site that predates batching, including this module's own
+/// tests, needs no change.
+///
+/// Only `cost_usd` is scaled. Token counts (`input_tokens`, `output_tokens`,
+/// ...) are recorded as reported — a batch call processes exactly as many
+/// tokens as a live one would, so `ai.limits.daily_token_cap` and any
+/// token-level accounting must see the real count; the discount is a price
+/// term, not a token-count fiction.
+///
+/// # Errors
+///
+/// A mapped storage error.
+#[tracing::instrument(skip(db, record), fields(model = %record.model, cost_usd, id))]
+pub async fn record_call_priced(
+    db: &Database,
+    record: CallRecord<'_>,
+    price_multiplier: f64,
+) -> Result<i64> {
     let payload_sha256 = Sha256::digest(record.payload).to_vec();
-    let cost_usd = estimate_cost_usd(&record.model, record.usage);
+    let cost_usd = estimate_cost_usd(&record.model, record.usage) * price_multiplier;
     // Saturating rather than truncating: a latency that overflows i64
     // milliseconds is not a value this ledger should misrepresent as small.
     let latency_ms = i64::try_from(record.latency.as_millis()).unwrap_or(i64::MAX);

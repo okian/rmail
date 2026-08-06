@@ -53,7 +53,11 @@ use crate::error::Error;
 const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 
 /// The Messages API version this client speaks.
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+///
+/// `pub(crate)`, not private: `ai::queue`'s Message Batches client (task 47)
+/// speaks the same API version over its own `reqwest::Client` and must not
+/// let that copy drift from this one.
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 // No `anthropic-beta` header: structured outputs (`output_config.format`) and
 // the 1-hour prompt-cache `ttl` are both current, non-beta surface — neither
@@ -379,7 +383,13 @@ pub struct ChatResponse {
 }
 
 impl ChatResponse {
-    fn from_raw(raw: RawMessage) -> Result<Self, Error> {
+    /// `pub(crate)`: `ai::queue`'s Message Batches result path (task 47)
+    /// decodes a batch result's `message` field — the same non-streaming
+    /// `Message` object shape a live `POST /v1/messages` response uses —
+    /// through this exact conversion, so refusal handling, stop-reason
+    /// parsing, and usage accounting stay in one place rather than a second
+    /// copy that could drift from this one.
+    pub(crate) fn from_raw(raw: RawMessage) -> Result<Self, Error> {
         let raw_stop_reason = raw.stop_reason.as_deref().unwrap_or("end_turn");
         if raw_stop_reason == "refusal" {
             return Err(refusal_error(
@@ -1199,8 +1209,12 @@ fn parse_stop_reason(raw: &str) -> Result<StopReason, Error> {
 // Wire shapes (non-streaming)
 // ---------------------------------------------------------------------------
 
+/// `pub(crate)`: named directly by `ai::queue`'s batch-result decoding (see
+/// [`ChatResponse::from_raw`]) so a batch result's `message` field is parsed
+/// by the identical `Deserialize` impl a live response uses, not a
+/// hand-rolled second copy of this wire shape.
 #[derive(Debug, serde::Deserialize)]
-struct RawMessage {
+pub(crate) struct RawMessage {
     id: String,
     model: String,
     #[serde(default)]

@@ -1,29 +1,32 @@
 //! The Claude bridge: turning mail into model calls and model calls back into
 //! mail.
 //!
-//! # The pipeline this module is one stage of
+//! # The pipeline, now that every stage has landed
 //!
 //! ```text
-//! Sync Engine ──▶ AI Queue ──▶ redact ──▶ Provider ──▶ audit ──▶ policy
+//! Sync Engine ──▶ AI Queue ──▶ policy ──▶ assemble ──▶ redact ──▶ Provider ──▶ audit
 //! ```
 //!
-//! Every later stage in that pipeline is a separate task: the PII redaction
-//! firewall, the append-only audit ledger, the data-residency policy engine,
-//! and the durable worker queue all land after this one and all depend on it.
-//! What they depend on is narrow on purpose — [`provider::Provider`], a plain
-//! request/response/stream trait with no opinion about what talks to it or
-//! what it is talking about. Redaction runs *before* a request reaches a
-//! `Provider`; audit and policy wrap *around* a call to one. None of that
-//! needs to exist yet for the trait to be right, and building it here would
-//! mean guessing at their contracts three tasks early.
+//! [`queue::AiWorkerPool`]/[`queue::BatchCoordinator`] (task 47) are what
+//! actually sequence this: [`policy::PolicyEngine::resolve`] first (a
+//! forbidden folder never reaches any later step), then
+//! [`queue::assemble_content`] builds bounded request content, then
+//! [`redact::guard`] is the mandatory PII firewall, then
+//! [`provider::Provider::complete`] is the one step that leaves the
+//! machine, then [`audit::record_call`] with the **redacted** payload. See
+//! `queue`'s module docs for why that order is load-bearing and what
+//! swapping any two steps would break. [`provider::Provider`] stays a plain
+//! request/response/stream trait with no opinion about what talks to it —
+//! that was deliberate when only it existed, and still holds now that
+//! everything around it does too.
 //!
-//! One consequence: [`ClaudeProvider`] enforces none of `ai.limits`
-//! (`max_concurrency`, `requests_per_minute`, the token/cost caps) and
-//! [`provider::build`] does not consult `ai.enabled`. Those are policy —
-//! deciding *whether* and *how fast* to call a provider — not the provider
-//! itself, and belong to the queue/policy tasks that sit around this one in
-//! the pipeline above, the same way `Provider::complete` does not decide
-//! whether a message was allowed to reach it in the first place.
+//! One consequence, no longer hypothetical: [`ClaudeProvider`] enforces none
+//! of `ai.limits` (`max_concurrency`, `requests_per_minute`, the token/cost
+//! caps) and [`provider::build`] does not consult `ai.enabled`. Those are
+//! policy — deciding *whether* and *how fast* to call a provider — not the
+//! provider itself, and [`queue::AiWorkerPool`]/[`queue::CostGate`] are
+//! exactly where they now live, the same way `Provider::complete` does not
+//! decide whether a message was allowed to reach it in the first place.
 //!
 //! # Why a trait at all
 //!
@@ -39,11 +42,12 @@
 pub mod audit;
 pub mod policy;
 pub mod provider;
+pub mod queue;
 pub mod redact;
 
 pub use audit::{
-    estimate_cost_usd, query_calls, record_call, usage_for_day, AuditFilter, CallOutcome,
-    CallRecord, CallStatus, DayUsage, LedgerEntry,
+    estimate_cost_usd, query_calls, record_call, record_call_priced, usage_for_day, AuditFilter,
+    CallOutcome, CallRecord, CallStatus, DayUsage, LedgerEntry,
 };
 pub use provider::{
     build, ChatMessage, ChatRequest, ChatResponse, ClaudeProvider, OutputFormat, Provider,
@@ -53,6 +57,12 @@ pub use provider::{
 pub use policy::{
     AiPolicyMode, PolicyDecision, PolicyEngine, PolicyExplanation, PolicyTarget, PolicyTier,
     RuleMatch,
+};
+pub use queue::{
+    AiLease, AiQueue, AiWorkerPool, BatchClient, BatchCoordinator, BatchHandle, BatchOutcome,
+    BatchPollOutcome, BatchRequestCounts, BatchRequestItem, BatchResult, BatchStatus, CapDecision,
+    CostGate, DeadLetter, DispatchSummary, Failure, JobState, MessageContent, NewAiJob,
+    PassHandler, QueueOptions, QueueStats, RateLimiter,
 };
 pub use redact::{
     guard, preview, rehydrate, GuardedRequest, RedactPreview, RedactionKind, TokenMap,
