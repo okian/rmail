@@ -112,6 +112,21 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AdminService/ListTokens",
         Requirement::Scope(Scope::Admin),
     ),
+    // -- AuditService (task 45) ----------------------------------------------
+    // The ledger is the record of what was sent to a model provider, including
+    // an account id and a message id per call. Reading it is therefore reading
+    // metadata about mail, and `admin` rather than `mail.read` because the
+    // trail exists to hold the operator to account: a token minted for routine
+    // mail access should not be able to enumerate — or export wholesale — the
+    // history of every AI call made on this machine.
+    (
+        "/rmail.v1.AuditService/QueryAiCalls",
+        Requirement::Scope(Scope::Admin),
+    ),
+    (
+        "/rmail.v1.AuditService/ExportLedger",
+        Requirement::Scope(Scope::Admin),
+    ),
     // -- MailService (task 39, provisional) ----------------------------------
     (
         "/rmail.v1.MailService/List",
@@ -196,6 +211,88 @@ mod tests {
     #[test]
     fn an_unregistered_method_is_not_found_which_callers_must_deny() {
         assert_eq!(lookup("/rmail.v1.DoesNotExist/Method"), None);
+    }
+
+    /// Every method the server actually exposes has a row.
+    ///
+    /// The rest of the tests here check this table against itself, which cannot
+    /// catch the failure that matters: a service is added, nobody adds its rows,
+    /// and because [`lookup`] fails closed every one of its RPCs is denied at
+    /// runtime with no compile-time or test-time complaint. That is exactly what
+    /// happened when `AuditService` landed — it was written against a checkout
+    /// that predated this table, so it shipped deny-everything.
+    ///
+    /// Reconciling against the compiled descriptor set is the only check that
+    /// scales: the descriptor is generated from the protos, so a new RPC appears
+    /// here the moment it exists, whether or not anyone remembered this file.
+    #[test]
+    fn every_rpc_in_the_descriptor_set_has_a_scope_row() {
+        for (service, method) in descriptor_methods() {
+            let path = format!("/{service}/{method}");
+            assert!(
+                lookup(&path).is_some(),
+                "{path} is served but has no row in the scope table, so the \
+                 fail-closed default denies every call to it. Add a row."
+            );
+        }
+    }
+
+    /// No row names a method of an existing service that does not exist.
+    ///
+    /// Rows for a service absent from the descriptor set are allowed on purpose:
+    /// scopes are written ahead of the services they will govern, so a task can
+    /// land its RPCs into a table that already expects them. But once a service
+    /// *is* compiled in, a row naming a method it does not have is a typo — and
+    /// a silent one, since the row simply never matches while the real method
+    /// falls through to the deny default.
+    #[test]
+    fn no_row_names_a_missing_method_of_a_service_that_exists() {
+        let methods = descriptor_methods();
+        let served: std::collections::HashSet<String> =
+            methods.iter().map(|(s, m)| format!("/{s}/{m}")).collect();
+        let services: std::collections::HashSet<&str> =
+            methods.iter().map(|(s, _)| s.as_str()).collect();
+
+        for (path, _) in TABLE {
+            let Some(service) = path.strip_prefix('/').and_then(|p| p.split('/').next()) else {
+                continue;
+            };
+            if !services.contains(service) {
+                // The service has not landed yet; the row is a forward
+                // declaration, which is allowed.
+                continue;
+            }
+            assert!(
+                served.contains(*path),
+                "{path} names a method that {service} does not have — the row \
+                 never matches, and the real method is denied by default."
+            );
+        }
+    }
+
+    /// Every `(fully.qualified.Service, Method)` pair in the compiled protos.
+    fn descriptor_methods() -> Vec<(String, String)> {
+        use prost::Message as _;
+
+        let set = prost_types::FileDescriptorSet::decode(rmail_proto::FILE_DESCRIPTOR_SET)
+            .expect("the compiled descriptor set must decode");
+
+        let mut out = Vec::new();
+        for file in &set.file {
+            let package = file.package();
+            for service in &file.service {
+                let fq = if package.is_empty() {
+                    service.name().to_string()
+                } else {
+                    format!("{package}.{}", service.name())
+                };
+                for method in &service.method {
+                    out.push((fq.clone(), method.name().to_string()));
+                }
+            }
+        }
+        assert!(!out.is_empty(), "descriptor set contained no services");
+        out
     }
 
     #[test]
