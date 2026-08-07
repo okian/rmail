@@ -497,15 +497,30 @@ const HIGHLIGHT_OFF: &str = "\x1b[0m";
 fn render_snippet(snippet: &Snippet, styled: bool) -> String {
     let ranges = valid_ranges(snippet);
     let mut out = String::with_capacity(snippet.text.len());
+    // Emit the SGR codes on the *transitions* into and out of a highlight,
+    // not around each character. Per-character bracketing renders the same
+    // and is far easier to write, but a seven-character match becomes seven
+    // on/off pairs — 56 bytes of escapes around 7 bytes of text — which
+    // bloats every line, defeats a terminal's own run-length handling, and
+    // makes the output painful to read when piped somewhere that shows the
+    // escapes literally.
+    let mut open = false;
     for (idx, ch) in snippet.text.char_indices() {
         let in_highlight = ranges.iter().any(|&(start, end)| idx >= start && idx < end);
-        if styled && in_highlight {
-            out.push_str(HIGHLIGHT_ON);
-            push_sanitized(&mut out, ch);
-            out.push_str(HIGHLIGHT_OFF);
-        } else {
-            push_sanitized(&mut out, ch);
+        if styled && in_highlight != open {
+            out.push_str(if in_highlight {
+                HIGHLIGHT_ON
+            } else {
+                HIGHLIGHT_OFF
+            });
+            open = in_highlight;
         }
+        push_sanitized(&mut out, ch);
+    }
+    // A highlight running to the end of the text still has to be closed, or
+    // the escape leaks into whatever the terminal prints next.
+    if open {
+        out.push_str(HIGHLIGHT_OFF);
     }
     out
 }

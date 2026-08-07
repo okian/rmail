@@ -340,7 +340,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmaild search_service` (streamed hits, cancellation, explain block)
 
 ## 34. Search CLI verbs
-- [ ] status
+- [x] status
 - **depends-on:** 33
 - **parallel-safe:** yes
 - **acceptance:**
