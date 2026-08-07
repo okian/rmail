@@ -35,6 +35,9 @@ tonic.workspace = true
 tokio-stream.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 rmaild.workspace = true

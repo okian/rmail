@@ -2876,10 +2876,13 @@ name = "rmail-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "rmail-core",
  "rmail-proto",
  "rmaild",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",

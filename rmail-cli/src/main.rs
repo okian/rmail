@@ -1,5 +1,7 @@
 //! The `mail` CLI — a thin gRPC client for the rmail daemon.
 
+mod search_cli;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,6 +14,7 @@ use rmail_proto::v1::{
     EventKind, ListTokensRequest, MintTokenRequest, RevokeTokenRequest, SyncFolderRequest,
     SyncMode, WatchEventsRequest,
 };
+use search_cli::{SearchArgs, SimilarArgs};
 use tokio_stream::StreamExt;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
@@ -53,6 +56,10 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// Ranked search over the local index (`SearchService.Search`).
+    Search(SearchArgs),
+    /// Embedding-kNN neighbors of a message (`SearchService.Semantic`).
+    Similar(SimilarArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -107,6 +114,8 @@ async fn main() -> Result<()> {
             TokenAction::List => token_list(&socket).await,
             TokenAction::Revoke { id } => token_revoke(&socket, id).await,
         },
+        Command::Search(args) => search_cli::search(&socket, args).await,
+        Command::Similar(args) => search_cli::similar(&socket, args).await,
     }
 }
 
