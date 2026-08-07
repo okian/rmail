@@ -252,6 +252,7 @@ impl TestServer {
             daily_cost_cap_usd: 1_000.0,
             monthly_cost_cap_usd: 1_000.0,
             on_cap: OnCap::Pause,
+            ..AiLimits::default()
         };
         let shutdown_cancel = CancellationToken::new();
 
@@ -623,6 +624,82 @@ async fn analyze_message_on_an_unknown_message_is_not_found_before_any_stream_op
 
     assert_eq!(status.code(), Code::NotFound);
     assert_eq!(server.provider.stream_calls(), 0);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn analyze_message_is_resource_exhausted_when_a_budget_hard_cap_is_reached() {
+    let server = TestServer::start().await;
+    let (account_id, mailbox_id) = server.account("INBOX").await;
+    let id = server
+        .message(account_id, mailbox_id, 1, "please analyze me")
+        .await;
+
+    // A $1/day global ceiling with $2 already spent. The harness's
+    // `ai.limits` are deliberately enormous, so the cycle-level `CostGate`
+    // is wide open and only the per-call budget enforcer can refuse this.
+    rmail_core::ai::set_budget(
+        &server.db,
+        &rmail_core::ai::Budget {
+            account_id: rmail_core::ai::GLOBAL_ACCOUNT_ID,
+            class: rmail_core::ai::BudgetClass::All,
+            caps: rmail_core::ai::BudgetCaps {
+                daily: rmail_core::ai::WindowCaps {
+                    hard_usd_micros: Some(1_000_000),
+                    ..rmail_core::ai::WindowCaps::default()
+                },
+                monthly: rmail_core::ai::WindowCaps::default(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    rmail_core::ai::record_call(
+        &server.db,
+        rmail_core::ai::CallRecord {
+            account_id: Some(account_id),
+            message_id: None,
+            request_id: None,
+            // A model the ledger prices, so this actually moves the dollar
+            // figure — an unpriced one would record $0 and prove nothing.
+            model: "claude-opus-4-8".to_owned(),
+            pass: Some("deep".to_owned()),
+            usage: CoreUsage {
+                input_tokens: 500_000,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            redaction_level: "none".to_owned(),
+            latency: Duration::from_millis(1),
+            payload: b"prior spend",
+            outcome: rmail_core::ai::CallOutcome::Ok,
+        },
+    )
+    .await
+    .unwrap();
+
+    let status = server
+        .client()
+        .await
+        .analyze_message(AnalyzeMessageRequest { message_id: id })
+        .await
+        .expect_err("the daily budget is exhausted");
+
+    // prd.md maps budget exhaustion to RESOURCE_EXHAUSTED, distinct from the
+    // FAILED_PRECONDITION the older cycle-level cost gate returns.
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(
+        !status.message().contains("1000000"),
+        "the message must not disclose aggregate spend figures to a caller holding only \
+         `ai.invoke`: {}",
+        status.message()
+    );
+    assert_eq!(
+        server.provider.stream_calls(),
+        0,
+        "a hard cap must mean the provider is never reached, not that its answer was discarded"
+    );
     server.stop().await;
 }
 

@@ -1,7 +1,8 @@
 //! The live worker pool: leases pending [`super::AiLease`]s and drives each
-//! through policy → assemble → redact → provider → audit, bounded by
-//! `Semaphore(max_concurrency)`, paced by [`super::RateLimiter`], and gated
-//! by [`super::CostGate`].
+//! through policy → assemble → budget → redact → provider → audit, bounded
+//! by `Semaphore(max_concurrency)`, paced by [`super::RateLimiter`], and
+//! gated by [`super::CostGate`] (once per cycle) and
+//! [`crate::ai::budget::BudgetEnforcer`] (once per job).
 //!
 //! This is the surface tasks 48/49 (the triage and deep passes) are meant
 //! to call: implement [`PassHandler`] for a pass, hand it to
@@ -23,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::ai::audit::{self, CallOutcome, CallRecord};
+use crate::ai::budget::{BudgetEnforcer, BudgetRequest, BudgetVerdict, WorkClass};
 use crate::ai::policy::{PolicyEngine, PolicyTarget};
 use crate::ai::provider::{ChatRequest, ChatResponse, Provider};
 use crate::ai::redact::{self, GuardedRequest, TokenMap};
@@ -113,6 +115,15 @@ pub struct DispatchSummary {
     /// Jobs leased and immediately terminated because `on_cap = "drop"` and
     /// today's/this month's spend cap was reached.
     pub dropped: u64,
+    /// Jobs the budget enforcer ([`crate::ai::budget`]) held back at a hard
+    /// cap. Counted separately from `dropped` and `terminated` because the
+    /// job is neither gone nor failed: it went back to `pending` with its
+    /// attempt refunded and a `next_attempt_at` at the end of the window that
+    /// blocked it, so the first cycle after that window rolls over will run
+    /// it. See [`AiWorkerPool::withhold_outcome`] for why
+    /// [`AiQueue::defer`] — rather than terminate, fail, or a plain
+    /// release — is the right disposition.
+    pub withheld: u64,
     /// The cost gate held this cycle back entirely (`on_cap = "pause"`).
     pub paused: bool,
 }
@@ -381,7 +392,6 @@ impl AiWorkerPool {
                 request, tokens, ..
             } => (request, tokens),
         };
-        let payload = super::payload_bytes(&redacted_request);
 
         // Pace and bound concurrency *before* the provider call — never
         // after. Both waits are raced against `cancel`: a shutdown must not
@@ -400,8 +410,72 @@ impl AiWorkerPool {
             () = self.rate_limiter.acquire() => {}
         }
 
-        // 5. Provider, then audit — with the redacted payload, at the live
-        // (unmultiplied) price.
+        // 5. Budget — the last thing before the provider, and deliberately
+        // *after* the semaphore and the RPM wait rather than before them.
+        //
+        // A pre-call check can only ever see spend that has already reached
+        // the ledger, so what bounds the overshoot is how many checks can be
+        // outstanding at once. Evaluating up in step 3 would have let every
+        // job leased this cycle (`lease_limit`, 32 by default) grade itself
+        // against the same pre-cycle snapshot, and at `requests_per_minute`
+        // pacing the last of them could reach the provider half a minute
+        // later — 32 calls admitted past a cap that was already reached.
+        // Here, at most `max_concurrency` (4) evaluations are in flight, and
+        // each one sees the spend of every call that finished ahead of it in
+        // the same cycle. The residual race is real and irreducible for a
+        // check-then-call design: the enforcer cannot know what a call it
+        // admits will cost until the response comes back.
+        //
+        // Still strictly before anything that leaves the machine, which is
+        // the property that matters: a hard cap means the provider is never
+        // called, not that a call was made and its result discarded. The
+        // downgrade rewrites the *redacted* request's model, since that is
+        // the value actually transmitted and the one `payload_bytes` hashes
+        // into the audit trail.
+        let charge = WorkClass::for_priority(lease.priority, self.limits.budget.bulk_priority);
+        let verdict = BudgetEnforcer {
+            db: &self.db,
+            limits: &self.limits,
+        }
+        .evaluate(&BudgetRequest {
+            account_id: lease.account_id,
+            model: &redacted_request.model,
+            work_class: charge,
+            now: chrono::Utc::now().timestamp(),
+        })
+        .await;
+        let mut redacted_request = redacted_request;
+        match verdict {
+            Ok(BudgetVerdict::Allow) => {}
+            Ok(BudgetVerdict::Downgrade { model, reason }) => {
+                tracing::info!(
+                    job_id = lease.job_id,
+                    from = %redacted_request.model,
+                    to = %model,
+                    reason = %reason,
+                    "ai budget soft cap: downgrading this job's model"
+                );
+                redacted_request.model = model;
+            }
+            Ok(BudgetVerdict::Block { reason, retry_at }) => {
+                tracing::info!(
+                    job_id = lease.job_id,
+                    reason = %reason,
+                    retry_at,
+                    "ai budget hard cap: withholding this job; the provider is not called"
+                );
+                return self.withhold_outcome(&lease, retry_at).await;
+            }
+            // A budget that cannot be read is not permission to spend. Fail
+            // the job (backoff + retry) exactly as any other storage error on
+            // this path does — never fall through to the provider.
+            Err(e) => return self.fail_outcome(&lease, e.to_string()).await,
+        }
+        let redacted_request = redacted_request;
+        let payload = super::payload_bytes(&redacted_request);
+
+        // 6. Provider, then audit — with the redacted payload, at the live
+        // (unmultiplied) price, charged to the class the budget check used.
         let start = Instant::now();
         let result = self.provider.complete(&redacted_request, cancel).await;
         let latency = start.elapsed();
@@ -414,6 +488,7 @@ impl AiWorkerPool {
             &tokens,
             payload,
             1.0,
+            charge,
             latency,
             result,
         )
@@ -443,6 +518,36 @@ impl AiWorkerPool {
             tracing::error!(job_id = lease.job_id, error = %e, "failed to release a cancelled ai job back to pending");
         }
         Outcome::Skipped
+    }
+
+    /// Put a budget-blocked job back to `pending`, attempt refunded, and not
+    /// eligible again until the window that blocked it has rolled over.
+    ///
+    /// Deliberately not [`AiQueue::terminate`]: `Error` is a one-way door for
+    /// work no retry can fix, and a job held back by a *daily* cap is the
+    /// opposite of that — the window rolls over at midnight and the work is
+    /// still wanted. Deliberately not [`AiQueue::fail`] either: backing off
+    /// and eventually quarantining to `dead` would burn `max_attempts` on
+    /// attempts that never happened, so a long spell at the cap would leave a
+    /// pile of `dead` jobs an operator has to `mail ai retry --failed` out of
+    /// for no reason.
+    ///
+    /// It is also not a plain [`AiQueue::release`], which is what a
+    /// *cancelled* job uses: `release` leaves `next_attempt_at` alone, so the
+    /// same jobs would be re-leased on the very next tick and every tick
+    /// after — several `SUM` scans and a write transaction each, once every
+    /// `DEFAULT_TICK_INTERVAL`, for as long as the cap holds. Worse, `lease`
+    /// orders by `(priority, enqueued_at, job_id)`, so a capped account's
+    /// oldest jobs would sit at the head of the candidate set and starve
+    /// every *uncapped* account's work behind them. [`AiQueue::defer`] sets
+    /// `next_attempt_at` to the moment the blocking window ends, which drops
+    /// the job out of the candidate set entirely until it can actually run.
+    async fn withhold_outcome(&self, lease: &AiLease, retry_at: i64) -> Outcome {
+        if let Err(e) = self.queue.defer(lease, retry_at).await {
+            tracing::error!(job_id = lease.job_id, error = %e, "failed to defer a budget-withheld ai job");
+            return Outcome::Skipped;
+        }
+        Outcome::Withheld
     }
 }
 
@@ -477,6 +582,9 @@ pub(super) enum Outcome {
     Retried,
     Dead,
     Terminated,
+    /// Held back at a budget hard cap and returned to `pending` — see
+    /// [`AiWorkerPool::withhold_outcome`].
+    Withheld,
     /// Cancelled before dispatch, or a fencing/logging failure already
     /// reported — nothing left for the summary to count.
     Skipped,
@@ -489,6 +597,7 @@ impl DispatchSummary {
             Outcome::Retried => self.retried += 1,
             Outcome::Dead => self.dead += 1,
             Outcome::Terminated => self.terminated += 1,
+            Outcome::Withheld => self.withheld += 1,
             Outcome::Skipped => {}
         }
     }
@@ -548,6 +657,7 @@ pub(super) async fn finish_call(
     tokens: &TokenMap,
     payload: Vec<u8>,
     price_multiplier: f64,
+    work_class: WorkClass,
     latency: Duration,
     result: Result<ChatResponse, Error>,
 ) -> Outcome {
@@ -571,7 +681,7 @@ pub(super) async fn finish_call(
                 payload: &payload,
                 outcome: CallOutcome::Ok,
             };
-            match audit::record_call_priced(db, record, price_multiplier).await {
+            match audit::record_call_charged(db, record, price_multiplier, work_class).await {
                 Ok(ledger_entry_id) => {
                     let text = redact::rehydrate(&response.text, tokens);
                     if let Err(e) = handler.on_success(lease, &text, ledger_entry_id).await {
@@ -609,7 +719,9 @@ pub(super) async fn finish_call(
                 payload: &payload,
                 outcome: CallOutcome::Error(e.to_string()),
             };
-            if let Err(audit_err) = audit::record_call_priced(db, record, price_multiplier).await {
+            if let Err(audit_err) =
+                audit::record_call_charged(db, record, price_multiplier, work_class).await
+            {
                 tracing::error!(job_id = lease.job_id, error = %audit_err, "ai audit ledger write failed");
             }
             if is_terminal(&e) {

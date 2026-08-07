@@ -1137,6 +1137,13 @@ pub struct AiLimits {
     pub monthly_cost_cap_usd: f64,
     /// Behavior when a cap is hit.
     pub on_cap: OnCap,
+    /// Per-call budget enforcement (soft-cap model downgrade, hard-cap block,
+    /// the bulk sub-budget). Nested under `limits` rather than given its own
+    /// `[ai.budget]` table because it enforces *these* caps at a finer grain:
+    /// `daily_cost_cap_usd`/`daily_token_cap`/`monthly_cost_cap_usd` above are
+    /// where the global budget's hard ceilings come from when no operator
+    /// override has been stored — see [`AiBudget`].
+    pub budget: AiBudget,
 }
 
 impl Default for AiLimits {
@@ -1148,6 +1155,78 @@ impl Default for AiLimits {
             daily_cost_cap_usd: 5.00,
             monthly_cost_cap_usd: 100.00,
             on_cap: OnCap::Pause,
+            budget: AiBudget::default(),
+        }
+    }
+}
+
+/// Budget-enforcer settings — see [`crate::ai::budget`] for what each knob
+/// actually decides.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AiBudget {
+    /// Whether the per-call budget enforcer runs at all. Turning it off does
+    /// **not** turn off `ai.limits`' cycle-level cost gate
+    /// ([`crate::ai::queue::CostGate`]) — that is a separate, coarser control
+    /// that still pauses dispatch when the day's global spend is exhausted.
+    pub enabled: bool,
+    /// Where the soft cap sits, as a fraction of the hard cap, for any cap a
+    /// stored budget row leaves unset. `0.8` means "start downgrading the
+    /// model once 80% of the ceiling is gone." A value outside `0.0..1.0`
+    /// disables the derived soft cap entirely (an explicit soft cap set via
+    /// `SetBudget` still applies).
+    pub soft_cap_ratio: f64,
+    /// The share of a scope's hard caps that bulk work may consume, for any
+    /// scope with no explicit `bulk` budget row. `0.5` means a backlog walk
+    /// can spend at most half the day's budget, leaving the rest for
+    /// interactive and triage work no matter how much backlog there is.
+    pub bulk_share: f64,
+    /// Queue priority at or beyond which a job is charged as bulk work.
+    /// Defaults to [`crate::ai::queue::PRIORITY_BACKFILL`] — a backlog walk
+    /// is bulk; `PRIORITY_NORMAL`/`PRIORITY_RECENT` work is not.
+    pub bulk_priority: i64,
+    /// The model ids a soft-cap downgrade steps between.
+    pub ladder: AiModelLadder,
+}
+
+impl Default for AiBudget {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            soft_cap_ratio: 0.8,
+            bulk_share: 0.5,
+            bulk_priority: 500,
+            ladder: AiModelLadder::default(),
+        }
+    }
+}
+
+/// The `opus → sonnet → haiku` ladder a soft cap steps down.
+///
+/// Every default here is a model id [`crate::ai::estimate_cost_usd`]'s pricing
+/// table knows. That is load-bearing, not incidental: a downgrade to a model
+/// the ledger cannot price would record `cost_usd = 0.0` for every call made
+/// after the soft cap engaged, so crossing the soft cap would make the *hard*
+/// cap unreachable — the budget would stop counting exactly when it matters
+/// most. An operator retargeting this ladder at a newer model id must add it
+/// to that table in the same change.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AiModelLadder {
+    /// Top rung.
+    pub opus: String,
+    /// Middle rung.
+    pub sonnet: String,
+    /// Bottom rung; nothing steps below it.
+    pub haiku: String,
+}
+
+impl Default for AiModelLadder {
+    fn default() -> Self {
+        Self {
+            opus: "claude-opus-4-8".to_owned(),
+            sonnet: "claude-sonnet-5".to_owned(),
+            haiku: "claude-haiku-4-5".to_owned(),
         }
     }
 }

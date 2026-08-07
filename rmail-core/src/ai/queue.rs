@@ -98,6 +98,21 @@
 //! every branch, the provider is either never reached or explicitly skipped;
 //! it is never called and then discarded after the fact.
 //!
+//! [`crate::ai::budget::BudgetEnforcer`] (task 76) is the second half of the
+//! same seam, one level finer. [`CostGate`] answers a question about the
+//! whole cycle — "has this daemon's global daily spend run out?" — which is
+//! all it can answer, because it is consulted once, before anything is
+//! leased, when no account or model is yet known. The per-account caps, the
+//! bulk sub-budget, and the soft-cap model downgrade all need a *specific*
+//! job: they are therefore evaluated inside [`AiWorkerPool::process_one`],
+//! after the pass handler has chosen a model and before redaction and the
+//! provider call. Both act before dispatch; they differ only in what they can
+//! see. A job the enforcer blocks is released back to `pending` rather than
+//! terminated — a daily cap rolls over at midnight, so the work is still
+//! wanted, and [`AiQueue::release`] hands back the attempt `lease` charged it
+//! so a week of capped-out cycles cannot quietly exhaust `max_attempts` and
+//! quarantine work that was never actually tried.
+//!
 //! # Batch mode and why its bookkeeping does not survive a restart
 //!
 //! [`BatchCoordinator::maybe_submit`] flips a pass from the live per-request
@@ -301,6 +316,13 @@ pub struct AiLease {
     pub account_id: i64,
     /// Which pass this lease is for.
     pub pass: String,
+    /// The queue priority this job was enqueued at. Carried onto the lease
+    /// (rather than left behind on the row) because it is what
+    /// [`crate::ai::budget::WorkClass::for_priority`] classifies a job as
+    /// bulk or interactive by, and the budget check happens per job on the
+    /// dispatch path — re-reading `ai_queue` for one integer that was already
+    /// in hand at lease time would be a second round trip per call.
+    pub priority: i64,
     /// How many times this job has been attempted, including this one.
     pub attempts: i64,
     /// When the lease lapses (unix seconds).
@@ -732,7 +754,7 @@ impl AiQueue {
                              updated_at = unixepoch()
                          WHERE job_id = ?1
                          RETURNING job_id, message_id, account_id, pass, attempts,
-                                   lease_expires_at, leased_by",
+                                   lease_expires_at, leased_by, priority",
                     )?;
                     for job_id in candidates {
                         let row = claim.query_row(
@@ -972,6 +994,63 @@ impl AiQueue {
         Ok(held)
     }
 
+    /// Return a leased job to `pending` without charging it an attempt, and
+    /// hold it out of the candidate set until `next_attempt_at`.
+    ///
+    /// [`Self::release`] with a deadline, and the difference matters. A job
+    /// the budget enforcer withheld ([`crate::ai::budget`]) cannot run until
+    /// its blocking window rolls over, but `release` leaves
+    /// `next_attempt_at` alone — so `lease`, which orders by
+    /// `(priority, enqueued_at, job_id)`, would hand back the same jobs on
+    /// every tick for as long as the cap held. That is a fixed cost per tick
+    /// in leases, spend scans, and write transactions, and worse, it is
+    /// head-of-line starvation: a capped account's oldest jobs would sit at
+    /// the front of the candidate set and keep an *uncapped* account's work
+    /// from ever being leased. Setting the deadline drops the job out of the
+    /// candidate set entirely (`lease`'s own `next_attempt_at <= now`
+    /// filter) until it can actually run.
+    ///
+    /// The attempt refund is [`Self::release`]'s, for [`Self::release`]'s
+    /// reason: `lease` already incremented `attempts`, and a job that was
+    /// never dispatched must not lose a retry to a cap it never got to spend
+    /// against.
+    ///
+    /// Returns whether this worker still held the lease — a job reaped and
+    /// re-leased elsewhere is left alone, the same fencing every other
+    /// transition here uses.
+    ///
+    /// # Errors
+    /// A mapped storage error.
+    pub async fn defer(&self, lease: &AiLease, next_attempt_at: i64) -> Result<bool, Error> {
+        let job_id = lease.job_id;
+        let worker = lease.worker.clone();
+        let held = self
+            .db
+            .write(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE ai_queue
+                     SET state = 'pending', attempts = MAX(attempts - 1, 0),
+                         next_attempt_at = ?3,
+                         lease_expires_at = NULL, leased_by = NULL, batch_id = NULL,
+                         updated_at = unixepoch()
+                     WHERE job_id = ?1 AND state = 'leased' AND leased_by = ?2",
+                    rusqlite::params![job_id, worker, next_attempt_at],
+                )?;
+                Ok(changed > 0)
+            })
+            .await?;
+        if held {
+            tracing::debug!(
+                job_id,
+                next_attempt_at,
+                "ai job deferred to pending, uncharged"
+            );
+        } else {
+            tracing::warn!(job_id, "deferred an ai job this worker no longer holds");
+        }
+        Ok(held)
+    }
+
     /// Return jobs whose lease has lapsed to the queue — called at the start
     /// of every [`AiWorkerPool::dispatch_pending`] cycle, and should also be
     /// called periodically even when nothing is actively dispatching, so a
@@ -1170,6 +1249,7 @@ struct RawLease {
     attempts: i64,
     lease_expires_at: i64,
     worker: String,
+    priority: i64,
 }
 
 fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiLease> {
@@ -1181,12 +1261,14 @@ fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiLease> {
         attempts: row.get(4)?,
         lease_expires_at: row.get(5)?,
         worker: row.get(6)?,
+        priority: row.get(7)?,
     };
     Ok(AiLease {
         job_id: raw.job_id,
         message_id: raw.message_id,
         account_id: raw.account_id,
         pass: raw.pass,
+        priority: raw.priority,
         attempts: raw.attempts,
         lease_expires_at: raw.lease_expires_at,
         worker: raw.worker,

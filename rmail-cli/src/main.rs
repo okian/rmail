@@ -13,11 +13,13 @@ use clap::{Parser, Subcommand};
 use note_cli::{NoteAction, NotesArgs};
 use rmail_core::socket_path_from_env;
 use rmail_proto::v1::admin_service_client::AdminServiceClient;
+use rmail_proto::v1::ai_policy_service_client::AiPolicyServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
-    analyze_event, AnalyzeMessageRequest, EventKind, GetSummaryRequest, GetUsageRequest,
-    ListTokensRequest, MintTokenRequest, RetryFailedRequest, RevokeTokenRequest, SetPausedRequest,
+    analyze_event, AnalyzeMessageRequest, BudgetCaps, BudgetClass, BudgetWindowCaps, ClassSpend,
+    EventKind, GetSpendRequest, GetSummaryRequest, GetUsageRequest, ListTokensRequest,
+    MintTokenRequest, RetryFailedRequest, RevokeTokenRequest, SetBudgetRequest, SetPausedRequest,
     SuggestReplyRequest, Summary, SyncFolderRequest, SyncMode, WatchEventsRequest,
 };
 use search_cli::{SearchArgs, SimilarArgs};
@@ -177,6 +179,69 @@ enum AiAction {
         #[arg(long)]
         month: bool,
     },
+    /// Per-account and global spend budgets
+    /// (`AiPolicyService.SetBudget`/`GetSpend`).
+    Budget {
+        #[command(subcommand)]
+        action: BudgetAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BudgetAction {
+    /// Store the caps for one scope (`AiPolicyService.SetBudget`).
+    ///
+    /// A cap left off the command line is left *uncapped*, not set to zero:
+    /// the enforcer's boundary is `>=`, so `--daily-hard-usd 0` forbids all
+    /// spending while omitting it forbids none. Setting a budget replaces
+    /// whatever was stored for that scope, so pass every cap you want in
+    /// force, not just the one you are changing.
+    Set {
+        /// Account id to budget, or 0 (the default) for the global budget
+        /// every call counts toward.
+        #[arg(long, default_value_t = 0)]
+        account: i64,
+        /// Budget the bulk sub-budget (backlog work) instead of the
+        /// everything budget. A bulk call is checked against both.
+        #[arg(long)]
+        bulk: bool,
+        /// Downgrade the model (opus -> sonnet -> haiku) at or above this
+        /// many dollars spent today.
+        #[arg(long)]
+        daily_soft_usd: Option<f64>,
+        /// Block dispatch at or above this many dollars spent today.
+        #[arg(long)]
+        daily_hard_usd: Option<f64>,
+        /// Downgrade the model at or above this many tokens spent today.
+        #[arg(long)]
+        daily_soft_tokens: Option<i64>,
+        /// Block dispatch at or above this many tokens spent today.
+        #[arg(long)]
+        daily_hard_tokens: Option<i64>,
+        /// Downgrade the model at or above this many dollars spent this
+        /// calendar month.
+        #[arg(long)]
+        monthly_soft_usd: Option<f64>,
+        /// Block dispatch at or above this many dollars spent this calendar
+        /// month.
+        #[arg(long)]
+        monthly_hard_usd: Option<f64>,
+        /// Downgrade the model at or above this many tokens spent this
+        /// calendar month.
+        #[arg(long)]
+        monthly_soft_tokens: Option<i64>,
+        /// Block dispatch at or above this many tokens spent this calendar
+        /// month.
+        #[arg(long)]
+        monthly_hard_tokens: Option<i64>,
+    },
+    /// Spend so far today and this month against the caps in force
+    /// (`AiPolicyService.GetSpend`).
+    Status {
+        /// Account id to report, or 0 (the default) for the global budget.
+        #[arg(long, default_value_t = 0)]
+        account: i64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -242,6 +307,7 @@ async fn main() -> Result<()> {
             AiAction::Pause => ai_set_paused(&socket, true).await,
             AiAction::Resume => ai_set_paused(&socket, false).await,
             AiAction::Cost { month } => ai_cost(&socket, month).await,
+            AiAction::Budget { action } => ai_budget(&socket, action).await,
         },
         Command::Note { action } => note_cli::dispatch(&socket, action).await,
         Command::Notes(args) => note_cli::list(&socket, args).await,
@@ -666,6 +732,160 @@ async fn ai_cost(socket: &Path, month: bool) -> Result<()> {
         period.day, period.requests, period.input_tokens, period.output_tokens, period.cost_usd
     );
     Ok(())
+}
+
+async fn ai_policy_client(
+    socket: &Path,
+) -> Result<AiPolicyServiceClient<tonic::transport::Channel>> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    Ok(AiPolicyServiceClient::new(channel))
+}
+
+/// `mail ai budget set/status`.
+async fn ai_budget(socket: &Path, action: BudgetAction) -> Result<()> {
+    match action {
+        BudgetAction::Set {
+            account,
+            bulk,
+            daily_soft_usd,
+            daily_hard_usd,
+            daily_soft_tokens,
+            daily_hard_tokens,
+            monthly_soft_usd,
+            monthly_hard_usd,
+            monthly_soft_tokens,
+            monthly_hard_tokens,
+        } => {
+            let class = if bulk {
+                BudgetClass::Bulk
+            } else {
+                BudgetClass::All
+            };
+            let response = ai_policy_client(socket)
+                .await?
+                .set_budget(SetBudgetRequest {
+                    account_id: account,
+                    class: class.into(),
+                    caps: Some(BudgetCaps {
+                        daily: Some(BudgetWindowCaps {
+                            soft_usd: daily_soft_usd,
+                            hard_usd: daily_hard_usd,
+                            soft_tokens: daily_soft_tokens,
+                            hard_tokens: daily_hard_tokens,
+                        }),
+                        monthly: Some(BudgetWindowCaps {
+                            soft_usd: monthly_soft_usd,
+                            hard_usd: monthly_hard_usd,
+                            soft_tokens: monthly_soft_tokens,
+                            hard_tokens: monthly_hard_tokens,
+                        }),
+                    }),
+                })
+                .await
+                .context("SetBudget RPC failed")?
+                .into_inner();
+            println!(
+                "budget stored for {} ({})",
+                scope_label(response.account_id),
+                class_label(response.class())
+            );
+            if let Some(caps) = &response.caps {
+                print_caps(caps);
+            }
+            Ok(())
+        }
+        BudgetAction::Status { account } => {
+            let spend = ai_policy_client(socket)
+                .await?
+                .get_spend(GetSpendRequest {
+                    account_id: account,
+                })
+                .await
+                .context("GetSpend RPC failed")?
+                .into_inner();
+            println!(
+                "{} — day {}, month {}",
+                scope_label(spend.account_id),
+                spend.day,
+                spend.month
+            );
+            for class in [spend.all.as_ref(), spend.bulk.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                print_class_spend(class);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn scope_label(account_id: i64) -> String {
+    if account_id == 0 {
+        "global budget".to_owned()
+    } else {
+        format!("account {account_id}")
+    }
+}
+
+fn class_label(class: BudgetClass) -> &'static str {
+    match class {
+        BudgetClass::All => "all",
+        BudgetClass::Bulk => "bulk",
+        BudgetClass::Unspecified => "unspecified",
+    }
+}
+
+fn print_caps(caps: &BudgetCaps) {
+    for (window, window_caps) in [
+        ("daily", caps.daily.as_ref()),
+        ("monthly", caps.monthly.as_ref()),
+    ] {
+        let Some(window_caps) = window_caps else {
+            continue;
+        };
+        println!(
+            "  {window:<8} soft ${} / hard ${}, soft {} / hard {} tokens",
+            opt_usd(window_caps.soft_usd),
+            opt_usd(window_caps.hard_usd),
+            opt_count(window_caps.soft_tokens),
+            opt_count(window_caps.hard_tokens),
+        );
+    }
+}
+
+fn print_class_spend(class: &ClassSpend) {
+    let source = if class.stored {
+        "set"
+    } else {
+        "derived from ai.limits"
+    };
+    println!("\n{} budget ({source}):", class_label(class.class()));
+    for (window, spend) in [
+        ("daily", class.daily.as_ref()),
+        ("monthly", class.monthly.as_ref()),
+    ] {
+        let Some(spend) = spend else { continue };
+        println!(
+            "  {window:<8} spent ${:.4}, {} tokens",
+            spend.usd, spend.tokens
+        );
+    }
+    if let Some(caps) = &class.caps {
+        print_caps(caps);
+    }
+}
+
+/// A dollar cap, or `-` when that dimension is uncapped. Uncapped is not
+/// zero: printing `$0.00` for an absent cap would read as "spend nothing".
+fn opt_usd(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |v| format!("{v:.4}"))
+}
+
+fn opt_count(value: Option<i64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |v| v.to_string())
 }
 
 /// A formatted, human-readable rendering of a `Summary` — shared by

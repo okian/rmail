@@ -38,6 +38,17 @@
 //! billed but not counted, or counted but not billed). Its rows are derived,
 //! not evidentiary, so nothing here protects it from `UPDATE`.
 //!
+//! # `work_class` is attribution, and it lives here for a reason
+//!
+//! `V27__ai_budget.sql` adds `ai_ledger.work_class`, written by
+//! [`record_call_charged`]. [`crate::ai::budget`] derives every spend figure
+//! it enforces from this table — there is no counter table beside it — and
+//! deriving a *bulk* sub-budget requires knowing which calls were bulk. That
+//! fact belongs on the evidentiary row, next to the tokens and the payload
+//! hash it describes, not in a side table that could drift from it. Nothing
+//! in this module reads the column back; [`crate::ai::budget`] filters on it
+//! in SQL, which is the only place it is ever needed.
+//!
 //! # What links an AI artifact to its ledger entry
 //!
 //! [`record_call`] returns the new row's `id`. Later tasks that persist an AI
@@ -54,6 +65,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
+use crate::ai::budget::WorkClass;
 use crate::ai::provider::Usage;
 use crate::error::{Error, Result};
 use crate::storage::Database;
@@ -289,6 +301,19 @@ fn pricing_for(model: &str) -> Option<ModelPricing> {
     })
 }
 
+/// Whether this table can price `model` at all.
+///
+/// Exposed because an unpriced model is not merely a cosmetic gap for
+/// [`crate::ai::budget`]: a call recorded at `cost_usd = 0.0` never moves a
+/// dollar cap, so routing traffic to an unpriced model would make the budget
+/// enforcer's hard cap unreachable. The enforcer checks this before
+/// downgrading to a configured ladder id and refuses the downgrade rather
+/// than spending against a ceiling that has stopped counting.
+#[must_use]
+pub fn is_priced(model: &str) -> bool {
+    pricing_for(model).is_some()
+}
+
 /// Estimate the USD cost of one call from its token usage.
 ///
 /// Returns `0.0` (and logs a warning) for a model id this table does not
@@ -332,6 +357,35 @@ pub async fn record_call(db: &Database, record: CallRecord<'_>) -> Result<i64> {
     record_call_priced(db, record, 1.0).await
 }
 
+/// As [`record_call_priced`], but says which budget the call is charged to
+/// ([`crate::ai::budget`], task 76) — written to `ai_ledger.work_class`.
+///
+/// The work class is a *parameter* rather than a [`CallRecord`] field so that
+/// [`record_call`] and [`record_call_priced`] keep their existing signatures
+/// and semantics: every call site that predates budgets — including
+/// `rmaild::AiApi`'s forced `AnalyzeMessage`/`SuggestReply`, which are
+/// interactive by definition — is charged as
+/// [`WorkClass::Interactive`] without needing to say so. The only caller that
+/// passes something else is the queue's dispatch path, which is the only one
+/// that knows a job's priority.
+///
+/// Attribution here is what makes the bulk sub-budget enforceable at all: a
+/// call recorded without it is charged to the ordinary caps, which
+/// under-consumes the bulk reservation (conservative) rather than escaping
+/// every cap (not).
+///
+/// # Errors
+///
+/// A mapped storage error.
+pub async fn record_call_charged(
+    db: &Database,
+    record: CallRecord<'_>,
+    price_multiplier: f64,
+    work_class: WorkClass,
+) -> Result<i64> {
+    record_call_inner(db, record, price_multiplier, work_class).await
+}
+
 /// As [`record_call`], but scales the computed cost by `price_multiplier`
 /// before it is stored. The Message Batches API's 50% discount
 /// ([`crate::ai::queue::BatchCoordinator`], task 47) is the motivating case,
@@ -348,11 +402,24 @@ pub async fn record_call(db: &Database, record: CallRecord<'_>) -> Result<i64> {
 /// # Errors
 ///
 /// A mapped storage error.
-#[tracing::instrument(skip(db, record), fields(model = %record.model, cost_usd, id))]
 pub async fn record_call_priced(
     db: &Database,
     record: CallRecord<'_>,
     price_multiplier: f64,
+) -> Result<i64> {
+    record_call_inner(db, record, price_multiplier, WorkClass::Interactive).await
+}
+
+/// The one function that writes `ai_ledger`. Both public entry points above
+/// funnel through it so there is exactly one `INSERT` statement to keep in
+/// step with the schema — see the module docs on why this module is the only
+/// thing that appends to the ledger.
+#[tracing::instrument(skip(db, record), fields(model = %record.model, cost_usd, id))]
+async fn record_call_inner(
+    db: &Database,
+    record: CallRecord<'_>,
+    price_multiplier: f64,
+    work_class: WorkClass,
 ) -> Result<i64> {
     let payload_sha256 = Sha256::digest(record.payload).to_vec();
     let cost_usd = estimate_cost_usd(&record.model, record.usage) * price_multiplier;
@@ -382,8 +449,8 @@ pub async fn record_call_priced(
                 created_at, account_id, message_id, request_id, model, pass,
                 input_tokens, output_tokens, cache_creation_input_tokens,
                 cache_read_input_tokens, cost_usd, redaction_level, latency_ms,
-                payload_sha256, status, error
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                payload_sha256, status, error, work_class
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             RETURNING id",
                 rusqlite::params![
                     created_at,
@@ -402,6 +469,7 @@ pub async fn record_call_priced(
                     payload_sha256,
                     status.as_str(),
                     error,
+                    work_class.as_str(),
                 ],
                 |row| row.get(0),
             )?;

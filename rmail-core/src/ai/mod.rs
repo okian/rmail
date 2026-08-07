@@ -50,6 +50,7 @@
 //! from wiring in, not a redesign.
 
 pub mod audit;
+pub mod budget;
 pub mod deep;
 pub mod dispatch;
 pub mod policy;
@@ -59,8 +60,13 @@ pub mod redact;
 pub mod triage;
 
 pub use audit::{
-    estimate_cost_usd, query_calls, record_call, record_call_priced, usage_for_day, AuditFilter,
-    CallOutcome, CallRecord, CallStatus, DayUsage, LedgerEntry,
+    estimate_cost_usd, query_calls, record_call, record_call_charged, record_call_priced,
+    usage_for_day, AuditFilter, CallOutcome, CallRecord, CallStatus, DayUsage, LedgerEntry,
+};
+pub use budget::{
+    get_budget, micros_to_usd, set_budget, spend_report, usd_to_micros, Budget, BudgetCaps,
+    BudgetClass, BudgetEnforcer, BudgetRequest, BudgetVerdict, ClassReport, ModelTier, Severity,
+    Spend, SpendReport, WindowCaps, WindowSpend, WorkClass, GLOBAL_ACCOUNT_ID,
 };
 pub use deep::{DeepPassGate, DeepPassHandler};
 pub use dispatch::{

@@ -57,8 +57,9 @@ use futures::StreamExt;
 use rmail_core::ai::provider::StreamFrame;
 use rmail_core::ai::queue::{assemble_content, payload_bytes, AiLease, PassHandler};
 use rmail_core::ai::{
-    self, deep, triage, AiPauseFlag, AiQueue, CallOutcome, CallRecord, CapDecision, CostGate,
-    DeepPassHandler, GuardedRequest, PolicyEngine, PolicyTarget, Provider, RateLimiter, TokenMap,
+    self, deep, triage, AiPauseFlag, AiQueue, BudgetEnforcer, BudgetRequest, BudgetVerdict,
+    CallOutcome, CallRecord, CapDecision, CostGate, DeepPassHandler, GuardedRequest, PolicyEngine,
+    PolicyTarget, Provider, RateLimiter, TokenMap, WorkClass,
 };
 use rmail_core::config::{AiLimits, AiPrivacy};
 use rmail_core::events::{Event as CoreEvent, EventKind, EventLog, NewEvent};
@@ -510,11 +511,80 @@ impl AiApi {
             .await
             .map_err(Status::from)?;
         let account_id = content.account_id;
-        let request = self
+        let mut request = self
             .deep
             .build_request(&content)
             .await
             .map_err(Status::from)?;
+
+        // The per-call budget enforcer (task 76), at the same point in the
+        // pipeline `ai::queue::worker::process_one` consults it: after
+        // `build_request` has named a model (so a soft cap has something to
+        // downgrade) and before anything that could reach the network. The
+        // `CostGate` check above is not a substitute — it can only speak for
+        // this daemon's global daily spend, while this account may have a
+        // budget of its own, and it has no notion of a model tier at all.
+        // Without this, `mail ai process` would be a documented way to spend
+        // past a per-account cap the queue enforces.
+        //
+        // Charged as `WorkClass::Interactive`: a user is waiting on this
+        // call, which is also what `record_call` (used by
+        // `persist_forced_result`) attributes it as, so the check and the
+        // charge agree.
+        let verdict = BudgetEnforcer {
+            db: &self.db,
+            limits: &self.limits,
+        }
+        .evaluate(&BudgetRequest {
+            account_id,
+            model: &request.model,
+            work_class: WorkClass::Interactive,
+            now: chrono::Utc::now().timestamp(),
+        })
+        .await
+        .map_err(Status::from)?;
+        match verdict {
+            BudgetVerdict::Allow => {}
+            BudgetVerdict::Downgrade { model, reason } => {
+                tracing::info!(
+                    message_id,
+                    from = %request.model,
+                    to = %model,
+                    reason = %reason,
+                    "ai budget soft cap: downgrading this forced analysis"
+                );
+                request.model = model;
+            }
+            BudgetVerdict::Block { reason, .. } => {
+                // The detailed reason names the scope and the figures
+                // (`global all budget: daily usd hard cap reached (4500000
+                // of 5000000)`) — that is aggregate spend, and this RPC only
+                // requires `ai.invoke`, while `GetSpend`/`GetUsage` require
+                // `admin` precisely so a token minted to summarize mail
+                // cannot read the account's total AI dollar spend. So the
+                // detail goes to the log and the client is told only that a
+                // cap was reached, matching what the `CostGate` rejection
+                // above already discloses.
+                tracing::info!(
+                    message_id,
+                    reason = %reason,
+                    "ai budget hard cap: refusing a forced deep analysis"
+                );
+                // `RESOURCE_EXHAUSTED`, per prd.md's error table, which maps
+                // budget exhaustion to exactly that code. The `CostGate`
+                // rejection above still returns `FAILED_PRECONDITION`: that
+                // is task 50's existing contract for a condition clients may
+                // already branch on, and changing it is not this task's to
+                // make.
+                return Err(Status::from(Error::resource_exhausted(
+                    "an AI spend budget has been reached; a forced deep analysis cannot run \
+                     until the window resets or an operator raises the budget"
+                        .to_owned(),
+                )));
+            }
+        }
+        let request = request;
+
         match rmail_core::ai::guard(&request, &self.privacy) {
             GuardedRequest::RedactedSkip => Err(Status::from(Error::failed_precondition(
                 "nothing was left to analyze once PII was redacted from this message".to_owned(),
@@ -889,6 +959,11 @@ fn synthetic_lease(message_id: i64, account_id: i64) -> AiLease {
         message_id,
         account_id,
         pass: deep::PASS.to_owned(),
+        // A forced `AnalyzeMessage`/`SuggestReply` is the definition of
+        // interactive work — a user is waiting on it — so it carries the
+        // priority the queue reserves for exactly that, and the budget
+        // enforcer charges it to the interactive side of the ledger.
+        priority: rmail_core::ai::queue::PRIORITY_RECENT,
         attempts: 0,
         lease_expires_at: 0,
         worker: "ai-service-forced".to_owned(),

@@ -306,6 +306,34 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AiService/RetryFailed",
         Requirement::Scope(Scope::Admin),
     ),
+    // -- AiPolicyService (task 76) --------------------------------------------
+    // Both rows are `admin`, and neither is `AiSpend`.
+    //
+    // `Scope::AiSpend(cap)` is tempting here — it is literally named for
+    // dollars — but it is the wrong requirement, for the same structural
+    // reason its own doc comment gives: this table is keyed by method name
+    // alone and cannot see a request's amount, so requiring `AiSpend(n)`
+    // would have to pick some fixed `n` unrelated to the budget being set.
+    // Worse, the relationship runs backwards. `AiSpend` bounds what a token
+    // may *spend*; `SetBudget` changes what *every* token may spend, for
+    // every account this daemon serves. A token granted `ai.spend:5` would,
+    // under an `AiSpend`-scoped SetBudget, be able to raise the global cap to
+    // $500 and then spend it — the cap it was minted with would bound
+    // nothing at all. Raising a spend limit is administration, not spending,
+    // and sits behind `admin` exactly as `AiService/SetPaused` does for the
+    // same "mutates shared, global state" reason.
+    (
+        "/rmail.v1.AiPolicyService/SetBudget",
+        Requirement::Scope(Scope::Admin),
+    ),
+    // GetSpend is `admin` for the reason `AiService/GetUsage`'s row above
+    // gives verbatim: it exposes *aggregate spend*, not an answer about one
+    // message the caller already named. A token minted to summarize mail
+    // should not also be able to read the account's total AI dollar spend.
+    (
+        "/rmail.v1.AiPolicyService/GetSpend",
+        Requirement::Scope(Scope::Admin),
+    ),
     // -- HookService (task 67) ------------------------------------------------
     // Hooks execute operator-configured shell commands (config-driven, never
     // user-supplied at the RPC layer — see `rmail_core::hooks`'s own module

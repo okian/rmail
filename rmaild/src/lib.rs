@@ -12,6 +12,7 @@
 
 mod account_service;
 mod admin_service;
+mod ai_policy_service;
 mod ai_service;
 mod audit_service;
 mod auth;
@@ -62,6 +63,7 @@ use rmail_core::tags::TagStore;
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
+use rmail_proto::v1::ai_policy_service_server::AiPolicyServiceServer;
 use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::hook_service_server::HookServiceServer;
@@ -684,6 +686,15 @@ where
         stopping.clone(),
     ));
 
+    // The budget control plane. Built unconditionally, unlike `ai_service`'s
+    // dispatch loop: an operator must be able to set and inspect a budget on
+    // a daemon whose AI subsystem is off (that is exactly when a spend cap
+    // gets tightened), and neither RPC touches a provider.
+    let ai_policy_service = AiPolicyServiceServer::new(ai_policy_service::AiPolicyApi::new(
+        db.clone(),
+        config.ai.limits.clone(),
+    ));
+
     // Only spawned when the subsystem is actually active — a disabled/
     // misconfigured daemon must not poll the event log and lease an empty
     // queue forever for nothing, and must never try to build a batch client
@@ -748,6 +759,7 @@ where
         .add_service(tag_service)
         .add_service(search_service)
         .add_service(ai_service)
+        .add_service(ai_policy_service)
         .add_service(hook_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;

@@ -388,6 +388,7 @@ fn lease_for(message_id: i64, account_id: i64) -> AiLease {
         message_id,
         account_id,
         pass: PASS.to_owned(),
+        priority: crate::ai::queue::PRIORITY_NORMAL,
         attempts: 1,
         lease_expires_at: 0,
         worker: "test-worker".to_owned(),

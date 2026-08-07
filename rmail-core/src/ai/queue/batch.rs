@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::OptionalExtension;
 
+use crate::ai::budget::{BudgetEnforcer, BudgetRequest, BudgetVerdict, WorkClass};
 use crate::ai::policy::{PolicyEngine, PolicyTarget};
 use crate::ai::provider::{ChatRequest, ChatResponse, RawMessage, Role};
 use crate::ai::redact::{self, GuardedRequest, TokenMap};
@@ -38,7 +39,9 @@ use crate::storage::Database;
 
 use super::content::assemble_content;
 use super::worker::{finish_call, DispatchSummary, PassHandler};
-use super::{AiLease, AiQueue, CapDecision, CostGate, BATCH_LEASE, BATCH_WORKER};
+use super::{
+    AiLease, AiQueue, CapDecision, CostGate, BATCH_LEASE, BATCH_WORKER, PRIORITY_BACKFILL,
+};
 
 /// The Message Batches API's discount over the live per-request price.
 const BATCH_PRICE_MULTIPLIER: f64 = 0.5;
@@ -477,6 +480,23 @@ struct InFlightItem {
     /// [`crate::ai::audit::record_call_priced`]'s payload hash.
     payload: Vec<u8>,
     tokens: TokenMap,
+    /// Which budget this item is charged to, decided at submission time from
+    /// the job's own queue priority and carried through to
+    /// [`finish_call`] so the ledger row records the class the enforcer
+    /// actually checked. Deciding it again at `poll` time would risk the two
+    /// answers disagreeing — see [`crate::ai::budget::WorkClass::for_priority`].
+    work_class: WorkClass,
+}
+
+/// One submitted-but-not-yet-reconciled batch.
+///
+/// The `pass` is kept alongside the items because [`BatchCoordinator::maybe_submit`]
+/// must be able to ask "is there already a batch of this pass in flight?" —
+/// see its own docs on why stacking submissions is what makes the budget
+/// unenforceable on this path.
+struct PendingBatch {
+    pass: String,
+    items: Vec<InFlightItem>,
 }
 
 /// Orchestrates the batch path: decides when to flip (`maybe_submit`), and
@@ -492,7 +512,7 @@ pub struct BatchCoordinator {
     privacy: AiPrivacy,
     batching: AiBatching,
     handlers: Arc<HashMap<String, Arc<dyn PassHandler>>>,
-    pending: Mutex<HashMap<String, Vec<InFlightItem>>>,
+    pending: Mutex<HashMap<String, PendingBatch>>,
     /// Passed straight through to [`finish_call`] from [`Self::poll`] — see
     /// that function's own docs on why it, not this coordinator, owns
     /// publishing `AiSummary` events.
@@ -575,6 +595,35 @@ impl BatchCoordinator {
     /// [`super::AiWorkerPool::dispatch_pending`]'s `Dropping` arm exactly:
     /// the backlog is leased and terminated rather than submitted.
     ///
+    /// # At most one batch per pass is in flight, and that bound is what
+    /// makes the budget enforceable here
+    ///
+    /// A batch's spend does not reach `ai_ledger` until [`Self::poll`]
+    /// reconciles its results, which can be up to 24 hours after submission.
+    /// [`crate::ai::budget`] derives every figure it enforces *from* that
+    /// ledger, so an un-reconciled batch is spend the enforcer cannot see.
+    /// Submitting a second batch while the first is outstanding therefore
+    /// grades it against a snapshot that is knowingly stale — and since
+    /// [`crate::ai::dispatch::AiDispatchLoop`] calls this every tick
+    /// (5 seconds by default) while `depth_for_pass` counts only `pending`
+    /// rows, nothing about the already-submitted work would stop the next
+    /// tick submitting another `max_batch` (5000 by default) items. A 50k
+    /// backlog would be submitted in its entirety inside a minute, every
+    /// item approved by a ledger still reading $0.00, and the bulk
+    /// sub-budget would bind on nothing.
+    ///
+    /// So this returns `None` while any batch of `pass` is still tracked in
+    /// [`Self::pending`]. Unaccounted spend is then bounded by one
+    /// submission's worth, and the next submission grades against a ledger
+    /// that includes it. This costs throughput on a large backlog — the
+    /// backlog drains one batch per reconciliation rather than all at once —
+    /// which is the correct trade for a control whose entire job is to stop
+    /// spending: a cap that can be outrun by submitting faster is not a cap.
+    ///
+    /// The per-item check in [`Self::prepare_item`] stays as well; it is
+    /// what applies per-account caps and the soft-cap downgrade to each
+    /// individual item, which a single pre-lease gate cannot do.
+    ///
     /// # Errors
     /// A mapped storage error, or the HTTP/credential failure from actually
     /// submitting — in which case every job this call leased is returned to
@@ -589,6 +638,20 @@ impl BatchCoordinator {
         }
         let depth = self.queue.depth_for_pass(pass).await?;
         if depth < i64::from(self.batching.threshold) {
+            return Ok(None);
+        }
+
+        // One batch per pass in flight — see this method's own docs on why
+        // stacking submissions makes every budget on this path unenforceable.
+        // Checked before the cost gate and before leasing so a backlog under
+        // an outstanding batch costs nothing at all per tick.
+        if self.has_batch_in_flight(pass) {
+            tracing::debug!(
+                pass,
+                depth,
+                "a batch of this pass is still awaiting reconciliation; not submitting another \
+                 until its spend has reached the ledger"
+            );
             return Ok(None);
         }
 
@@ -615,6 +678,38 @@ impl BatchCoordinator {
                 return Ok(None);
             }
             CapDecision::Open | CapDecision::TriageOnly => {}
+        }
+
+        // The bulk budget, once, before anything is leased. Every job on
+        // this path is bulk work by construction (batch mode only engages on
+        // a backlog), so an exhausted bulk sub-budget means there is nothing
+        // to submit — and answering that before leasing keeps a capped-out
+        // backlog from leasing, assembling, redacting, and releasing
+        // `max_batch` jobs every tick to reach the same conclusion.
+        //
+        // Evaluated with no model named: a pre-lease gate is only asking
+        // "may bulk work run at all right now?", which is the hard-cap
+        // question. An unnameable model classifies onto no rung of the
+        // ladder, so a soft cap resolves `Allow` here and is applied
+        // per item in `prepare_item`, where a real model is known.
+        let gate = BudgetEnforcer {
+            db: &self.db,
+            limits: &self.limits,
+        }
+        .evaluate(&BudgetRequest {
+            account_id: crate::ai::budget::GLOBAL_ACCOUNT_ID,
+            model: "",
+            work_class: WorkClass::Bulk,
+            now: chrono::Utc::now().timestamp(),
+        })
+        .await?;
+        if let BudgetVerdict::Block { reason, .. } = gate {
+            tracing::info!(
+                pass,
+                reason = %reason,
+                "ai budget hard cap: not submitting a batch"
+            );
+            return Ok(None);
         }
 
         let take = depth.min(i64::from(self.batching.max_batch));
@@ -644,13 +739,14 @@ impl BatchCoordinator {
         let mut in_flight = Vec::with_capacity(leases.len());
         for lease in &leases {
             match self.prepare_item(lease, &handler).await {
-                Ok(Some((item, tokens, payload))) => {
+                Ok(Some((item, tokens, payload, work_class))) => {
                     in_flight.push(InFlightItem {
                         job_id: lease.job_id,
                         message_id: lease.message_id,
                         account_id: lease.account_id,
                         payload,
                         tokens,
+                        work_class,
                     });
                     items.push(item);
                 }
@@ -686,7 +782,13 @@ impl BatchCoordinator {
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(handle.id.clone(), in_flight);
+            .insert(
+                handle.id.clone(),
+                PendingBatch {
+                    pass: pass.to_owned(),
+                    items: in_flight,
+                },
+            );
         if let Err(e) = self.queue.mark_batched(&job_ids, &handle.id).await {
             tracing::error!(
                 batch_id = %handle.id,
@@ -704,6 +806,17 @@ impl BatchCoordinator {
         Ok(Some(handle.id))
     }
 
+    /// Whether this coordinator still holds an un-reconciled batch of
+    /// `pass` — see [`Self::maybe_submit`]'s docs on why that blocks another
+    /// submission.
+    fn has_batch_in_flight(&self, pass: &str) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|batch| batch.pass == pass)
+    }
+
     /// Return every leased-but-not-yet-submitted item to `pending` (via
     /// [`AiQueue::fail`], so the attempt is charged and backed off like any
     /// other transient failure) after `resolve_key`/`submit` failed, and
@@ -716,6 +829,7 @@ impl BatchCoordinator {
                 message_id: item.message_id,
                 account_id: item.account_id,
                 pass: String::new(),
+                priority: PRIORITY_BACKFILL,
                 attempts: 0,
                 lease_expires_at: 0,
                 worker: BATCH_WORKER.to_owned(),
@@ -772,12 +886,12 @@ impl BatchCoordinator {
         // payloads and token maps on the first hiccup.
         let results = self.client.results(key.expose(), batch_id).await?;
 
-        let items = self
+        let tracked = self
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(batch_id);
-        let Some(items) = items else {
+        let Some(PendingBatch { items, .. }) = tracked else {
             return Err(Error::failed_precondition(format!(
                 "batch {batch_id}'s in-memory record disappeared while fetching its results \
                  (a concurrent poll of the same batch?); nothing was processed this call"
@@ -812,6 +926,7 @@ impl BatchCoordinator {
                 message_id: item.message_id,
                 account_id: item.account_id,
                 pass: handler.pass().to_owned(),
+                priority: PRIORITY_BACKFILL,
                 attempts: 0,
                 lease_expires_at: 0,
                 worker: BATCH_WORKER.to_owned(),
@@ -835,6 +950,7 @@ impl BatchCoordinator {
                 &item.tokens,
                 item.payload.clone(),
                 BATCH_PRICE_MULTIPLIER,
+                item.work_class,
                 std::time::Duration::ZERO,
                 provider_result,
             )
@@ -875,7 +991,7 @@ impl BatchCoordinator {
         &self,
         lease: &AiLease,
         handler: &Arc<dyn PassHandler>,
-    ) -> Result<Option<(BatchRequestItem, TokenMap, Vec<u8>)>, Error> {
+    ) -> Result<Option<(BatchRequestItem, TokenMap, Vec<u8>, WorkClass)>, Error> {
         let Some((account_name, mailbox_name)) = target_names(&self.db, lease.message_id).await?
         else {
             self.queue
@@ -928,6 +1044,69 @@ impl BatchCoordinator {
             }
             Err(e) => return Err(e),
         };
+
+        // The budget enforcer, at exactly the point `worker.rs`'s live path
+        // consults it: after the handler has named a model (so a soft cap has
+        // something to downgrade) and before anything that could reach the
+        // network. `CostGate` already ran once for the whole submission in
+        // `maybe_submit`, but it can only speak for the daemon's global daily
+        // spend; per-account caps and the bulk sub-budget need a specific
+        // job, and a Message Batches submission is a real, billed provider
+        // call — an item that must not be paid for has to be dropped from
+        // the request body, not merely skipped when the results come back.
+        //
+        // The class comes from the job's own queue priority, exactly as the
+        // live path derives it — not hardcoded to `Bulk`. Batch mode engages
+        // on queue *depth*, which is not the same question as "was this work
+        // a backlog walk": a burst of 200 freshly-synced `PRIORITY_NORMAL`
+        // messages crosses `ai.batching.threshold` too, and charging those
+        // to the backlog's reserved share would let ordinary new mail eat it.
+        // `WorkClass::for_priority` is the single answer both paths use, so
+        // the two cannot disagree.
+        let charge = WorkClass::for_priority(lease.priority, self.limits.budget.bulk_priority);
+        let mut request = request;
+        let verdict = BudgetEnforcer {
+            db: &self.db,
+            limits: &self.limits,
+        }
+        .evaluate(&BudgetRequest {
+            account_id: lease.account_id,
+            model: &request.model,
+            work_class: charge,
+            now: chrono::Utc::now().timestamp(),
+        })
+        .await?;
+        match verdict {
+            BudgetVerdict::Allow => {}
+            BudgetVerdict::Downgrade { model, reason } => {
+                tracing::info!(
+                    job_id = lease.job_id,
+                    from = %request.model,
+                    to = %model,
+                    reason = %reason,
+                    "ai budget soft cap: downgrading this batch item's model"
+                );
+                request.model = model;
+            }
+            BudgetVerdict::Block { reason, retry_at } => {
+                tracing::info!(
+                    job_id = lease.job_id,
+                    reason = %reason,
+                    retry_at,
+                    "ai budget hard cap: dropping this job from the batch; it is not submitted"
+                );
+                // Deferred, not terminated or failed — the same disposition
+                // the live path uses, for the same reasons: the window rolls
+                // over and the work is still wanted, so it must not lose an
+                // attempt to a cap it never got to spend against, and it must
+                // not sit at the head of the candidate set re-blocking every
+                // tick while an uncapped account's jobs queue behind it.
+                self.queue.defer(lease, retry_at).await?;
+                return Ok(None);
+            }
+        }
+        let request = request;
+
         match redact::guard(&request, &self.privacy) {
             GuardedRequest::RedactedSkip => {
                 self.queue.terminate(lease, "redacted_skip").await?;
@@ -941,7 +1120,7 @@ impl BatchCoordinator {
                     custom_id: lease.message_id.to_string(),
                     params: request,
                 };
-                Ok(Some((item, tokens, payload)))
+                Ok(Some((item, tokens, payload, charge)))
             }
         }
     }

@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// AiPolicyService is the AI governance control plane: the budgets that decide
+// what may be spent, on whose behalf, and on which model.
+//
+// Deliberately separate from AiService. AiService is the *data* plane —
+// summaries, on-demand analysis, the queue's own pause switch — and its reads
+// answer "what did the pipeline produce for this message." The RPCs here
+// change or report the rules the pipeline runs under, which is a different
+// privilege (see rmaild's method->scope table: SetBudget is `admin`, the same
+// as every other daemon-wide control-plane toggle) and a different lifecycle:
+// a budget outlives every job it governs.
+//
+// prd.md scopes redaction (RedactPreview/SetRedactionLevel) and residency
+// (Evaluate/SetAiMode) to this service too. Those are tasks 39/41's surface
+// and are not declared here — an RPC with no handler would be served as
+// UNIMPLEMENTED while looking, from reflection, like a shipped feature.
+service AiPolicyService {
+  // Store the caps for one scope. Idempotent: a second SetBudget for the
+  // same (account, class) replaces the first rather than accumulating.
+  //
+  // A cap left unset means "no cap on that dimension", which is not the same
+  // as zero — see BudgetCaps. Clearing a previously-set cap is therefore
+  // SetBudget with that field absent, not SetBudget with it set to 0 (which
+  // would forbid all spending).
+  rpc SetBudget(SetBudgetRequest) returns (SetBudgetResponse);
+
+  // Spend so far today and this month for one scope, against the caps
+  // actually in force — stored if an operator set them, derived from
+  // `ai.limits` otherwise. The RPC behind `mail ai budget status`.
+  rpc GetSpend(GetSpendRequest) returns (GetSpendResponse);
+}
+
+// Which calls a budget governs.
+enum BudgetClass {
+  BUDGET_CLASS_UNSPECIFIED = 0;
+  // Every call in the scope counts against it.
+  BUDGET_CLASS_ALL = 1;
+  // Only bulk work (a backlog walk) counts against it. A bulk call is
+  // checked against this *and* the ALL budget, so exhausting the sub-budget
+  // stops the backlog without touching what interactive work may still
+  // spend.
+  BUDGET_CLASS_BULK = 2;
+}
+
+// Caps for one window. Every field is optional; an absent field means that
+// dimension is uncapped. Dollars are doubles on the wire and are converted to
+// the integer micro-dollars the enforcer compares in — see
+// rmail_core::ai::budget's module docs on why a cap is never compared as a
+// float.
+message BudgetWindowCaps {
+  // Downgrade the model (opus -> sonnet -> haiku) at or above this spend.
+  optional double soft_usd = 1;
+  // Block dispatch at or above this spend.
+  optional double hard_usd = 2;
+  // Downgrade the model at or above this many tokens.
+  optional int64 soft_tokens = 3;
+  // Block dispatch at or above this many tokens.
+  optional int64 hard_tokens = 4;
+}
+
+// Both windows' caps for one scope and class.
+message BudgetCaps {
+  // Over the current UTC calendar day.
+  BudgetWindowCaps daily = 1;
+  // Over the current UTC calendar month.
+  BudgetWindowCaps monthly = 2;
+}
+
+// Spend over one window.
+message BudgetSpend {
+  double usd = 1;
+  // Every token: input, output, cache write, and cache read.
+  int64 tokens = 2;
+}
+
+message SetBudgetRequest {
+  // 0 = the global budget (every call counts toward it, whichever account it
+  // was made for); otherwise an account id from AccountService.List.
+  int64 account_id = 1;
+  BudgetClass class = 2;
+  BudgetCaps caps = 3;
+}
+
+message SetBudgetResponse {
+  // The budget as stored, echoed back so a client sees exactly what took
+  // effect rather than assuming its request round-tripped.
+  int64 account_id = 1;
+  BudgetClass class = 2;
+  BudgetCaps caps = 3;
+}
+
+message GetSpendRequest {
+  // 0 = the global budget; otherwise an account id.
+  int64 account_id = 1;
+}
+
+// One class's spend and the caps it is measured against.
+message ClassSpend {
+  BudgetClass class = 1;
+  BudgetSpend daily = 2;
+  BudgetSpend monthly = 3;
+  // The caps actually in force.
+  BudgetCaps caps = 4;
+  // Whether an operator stored these caps via SetBudget, as opposed to them
+  // being derived from `ai.limits`. "Unset" and "set to exactly the
+  // configured default" behave identically today but diverge the moment the
+  // configuration changes, so a client rendering a budget must be able to
+  // tell them apart.
+  bool stored = 5;
+}
+
+message GetSpendResponse {
+  int64 account_id = 1;
+  // The UTC day the daily figures cover, "YYYY-MM-DD".
+  string day = 2;
+  // The UTC month the monthly figures cover, "YYYY-MM".
+  string month = 3;
+  // Every call in this scope.
+  ClassSpend all = 4;
+  // Bulk calls in this scope.
+  ClassSpend bulk = 5;
+}
