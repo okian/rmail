@@ -389,24 +389,70 @@ async fn a_malformed_file_of_every_format_is_a_status_not_a_panic() {
 async fn a_zip_bomb_does_not_get_to_declare_its_own_size() {
     // A zip declares its uncompressed size in the header and is under no
     // obligation to be telling the truth. The bound has to be on the read.
-    let payload = "<w:p><w:r><w:t>x</w:t></w:r></w:p>".repeat(400_000);
-    let docx = zip_bytes(&[(
-        "word/document.xml",
-        &format!("<w:document><w:body>{payload}</w:body></w:document>"),
-    )]);
+    //
+    // The output cap below (`MAX_TEXT_BYTES`) does not prove that on its own:
+    // an extractor that read all 13 MB and *then* truncated its result would
+    // satisfy it while doing exactly the unbounded work this test exists to
+    // rule out. So the read bound is measured by how cost responds to input
+    // size. Doubling the archive must not double the time — past the cap the
+    // extractor should stop, so the second one costs about what the first
+    // does. An absolute wall-clock bound was tried first and is not viable
+    // here: it measures the machine, and it failed at 20.3s against a 20s
+    // limit purely because another container was building alongside it.
+    // Each paragraph carries 200 characters, so 15,000 of them yield ~3 MB of
+    // text — comfortably past `MAX_TEXT_BYTES` (2 MB), which is the whole
+    // point. An earlier version of this test used one character per paragraph
+    // and 400,000 paragraphs: ~800 KB, *under* the cap, so the cap never
+    // engaged and the extractor was measured doing ordinary bounded work. Both
+    // the timing assertion and `len() <= MAX_TEXT_BYTES` passed trivially
+    // without either one ever exercising a bomb.
+    let filler = "x".repeat(200);
+    let build = |reps: usize| {
+        let payload = format!("<w:p><w:r><w:t>{filler}</w:t></w:r></w:p>").repeat(reps);
+        zip_bytes(&[(
+            "word/document.xml",
+            &format!("<w:document><w:body>{payload}</w:body></w:document>"),
+        )])
+    };
+    let small = build(15_000);
+    let double = build(30_000);
+
     let started = std::time::Instant::now();
-    let (status, text) = extract(Format::Docx, docx).await.unwrap();
+    let (status, text) = extract(Format::Docx, small).await.unwrap();
+    let small_elapsed = started.elapsed();
+
+    let started = std::time::Instant::now();
+    let (double_status, double_text) = extract(Format::Docx, double).await.unwrap();
+    let double_elapsed = started.elapsed();
 
     assert!(matches!(status, Status::Ok | Status::Empty));
+    assert!(matches!(double_status, Status::Ok | Status::Empty));
+    // The cap must actually engage, or the rest of this test proves nothing.
+    assert!(
+        text.truncated,
+        "the fixture no longer exceeds MAX_TEXT_BYTES ({} bytes produced), so \
+         this test is not exercising the cap at all",
+        text.text.len()
+    );
     assert!(
         text.text.len() <= MAX_TEXT_BYTES,
         "produced {} bytes",
         text.text.len()
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
-        "took {:?}",
-        started.elapsed()
+        double_text.text.len() <= MAX_TEXT_BYTES,
+        "twice the archive produced {} bytes",
+        double_text.text.len()
+    );
+    // 1.6x leaves room for the extra inflate the bigger archive genuinely
+    // costs, while still separating "stopped at the cap" from "read it all":
+    // a read proportional to input would land at ~2x or beyond. Load moves
+    // both measurements together, so the ratio holds on a busy machine.
+    let ratio = double_elapsed.as_secs_f64() / small_elapsed.as_secs_f64().max(0.001);
+    assert!(
+        ratio < 1.6,
+        "cost scaled with the archive rather than stopping at the cap: \
+         {small_elapsed:?} for 15k paragraphs vs {double_elapsed:?} for 30k ({ratio:.2}x)"
     );
 }
 
