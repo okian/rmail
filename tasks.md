@@ -538,7 +538,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core tags::` · `cargo nextest run -p rmaild tag_service`
 
 ## 56. Notes subsystem
-- [ ] status
+- [x] status
 - **depends-on:** 6, 18
 - **parallel-safe:** yes
 - **acceptance:**
@@ -637,7 +637,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core rules::` · `cargo nextest run -p rmaild rule_service` (eval, dry-run, cache reuse)
 
 ## 67. Hooks dispatcher
-- [ ] status
+- [x] status
 - **depends-on:** 14
 - **parallel-safe:** yes
 - **acceptance:**
