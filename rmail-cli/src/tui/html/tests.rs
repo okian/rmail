@@ -186,7 +186,7 @@ fn the_opener_returns_without_waiting_for_the_handler_to_exit() {
 }
 
 #[test]
-fn sweep_removes_this_processs_files_and_leaves_everyone_elses_alone() {
+fn sweep_removes_files_from_this_process_and_leaves_everyone_elses_alone() {
     let opener = Recorder::default();
     let mine = open_in_browser(555, "<p>private</p>", &opener).unwrap();
 
