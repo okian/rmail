@@ -67,6 +67,17 @@ V15 and V17 are permanently unused, which costs nothing. **Next free: V21.**
   full suite, suspect a latent race before suspecting the merge that happened
   to be in flight, and reproduce it by asserting on ordering directly rather
   than on the downstream side effect.
+- **Reclaim the host side too, and do it *before* dispatching a wave.** The
+  disk hit 100% (12 GiB free of 1.8 TiB) with three agents already launched
+  and about to need ~7 GB of host `target/` each. Three places accumulate,
+  and they are independent: Docker's named volumes (see above), each
+  worktree's host-side `target/`, and the main checkout's own `target/`.
+  Clearing every stale worktree's `target/` took `.claude/worktrees` from
+  13 GB to 92 MB; dropping the main `target/` bought another 9 GB. All three
+  are pure build output — deleting them costs a rebuild and nothing else, so
+  do it freely, but delete only the *build output*, never the worktree
+  checkouts: `git worktree remove` would also drop branches that still hold
+  preserved WIP commits.
 - **Do not union-merge structured code by deduplicating lines.** A script that
   keeps "lines from theirs not already in ours" silently drops repeated closing
   braces and attributes, which are exactly what Rust has a lot of. It happened
