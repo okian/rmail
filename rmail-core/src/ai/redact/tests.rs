@@ -194,10 +194,12 @@ fn a_jwt_is_tokenized() {
 
 #[test]
 fn a_labeled_secret_redacts_only_the_value_not_the_label() {
-    // gitleaks:allow — a synthetic fixture, not a credential. A module whose
-    // job is recognizing secrets has to contain things that look like secrets;
-    // the alternative is a detector nobody can test.
-    let content = redacted_content("api_key: abcdef123456 is in the .env file");
+    // A synthetic fixture, not a credential. A module whose job is
+    // recognizing secrets has to contain things that look like secrets; the
+    // alternative is a detector nobody can test. The annotation has to sit on
+    // the offending line itself — gitleaks does not look at the line above,
+    // which is why this was still being reported.
+    let content = redacted_content("api_key: abcdef123456 is in the .env file"); // gitleaks:allow
     assert_eq!(content, "api_key: ⟦SECRET_1⟧ is in the .env file");
 }
 

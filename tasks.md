@@ -715,7 +715,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core extract::tables extract::events extract::links`
 
 ## 76. Budget enforcer
-- [ ] status
+- [x] status
 - **depends-on:** 45, 46
 - **parallel-safe:** yes
 - **acceptance:**

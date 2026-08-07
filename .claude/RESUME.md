@@ -6,10 +6,15 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-Tasks **24 is not done**; merged so far are **25, 26, 27, 28, 38, 39, 43, 44,
-45, 46, 47, 86**. Each was verified on the *combined* tree after merge, not
-merely in its own worktree: 1080/1080 tests, clippy clean, `cargo deny` and
-`cargo audit` clean, `buf lint` + `buf breaking` clean, gitleaks clean.
+**47 of 86 done, 39 remaining.** `tasks.md` is authoritative — count with
+`grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
+after merge, never on the agent's own report: currently **1616/1616** tests,
+clippy clean, `buf lint` clean.
+
+Two defects have been found in already-merged work by the full-suite run
+rather than by the task that introduced them (a hook-dispatcher boot race, a
+budget enforcer that did not bound in-flight batches). Re-running the whole
+suite after each merge is what catches those; do not skip it.
 
 ## Unfinished work preserved on branches
 
@@ -31,8 +36,8 @@ The rule now is: whatever number a branch used, rename it at merge to
 `max_merged + 1` and fix any `-- Vnn:` references inside the file. Never
 reference a migration version from Rust.
 
-Merged: V1–V14, V16, V18 (ai_ledger), V19 (retrievers), V20 (ai_queue).
-V15 and V17 are permanently unused, which costs nothing. **Next free: V21.**
+Merged: V1–V14, V16, V18–V25. V15 and V17 are permanently unused, which
+costs nothing. **Next free: V26.**
 
 ## Orchestration notes worth not relearning
 
@@ -58,7 +63,13 @@ V15 and V17 are permanently unused, which costs nothing. **Next free: V21.**
   the whole link phase through serially instead, then run the suite normally:
   `scripts/docker-test.sh -- sh -c 'CARGO_BUILD_JOBS=1 cargo nextest run
   --locked --workspace --all-features --no-run'`. (`docker-test.sh` passes no
-  env through, hence the `--` escape hatch.)
+  env through, hence the `--` escape hatch.) Once every binary is linked, the
+  plain `scripts/docker-test.sh` run is fine — the OOM is a *link-time* memory
+  problem, not a test-time one. This is not merely a contention artifact: the
+  task-76 agent hit the identical SIGKILL three times **with an exclusive
+  container slot**, and only got green by narrowing to per-package runs with
+  `-j 1|2`. Treat serial linking as the normal procedure, not a workaround,
+  until the Docker VM gets more memory.
 - **A green suite is not a race-free suite.** The full parallel run is the
   only thing on this project that has ever exercised enough scheduling
   pressure to expose a boot-ordering race — it caught one in the hook
