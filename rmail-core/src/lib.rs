@@ -16,6 +16,7 @@ pub mod error;
 pub mod events;
 pub mod features;
 pub mod fuse;
+pub mod hooks;
 pub mod imap;
 pub mod index;
 pub mod mail;

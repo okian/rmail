@@ -105,6 +105,16 @@ fn defaults_match_prd() {
         assert_eq!(cfg.grpc.limits.max_message_bytes, 16_777_216);
         assert_eq!(cfg.grpc.events.retention_days, 7);
 
+        // hooks
+        assert!(cfg.hooks.enabled);
+        assert_eq!(cfg.hooks.max_concurrency, 4);
+        assert_eq!(
+            cfg.hooks.default_timeout.as_duration(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(cfg.hooks.max_output_bytes, 64 * 1024);
+        assert!(cfg.hooks.hooks.is_empty());
+
         // no accounts by default
         assert!(cfg.accounts.is_empty());
         Ok(())
@@ -270,6 +280,142 @@ fn ai_policy_rule_without_mode_is_rejected() {
         assert!(
             matches!(err, ConfigError::Invalid(_)),
             "expected Invalid, got: {err}"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn hooks_parse_with_defaults_for_optional_fields() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let toml = r#"
+[hooks]
+max_concurrency = 8
+default_timeout = "10s"
+
+[[hooks.hooks]]
+name = "notify-new-mail"
+event = "on_new_message"
+command = "/usr/local/bin/notify"
+args = ["--flag", "value"]
+
+[[hooks.hooks]]
+name = "log-sync-errors"
+event = "on_sync_error"
+command = "/usr/local/bin/log-error"
+enabled = false
+timeout = "5s"
+"#;
+        let cfg = Config::from_toml_str(toml).map_err(fe)?;
+
+        assert_eq!(cfg.hooks.max_concurrency, 8);
+        assert_eq!(
+            cfg.hooks.default_timeout.as_duration(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(cfg.hooks.hooks.len(), 2);
+
+        let first = &cfg.hooks.hooks[0];
+        assert_eq!(first.name, "notify-new-mail");
+        assert_eq!(first.event, HookEvent::OnNewMessage);
+        assert_eq!(first.command, "/usr/local/bin/notify");
+        assert_eq!(first.args, vec!["--flag".to_owned(), "value".to_owned()]);
+        assert!(first.enabled, "enabled defaults to true when omitted");
+        assert_eq!(first.timeout, None, "timeout falls back to the default");
+
+        let second = &cfg.hooks.hooks[1];
+        assert_eq!(second.event, HookEvent::OnSyncError);
+        assert!(!second.enabled);
+        assert_eq!(
+            second.timeout.map(|t| t.as_duration()),
+            Some(Duration::from_secs(5))
+        );
+        assert!(
+            second.args.is_empty(),
+            "args defaults to empty when omitted"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn every_hook_event_wire_form_round_trips() {
+    // Pins the exact snake_case wire vocabulary the PRD/proto name
+    // (`on_new_message`, `on_label`, `on_move`, `on_rule_match`,
+    // `on_sync_error`) rather than leaving it to `serde`'s derived
+    // `rename_all` to define implicitly.
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        for (wire, expected) in [
+            ("on_new_message", HookEvent::OnNewMessage),
+            ("on_label", HookEvent::OnLabel),
+            ("on_move", HookEvent::OnMove),
+            ("on_rule_match", HookEvent::OnRuleMatch),
+            ("on_sync_error", HookEvent::OnSyncError),
+        ] {
+            let toml = format!(
+                "[[hooks.hooks]]\nname = \"h\"\nevent = \"{wire}\"\ncommand = \"/bin/true\"\n"
+            );
+            let cfg = Config::from_toml_str(&toml).map_err(fe)?;
+            assert_eq!(cfg.hooks.hooks[0].event, expected, "wire form {wire:?}");
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn hook_without_a_name_or_command_is_rejected() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let err = Config::from_toml_str(
+            "[[hooks.hooks]]\nevent = \"on_new_message\"\ncommand = \"/bin/true\"\n",
+        )
+        .expect_err("name is required on every hook");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+
+        let err = Config::from_toml_str("[[hooks.hooks]]\nname = \"h\"\nevent = \"on_move\"\n")
+            .expect_err("command is required on every hook");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn hook_with_an_unknown_field_is_rejected() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let err = Config::from_toml_str(
+            "[[hooks.hooks]]\nname = \"h\"\nevent = \"on_move\"\ncommand = \"/bin/true\"\n\
+             shell = \"true\"\n",
+        )
+        .expect_err("unknown key must be rejected, not silently ignored");
+        assert!(matches!(err, ConfigError::Invalid(_)));
+        Ok(())
+    });
+}
+
+#[test]
+fn hooks_env_overrides_apply_to_scalar_fields() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        jail.set_env("RMAIL_HOOKS__ENABLED", "false");
+        jail.set_env("RMAIL_HOOKS__MAX_CONCURRENCY", "16");
+        jail.set_env("RMAIL_HOOKS__DEFAULT_TIMEOUT", "1m");
+
+        let cfg = Config::from_toml_str("").map_err(fe)?;
+
+        assert!(!cfg.hooks.enabled);
+        assert_eq!(cfg.hooks.max_concurrency, 16);
+        assert_eq!(
+            cfg.hooks.default_timeout.as_duration(),
+            Duration::from_secs(60)
         );
         Ok(())
     });

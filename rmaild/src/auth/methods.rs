@@ -306,6 +306,27 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AiService/RetryFailed",
         Requirement::Scope(Scope::Admin),
     ),
+    // -- HookService (task 67) ------------------------------------------------
+    // Hooks execute operator-configured shell commands (config-driven, never
+    // user-supplied at the RPC layer — see `rmail_core::hooks`'s own module
+    // docs) — `automation` is exactly the scope this table's own header
+    // anticipated for the rules/hooks/webhooks surface (`Scope::Automation`'s
+    // doc comment: "Rules/hooks/webhooks automation surfaces"). ListHooks only
+    // reads the configured (already locally-visible-in-the-config-file) hook
+    // list; TestHook actually spawns one. Both sit behind the same scope
+    // rather than splitting read/write the way `MailService` does, because a
+    // hook's command is itself already an admin-authored artifact — nothing
+    // about *reading* the list is more sensitive than *running* an entry from
+    // it, unlike mail content where reading and mutating are genuinely
+    // different privileges.
+    (
+        "/rmail.v1.HookService/ListHooks",
+        Requirement::Scope(Scope::Automation),
+    ),
+    (
+        "/rmail.v1.HookService/TestHook",
+        Requirement::Scope(Scope::Automation),
+    ),
 ];
 
 /// The requirement for `method` (a full gRPC path like

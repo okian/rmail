@@ -3,7 +3,7 @@
 //! [`serve_uds`] boots the tonic server on a Unix domain socket exposing gRPC
 //! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and the
 //! `AccountService`/`SyncService`/`AdminService`/`MailService`/
-//! `SearchService`/`AiService` handlers — all wrapped in a
+//! `SearchService`/`AiService`/`HookService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -14,6 +14,7 @@ mod admin_service;
 mod ai_service;
 mod audit_service;
 mod auth;
+mod hook_service;
 mod mail_service;
 mod note_service;
 mod search_service;
@@ -25,6 +26,7 @@ pub use admin_service::AdminApi;
 pub use ai_service::AiApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
+pub use hook_service::HookApi;
 pub use mail_service::MailApi;
 pub use note_service::NoteApi;
 pub use search_service::SearchApi;
@@ -45,6 +47,7 @@ use rmail_core::ai::{
 use rmail_core::embed::hash::HashEmbedder;
 use rmail_core::embed::Embedder;
 use rmail_core::events::{EventLog, Retention};
+use rmail_core::hooks::HookDispatcher;
 use rmail_core::imap::mutate::LiveImapMutator;
 use rmail_core::index::semantic::VECTOR_DIM;
 use rmail_core::index::{IndexQueue, QueueOptions as IndexQueueOptions};
@@ -57,6 +60,7 @@ use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
 use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
+use rmail_proto::v1::hook_service_server::HookServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::note_service_server::NoteServiceServer;
 use rmail_proto::v1::search_service_server::SearchServiceServer;
@@ -470,6 +474,35 @@ where
         config.notes.index,
     );
     let note_service = NoteServiceServer::new(NoteApi::new(note_store, stopping.clone()));
+    // `HookService` is always registered (reflection and the auth scope
+    // table must see every RPC regardless of runtime config, the same
+    // convention `AiService`/`ai_active` established below); `hooks.enabled`
+    // gates only whether the background dispatcher consumer actually runs —
+    // `TestHook` stays available either way, since it is an operator-invoked
+    // dry run, not "did the automatic dispatcher fire" (see
+    // `rmail_core::config::HooksConfig::enabled`'s own docs). The
+    // dispatcher is therefore always *built* (so its semaphore exists for
+    // `HookApi` to share — see `hook_service`'s own module docs) but only
+    // conditionally *spawned*, and only when it actually drives at least
+    // one enabled hook: an empty or fully-disabled hook list would
+    // otherwise still pay a retention-window paging scan at boot and a
+    // query every tick for nothing to match against.
+    let hook_dispatcher = HookDispatcher::new(events.clone(), &config.hooks);
+    let hook_service = HookServiceServer::new(HookApi::new(
+        &config.hooks,
+        stopping.clone(),
+        hook_dispatcher.semaphore(),
+    ));
+    let hook_dispatch_handle = if config.hooks.enabled && hook_dispatcher.hook_count() > 0 {
+        Some(hook_dispatcher.spawn(stopping.clone()))
+    } else {
+        tracing::info!(
+            enabled = config.hooks.enabled,
+            hooks = hook_dispatcher.hook_count(),
+            "the hook dispatch loop is not running on this daemon"
+        );
+        None
+    };
 
     // Held for the lifetime of the server (bound here, dropped only when this
     // function returns): a model loaded into an `Arc` that a warming task
@@ -655,12 +688,16 @@ where
         .add_service(note_service)
         .add_service(search_service)
         .add_service(ai_service)
+        .add_service(hook_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
     stopping.cancel();
     let _ = pruner.await;
     if let Some(handle) = ai_dispatch_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = hook_dispatch_handle {
         let _ = handle.await;
     }
 

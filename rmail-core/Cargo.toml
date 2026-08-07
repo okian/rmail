@@ -67,6 +67,11 @@ chrono.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# `hooks::kill_process_group` — see the workspace `Cargo.toml`'s own
+# comment on this dependency.
+libc.workspace = true
+
 [dev-dependencies]
 # Enable figment's `Jail` sandbox for isolated env/file config tests.
 figment = { workspace = true, features = ["test"] }

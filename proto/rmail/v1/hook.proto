@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// HookService exposes the event-hook dispatcher (task 67, prd.md #48):
+// read-only inspection of the configured hooks, plus an on-demand dry run
+// (TestHook) that lets an operator validate a hook's command/timeout without
+// waiting for a real mail event to fire it.
+//
+// Hooks themselves are config-driven (`[hooks]` / `[[hooks.hooks]]` in the
+// master TOML) — there is no Create/Update/Delete RPC here. `mail hook add`
+// is a local config-file editor, not a CRUD client of this service; see
+// `rmail-cli::hook_cli`'s own module docs for why writing straight to the
+// operator's config file is the correct place for that, not a new RPC.
+service HookService {
+  // List every configured hook, enabled and disabled alike.
+  rpc ListHooks(ListHooksRequest) returns (ListHooksResponse);
+
+  // Run one hook immediately with a synthetic or caller-supplied event
+  // payload, subject to the same stdin-only/timeout contract a real
+  // dispatch uses, and report exactly what happened. Never touches the
+  // durable event log or the live dispatcher's own worker pool — see
+  // rmail_core::hooks's module docs for why the same run_hook function
+  // underlies both this and the real dispatch path.
+  rpc TestHook(TestHookRequest) returns (TestHookResponse);
+}
+
+// Mirrors `rmail_core::config::HookEvent` — the fixed vocabulary of mail
+// events a hook can subscribe to. Deliberately its own enum, not a reuse of
+// sync.proto's `EventKind`: this is the product-facing hook vocabulary the
+// PRD/CLI name (`on_new_message`, `on_label`, ...), not the durable event
+// bus's internal wire vocabulary the two are not 1:1 with — see the config
+// type's own doc comment.
+enum HookEvent {
+  HOOK_EVENT_UNSPECIFIED = 0;
+  HOOK_EVENT_ON_NEW_MESSAGE = 1;
+  HOOK_EVENT_ON_LABEL = 2;
+  HOOK_EVENT_ON_MOVE = 3;
+  HOOK_EVENT_ON_RULE_MATCH = 4;
+  HOOK_EVENT_ON_SYNC_ERROR = 5;
+}
+
+// One configured hook, as `ListHooks` reports it.
+message HookInfo {
+  string name = 1;
+  HookEvent event = 2;
+  string command = 3;
+  repeated string args = 4;
+  bool enabled = 5;
+  int64 timeout_ms = 6;
+}
+
+message ListHooksRequest {}
+
+message ListHooksResponse {
+  repeated HookInfo hooks = 1;
+}
+
+message TestHookRequest {
+  // Name of a configured hook to run (see ListHooks).
+  string name = 1;
+  // Event JSON to pipe to the hook's stdin, exactly as given — the server
+  // does not interpret it beyond checking it parses as JSON, and it is
+  // NEVER interpolated into the hook's command/args, only ever written to
+  // its stdin (see rmail_core::hooks's module docs on why that is the one
+  // invariant this whole surface exists to protect). Omit to run the hook
+  // against a synthetic sample event shaped like a real dispatch for this
+  // hook's configured event kind.
+  optional string event_json = 2;
+}
+
+message TestHookResponse {
+  // The hook exceeded its timeout and was killed before finishing.
+  bool timed_out = 1;
+  // The hook was cancelled by the daemon shutting down mid-run.
+  bool cancelled = 2;
+  // Absent when the process could not be spawned at all (e.g. the command
+  // was not found), or when it was killed rather than exiting on its own —
+  // mirrors `std::process::ExitStatus::code`'s own absence contract.
+  optional int32 exit_code = 3;
+  // Captured stdout/stderr, truncated to the configured max_output_bytes
+  // and lossily decoded as UTF-8 — diagnostic text for an operator, not a
+  // byte-exact contract.
+  string stdout = 4;
+  string stderr = 5;
+  int64 duration_ms = 6;
+}

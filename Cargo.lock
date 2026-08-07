@@ -2905,6 +2905,7 @@ dependencies = [
  "futures",
  "html2text",
  "hyper-util",
+ "libc",
  "libsqlite3-sys",
  "mail-parser",
  "nucleo-matcher",

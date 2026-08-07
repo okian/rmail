@@ -46,6 +46,12 @@ tokio = { version = "1", features = [
     "signal",
     "sync",
     "time",
+    # `hooks::run_hook` (task 67) spawns a hook's configured command via
+    # `tokio::process::Command` and drains its stdout/stderr concurrently
+    # with writing its stdin via `AsyncReadExt`/`AsyncWriteExt` — "process"
+    # gates the former, "io-util" the latter's extension-trait methods.
+    "process",
+    "io-util",
 ] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = { version = "0.7", default-features = false }
@@ -90,6 +96,13 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
 futures = "0.3"
+# `hooks::kill_process_group` (task 67): killing a whole POSIX process
+# group (`kill(-pid, SIGKILL)`) rather than only the one pid
+# `tokio::process::Child::start_kill` tracks — needed so a timed-out hook
+# that forked children (the documented `sh -c "cmd1; cmd2"` pattern) does
+# not leave them running. Already resolved transitively by nearly every
+# dependency in this tree; this is only promoting it to a direct one.
+libc = "0.2"
 mail-parser = "0.9"
 html2text = "0.12"
 # Attachment text extraction. `pdf-extract` carries ~100 panicking call sites,

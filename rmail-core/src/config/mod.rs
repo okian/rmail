@@ -33,7 +33,7 @@ pub use duration::{parse_human_duration, HumanDuration};
 
 /// Top-level table names accepted from the environment overlay.
 const KNOWN_TABLES: &[&str] = &[
-    "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc",
+    "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc", "hooks",
 ];
 
 /// Errors produced while loading or parsing configuration.
@@ -264,6 +264,8 @@ pub struct Config {
     pub finder: FinderConfig,
     /// gRPC server settings.
     pub grpc: GrpcConfig,
+    /// Event-hook dispatcher settings.
+    pub hooks: HooksConfig,
 }
 
 impl Config {
@@ -1427,6 +1429,126 @@ impl Default for NotesConfig {
             index: true,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
+/// Event-hook dispatcher settings (prd.md #48 "Event Hook Dispatcher"):
+/// config-driven shell commands that fire on mail events, run in a bounded
+/// worker pool with a per-hook timeout. See `rmail_core::hooks`'s own module
+/// docs for the dispatcher itself — in particular, why the event JSON only
+/// ever reaches a hook on stdin, never interpolated into the command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HooksConfig {
+    /// Whether the hook dispatcher's background consumer runs at all.
+    ///
+    /// A disabled dispatcher still registers `HookService` — reflection and
+    /// the auth scope table see every RPC regardless of runtime config, the
+    /// same convention `AiService`/`ai.enabled` already established (see
+    /// `rmaild::serve_uds_with_engine_and_mail_store`'s own comment) — and
+    /// `TestHook` still runs on demand: it is an operator-invoked dry run,
+    /// not "did the automatic dispatcher fire," so it stays available even
+    /// with the automatic path off.
+    pub enabled: bool,
+    /// Bounded worker pool size: the maximum number of hook processes
+    /// running concurrently across every configured hook. `0` is coerced up
+    /// to `1` by `hooks::HookDispatcher::new` — a config typo here degrades
+    /// the dispatcher to fully serial rather than silently running nothing
+    /// at all.
+    pub max_concurrency: u32,
+    /// Default per-hook execution timeout, overridable per hook
+    /// (`[[hooks.hooks]] timeout = "..."`).
+    pub default_timeout: HumanDuration,
+    /// Maximum bytes of stdout/stderr retained per run. Output past this
+    /// cap is still drained (never left to back up the pipe, which would
+    /// stall the hook and, transitively, the dispatcher — see the `hooks`
+    /// module docs), just not kept.
+    pub max_output_bytes: u32,
+    /// Configured hooks.
+    pub hooks: Vec<HookConfig>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_concurrency: 4,
+            default_timeout: HumanDuration::new(secs(30)),
+            max_output_bytes: 64 * 1024,
+            hooks: Vec::new(),
+        }
+    }
+}
+
+/// One configured hook: a shell command bound to a mail event.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookConfig {
+    /// Unique, human-chosen name — what `ListHooks`/`TestHook` and
+    /// `mail hook add`/`mail hook test` address it by. A duplicate name is
+    /// not rejected by this type (TOML has no native way to reject a
+    /// duplicate key across array-of-table elements); `hooks::resolve`
+    /// drops later duplicates with a logged warning instead — see that
+    /// function's own docs.
+    pub name: String,
+    /// Which mail event fires this hook.
+    pub event: HookEvent,
+    /// The program to execute — resolved via `$PATH`, exactly like
+    /// `std::process::Command::new`; never a shell. An operator who wants
+    /// shell features (pipes, redirects, globbing) names `/bin/sh` here
+    /// with `args = ["-c", "..."]`, the same convention cron/systemd use —
+    /// this field itself performs no shell interpretation, which is what
+    /// keeps the event JSON's stdin-only contract airtight (see the
+    /// `hooks` module docs).
+    pub command: String,
+    /// Additional argv entries, in order, after `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Whether this hook is active. A disabled hook is still listed by
+    /// `ListHooks` and runnable via `TestHook` (an operator validating a
+    /// hook before flipping it on), but the dispatcher never fires it from
+    /// a real event.
+    #[serde(default = "default_hook_enabled")]
+    pub enabled: bool,
+    /// Per-hook timeout override. Falls back to `hooks.default_timeout`
+    /// when unset.
+    #[serde(default)]
+    pub timeout: Option<HumanDuration>,
+}
+
+const fn default_hook_enabled() -> bool {
+    true
+}
+
+/// The fixed vocabulary of mail events a hook can subscribe to (prd.md #48).
+///
+/// Deliberately its own type rather than a reuse of `events::EventKind`: a
+/// hook's vocabulary is the *product* surface named in the PRD/proto
+/// (`on_new_message`, `on_label`, ...), while `EventKind` is the durable
+/// event bus's internal wire vocabulary — and the two are not 1:1.
+/// `OnSyncError` in particular names no distinct `EventKind` at all; it is
+/// `EventKind::SyncState` filtered to entries whose payload carries a
+/// non-null `error` (see `hooks::hook_matches` for exactly that filter).
+/// Collapsing the two enums into one would either invent an `EventKind` no
+/// other subscriber publishes, or leak dispatcher-internal filtering into
+/// the wire/config contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    /// A new message synced (`events::EventKind::NewMail`).
+    OnNewMessage,
+    /// A message's flags/labels changed (`events::EventKind::FlagChanged`).
+    OnLabel,
+    /// A message moved between folders (`events::EventKind::Moved`).
+    OnMove,
+    /// A rule matched and acted (`events::EventKind::RuleFired`).
+    OnRuleMatch,
+    /// A sync pass recorded an error (`events::EventKind::SyncState` whose
+    /// payload's `error` field is non-null).
+    OnSyncError,
 }
 
 // ---------------------------------------------------------------------------

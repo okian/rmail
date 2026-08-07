@@ -1,5 +1,6 @@
 //! The `mail` CLI — a thin gRPC client for the rmail daemon.
 
+mod hook_cli;
 mod note_cli;
 mod search_cli;
 
@@ -76,6 +77,13 @@ enum Command {
     },
     /// List notes on a message or thread (`NoteService.ListNotes`).
     Notes(NotesArgs),
+    /// Event hooks: config-driven shell commands on mail events
+    /// (`HookService`; `add` edits the local config file directly — see
+    /// `hook_cli`'s own module docs).
+    Hook {
+        #[command(subcommand)]
+        action: hook_cli::HookAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,6 +199,7 @@ async fn main() -> Result<()> {
         },
         Command::Note { action } => note_cli::dispatch(&socket, action).await,
         Command::Notes(args) => note_cli::list(&socket, args).await,
+        Command::Hook { action } => hook_cli::run(&socket, action).await,
     }
 }
 
