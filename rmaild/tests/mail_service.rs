@@ -175,6 +175,22 @@ impl ImapMutator for FakeImap {
         }
         Ok(())
     }
+
+    // Not exercised by this suite (task 55's tag keyword round-trip has its
+    // own gRPC test, `tag_service.rs`) — present only so this fake satisfies
+    // the full `ImapMutator` trait.
+    async fn store_keyword(
+        &self,
+        _account_id: i64,
+        _mailbox: &str,
+        _uidvalidity: i64,
+        _uids: &[i64],
+        _keyword: &str,
+        _prefer_gmail_label: bool,
+        _add: bool,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

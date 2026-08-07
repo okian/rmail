@@ -3,6 +3,7 @@
 mod hook_cli;
 mod note_cli;
 mod search_cli;
+mod tag_cli;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,6 +21,7 @@ use rmail_proto::v1::{
     SuggestReplyRequest, Summary, SyncFolderRequest, SyncMode, WatchEventsRequest,
 };
 use search_cli::{SearchArgs, SimilarArgs};
+use tag_cli::{TagArgs, TagsArgs, UntagArgs};
 use tokio_stream::StreamExt;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
@@ -83,6 +85,50 @@ enum Command {
     Hook {
         #[command(subcommand)]
         action: hook_cli::HookAction,
+    },
+    /// Apply one or more tags to a message, thread, or bulk selection
+    /// (`TagService.AddTag`/`BulkTag`).
+    Tag(TagArgs),
+    /// Bulk-apply tags to every message a filter-only query selects
+    /// (`TagService.BulkTag`).
+    #[command(name = "tag-bulk")]
+    TagBulk {
+        /// Filter-only query (`from:`/`to:`/`subject:`/`is:`/`in:`/
+        /// `has:attachment`/`tag:`).
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        account: i64,
+        /// Tag name(s) to apply.
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Remove one or more tags from a message or thread
+    /// (`TagService.RemoveTag`).
+    Untag(UntagArgs),
+    /// List tags, or create one (`TagService.ListTags`/`CreateTag`).
+    Tags(TagsArgs),
+    /// Print a message's pending AI tag suggestions
+    /// (`TagService.SuggestTags`). Never triggers a model call — task 57
+    /// owns generating suggestions; this only displays what is pending.
+    #[command(name = "suggest-tags")]
+    SuggestTags {
+        /// Message id.
+        message_id: i64,
+    },
+    /// Accept pending suggestions by id, as printed by `suggest-tags`
+    /// (`TagService.ResolveSuggestion`).
+    #[command(name = "accept-tags")]
+    AcceptTags {
+        #[arg(required = true)]
+        message_tag_ids: Vec<i64>,
+    },
+    /// Reject pending suggestions by id, as printed by `suggest-tags`
+    /// (`TagService.ResolveSuggestion`).
+    #[command(name = "reject-tags")]
+    RejectTags {
+        #[arg(required = true)]
+        message_tag_ids: Vec<i64>,
     },
 }
 
@@ -200,6 +246,21 @@ async fn main() -> Result<()> {
         Command::Note { action } => note_cli::dispatch(&socket, action).await,
         Command::Notes(args) => note_cli::list(&socket, args).await,
         Command::Hook { action } => hook_cli::run(&socket, action).await,
+        Command::Tag(args) => tag_cli::tag(&socket, args).await,
+        Command::TagBulk {
+            query,
+            account,
+            tags,
+        } => tag_cli::bulk_tag(&socket, account, query, tags).await,
+        Command::Untag(args) => tag_cli::untag(&socket, args).await,
+        Command::Tags(args) => tag_cli::tags(&socket, args).await,
+        Command::SuggestTags { message_id } => tag_cli::suggest_tags(&socket, message_id).await,
+        Command::AcceptTags { message_tag_ids } => {
+            tag_cli::resolve_suggestions(&socket, message_tag_ids, true).await
+        }
+        Command::RejectTags { message_tag_ids } => {
+            tag_cli::resolve_suggestions(&socket, message_tag_ids, false).await
+        }
     }
 }
 

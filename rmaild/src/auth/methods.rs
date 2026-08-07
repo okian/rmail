@@ -327,6 +327,44 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.HookService/TestHook",
         Requirement::Scope(Scope::Automation),
     ),
+    // -- TagService (task 55) -------------------------------------------------
+    // `ListTags`/`SuggestTags` are pure reads over the local mirror (no IMAP
+    // round trip — `SuggestTags` in particular never calls a model, see
+    // `rmaild::tag_service`'s own docs), so `mail.read` is the right ceiling,
+    // the same reasoning `MailService`'s reads sit behind. Every mutation
+    // (`AddTag`/`RemoveTag`/`CreateTag`/`BulkTag`/`ResolveSuggestion`) can
+    // reflect to IMAP and always writes `message_tags`/`tags`, so those sit
+    // behind `mail.write` — matching `MailService::SetFlags`'s row exactly,
+    // since a tag is conceptually the same kind of per-message annotation a
+    // flag is.
+    (
+        "/rmail.v1.TagService/ListTags",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.TagService/SuggestTags",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.TagService/AddTag",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.TagService/RemoveTag",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.TagService/CreateTag",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.TagService/BulkTag",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.TagService/ResolveSuggestion",
+        Requirement::Scope(Scope::MailWrite),
+    ),
 ];
 
 /// The requirement for `method` (a full gRPC path like

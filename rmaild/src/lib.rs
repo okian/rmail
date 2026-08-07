@@ -4,6 +4,7 @@
 //! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and the
 //! `AccountService`/`SyncService`/`AdminService`/`MailService`/
 //! `SearchService`/`AiService`/`HookService` handlers — all wrapped in a
+//! `SearchService`/`AiService`/`TagService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -19,6 +20,7 @@ mod mail_service;
 mod note_service;
 mod search_service;
 mod sync_service;
+mod tag_service;
 mod trace;
 
 pub use account_service::AccountApi;
@@ -31,6 +33,7 @@ pub use mail_service::MailApi;
 pub use note_service::NoteApi;
 pub use search_service::SearchApi;
 pub use sync_service::SyncApi;
+pub use tag_service::TagApi;
 pub use trace::RequestTraceLayer;
 
 use std::future::Future;
@@ -55,6 +58,7 @@ use rmail_core::mail::MailStore;
 use rmail_core::notes::NoteStore;
 use rmail_core::rank::l1::Weights;
 use rmail_core::sync::{SyncEngine, SyncOptions};
+use rmail_core::tags::TagStore;
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
@@ -65,6 +69,7 @@ use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::note_service_server::NoteServiceServer;
 use rmail_proto::v1::search_service_server::SearchServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
+use rmail_proto::v1::tag_service_server::TagServiceServer;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
@@ -337,6 +342,12 @@ where
 /// the whole process" is [`rmail_core::embed::Embedder`]'s own documented
 /// contract.
 ///
+/// `TagService` is wired here too, over a [`TagStore`] built the same way
+/// `mail_store` is expected to have been (a real [`LiveImapMutator`]) —
+/// tests that need `TagService`'s IMAP calls to go through a fake mutator
+/// instead should call [`serve_uds_with_stores`] directly, the identical
+/// seam this function already is for `MailStore`.
+///
 /// # Errors
 ///
 /// As [`serve_uds`], plus [`ServeError::InvalidRankWeights`] under the same
@@ -346,6 +357,53 @@ pub async fn serve_uds_with_engine_and_mail_store<F>(
     db: Database,
     engine: SyncEngine,
     mail_store: MailStore,
+    config: &Config,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let tag_store = TagStore::new(
+        db.clone(),
+        std::sync::Arc::new(LiveImapMutator::new(db.clone())),
+        config.tags.clone(),
+    );
+    serve_uds_with_stores(
+        socket_path,
+        db,
+        engine,
+        mail_store,
+        tag_store,
+        config,
+        shutdown,
+    )
+    .await
+}
+
+/// [`serve_uds_with_engine_and_mail_store`] over a caller-supplied
+/// [`TagStore`] as well — for tests that need `TagService`'s IMAP calls to
+/// go through a fake [`rmail_core::imap::mutate::ImapMutator`] rather than
+/// [`LiveImapMutator`]'s real one, the identical reason
+/// [`serve_uds_with_engine_and_mail_store`] exists for `MailStore`.
+/// Production code has no reason to call this directly.
+///
+/// This is the function every other `serve_uds*` entry point in this module
+/// ultimately delegates to; extracting it (rather than adding a `tag_store`
+/// parameter to [`serve_uds_with_engine_and_mail_store`] directly) is what
+/// keeps every existing caller's signature — and therefore every sibling
+/// task's own test harness already calling it — unchanged by task 55's
+/// addition.
+///
+/// # Errors
+///
+/// As [`serve_uds`], plus [`ServeError::InvalidRankWeights`] under the same
+/// condition [`serve_uds_with_engine`] documents.
+pub async fn serve_uds_with_stores<F>(
+    socket_path: impl AsRef<Path>,
+    db: Database,
+    engine: SyncEngine,
+    mail_store: MailStore,
+    tag_store: TagStore,
     config: &Config,
     shutdown: F,
 ) -> Result<(), ServeError>
@@ -463,6 +521,7 @@ where
     let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
     let mail_service = MailServiceServer::new(MailApi::new(mail_store, stopping.clone()));
+    let tag_service = TagServiceServer::new(TagApi::new(tag_store));
 
     // A dedicated `IndexQueue` handle rather than reusing the AI subsystem's
     // (below) — `IndexQueue` is a cheap, stateless wrapper over `db` (see its
@@ -686,6 +745,7 @@ where
         .add_service(sync_service)
         .add_service(mail_service)
         .add_service(note_service)
+        .add_service(tag_service)
         .add_service(search_service)
         .add_service(ai_service)
         .add_service(hook_service)

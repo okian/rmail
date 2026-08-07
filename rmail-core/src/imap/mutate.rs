@@ -74,6 +74,31 @@
 //! exactly where it was — a caller can inspect the mailbox and retry, rather
 //! than the local mirror silently disagreeing with a partially-moved message.
 //!
+//! # `store_keyword` is a delta `STORE`, not `set_flags`' full replace
+//!
+//! [`store_keyword`](ImapMutator::store_keyword) is task 55's addition, the
+//! model [`set_flags`](ImapMutator::set_flags) it is a sibling of rather
+//! than a copy: applying or removing one tag must never disturb any other
+//! flag or tag already on the same message the way a full-replace `STORE
+//! FLAGS` would, so this issues `+FLAGS.SILENT (kw)` / `-FLAGS.SILENT (kw)`
+//! instead — an additive/subtractive delta. It also takes a *set* of UIDs,
+//! not one: task 55's bulk-tag path coalesces every message that shares a
+//! mailbox into a single `STORE` over a compact UID set (`5,7:9,12`) rather
+//! than one round trip per message, and `set_flags`'s one-UID-at-a-time
+//! shape has no room for that. A single-message apply is simply the `uids.len()
+//! == 1` case of the same call, not a separate code path.
+//!
+//! Gmail's non-standard `X-GM-LABELS` item is used instead of `FLAGS` when
+//! `prefer_gmail_label` is set *and* the live session actually advertises
+//! `X-GM-EXT-1` — checked fresh per call (via [`Session::capabilities`]) not
+//! carried on the [`ImapCapabilities`] this connection also returns from
+//! [`conn::connect_account`] at login: adding a `gmail` field to that struct
+//! would touch every one of its many existing call sites across
+//! `crate::sync` (most of them hand-built test fixtures with no
+//! `..Default::default()`) for a fact only this one method needs — a self-
+//! contained, redundant capability check here costs one extra `CAPABILITY`
+//! round trip and touches nothing else.
+//!
 //! # Delete does not distinguish its target's `\Deleted` flag from anyone else's
 //!
 //! `EXPUNGE` removes every message flagged `\Deleted` in the selected
@@ -91,7 +116,7 @@
 use async_imap::Session;
 
 use super::conn::{self, ImapStream};
-use super::{command_error, mailbox_not_found_error, select_error, ImapCapabilities};
+use super::{command_error, mailbox_not_found_error, map_imap_err, select_error, ImapCapabilities};
 use crate::error::Error;
 use crate::storage::Database;
 
@@ -159,6 +184,34 @@ pub trait ImapMutator: Send + Sync + std::fmt::Debug {
         mailbox: &str,
         uidvalidity: i64,
         uid: i64,
+    ) -> Result<(), Error>;
+
+    /// Add (`add = true`) or remove (`add = false`) one keyword/label on
+    /// every UID in `uids` with a single coalesced `STORE` — a delta, not a
+    /// full replace. See the module docs' "`store_keyword` is a delta
+    /// `STORE`..." section for why this differs from
+    /// [`set_flags`](Self::set_flags) in both regards, and for
+    /// `prefer_gmail_label`'s exact meaning.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] if `uids` is empty or `keyword` contains a
+    /// control character (unsafe to interpolate into a command line —
+    /// see [`validate_keyword`]); [`Error::FailedPrecondition`] if the
+    /// server's `UIDVALIDITY` disagrees with `uidvalidity`; otherwise a
+    /// mapped IMAP connection/protocol error (a refused `STORE` — including
+    /// one naming an unsupported item like `X-GM-LABELS` on a non-Gmail
+    /// server — surfaces here as an ordinary retryable error, exactly what
+    /// [`crate::tags::sync`]'s `auto` downgrade watches for).
+    #[allow(clippy::too_many_arguments)]
+    async fn store_keyword(
+        &self,
+        account_id: i64,
+        mailbox: &str,
+        uidvalidity: i64,
+        uids: &[i64],
+        keyword: &str,
+        prefer_gmail_label: bool,
+        add: bool,
     ) -> Result<(), Error>;
 }
 
@@ -236,6 +289,58 @@ impl ImapMutator for LiveImapMutator {
         logout(session).await;
         result
     }
+
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        skip(self, uids, keyword),
+        fields(mailbox = mailbox, uids = uids.len(), add = add),
+        err
+    )]
+    async fn store_keyword(
+        &self,
+        account_id: i64,
+        mailbox: &str,
+        uidvalidity: i64,
+        uids: &[i64],
+        keyword: &str,
+        prefer_gmail_label: bool,
+        add: bool,
+    ) -> Result<(), Error> {
+        let (mut session, _caps) = conn::connect_account(&self.db, account_id).await?;
+        // Checked fresh, per call, rather than threaded from the
+        // `ImapCapabilities` `connect_account` also returned — see the
+        // module docs' "`store_keyword` is a delta `STORE`..." section.
+        let gmail = if prefer_gmail_label {
+            match bounded("CAPABILITY", async {
+                session.capabilities().await.map_err(map_imap_err)
+            })
+            .await
+            {
+                Ok(caps) => caps.has_str("X-GM-EXT-1"),
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "capability probe for X-GM-EXT-1 failed; treating as non-Gmail"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let result = store_keyword_via(
+            &mut session,
+            gmail,
+            mailbox,
+            uidvalidity,
+            uids,
+            keyword,
+            add,
+        )
+        .await;
+        logout(session).await;
+        result
+    }
 }
 
 /// Run one IMAP round trip under [`super::IMAP_DEADLINE`], mapping a timeout
@@ -301,9 +406,21 @@ async fn store<T: ImapStream>(
     uid: i64,
     query: &str,
 ) -> Result<(), Error> {
+    store_set(session, &uid.to_string(), query).await
+}
+
+/// `UID STORE <uid-set> <query>`, checking the tagged completion — the
+/// multi-UID generalization of [`store`] (which is now a thin wrapper over
+/// this for the single-UID case), added for
+/// [`store_keyword_via`]'s coalesced apply.
+async fn store_set<T: ImapStream>(
+    session: &mut Session<T>,
+    uid_set: &str,
+    query: &str,
+) -> Result<(), Error> {
     bounded("UID STORE", async {
         session
-            .run_command_and_check_ok(format!("UID STORE {uid} {query}"))
+            .run_command_and_check_ok(format!("UID STORE {uid_set} {query}"))
             .await
             .map_err(|e| command_error("UID STORE", e))
     })
@@ -369,6 +486,152 @@ async fn set_flags_via<T: ImapStream>(
     select(session, mailbox, uidvalidity).await?;
     let query = format!("FLAGS ({})", flags.join(" "));
     store(session, uid, &query).await
+}
+
+/// `SELECT` then a coalesced `UID STORE {+|-}<item> (<keyword>)` over every
+/// UID in `uids` — the delta apply/remove [`store_keyword`](super::
+/// ImapMutator::store_keyword) drives. `gmail` selects `X-GM-LABELS` over
+/// plain `FLAGS.SILENT`; see that method's docs for why this takes an
+/// already-resolved `bool` rather than probing capabilities itself (the
+/// caller does that, once, before opening this — or, in a test, simply
+/// knows what the mock advertises).
+///
+/// `pub(crate)` rather than private: this is what
+/// `crate::tags`' own tests drive directly against
+/// [`super::mock`](crate::imap::mock)'s real, plaintext TCP server (manually
+/// logged in, bypassing [`LiveImapMutator`]'s TLS-only [`conn::connect_account`]
+/// entirely) to prove the auto-downgrade path is driven by a genuine IMAP
+/// `NO`, not a test double — see `crate::tags::sync`'s own module docs. This
+/// mirrors [`set_flags_via`]'s own tests below, which drive it the identical
+/// way for the same reason.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] if `uids` is empty or `keyword` contains a
+/// control character; otherwise as [`select`]/[`store_set`].
+pub(crate) async fn store_keyword_via<T: ImapStream>(
+    session: &mut Session<T>,
+    gmail: bool,
+    mailbox: &str,
+    uidvalidity: i64,
+    uids: &[i64],
+    keyword: &str,
+    add: bool,
+) -> Result<(), Error> {
+    if uids.is_empty() {
+        return Err(Error::invalid_argument(
+            "store_keyword requires at least one uid",
+        ));
+    }
+    validate_keyword(keyword)?;
+    // RFC 3501's `flag-keyword` production is `atom` -- full stop, never a
+    // quoted string -- so unlike `X-GM-LABELS` (Gmail's own extension,
+    // whose label list accepts `atom / string`), there is no legal way to
+    // send a non-atom-safe keyword through a plain `FLAGS`/`FLAGS.SILENT`
+    // STORE. An earlier version of this function quoted it anyway, which
+    // produced a syntactically invalid command a compliant server answers
+    // `BAD` to -- silently, since nothing here inspected the response
+    // differently. Rejecting up front turns that into an immediate,
+    // diagnosable `Err` instead: exactly the shape `sync::apply_wire`'s
+    // `auto` downgrade already knows how to react to, and a clear message
+    // under `sync_mode = imap` instead of a mysterious server `BAD`.
+    if !gmail && !keyword.chars().all(is_atom_char) {
+        return Err(Error::invalid_argument(format!(
+            "{keyword:?} is not a valid IMAP keyword atom (RFC 3501 flag-keyword = atom, \
+             never a quoted string) — rename the tag, or use sync_mode=auto/local, or a \
+             Gmail account with X-GM-LABELS"
+        )));
+    }
+    select(session, mailbox, uidvalidity).await?;
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let uid_set = render_uid_set(&sorted);
+    let verb = if add { '+' } else { '-' };
+    let item = if gmail { "X-GM-LABELS" } else { "FLAGS.SILENT" };
+    let query = format!("{verb}{item} ({})", quote_keyword(keyword));
+    store_set(session, &uid_set, &query).await
+}
+
+/// Whether `c` is a valid IMAP `ATOM-CHAR` (RFC 3501): any non-control
+/// ASCII character except the `atom-specials` — `(`, `)`, `{`, space,
+/// `%`/`*` (list wildcards), `"`/`\` (quoted-specials), and `]`
+/// (resp-specials). Deliberately closer to the real grammar than a narrow
+/// `[A-Za-z0-9-_./]` allow-list: a tag keyword legitimately contains `/`
+/// (hierarchy) and this admits the rest of what RFC 3501 actually permits
+/// too (`$`, `+`, `#`, ...) rather than forcing every such name through
+/// [`quote_keyword`]'s quoted-string fallback, which [`store_keyword_via`]
+/// now rejects outright for the plain-`FLAGS` case (a quoted string is
+/// simply not a legal `flag-keyword`, ever — see that function's own docs).
+fn is_atom_char(c: char) -> bool {
+    c.is_ascii_graphic() && !matches!(c, '(' | ')' | '{' | '%' | '*' | '"' | '\\' | ']')
+}
+
+/// Reject a keyword/label containing an ASCII control character — in
+/// particular CR/LF, which (unlike `\`/`"`) an IMAP quoted string cannot
+/// escape at all: a literal newline inside one would break the line-based
+/// protocol and could smuggle a second command, the same command-injection
+/// concern [`crate::mail::is_safe_flag`] guards a full-replace `FLAGS`
+/// argument against. Everything else is admitted (and, if not atom-safe,
+/// quoted by [`quote_keyword`]) — a hierarchical tag keyword legitimately
+/// contains `/` (`rmail/project/alpha`), and a Gmail label may contain
+/// spaces, which `is_safe_flag`'s narrower allow-list does not.
+fn validate_keyword(value: &str) -> Result<(), Error> {
+    if value.is_empty() || value.chars().any(|c| c.is_control()) {
+        return Err(Error::invalid_argument(format!(
+            "{value:?} is not a valid IMAP keyword/label"
+        )));
+    }
+    Ok(())
+}
+
+/// Render `value` as a bare IMAP atom when every character is atom-safe
+/// ([`is_atom_char`]), or as a quoted string (escaping `\`/`"`, mirroring
+/// [`quote_mailbox`]) otherwise. The quoted-string fallback is only ever
+/// reached for a Gmail label (`X-GM-LABELS` accepts `atom / string`) — the
+/// plain-`FLAGS` caller in [`store_keyword_via`] rejects a non-atom-safe
+/// keyword before this is even called, since a quoted string is not a
+/// legal `flag-keyword` at all. Callers must run [`validate_keyword`]
+/// first; this does not itself reject a control character (quoting cannot
+/// make one safe — see that function's docs).
+fn quote_keyword(value: &str) -> String {
+    if value.chars().all(is_atom_char) {
+        value.to_owned()
+    } else {
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    }
+}
+
+/// Render a sorted, deduped list of UIDs as a compact IMAP UID set
+/// (`5`, `1:3,7`, ...) — the client-request-side counterpart to
+/// [`super::mock`](crate::imap::mock)'s response-side renderer of the same
+/// shape, used here to build a coalesced multi-message `STORE`'s argument.
+fn render_uid_set(uids: &[i64]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut iter = uids.iter().copied();
+    let Some(mut start) = iter.next() else {
+        return String::new();
+    };
+    let mut end = start;
+    for uid in iter {
+        if uid == end + 1 {
+            end = uid;
+        } else {
+            parts.push(render_range(start, end));
+            start = uid;
+            end = uid;
+        }
+    }
+    parts.push(render_range(start, end));
+    parts.join(",")
+}
+
+fn render_range(start: i64, end: i64) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}:{end}")
+    }
 }
 
 /// `SELECT` then either `UID MOVE` (when advertised) or the
@@ -745,5 +1008,287 @@ mod tests {
              destination"
         );
         let _ = session.logout().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // store_keyword_via (task 55)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_keyword_via_issues_a_delta_store_not_a_full_replace() {
+        let mock = MockImap::start(MockConfig::default().password("pw").fetch(
+            5,
+            &["\\Seen"],
+            b"body",
+        ))
+        .await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+
+        store_keyword_via(
+            &mut session,
+            false,
+            "INBOX",
+            UIDVALIDITY,
+            &[5],
+            "rmail/work",
+            true,
+        )
+        .await
+        .expect("store_keyword_via should succeed");
+
+        let commands = mock.commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("UID STORE 5 +FLAGS.SILENT (rmail/work)")),
+            "expected an additive keyword STORE, got: {commands:?}"
+        );
+        let _ = session.logout().await;
+    }
+
+    #[tokio::test]
+    async fn store_keyword_via_removes_with_a_minus_flags_delta() {
+        let mock =
+            MockImap::start(MockConfig::default().password("pw").fetch(5, &[], b"body")).await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+
+        store_keyword_via(
+            &mut session,
+            false,
+            "INBOX",
+            UIDVALIDITY,
+            &[5],
+            "rmail/work",
+            false,
+        )
+        .await
+        .expect("store_keyword_via should succeed");
+
+        let commands = mock.commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("UID STORE 5 -FLAGS.SILENT (rmail/work)")),
+            "expected a subtractive keyword STORE, got: {commands:?}"
+        );
+        let _ = session.logout().await;
+    }
+
+    #[tokio::test]
+    async fn store_keyword_via_coalesces_multiple_uids_into_one_store() {
+        // Task 55's bulk-tag acceptance: N messages sharing a mailbox get one
+        // STORE over a compact UID set, not N round trips.
+        let mock = MockImap::start(
+            MockConfig::default()
+                .password("pw")
+                .fetch(1, &[], b"a")
+                .fetch(2, &[], b"b")
+                .fetch(3, &[], b"c")
+                .fetch(7, &[], b"d"),
+        )
+        .await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+
+        store_keyword_via(
+            &mut session,
+            false,
+            "INBOX",
+            UIDVALIDITY,
+            &[3, 1, 2, 7],
+            "rmail/urgent",
+            true,
+        )
+        .await
+        .expect("store_keyword_via should succeed");
+
+        let commands = mock.commands();
+        let store_commands: Vec<&String> = commands
+            .iter()
+            .filter(|c| c.to_ascii_uppercase().starts_with("UID STORE"))
+            .collect();
+        assert_eq!(
+            store_commands.len(),
+            1,
+            "expected exactly one coalesced STORE, got: {commands:?}"
+        );
+        assert!(
+            store_commands[0].eq_ignore_ascii_case("UID STORE 1:3,7 +FLAGS.SILENT (rmail/urgent)"),
+            "expected a compact UID set, got: {}",
+            store_commands[0]
+        );
+        let _ = session.logout().await;
+    }
+
+    #[tokio::test]
+    async fn store_keyword_via_prefers_gmail_labels_when_asked() {
+        let mock =
+            MockImap::start(MockConfig::default().password("pw").fetch(5, &[], b"body")).await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+
+        store_keyword_via(&mut session, true, "INBOX", UIDVALIDITY, &[5], "work", true)
+            .await
+            .expect("store_keyword_via should succeed");
+
+        let commands = mock.commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("UID STORE 5 +X-GM-LABELS (work)")),
+            "expected an X-GM-LABELS STORE, got: {commands:?}"
+        );
+        let _ = session.logout().await;
+    }
+
+    #[tokio::test]
+    async fn store_keyword_via_quotes_a_label_containing_a_space() {
+        let mock =
+            MockImap::start(MockConfig::default().password("pw").fetch(5, &[], b"body")).await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+
+        store_keyword_via(
+            &mut session,
+            true,
+            "INBOX",
+            UIDVALIDITY,
+            &[5],
+            "Q3 Report",
+            true,
+        )
+        .await
+        .expect("store_keyword_via should succeed");
+
+        let commands = mock.commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("UID STORE 5 +X-GM-LABELS (\"Q3 Report\")")),
+            "expected a quoted label, got: {commands:?}"
+        );
+        let _ = session.logout().await;
+    }
+
+    #[tokio::test]
+    async fn store_keyword_via_rejects_a_non_atom_keyword_against_plain_flags() {
+        // RFC 3501's `flag-keyword` is always `atom`, never a quoted
+        // string -- unlike the Gmail-only test above (`gmail = true`),
+        // sending "Q3 Report" through plain `FLAGS.SILENT` (`gmail =
+        // false`) has no legal wire form at all, so this must be rejected
+        // up front rather than silently quoted into a malformed command.
+        let mock =
+            MockImap::start(MockConfig::default().password("pw").fetch(5, &[], b"body")).await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+
+        let err = store_keyword_via(
+            &mut session,
+            false,
+            "INBOX",
+            UIDVALIDITY,
+            &[5],
+            "Q3 Report",
+            true,
+        )
+        .await
+        .expect_err("a non-atom-safe keyword must be rejected for plain FLAGS");
+        assert_eq!(err.reason(), crate::ErrorReason::InvalidArgument);
+        assert!(
+            mock.commands()
+                .iter()
+                .all(|c| !c.to_ascii_uppercase().contains("SELECT")),
+            "the rejection must happen before SELECT, not after a malformed STORE"
+        );
+        let _ = session.logout().await;
+    }
+
+    #[tokio::test]
+    async fn store_keyword_via_rejects_an_empty_uid_list() {
+        let mock =
+            MockImap::start(MockConfig::default().password("pw").fetch(5, &[], b"body")).await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+
+        let err = store_keyword_via(&mut session, false, "INBOX", UIDVALIDITY, &[], "work", true)
+            .await
+            .expect_err("an empty uid list must be rejected");
+        assert_eq!(err.reason(), crate::ErrorReason::InvalidArgument);
+        // `LOGIN` already happened to establish `session` above; what this
+        // asserts is that the rejection short-circuits *before* `select`, not
+        // that the connection sent nothing at all.
+        let commands = mock.commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.to_ascii_uppercase().contains("SELECT")
+                    || c.to_ascii_uppercase().contains("STORE")),
+            "no SELECT/STORE should be sent for a rejected call, got: {commands:?}"
+        );
+        let _ = session.logout().await;
+    }
+
+    #[tokio::test]
+    async fn store_keyword_via_rejects_a_keyword_containing_a_control_character() {
+        let mock =
+            MockImap::start(MockConfig::default().password("pw").fetch(5, &[], b"body")).await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+
+        let err = store_keyword_via(
+            &mut session,
+            false,
+            "INBOX",
+            UIDVALIDITY,
+            &[5],
+            "work\r\nA1 LOGOUT",
+            true,
+        )
+        .await
+        .expect_err("a control character must be rejected, not smuggled onto the wire");
+        assert_eq!(err.reason(), crate::ErrorReason::InvalidArgument);
+        let _ = session.logout().await;
+    }
+
+    /// The proof the acceptance criterion asks for by name: this is a real
+    /// IMAP `NO` from the mock server, not a boolean a test set itself. This
+    /// alone proves the wire-level contract `store_keyword` (and therefore
+    /// `crate::tags::sync`'s `auto`-downgrade decision, which reacts to
+    /// exactly this shape of `Err`) depends on.
+    #[tokio::test]
+    async fn a_refused_keyword_store_maps_to_a_retryable_error() {
+        let mock = MockImap::start(
+            MockConfig::default()
+                .password("pw")
+                .fetch(5, &[], b"body")
+                .refusing_uid_commands(),
+        )
+        .await;
+        let stream = connect_mock(mock.addr).await;
+        let mut session = login(stream, "user", "pw").await.unwrap();
+
+        let err = store_keyword_via(
+            &mut session,
+            false,
+            "INBOX",
+            UIDVALIDITY,
+            &[5],
+            "work",
+            true,
+        )
+        .await
+        .expect_err("a server NO must surface as an error");
+        assert_eq!(err.reason(), crate::ErrorReason::Unavailable);
+        let _ = session.logout().await;
+    }
+
+    #[test]
+    fn render_uid_set_compacts_consecutive_runs() {
+        assert_eq!(render_uid_set(&[1, 2, 3, 7]), "1:3,7");
+        assert_eq!(render_uid_set(&[5]), "5");
+        assert_eq!(render_uid_set(&[1, 3, 5]), "1,3,5");
+        assert_eq!(render_uid_set(&[]), "");
     }
 }

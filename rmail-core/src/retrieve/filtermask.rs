@@ -9,8 +9,13 @@
 //! allow". Writing that predicate once and reusing it is not just less code —
 //! it is the difference between six retrievers that agree about what `-in:Spam`
 //! means and six retrievers that each got one detail (NULL-safety on
-//! negation, an unbacked `tag:` filter excluding everything, a malformed
-//! `thread:` id) slightly differently. [`compile`] is that one place.
+//! negation, an unbacked `note:` filter excluding everything, a malformed
+//! `thread:` id) slightly differently. [`compile`] is that one place — and
+//! [`super::lexical`], which does *not* share it (see the next section), is
+//! exactly the shape of gap this design closes for the other six: task 48's
+//! own postmortem was a `tag:`-shaped fix landing in only one of `compile`/
+//! `lexical::compile_filters`, silently dropping the BM25 arm from any query
+//! mixing free text with the operator.
 //!
 //! # Why not share `retrieve::lexical`'s compiler instead
 //!
@@ -215,11 +220,18 @@ fn classify(op: &Operator) -> RawEffect {
         Operator::Has(HasTarget::Attachment) => {
             RawEffect::Sql("has_attachments = 1".to_owned(), Vec::new())
         }
+        // `has:note` is backed by the `notes` table (task 56); `has:tag` by
+        // `tags`/`message_tags` (task 55). Both go through the shared helpers
+        // below so this compiler and `retrieve::lexical`'s can never disagree.
         Operator::Has(HasTarget::Note) => {
             let (sql, params) = note_exists_sql();
             RawEffect::Sql(sql, params)
         }
-        Operator::Has(HasTarget::Tag | HasTarget::Other(_)) => RawEffect::Never,
+        Operator::Has(HasTarget::Tag) => {
+            let (sql, params) = has_tag_predicate_sql();
+            RawEffect::Sql(sql, params)
+        }
+        Operator::Has(HasTarget::Other(_)) => RawEffect::Never,
         Operator::Filename(pattern) => RawEffect::Sql(
             "EXISTS (SELECT 1 FROM attachments WHERE attachments.message_id = messages.id \
              AND lower(attachments.filename) GLOB ?)"
@@ -241,13 +253,14 @@ fn classify(op: &Operator) -> RawEffect {
         Operator::Is(IsFlag::Replied) => flag_predicate("\\Answered", true),
         Operator::Is(IsFlag::Pinned | IsFlag::Muted) => RawEffect::Never,
         Operator::Is(IsFlag::Other(value)) => is_other_flag(value),
-        // `tag:` has no backing table yet (task 55). `note:` is backed by
-        // the `notes` table (task 56, migration V23) via [`note_text_sql`],
-        // shared with `retrieve::lexical`'s own classifier so the two can
-        // never disagree about what `note:` matches. `ai:` is backed by
-        // `ai_summaries` (task 48, migration V21) and has its own
-        // classifier below.
-        Operator::Tag(_) => RawEffect::Never,
+        // `tag:` is backed by `tags`/`message_tags` (task 55) and `note:` by
+        // the `notes` table (task 56); `ai:` by `ai_summaries` (task 48) via
+        // its own classifier below. Each shares its SQL with
+        // `retrieve::lexical`'s classifier rather than re-deriving it.
+        Operator::Tag(name) => {
+            let (sql, params) = tag_predicate_sql(name);
+            RawEffect::Sql(sql, params)
+        }
         Operator::Note(value) => {
             let (sql, params) = note_text_sql(value);
             RawEffect::Sql(sql, params)
@@ -428,6 +441,121 @@ pub(crate) fn note_text_sql(value: &str) -> (String, Vec<Value>) {
         ),
         vec![Value::Text(like_pattern(value))],
     )
+}
+
+/// `tag:<name>` / `tag:<name>/*` -- matches a message's *effective* tags
+/// (its own applied tags, or its thread's) within its own account.
+/// `pub(crate)` (not `fn` private to this module) for the same reason
+/// [`ai_predicate_sql`] is, and shared with the identical operator in two
+/// more places: [`super::lexical::classify`] (see that module's own docs on
+/// why it does not reuse this module's *filter compiler*, only individual
+/// predicate classifiers like this one), and [`crate::tags::query`]'s
+/// `BulkTag`-selector compiler, which needs the exact same "what does
+/// `tag:x` mean" answer search does — task 48's own postmortem (a `tag:`-
+/// shaped fix landing in only one of two retrievers, silently dropping the
+/// BM25 arm from a mixed query) is exactly the failure a second,
+/// independently-drifting copy would repeat.
+///
+/// # Queries `message_tags` directly, not the `messages_tags_effective` view
+///
+/// The view (migration V24) is `SELECT DISTINCT ...`, and `DISTINCT` blocks
+/// SQLite's subquery flattener: a correlated `EXISTS` against the view
+/// cannot push the outer row's `messages.id` down into an indexed lookup on
+/// `message_tags`, so it degenerates into a full scan of `message_tags` (plus
+/// a `TEMP B-TREE` for the `DISTINCT` itself) on *every* candidate row this
+/// runs against — for `tag:`, that is every retriever that calls
+/// [`compile`], on every query. Measured against a 200k-row `message_tags`
+/// table, that is the difference between ~0.1ms and ~70ms per call, blowing
+/// prd.md's <50ms Stage 1 budget on its own. This mirrors the exact
+/// `rowid IN (SELECT ...)` hazard this module's own docs warn about for the
+/// `EXISTS`-vs-`IN` choice generally -- a view is not exempt from it just for
+/// being spelled as a `JOIN` instead of a subquery. The view still exists,
+/// and is still the right tool, for `TagStore::list_tags`'s aggregate count
+/// (one materialization per call, not per candidate row).
+///
+/// A trailing `/*` requests the tag *and its descendants*: `tag:project/*`
+/// matches a tag named exactly `"project"` as well as any
+/// `"project/alpha"`, `"project/alpha/q3"`, ... (tag names store the full
+/// hierarchical path -- see `crate::tags::hierarchy`'s module docs).
+/// Anything else matches that exact tag name only. Matching is
+/// case-insensitive (`tags.name`'s own `COLLATE NOCASE`, migration V24 --
+/// the same collation `UNIQUE(account_id, name)` uses, so `tag:Work` and
+/// `tag:work` name the same tag a second `create_tag("Work", ...)` would
+/// have collided with anyway).
+///
+/// Every `?` here is anonymous, never `?1`/`?2` — matching every other
+/// classifier in this module (and in `retrieve::lexical`/`tags::query`).
+/// SQLite numbers an explicit `?N` and an anonymous `?` from the *same*
+/// index space, so an explicitly-numbered placeholder inside one fragment
+/// silently collides with whichever index an anonymous `?` elsewhere in the
+/// composed query happens to land on — `compile`'s own `clauses.join(" AND
+/// ")` concatenates this fragment's SQL next to others that all use
+/// anonymous `?`, and `tags::query::compile` additionally prepends its own
+/// anonymous `account_id = ?` ahead of every filter. An earlier version of
+/// this function used `?1`/`?2` and it was a real, caught-by-test bug:
+/// `?1` collided with the *first* anonymous `?` in the composed statement
+/// (here, that filter itself if it were first; in `tags::query::compile`,
+/// `account_id`'s own placeholder), and `rusqlite` rejected the mismatched
+/// parameter count outright rather than silently binding the wrong value —
+/// still not something to rely on twice.
+#[must_use]
+pub(crate) fn tag_predicate_sql(name: &str) -> (String, Vec<Value>) {
+    let exists = |extra: &str| -> String {
+        format!(
+            "EXISTS (SELECT 1 FROM message_tags mt \
+             JOIN tags t ON t.id = mt.tag_id \
+             WHERE mt.state = 'applied' \
+             AND (mt.message_id = messages.id OR mt.thread_id = messages.thread_id) \
+             AND t.account_id = messages.account_id \
+             AND ({extra}))"
+        )
+    };
+    match name.strip_suffix("/*") {
+        // `tag:/*` is degenerate (no tag can be named the empty string) --
+        // treated as an exact, unmatchable name rather than building an
+        // unbounded `LIKE '%/...'` from an empty prefix, which would match
+        // every hierarchical tag in the account.
+        Some(prefix) if !prefix.is_empty() => {
+            let sql = exists("t.name = ? OR t.name LIKE ? ESCAPE '\\'");
+            let child_pattern = format!("{}/%", like_pattern_component(prefix));
+            (
+                sql,
+                vec![Value::Text(prefix.to_owned()), Value::Text(child_pattern)],
+            )
+        }
+        _ => (exists("t.name = ?"), vec![Value::Text(name.to_owned())]),
+    }
+}
+
+/// `has:tag` -- any *applied* effective tag at all, regardless of which.
+/// Shared between this module's `classify` and [`super::lexical::classify`]
+/// for the identical reason [`tag_predicate_sql`] is (see its own docs) --
+/// this exact predicate was duplicated verbatim in both files until this
+/// extraction, exactly the drift `tag_predicate_sql`'s sharing exists to
+/// prevent. No `tags` join is needed (unlike `tag_predicate_sql`): a
+/// `message_tags` row's `tag_id` always names a tag in the same account as
+/// the message it is attached to (`TagStore` resolves a target's account
+/// before creating or looking up a tag, never across accounts), so an
+/// unqualified "does any applied row exist" is already account-correct.
+#[must_use]
+pub(crate) fn has_tag_predicate_sql() -> (String, Vec<Value>) {
+    (
+        "EXISTS (SELECT 1 FROM message_tags mt WHERE mt.state = 'applied' \
+         AND (mt.message_id = messages.id OR mt.thread_id = messages.thread_id))"
+            .to_owned(),
+        Vec::new(),
+    )
+}
+
+/// Escape a `LIKE` pattern's own wildcards (`%`, `_`) and its escape
+/// character, without the `%...%` substring wrapping [`like_pattern`]
+/// applies -- [`tag_predicate_sql`] needs a *prefix*-anchored pattern
+/// (`"prefix/%"`), not a substring one.
+fn like_pattern_component(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn size_cmp(cmp: &str, bytes: u64) -> RawEffect {

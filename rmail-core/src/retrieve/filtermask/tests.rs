@@ -28,11 +28,79 @@ fn no_filters_is_unconstrained() {
 
 #[test]
 fn an_unbacked_filter_excludes_everything_but_its_negation_does_not() {
-    let tag = other(Operator::Tag("work".to_owned()), false);
-    assert!(matches!(compile(&[tag]), FilterMask::ExcludesEverything));
+    // `note:` still has no backing table (task 56) -- `tag:` used to be the
+    // example here too, until task 55 gave it a real one; see
+    // `tag_filters_compile_to_a_real_predicate` below for its current
+    // (backed) behavior.
+    let note = other(Operator::Note("contract".to_owned()), false);
+    assert!(matches!(compile(&[note]), FilterMask::ExcludesEverything));
 
-    let not_tag = other(Operator::Tag("work".to_owned()), true);
-    assert!(matches!(compile(&[not_tag]), FilterMask::Unconstrained));
+    let not_note = other(Operator::Note("contract".to_owned()), true);
+    assert!(matches!(compile(&[not_note]), FilterMask::Unconstrained));
+}
+
+#[test]
+fn tag_filters_compile_to_a_real_predicate() {
+    let tag = other(Operator::Tag("work".to_owned()), false);
+    let FilterMask::Sql(mask) = compile(&[tag]) else {
+        unreachable!("tag: is backed (task 55) and must compile to a real predicate");
+    };
+    // Queries `message_tags`/`tags` directly rather than the
+    // `messages_tags_effective` view — see `tag_predicate_sql`'s doc comment
+    // for why (a correlated `EXISTS` against a `SELECT DISTINCT` view forces
+    // a full scan; going straight at the base tables lets SQLite use the
+    // partial unique indexes from migration V24).
+    assert!(mask.sql.contains("message_tags"));
+    assert!(mask.sql.contains("tags"));
+    assert!(!mask.sql.contains("messages_tags_effective"));
+    assert_eq!(mask.params, vec![Value::Text("work".to_owned())]);
+}
+
+#[test]
+fn a_hierarchy_wildcard_tag_filter_binds_both_the_exact_name_and_the_child_prefix() {
+    let tag = other(Operator::Tag("project/*".to_owned()), false);
+    let FilterMask::Sql(mask) = compile(&[tag]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert_eq!(
+        mask.params,
+        vec![
+            Value::Text("project".to_owned()),
+            Value::Text("project/%".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn a_negated_tag_filter_is_null_safely_negated() {
+    let tag = other(Operator::Tag("newsletter".to_owned()), true);
+    let FilterMask::Sql(mask) = compile(&[tag]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert!(mask.sql.starts_with("NOT COALESCE("));
+}
+
+#[test]
+fn a_tag_filter_composed_with_another_filter_binds_every_placeholder_positionally() {
+    // The regression this guards: `tag_predicate_sql` once used explicit
+    // `?1`/`?2` placeholders, which collided with the anonymous `?` every
+    // other classifier here uses the moment `compile` joined this filter's
+    // SQL next to another filter's -- caught by `rusqlite` rejecting the
+    // mismatched parameter count outright. `Cc` (`like_one`, one param) and
+    // `Tag` (also one param, in its exact-name form) must produce exactly
+    // two params in filter order.
+    let filters = vec![
+        other(Operator::Cc("legal".to_owned()), false),
+        other(Operator::Tag("work".to_owned()), false),
+    ];
+    let FilterMask::Sql(mask) = compile(&filters) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert_eq!(
+        mask.params.len(),
+        2,
+        "one placeholder must exist per bound param"
+    );
 }
 
 #[test]

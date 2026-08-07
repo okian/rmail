@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+import "google/protobuf/empty.proto";
+
+// TagService is the tags subsystem's gRPC surface (task 55): colored,
+// hierarchical labels applied to a message or a whole thread, with an
+// optional IMAP-keyword / Gmail-label round-trip. See
+// rmail-core's `tags` module docs for the full domain contract (ordering,
+// hierarchy, the `auto` downgrade); this service is a thin translation over
+// it.
+//
+// SuggestTags/ResolveSuggestion are the *surface* for AI tag suggestions —
+// this task defines the pending/accepted state model and these two RPCs,
+// but never calls a model itself. SuggestTags streams back whatever is
+// already `state = PENDING` for a message (written by task 57's suggestion
+// job, or by any other caller); ResolveSuggestion accepts or rejects one.
+service TagService {
+  // Apply one or more tags (created on demand) to a message or thread.
+  rpc AddTag(AddTagRequest) returns (AddTagResponse);
+
+  // Remove one or more tags from a message or thread. A name that does not
+  // resolve to an existing tag is silently a no-op for that name.
+  rpc RemoveTag(RemoveTagRequest) returns (google.protobuf.Empty);
+
+  // List an account's tags with their effective message counts.
+  rpc ListTags(ListTagsRequest) returns (ListTagsResponse);
+
+  // Create a tag, or update an existing one of the same name (color/sync
+  // mode/parent). Ancestor tags implied by a `/`-separated name are
+  // auto-created if they do not already exist.
+  rpc CreateTag(CreateTagRequest) returns (Tag);
+
+  // Apply tags to every message a query or an explicit id list resolves to,
+  // in one local transaction with one coalesced IMAP `STORE` per mailbox
+  // (not one round trip per message).
+  rpc BulkTag(BulkTagRequest) returns (BulkTagResponse);
+
+  // Stream a message's currently pending AI tag suggestions. Never calls a
+  // model (see the service's own doc comment) — this reads
+  // `message_tags(state = 'pending')` exactly as it stands.
+  rpc SuggestTags(SuggestTagsRequest) returns (stream TagSuggestion);
+
+  // Accept or reject a pending suggestion. Accepting applies the tag
+  // (including its IMAP round-trip, if configured) exactly like `AddTag`
+  // would; rejecting marks it `rejected` (kept, not deleted, so a future
+  // suggestion pass can learn from it).
+  rpc ResolveSuggestion(ResolveSuggestionRequest) returns (google.protobuf.Empty);
+}
+
+// What a tag application/removal targets: exactly one of a message or a
+// whole thread (thread = every current *and future* member).
+message Target {
+  oneof of {
+    int64 message_id = 1;
+    int64 thread_id = 2;
+  }
+}
+
+// `message_tags.source` — who or what applied a tag.
+enum TagSource {
+  TAG_SOURCE_UNSPECIFIED = 0;
+  TAG_SOURCE_USER = 1;
+  TAG_SOURCE_AI = 2;
+  TAG_SOURCE_RULE = 3;
+  TAG_SOURCE_IMAP = 4;
+}
+
+// `message_tags.state` — a row's lifecycle.
+enum TagState {
+  TAG_STATE_UNSPECIFIED = 0;
+  TAG_STATE_APPLIED = 1;
+  TAG_STATE_PENDING = 2;
+  TAG_STATE_REJECTED = 3;
+}
+
+// `tags.sync_mode`.
+enum TagSyncMode {
+  TAG_SYNC_MODE_UNSPECIFIED = 0;
+  TAG_SYNC_MODE_LOCAL = 1;
+  TAG_SYNC_MODE_IMAP = 2;
+  TAG_SYNC_MODE_AUTO = 3;
+}
+
+message Tag {
+  int64 id = 1;
+  int64 account_id = 2;
+  // The full hierarchical path ("project/alpha"), not just the leaf
+  // segment.
+  string name = 3;
+  optional int64 parent_id = 4;
+  optional string color = 5;
+  TagSyncMode sync_mode = 6;
+  int64 created_at = 7;
+}
+
+// A [Tag] plus how many messages currently carry it effectively (its own
+// applications, or its thread's).
+message TagWithCount {
+  Tag tag = 1;
+  int64 message_count = 2;
+}
+
+// One (tag, target) application.
+message TagApplication {
+  int64 id = 1;
+  Tag tag = 2;
+  Target target = 3;
+  TagSource source = 4;
+}
+
+message AddTagRequest {
+  Target target = 1;
+  // Tag names; unknown names are created on demand.
+  repeated string names = 2;
+}
+
+message AddTagResponse {
+  repeated TagApplication applications = 1;
+}
+
+message RemoveTagRequest {
+  Target target = 1;
+  repeated string names = 2;
+}
+
+message ListTagsRequest {
+  int64 account_id = 1;
+}
+
+message ListTagsResponse {
+  repeated TagWithCount tags = 1;
+}
+
+message CreateTagRequest {
+  int64 account_id = 1;
+  string name = 2;
+  optional string color = 3;
+  optional TagSyncMode sync_mode = 4;
+  // Explicit parent, independent of the `/`-name convention (e.g. a
+  // tag-picker UI reparenting an existing tag). Rejected with
+  // INVALID_ARGUMENT if it would make the tag its own ancestor.
+  optional int64 parent_id = 5;
+}
+
+message BulkTagRequest {
+  int64 account_id = 1;
+  // Exactly one of `query`/`message_ids` should be set; `query` is a
+  // filter-only subset of the search grammar (`from:`/`to:`/`cc:`/
+  // `subject:`/`is:`/`in:`/`has:attachment`/`tag:`) — free text and other
+  // operators are not applied as a bulk-selection constraint.
+  oneof selector {
+    string query = 2;
+    MessageIds message_ids = 3;
+  }
+  repeated string names = 4;
+}
+
+message MessageIds {
+  repeated int64 ids = 1;
+}
+
+message BulkTagResponse {
+  int64 message_count = 1;
+  int64 applied = 2;
+}
+
+message SuggestTagsRequest {
+  int64 message_id = 1;
+}
+
+// One pending AI tag suggestion.
+message TagSuggestion {
+  int64 message_tag_id = 1;
+  Tag tag = 2;
+  double confidence = 3;
+  string rationale = 4;
+}
+
+message ResolveSuggestionRequest {
+  int64 message_tag_id = 1;
+  bool accept = 2;
+}

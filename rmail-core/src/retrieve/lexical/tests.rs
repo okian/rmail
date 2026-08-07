@@ -195,7 +195,7 @@ impl Fixture {
             .unwrap();
     }
 
-    /// Insert a `notes` row directly (task 56, migration V23) -- this
+    /// Insert a `notes` row directly (task 56, migration V24) -- this
     /// module is proving `note:`/`has:note` compose with the lexical
     /// `MATCH`, not re-proving `NoteStore`'s own CRUD (`notes::tests` does
     /// that). Exactly one of `message_id`/`thread_id` should be `Some`,
@@ -1213,13 +1213,15 @@ async fn a_filter_with_no_matching_rows_excludes_everything_but_its_negation_doe
         })
         .await;
 
-    for op in [
-        "tag:work",
-        "note:reminder",
-        "ai:needs-reply",
-        "has:note",
-        "has:tag",
-    ] {
+    // `tag:`/`has:tag` (task 55) are deliberately *not* in this list any
+    // more -- they are real, backed predicates now (see
+    // `a_tag_filter_with_no_free_text_returns_nothing_from_lexical` and
+    // `a_tag_filter_gates_which_messages_the_free_text_can_rank` for their
+    // own tests), and leaving them here would only pass because this
+    // fixture's message happens to carry no tags -- proving "no data for
+    // this message" instead of what the test's name claims ("names a
+    // subsystem with no data yet").
+    for op in ["note:reminder", "ai:needs-reply", "has:note"] {
         assert!(
             fx.ids(&format!("invoice {op}")).await.is_empty(),
             "{op} has no matching data in this fixture, so it must exclude everything"
@@ -1230,6 +1232,27 @@ async fn a_filter_with_no_matching_rows_excludes_everything_but_its_negation_doe
             "negating it is vacuously true: nothing matches, so nothing is excluded"
         );
     }
+}
+
+#[tokio::test]
+async fn has_tag_matches_a_message_with_any_applied_tag_and_its_negation_excludes_it() {
+    let fx = Fixture::open().await;
+    let tagged = fx
+        .index(repo::NewMessage {
+            body_text: Some("invoice".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let untagged = fx
+        .index(repo::NewMessage {
+            body_text: Some("invoice".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    apply_test_tag(&fx.db, fx.account_id, "work", tagged).await;
+
+    assert_eq!(fx.ids("invoice has:tag").await, vec![tagged]);
+    assert_eq!(fx.ids("invoice -has:tag").await, vec![untagged]);
 }
 
 #[tokio::test]
@@ -1421,12 +1444,15 @@ fn day_start_parses_plain_iso_dates_only() {
 
 #[test]
 fn compile_filters_excludes_everything_only_for_a_positive_unbacked_filter() {
+    // `note:` still has no backing table (task 56) -- `tag:` is now backed
+    // (task 55); see `tag_query_combined_with_free_text_still_ranks_by_bm25`
+    // below for its own, real-database-backed test.
     assert!(matches!(
-        compile_filters(&query::parse("tag:work").filters),
+        compile_filters(&query::parse("note:contract").filters),
         FilterMask::ExcludesEverything
     ));
     assert!(!matches!(
-        compile_filters(&query::parse("-tag:work").filters),
+        compile_filters(&query::parse("-note:contract").filters),
         FilterMask::ExcludesEverything
     ));
     assert!(!matches!(
@@ -1449,4 +1475,135 @@ fn compile_filters_is_unconstrained_with_no_filters() {
         compile_filters(&query::parse("invoice").filters),
         FilterMask::Unconstrained
     ));
+}
+
+// ---------------------------------------------------------------------------
+// tag: (task 55) -- the task 48 postmortem this guards against: a `tag:`
+// fix landing in only one of `retrieve::filtermask`/`retrieve::lexical`,
+// silently dropping the BM25 arm from any query mixing free text with the
+// operator. `compile_filters_excludes_everything_only_for_a_positive_
+// unbacked_filter` above already proves `tag:` is no longer treated as
+// unbacked *here specifically* (not just in `filtermask`, which has its own
+// equivalent test); the two tests below prove the full, real-database path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_tag_filter_with_no_free_text_returns_nothing_from_lexical() {
+    // `tag:work` alone has no free text for BM25 to rank -- the same "pure
+    // hard-filter query" case `a_pure_filter_query_with_no_free_text_returns_
+    // nothing` already proves generically, restated here for the specific
+    // operator this task adds so a future change to `tag:`'s classification
+    // cannot accidentally make it *look* like free text to `MatchExpr::build`.
+    let fx = Fixture::open().await;
+    let tagged = fx
+        .index(repo::NewMessage {
+            body_text: Some("quarterly report".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    apply_test_tag(&fx.db, fx.account_id, "work", tagged).await;
+
+    let ids = fx.ids("tag:work").await;
+    assert!(
+        ids.is_empty(),
+        "lexical has nothing to rank with no free text, even though the tag filter matches"
+    );
+}
+
+#[tokio::test]
+async fn a_tag_filter_gates_which_messages_the_free_text_can_rank() {
+    let fx = Fixture::open().await;
+    let tagged = fx
+        .index(repo::NewMessage {
+            body_text: Some("quarterly report".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let untagged = fx
+        .index(repo::NewMessage {
+            body_text: Some("quarterly report".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    apply_test_tag(&fx.db, fx.account_id, "work", tagged).await;
+    let _ = untagged;
+
+    let ids = fx.ids("tag:work quarterly").await;
+    assert_eq!(ids, vec![tagged]);
+}
+
+#[tokio::test]
+async fn tag_query_combined_with_free_text_still_ranks_by_bm25() {
+    // The exact shape task 48's postmortem describes: a query with *both* a
+    // `tag:` hard filter and a free-text term. If `retrieve::lexical`'s own
+    // classifier had been left at `RawEffect::Never` (or, after the fix,
+    // if `tag_predicate_sql`'s placeholder numbering had silently broken
+    // this module specifically while `filtermask` still worked), this
+    // would either return the untagged match too (filter dropped) or error
+    // out (parameter-count mismatch) instead of ranking only the tagged
+    // one by its BM25 score.
+    let fx = Fixture::open().await;
+    let matching = fx
+        .index(repo::NewMessage {
+            body_text: Some("the invoice is attached, please review".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let same_text_wrong_tag = fx
+        .index(repo::NewMessage {
+            body_text: Some("the invoice is attached, please review".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let tagged_no_match_text = fx
+        .index(repo::NewMessage {
+            body_text: Some("completely unrelated content".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    apply_test_tag(&fx.db, fx.account_id, "work", matching).await;
+    apply_test_tag(&fx.db, fx.account_id, "work", tagged_no_match_text).await;
+    let _ = same_text_wrong_tag;
+
+    let ids = fx.ids("tag:work invoice").await;
+    assert_eq!(
+        ids,
+        vec![matching],
+        "the hard filter must gate candidates and the free text must still rank them -- \
+         neither the wrong-tag match nor the right-tag-wrong-text one should appear"
+    );
+}
+
+/// Apply a tag directly against the schema (no `TagStore` in scope in this
+/// module) -- creates the tag if it does not already exist, then applies it
+/// to `message_id`.
+async fn apply_test_tag(db: &Database, account_id: i64, name: &str, message_id: i64) {
+    let name = name.to_owned();
+    db.write(move |conn| {
+        let tag_id = match crate::tags::repo::get_tag_by_name(conn, account_id, &name)? {
+            Some(tag) => tag.id,
+            None => crate::tags::repo::insert_tag(
+                conn,
+                account_id,
+                &name,
+                None,
+                None,
+                crate::config::TagSyncMode::Local,
+                None,
+            )?,
+        };
+        crate::tags::repo::insert_message_tag(
+            conn,
+            &crate::tags::model::NewMessageTag {
+                tag_id,
+                target: crate::tags::model::Target::Message(message_id),
+                source: crate::tags::model::TagSource::User,
+                state: crate::tags::model::TagState::Applied,
+                confidence: None,
+                rationale: None,
+            },
+        )
+    })
+    .await
+    .unwrap();
 }

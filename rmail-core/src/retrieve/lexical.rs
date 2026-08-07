@@ -86,11 +86,25 @@
 //! everything.
 //!
 //! `note:`/`has:note` *are* backed, by the `notes` table (task 56, migration
-//! `V23`) — see [`super::filtermask::note_text_sql`]/
+//! `V24`) — see [`super::filtermask::note_text_sql`]/
 //! [`super::filtermask::note_exists_sql`], which this module's own
 //! [`classify`] calls rather than re-deriving the same SQL, so this
 //! retriever and [`super::filtermask`]'s (used by every other retriever)
 //! can never disagree about what a note filter matches.
+//! `note:`/`has:note` name a subsystem that lands in a later task (56).
+//! Silently ignoring one of those would let `note:contract invoice` return
+//! every `invoice` hit regardless of the `note:` constraint, which breaks
+//! the "hard filters gate everything" contract just as badly as misapplying
+//! a filter that *is* backed. But the honest answer is not "unknown"
+//! either: with no notes table, *zero* messages currently have any note, so
+//! `note:contract` provably excludes everything, and this module makes it
+//! do exactly that (see [`RawEffect::Never`]) rather than pretend the
+//! constraint does not exist. Negating one of these (`-note:draft`) inverts
+//! correctly for the same reason: "not noted draft" is true of every
+//! message when nothing has a note at all, so it degrades to no constraint
+//! instead of excluding everything. `tag:`/`has:tag` (task 55) and `ai:`
+//! (task 48) are both real, backed constraints today — see
+//! [`tag_predicate_sql`]/[`ai_predicate_sql`].
 //!
 //! `is:` is a partial exception: `pinned`/`muted` name concepts with no
 //! backing data at all (same as `tag:`), but a value outside the six
@@ -114,7 +128,9 @@ use rusqlite::ToSql;
 use tokio_util::sync::CancellationToken;
 
 use super::cancel::interruptible_read;
-use super::filtermask::{ai_predicate_sql, note_exists_sql, note_text_sql};
+use super::filtermask::{
+    ai_predicate_sql, has_tag_predicate_sql, note_exists_sql, note_text_sql, tag_predicate_sql,
+};
 use super::{rank_by_score, Candidate, Source};
 use crate::error::Error;
 use crate::index::fts::{self, FtsIndex};
@@ -489,6 +505,10 @@ enum RawEffect {
     /// subsystem this build has no table for yet (`tag:`, `has:tag`,
     /// `is:pinned`, `is:muted`). See the module docs for why this degrades to
     /// "excludes everything" rather than "no constraint".
+    /// subsystem this build has no table for yet (`note:`, `has:note`,
+    /// `is:pinned`, `is:muted` — `tag:`/`has:tag` are backed as of task 55).
+    /// See the module docs for why this degrades to "excludes everything"
+    /// rather than "no constraint".
     Never,
     /// The operator is backed by real columns, but this stage cannot resolve
     /// *this* value with confidence in either direction (a `before:`/
@@ -611,7 +631,11 @@ fn classify(op: &Operator) -> RawEffect {
             let (sql, params) = note_exists_sql();
             RawEffect::Sql(sql, params)
         }
-        Operator::Has(HasTarget::Tag | HasTarget::Other(_)) => RawEffect::Never,
+        Operator::Has(HasTarget::Tag) => {
+            let (sql, params) = has_tag_predicate_sql();
+            RawEffect::Sql(sql, params)
+        }
+        Operator::Has(HasTarget::Other(_)) => RawEffect::Never,
         Operator::Filename(pattern) => RawEffect::Sql(
             "EXISTS (SELECT 1 FROM attachments WHERE attachments.message_id = messages.id \
              AND lower(attachments.filename) GLOB ?)"
@@ -659,12 +683,14 @@ fn classify(op: &Operator) -> RawEffect {
         Operator::Is(IsFlag::Replied) => flag_predicate("\\Answered", true),
         Operator::Is(IsFlag::Pinned | IsFlag::Muted) => RawEffect::Never,
         Operator::Is(IsFlag::Other(value)) => is_other_flag(value),
-        // `tag:` has no backing table yet (task 55). `note:` and `ai:` are
-        // both resolved through the same classifiers `retrieve::filtermask`
-        // uses — see [`RawEffect::Never`]'s docs and [`ai_predicate_sql`]/
-        // [`note_text_sql`] for why these are shared rather than a second,
-        // independently-drifting copy.
-        Operator::Tag(_) => RawEffect::Never,
+        // Both `tag:` (task 55) and `note:` (task 56) are backed now, and both
+        // call the shared helpers in `retrieve::filtermask` rather than
+        // re-deriving the SQL, so this retriever and every other one can never
+        // disagree about what either operator matches.
+        Operator::Tag(name) => {
+            let (sql, params) = tag_predicate_sql(name);
+            RawEffect::Sql(sql, params)
+        }
         Operator::Note(value) => {
             let (sql, params) = note_text_sql(value);
             RawEffect::Sql(sql, params)

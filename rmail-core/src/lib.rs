@@ -29,6 +29,7 @@ pub mod repo;
 pub mod retrieve;
 pub mod storage;
 pub mod sync;
+pub mod tags;
 pub mod telemetry;
 pub mod thread;
 pub mod transport;

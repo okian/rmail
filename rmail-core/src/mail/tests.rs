@@ -174,6 +174,22 @@ impl ImapMutator for FakeImap {
         }
         Ok(())
     }
+
+    // Not exercised by this module's own tests (task 55's tag keyword
+    // round-trip lives entirely in `crate::tags`) — present only so this
+    // fake satisfies the full `ImapMutator` trait.
+    async fn store_keyword(
+        &self,
+        _account_id: i64,
+        _mailbox: &str,
+        _uidvalidity: i64,
+        _uids: &[i64],
+        _keyword: &str,
+        _prefer_gmail_label: bool,
+        _add: bool,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// A store over a fresh database, an unlimited event log, and a fresh fake
