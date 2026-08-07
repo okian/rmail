@@ -16,6 +16,7 @@ mod ai_policy_service;
 mod ai_service;
 mod audit_service;
 mod auth;
+mod compose_service;
 mod hook_service;
 mod mail_service;
 mod note_service;
@@ -30,6 +31,7 @@ pub use admin_service::AdminApi;
 pub use ai_service::AiApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
+pub use compose_service::ComposeApi;
 pub use hook_service::HookApi;
 pub use mail_service::MailApi;
 pub use note_service::NoteApi;
@@ -50,6 +52,7 @@ use rmail_core::ai::{
     DeepPassGate, DeepPassHandler, PassHandler, PolicyEngine, Provider as AiProvider,
     QueueOptions as AiQueueOptions, TriagePassHandler,
 };
+use rmail_core::compose::DraftStore;
 use rmail_core::embed::hash::HashEmbedder;
 use rmail_core::embed::Embedder;
 use rmail_core::events::{EventLog, Retention};
@@ -70,6 +73,7 @@ use rmail_proto::v1::admin_service_server::AdminServiceServer;
 use rmail_proto::v1::ai_policy_service_server::AiPolicyServiceServer;
 use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
+use rmail_proto::v1::compose_service_server::ComposeServiceServer;
 use rmail_proto::v1::hook_service_server::HookServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::note_service_server::NoteServiceServer;
@@ -529,6 +533,10 @@ where
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
     let mail_service = MailServiceServer::new(MailApi::new(mail_store, stopping.clone()));
     let tag_service = TagServiceServer::new(TagApi::new(tag_store.clone()));
+    // `ComposeService` needs nothing but the database: drafts are local, and
+    // this task deliberately stops short of SMTP (task 61 owns submission),
+    // so there is no client, pool, or background loop to wire up here.
+    let compose_service = ComposeServiceServer::new(ComposeApi::new(DraftStore::new(db.clone())));
 
     // A dedicated `IndexQueue` handle rather than reusing the AI subsystem's
     // (below) — `IndexQueue` is a cheap, stateless wrapper over `db` (see its
@@ -786,6 +794,7 @@ where
         .add_service(mail_service)
         .add_service(note_service)
         .add_service(tag_service)
+        .add_service(compose_service)
         .add_service(search_service)
         .add_service(saved_search_service)
         .add_service(ai_service)

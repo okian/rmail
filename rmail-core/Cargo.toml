@@ -47,6 +47,7 @@ rustls.workspace = true
 webpki-roots.workspace = true
 futures.workspace = true
 mail-parser.workspace = true
+base64.workspace = true
 html2text.workspace = true
 pdf-extract.workspace = true
 calamine.workspace = true

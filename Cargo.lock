@@ -2896,6 +2896,7 @@ dependencies = [
  "argon2",
  "async-imap",
  "async-trait",
+ "base64 0.22.1",
  "calamine",
  "chrono",
  "criterion",

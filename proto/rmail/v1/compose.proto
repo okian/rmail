@@ -1,0 +1,196 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+import "google/protobuf/empty.proto";
+
+// ComposeService owns drafts: the editable source an outgoing message is
+// rendered from (prd.md, "Compose, Schedule & Send"; task 60). It is the
+// service prd.md's MCP mapping points `draft_reply` at
+// (`draft_reply` -> `ComposeService.CreateDraft`).
+//
+// It does not send. Scheduling, SMTP submission, the durable outbox, and
+// undo-send belong to `SendScheduler` (task 61), which reads RenderDraft's
+// output, freezes it as the outbox row's `raw_mime`, and transmits those
+// exact octets.
+service ComposeService {
+  // Create a draft. When `in_reply_to_message_id` is set, the parent's
+  // threading headers are resolved once, here, and frozen onto the draft —
+  // so a reply keeps a correct In-Reply-To/References chain even if the
+  // parent message is later expunged locally.
+  rpc CreateDraft(CreateDraftRequest) returns (Draft);
+
+  // Fetch a draft, attachment bytes included.
+  rpc GetDraft(GetDraftRequest) returns (Draft);
+
+  // List an account's drafts, most recently edited first. Attachment bytes
+  // are omitted (`DraftAttachment.size` is still authoritative); use
+  // GetDraft to fetch them.
+  //
+  // Single-page today: `page_size` caps at 500 and there is no page token, so
+  // an account with more than 500 drafts cannot page past the first. Adding
+  // `page_token`/`next_page_token` is additive and therefore non-breaking, so
+  // it is left to the pagination-hardening task rather than guessed at here.
+  rpc ListDrafts(ListDraftsRequest) returns (ListDraftsResponse);
+
+  // Apply a partial edit. Fields left unset are untouched; a recipient list
+  // that is set — even to empty — replaces that header wholesale.
+  rpc UpdateDraft(UpdateDraftRequest) returns (Draft);
+
+  // Delete a draft and its recipients and attachments.
+  rpc DeleteDraft(DeleteDraftRequest) returns (google.protobuf.Empty);
+
+  // Render a draft into the exact RFC 5322 octets an SMTP submission would
+  // transmit, together with the Message-ID those octets carry and the full
+  // RCPT TO list (which includes Bcc — the rendered message never does).
+  //
+  // Purely a read: it sends nothing and persists nothing. It nonetheless
+  // requires `mail.send` rather than `mail.read`, because it is the send
+  // path's serializer — a token that can only read mail should not be able
+  // to mint a sendable message, however it is later carried.
+  rpc RenderDraft(RenderDraftRequest) returns (RenderedDraft);
+}
+
+// One mailbox: an addr-spec plus an optional display name, both decoded.
+//
+// `address` is never MIME-encoded, in either direction — RFC 2047
+// encoded-words are forbidden inside an addr-spec. `display_name` is likewise
+// the plain text; the server encodes it when (and only when) it renders a
+// header.
+message DraftAddress {
+  // `local@domain`. ASCII only: internationalized addresses (SMTPUTF8) are
+  // rejected with INVALID_ARGUMENT, because the submission path cannot
+  // negotiate them and accepting one would defer the failure to send time.
+  string address = 1;
+  // Optional; empty means none.
+  string display_name = 2;
+}
+
+// An attachment on a persisted draft.
+message DraftAttachment {
+  int64 id = 1;
+  string filename = 2;
+  // `type/subtype`. Anything unparseable renders as
+  // `application/octet-stream`.
+  string content_type = 3;
+  // Decoded length in bytes. Always populated, including in ListDrafts.
+  int64 size = 4;
+  // The bytes. Empty in a ListDrafts result — see that RPC's comment.
+  bytes content = 5;
+}
+
+// An attachment being added to a draft.
+message NewDraftAttachment {
+  // Any directory prefix is stripped; only the basename is stored, so a
+  // receiving client cannot be handed a path to write to.
+  string filename = 1;
+  string content_type = 2;
+  bytes content = 3;
+}
+
+message Draft {
+  int64 id = 1;
+  int64 account_id = 2;
+  DraftAddress from = 3;
+  repeated DraftAddress to = 4;
+  repeated DraftAddress cc = 5;
+  // Blind recipients. They reach the SMTP envelope as RCPT TO commands and
+  // never appear as a header in the rendered message.
+  repeated DraftAddress bcc = 6;
+  string subject = 7;
+  string body_text = 8;
+  // Present means the rendered message is a multipart/alternative.
+  optional string body_html = 9;
+  repeated DraftAttachment attachments = 10;
+  // The local message this replies to, if it still exists. Cleared (not
+  // cascaded) when that message is deleted — the frozen headers below are
+  // what keep the reply attached to its conversation.
+  optional int64 in_reply_to_message_id = 11;
+  // The parent's Message-ID, frozen at reply time. Bare — no angle brackets.
+  optional string in_reply_to = 12;
+  // The References chain this reply will carry, frozen at reply time. Bare
+  // ids, oldest first.
+  repeated string references = 13;
+  // Unix seconds.
+  int64 created_at = 14;
+  // Unix seconds. Advances on every UpdateDraft, and is ListDrafts' sort key.
+  int64 updated_at = 15;
+}
+
+message CreateDraftRequest {
+  int64 account_id = 1;
+  DraftAddress from = 2;
+  repeated DraftAddress to = 3;
+  repeated DraftAddress cc = 4;
+  repeated DraftAddress bcc = 5;
+  string subject = 6;
+  string body_text = 7;
+  optional string body_html = 8;
+  repeated NewDraftAttachment attachments = 9;
+  optional int64 in_reply_to_message_id = 10;
+}
+
+message GetDraftRequest {
+  int64 draft_id = 1;
+}
+
+message ListDraftsRequest {
+  int64 account_id = 1;
+  // 0 uses the server default (50); the server caps this at 500 rather than
+  // rejecting a larger value, matching prd.md's pagination rule.
+  int32 page_size = 2;
+}
+
+message ListDraftsResponse {
+  repeated Draft drafts = 1;
+}
+
+// A recipient list in an UpdateDraftRequest.
+//
+// Wrapped in a message rather than declared `repeated` directly on the
+// request, because proto3 cannot distinguish an absent repeated field from an
+// empty one — and here the difference is "leave this header alone" versus
+// "clear it".
+message DraftAddressList {
+  repeated DraftAddress addresses = 1;
+}
+
+// The attachment list in an UpdateDraftRequest, wrapped for the same reason
+// DraftAddressList is.
+message DraftAttachmentList {
+  repeated NewDraftAttachment attachments = 1;
+}
+
+message UpdateDraftRequest {
+  int64 draft_id = 1;
+  DraftAddress from = 2;
+  DraftAddressList to = 3;
+  DraftAddressList cc = 4;
+  DraftAddressList bcc = 5;
+  optional string subject = 6;
+  optional string body_text = 7;
+  // Set to the empty string to remove the HTML alternative — an absent field
+  // already means "leave alone", so there is no other way to say it.
+  optional string body_html = 8;
+  DraftAttachmentList attachments = 9;
+}
+
+message DeleteDraftRequest {
+  int64 draft_id = 1;
+}
+
+message RenderDraftRequest {
+  int64 draft_id = 1;
+}
+
+message RenderedDraft {
+  // The complete RFC 5322 message: exactly the SMTP DATA payload, CRLF line
+  // endings throughout, no line over 998 octets.
+  bytes mime = 1;
+  // The Message-ID carried by those octets, bare (no angle brackets). Freshly
+  // minted on every call — the identity of a sent message is minted once, by
+  // the send path, not by every preview.
+  string message_id = 2;
+  // Every RCPT TO the submission must issue: To, Cc, and Bcc, deduplicated.
+  repeated string envelope_recipients = 3;
+}

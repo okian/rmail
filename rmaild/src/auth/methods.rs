@@ -211,6 +211,56 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.NoteService/WatchNotes",
         Requirement::Scope(Scope::MailRead),
     ),
+    // -- ComposeService (task 60) ---------------------------------------------
+    // Drafts are local mail the caller authored, scoped the same read/write
+    // way `NoteService`'s rows are: `GetDraft`/`ListDrafts` only read the
+    // local database, so `mail.read` suffices; `CreateDraft`/`UpdateDraft`/
+    // `DeleteDraft` mutate it, so they need `mail.write`. Nothing here
+    // reaches IMAP, SMTP, or a model provider — this task builds the draft
+    // and MIME layer only.
+    (
+        "/rmail.v1.ComposeService/CreateDraft",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.ComposeService/GetDraft",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.ComposeService/ListDrafts",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.ComposeService/UpdateDraft",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.ComposeService/DeleteDraft",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    // `RenderDraft` is the odd one out: it sends nothing and persists
+    // nothing, so on the "does it mutate?" test alone it would be
+    // `mail.read`. It requires `mail.send` because of *what it produces* —
+    // the exact, complete octets of a transmissible message, Message-ID and
+    // all (`rmail_core::compose::mime`'s own module docs: the submission path
+    // hands these bytes to SMTP unchanged). The property prd.md's scope model
+    // promises is "you can hand Claude a token that reads and summarizes
+    // freely but cannot send"; a read-only token that can mint a ready-to-
+    // transmit message and hand it to any other SMTP client has been given
+    // most of what that sentence says it cannot have.
+    //
+    // Two consequences of `Requirement` holding exactly one scope, with no
+    // conjunction and no hierarchy below `Admin` (see
+    // `rmail_core::auth::satisfies`): a `mail.read` + `mail.write` token —
+    // the natural composer token — cannot preview its own draft, and
+    // `mail.send` alone is now enough to *read* a draft's full body, since
+    // the rendered message contains it. Neither is wrong for this surface,
+    // but if `Requirement` ever grows a conjunction this row wants
+    // `MailRead + MailSend` rather than either alone.
+    (
+        "/rmail.v1.ComposeService/RenderDraft",
+        Requirement::Scope(Scope::MailSend),
+    ),
     // -- SearchService (task 33) ----------------------------------------------
     // Every RPC here is a read-only query over the local index (no IMAP round
     // trip, no mutation — see `search_service`'s own module docs), so

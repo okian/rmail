@@ -1,6 +1,44 @@
+# Allowlist for the `typos` pre-commit hook.
+#
+# Kept deliberately short. Every entry is a word the checker's dictionary is
+# simply wrong about in this codebase's context, never a real misspelling
+# someone did not want to fix — the hook only earns its place if a red run
+# means something. Before this file existed the hook failed on every commit
+# against long-merged files, which is how `--no-verify` became habitual.
+
 [default.extend-words]
-# Rust crate/tool names the spell-checker misreads.
-ratatui = "ratatui"
-# Intentional misspelling used in prd.md as a spell-correction/fuzzy-find
-# example ("invoce" -> "invoice"). Keep it verbatim.
+# A standard variant spelling ("not able to be parsed"); used throughout the
+# error-handling docs and in `AdminService`'s own test names.
+unparseable = "unparseable"
+
+# SQL, not a misspelling of "dead": predicates are "ANDed together" in the
+# retrieval layer's docs. The splitter breaks the token up and judges the
+# trailing fragment, so the fragment is what has to be allowed.
+Ded = "Ded"
+
+# The hyphenated prefix in "a mis-map", split off and read as a word.
+mis = "mis"
+
+# Not "calf". A deliberate fixture: `search_cli` asserts that a byte range
+# ending mid-character in "café" is rejected while the 0..3 prefix "caf"
+# remains a valid boundary.
+caf = "caf"
+
+# Deliberately misspelled. `query::plan`'s spellfix tests assert that "invoce"
+# is corrected to "invoice"; fixing it here would delete the test's subject.
 invoce = "invoce"
+
+# Deliberately misspelled. `ai::policy`'s tests use "Wrok" as an account name
+# that was never configured, and assert the rejection names it back.
+Wrok = "Wrok"
+
+# The TUI crate (tasks 83-85), not the dish.
+ratatui = "ratatui"
+
+# "ands" as a verb in `match_expr_build_ands_terms_and_phrases` -- the builder
+# ANDs its terms together.
+ands = "ands"
+
+# A deliberately mangled token: `rehydrate` must leave an unrecognized token
+# verbatim rather than guessing which real one was meant.
+EMAILL = "EMAILL"
