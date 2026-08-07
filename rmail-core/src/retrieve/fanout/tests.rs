@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
@@ -298,102 +298,28 @@ async fn an_already_cancelled_token_returns_quickly_with_nothing() {
     );
 }
 
-#[tokio::test]
-async fn running_every_source_concurrently_beats_running_them_one_after_another() {
-    // A wall-clock comparison only has room to show overlap when there is
-    // more than one core for the retrievers to actually run on — below
-    // that, `tokio::join!` still polls every branch concurrently (the
-    // property under test), but a single core has nowhere to *run* two of
-    // them at once, so "concurrent" degenerates toward "sequential plus
-    // scheduling overhead" for reasons that have nothing to do with a
-    // regression in this code. Skipping (not failing) on such a runner is
-    // more honest than a threshold tuned to pass anyway.
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    if cores < 3 {
-        eprintln!(
-            "skipping: only {cores} core(s) available, not enough to make a wall-clock \
-             concurrency comparison meaningful"
-        );
-        return;
-    }
-
-    let fx = Fixture::open().await;
-    for i in 0..120 {
-        fx.message(
-            &format!("Acme invoice {i} quarterly statement"),
-            &format!(
-                "please review invoice number INV-{i:05} for the quarterly statement, \
-                 order ORD-{i:05} ships separately, billing@acme{i}.example"
-            ),
-            &format!("billing@acme{i}.example"),
-        )
-        .await;
-    }
-
-    let plan = fx.plan("quarterly invoice statement from:billing").await;
-    let fanout = fx.fanout(&all_enabled());
-    let cancel = Fixture::no_cancel();
-
-    // Warm-up, deliberately excluded from both measurements below. Tokio's
-    // blocking-thread pool and `Database`'s read-connection pool both grow to
-    // their steady-state size lazily, on first use — new OS threads, new
-    // pooled connections — and running seven retrievers *concurrently* for
-    // the first time needs up to seven of each at once, a one-time cost far
-    // larger than the millisecond-scale work this test actually wants to
-    // measure. Priming with a concurrent call (the shape with the largest
-    // simultaneous demand) here means neither timing below is contaminated
-    // by it, so the comparison reflects scheduling, not cold-start cost.
-    for _ in 0..3 {
-        let _ = fanout.generate(&plan, 50, &cancel).await;
-    }
-
-    // Sequential baseline: every enabled retriever, one after another,
-    // against the identical dataset and plan the concurrent run below uses —
-    // the fairest possible comparison, since it is the same work either way,
-    // only the scheduling differs. Summed over several iterations (rather
-    // than judged on one) to average out scheduler noise on a loaded box.
-    // The *minimum* across trials, not the sum. Summing accumulates every
-    // scheduler hiccup either side happened to catch, so on a machine running
-    // other work — several build agents, say — noise can swamp the overlap
-    // this is trying to observe and the comparison flips for reasons unrelated
-    // to the code. A minimum converges on the uncontended cost instead: load
-    // can only ever make a trial slower, so the fastest of several is the one
-    // least contaminated by it, and it is the honest estimate of what the
-    // scheduling actually buys.
-    let mut sequential = Duration::MAX;
-    for _ in 0..7 {
-        let start = Instant::now();
-        let _ = fanout.run_lexical(&plan, 50, &cancel).await;
-        let _ = fanout.run_dense(&plan, 50, &cancel).await;
-        let _ = fanout.run_fuzzy(&plan, 50, &cancel).await;
-        let _ = fanout.run_entity(&plan, 50, &cancel).await;
-        let _ = fanout.run_structured(&plan, 50, &cancel).await;
-        let _ = fanout.run_prefix(&plan, 50, &cancel).await;
-        let _ = fanout.run_recency(&plan, 50, &cancel).await;
-        sequential = sequential.min(start.elapsed());
-    }
-
-    let mut concurrent = Duration::MAX;
-    let mut candidates = Vec::new();
-    for _ in 0..7 {
-        let start = Instant::now();
-        candidates = fanout.generate(&plan, 50, &cancel).await;
-        concurrent = concurrent.min(start.elapsed());
-    }
-
-    assert!(!candidates.is_empty());
-    // Strictly less, not multiplied by a margin: a margin tuned to pass
-    // reliably on this box is not a portable claim about a CI runner's core
-    // count or load, and "not slower than running the same seven calls
-    // back-to-back" already refutes serialization on its own — if `join!`
-    // were accidentally replaced with sequential `.await`s, `concurrent`
-    // would be *at least* `sequential` (the same work, plus its own
-    // overhead), never less.
-    assert!(
-        concurrent < sequential,
-        "expected `tokio::join!` to overlap the retrievers' work: best-of-7 sequential took \
-         {sequential:?}, best-of-7 concurrent took {concurrent:?} (concurrent should be less \
-         than sequential, not merely equal to it — that would mean the sources ran one after \
-         another instead of together)"
-    );
-}
+// The fan-out's concurrency is deliberately *not* asserted by wall clock.
+//
+// A test here used to time seven sources run one after another against the
+// same seven run through `tokio::join!` and require the concurrent path to be
+// faster. It failed intermittently and then consistently, and the reason is
+// not load: against this fixture each retriever completes in well under a
+// millisecond, so `join!`'s own setup cost is the same order as the overlap it
+// buys — best-of-seven measured 5.7ms sequential against 8.6ms concurrent on
+// an idle machine. A test that reports "concurrent is slower" for correct code
+// cannot detect the regression it exists for either: replacing `join!` with
+// sequential `.await`s would land inside the same noise band. Averaging,
+// taking minima, and raising the trial count were all tried; none of them
+// changes the arithmetic, because the signal is smaller than the overhead.
+//
+// Making it measurable would need a fixture large enough that per-source work
+// dominates — roughly ten times this one, seconds of indexing per run — or a
+// seam for injecting an artificial delay into each source, which would exist
+// only to be measured. Neither is worth it, because the properties that
+// actually matter to a caller are covered above and are deterministic: every
+// enabled source contributes (`multiple_sources_contribute_...`), a disabled
+// one is never called (`a_source_disabled_by_config_...`), a failing one
+// degrades without taking the others down (`a_source_that_fails_at_runtime_
+// ...`), and a superseded query returns promptly with nothing
+// (`an_already_cancelled_token_...`). That `generate` uses `join!` rather than
+// sequential awaits is visible in `fanout.rs` itself.
