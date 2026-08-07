@@ -1,0 +1,212 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+import "google/protobuf/empty.proto";
+import "rmail/v1/mail.proto";
+import "rmail/v1/search.proto";
+
+// SavedSearchService is the surface for prd.md's "Saved Searches & Smart
+// Folders" (task 35).
+//
+// Two related things live here because they share one idea — a *named
+// query* — and differ only in what is done with it:
+//
+//   * A saved search is a named query string, re-run through the whole
+//     ranking pipeline on demand. `RunSavedSearch` streams the identical
+//     `SearchHit`s `SearchService.Search` would for the same string,
+//     because it is the same call: the daemon resolves the name to its
+//     stored query and hands that query to the one search path in the
+//     process. No result set is ever stored (see `SavedSearch.query`).
+//
+//   * A deterministic smart folder is a named operator-DSL *predicate*
+//     whose membership is recomputed on every read and re-evaluated on
+//     every sync. No mail is moved on the server — `ListSmartFolderMembers`
+//     runs the predicate against current local state, so a message that
+//     synced a moment ago is a member a moment ago. New members can
+//     trigger an auto-tag and/or a notification, and only *new* ones do.
+//
+// Natural-language smart folders (a plain-English predicate Claude compiles
+// once into a stored hybrid plan) are task 58's, and extend `CreateSmartFolder`
+// rather than replacing it.
+service SavedSearchService {
+  // Persist a named query. The query string is stored verbatim and
+  // re-parsed on every run.
+  rpc CreateSavedSearch(CreateSavedSearchRequest) returns (SavedSearch);
+
+  // Replace an existing saved search's query text.
+  rpc UpdateSavedSearch(UpdateSavedSearchRequest) returns (SavedSearch);
+
+  // List an account's saved searches, alphabetical by name.
+  rpc ListSavedSearches(ListSavedSearchesRequest) returns (ListSavedSearchesResponse);
+
+  // Delete a saved search by name.
+  rpc DeleteSavedSearch(DeleteSavedSearchRequest) returns (google.protobuf.Empty);
+
+  // Re-run a saved search through the full ranking pipeline and stream its
+  // hits, exactly as `SearchService.Search` would for the same query string.
+  rpc RunSavedSearch(RunSavedSearchRequest) returns (stream SearchHit);
+
+  // Define a smart folder from an operator-DSL predicate. The predicate must
+  // be expressible entirely as hard filters: free text, and any operator the
+  // deterministic membership compiler does not back, are rejected with
+  // INVALID_ARGUMENT rather than silently dropped (which would make the
+  // folder match more than was asked for, on every future sync).
+  //
+  // The folder's current matches are recorded as an action baseline, so
+  // defining a folder over an existing mailbox never notifies for the
+  // backlog.
+  rpc CreateSmartFolder(CreateSmartFolderRequest) returns (SmartFolder);
+
+  // List an account's smart folders, alphabetical by name.
+  rpc ListSmartFolders(ListSmartFoldersRequest) returns (ListSmartFoldersResponse);
+
+  // Delete a smart folder by name. Deletes the folder's definition only —
+  // no message is touched, because none was ever moved.
+  rpc DeleteSmartFolder(DeleteSmartFolderRequest) returns (google.protobuf.Empty);
+
+  // Stream a smart folder's members as they stand right now. This runs the
+  // predicate; it does not read a stored membership, and it writes nothing.
+  rpc ListSmartFolderMembers(ListSmartFolderMembersRequest) returns (stream Message);
+
+  // Force an immediate re-evaluation instead of waiting for the background
+  // pass, firing auto-tag/notify for members that are genuinely new since
+  // the last evaluation.
+  rpc EvaluateSmartFolder(EvaluateSmartFolderRequest) returns (SmartFolderEvaluation);
+}
+
+// A named query. Note what is absent: there is no field for results. A saved
+// search stores the query and re-runs it, so it can never go stale and can
+// never disagree with what a live search of the same string returns.
+message SavedSearch {
+  int64 id = 1;
+  int64 account_id = 2;
+  // Unique per account, matched case-insensitively.
+  string name = 3;
+  // The raw query string, verbatim as typed — operators, free text, and
+  // `~`/`=` sigils included.
+  string query = 4;
+  // Unix seconds.
+  int64 created_at = 5;
+  // Unix seconds; advances when the query text changes.
+  int64 updated_at = 6;
+  // Unix seconds; 0 if never run.
+  int64 last_run_at = 7;
+}
+
+message CreateSavedSearchRequest {
+  int64 account_id = 1;
+  string name = 2;
+  string query = 3;
+}
+
+message UpdateSavedSearchRequest {
+  int64 account_id = 1;
+  string name = 2;
+  string query = 3;
+}
+
+message ListSavedSearchesRequest {
+  int64 account_id = 1;
+}
+
+message ListSavedSearchesResponse {
+  repeated SavedSearch searches = 1;
+}
+
+message DeleteSavedSearchRequest {
+  int64 account_id = 1;
+  string name = 2;
+}
+
+message RunSavedSearchRequest {
+  int64 account_id = 1;
+  string name = 2;
+  // 0 uses the server's `search.default_limit`, exactly as SearchRequest does.
+  uint32 limit = 3;
+  // Attach a RankExplanation to each hit, as SearchRequest.explain does.
+  bool explain = 4;
+}
+
+// A virtual mailbox defined by a predicate. As with SavedSearch, there is
+// deliberately no membership field: membership is derived, never stored.
+message SmartFolder {
+  int64 id = 1;
+  int64 account_id = 2;
+  // Unique per account, matched case-insensitively.
+  string name = 3;
+  // The operator-DSL predicate, e.g. `from:stripe is:unread -in:Spam`.
+  string predicate = 4;
+  // Applied to genuinely new members. Empty means no auto-tag.
+  string auto_tag = 5;
+  // Whether a genuinely new member publishes a RULE_FIRED event.
+  bool notify = 6;
+  // Unix seconds.
+  int64 created_at = 7;
+  int64 updated_at = 8;
+  // Unix seconds; 0 if never evaluated.
+  int64 last_evaluated_at = 9;
+}
+
+message CreateSmartFolderRequest {
+  int64 account_id = 1;
+  string name = 2;
+  string predicate = 3;
+  // Empty for no auto-tag. The tag is created on demand if it does not exist.
+  string auto_tag = 4;
+  bool notify = 5;
+}
+
+message ListSmartFoldersRequest {
+  int64 account_id = 1;
+}
+
+message ListSmartFoldersResponse {
+  repeated SmartFolder folders = 1;
+}
+
+message DeleteSmartFolderRequest {
+  int64 account_id = 1;
+  string name = 2;
+}
+
+message ListSmartFolderMembersRequest {
+  int64 account_id = 1;
+  string name = 2;
+  // 0 streams every member.
+  uint32 limit = 3;
+}
+
+message EvaluateSmartFolderRequest {
+  int64 account_id = 1;
+  string name = 2;
+}
+
+// What one evaluation found and did.
+//
+// The two id lists are capped (see `entered_truncated`/`departed_truncated`)
+// because a delta is unbounded in principle — a boot pass after a long
+// downtime, or a "mark all read" against an `is:unread` folder, moves every
+// member at once — and this is a unary response. The counts are always
+// exact; the lists are a sample for a UI to highlight. Re-derive full
+// membership with ListSmartFolderMembers, which streams.
+message SmartFolderEvaluation {
+  int64 smart_folder_id = 1;
+  // How many messages currently satisfy the predicate.
+  uint32 members = 2;
+  // Messages that became members since the previous evaluation, ascending.
+  // Capped; see `entered_count`.
+  repeated int64 entered = 3;
+  // Messages that stopped being members, ascending. Capped; see
+  // `departed_count`.
+  repeated int64 departed = 4;
+  // New tag applications the auto-tag action created (excludes messages that
+  // already carried the tag).
+  uint32 tagged = 5;
+  // Notifications published.
+  uint32 notified = 6;
+  // The exact number of new members, which may exceed `entered.len()`.
+  uint32 entered_count = 7;
+  // The exact number of departures, which may exceed `departed.len()`.
+  uint32 departed_count = 8;
+}

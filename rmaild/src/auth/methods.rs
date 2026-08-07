@@ -393,6 +393,59 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.TagService/ResolveSuggestion",
         Requirement::Scope(Scope::MailWrite),
     ),
+    // -- SavedSearchService (task 35) -----------------------------------------
+    // Reads sit at `mail.read` for the same reason `SearchService`'s do: they
+    // rank or enumerate messages the caller could already `MailService::List`,
+    // over the local index, with no IMAP round trip.
+    // `ListSmartFolderMembers` is a *read* despite naming a folder — it runs
+    // the predicate and streams what currently matches; it evaluates nothing
+    // and fires no action (see `rmaild::saved_search_service`'s module docs).
+    //
+    // Everything that persists a definition (`Create*`/`Update*`/`Delete*`)
+    // needs `mail.write`, and so does `EvaluateSmartFolder` — it is the one
+    // RPC here with side effects, since a genuinely new member can auto-tag
+    // (a `message_tags` write that may reflect to IMAP, exactly like
+    // `TagService::AddTag`) and notify.
+    (
+        "/rmail.v1.SavedSearchService/CreateSavedSearch",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.SavedSearchService/UpdateSavedSearch",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.SavedSearchService/ListSavedSearches",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.SavedSearchService/DeleteSavedSearch",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.SavedSearchService/RunSavedSearch",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.SavedSearchService/CreateSmartFolder",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.SavedSearchService/ListSmartFolders",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.SavedSearchService/DeleteSmartFolder",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.SavedSearchService/ListSmartFolderMembers",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.SavedSearchService/EvaluateSmartFolder",
+        Requirement::Scope(Scope::MailWrite),
+    ),
 ];
 
 /// The requirement for `method` (a full gRPC path like

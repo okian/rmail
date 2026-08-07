@@ -24,25 +24,64 @@
 //! without either running the full lexical retriever — the exact coupling
 //! this module exists to avoid — or silently dropping it, which is what
 //! this already does, just made explicit here).
+//!
+//! # Two consumers, one compiler (task 35)
+//!
+//! [`crate::smart_folder`] resolves a deterministic smart folder's
+//! membership through this same compiler and this same
+//! [`select_message_ids`] statement, rather than growing a third copy of
+//! "turn an operator query into a set of message ids" beside this one and
+//! [`crate::retrieve::filtermask`]'s. The two consumers differ only in what
+//! they do about the silent degradation described above, which is why
+//! [`compile_detailed`] reports what it dropped alongside the finished
+//! SQL: bulk-tagging accepts a dropped constraint (the caller named the
+//! tag and can see the count before committing), while a smart folder
+//! rejects one at create time — a *persistent* saved predicate whose ranked
+//! half was silently discarded resolves to a strictly larger set than the
+//! user described, on every future sync, with nobody watching.
 
 use rusqlite::types::Value;
+use rusqlite::Connection;
 
 use crate::query::parse::{self, HasTarget, IsFlag, Operator};
 use crate::retrieve::filtermask::tag_predicate_sql;
 
-/// Compile `raw` into a `WHERE`-clause fragment (already including the
-/// `account_id` scope) plus its bound parameters, in the order the `?`
-/// placeholders appear.
+/// A compiled hard-filter query, plus what the compiler could not express.
+///
+/// The two `dropped_*` counts are the whole reason this type exists —
+/// see the module docs' "Two consumers, one compiler" section.
+pub(crate) struct Compiled {
+    /// A `WHERE`-clause fragment over `messages`, already including the
+    /// `account_id` scope.
+    pub where_sql: String,
+    /// Bound parameters, in the order the `?` placeholders appear.
+    pub params: Vec<Value>,
+    /// How many parsed operators became SQL.
+    pub applied: usize,
+    /// Parsed operators this compiler does not back, dropped from the
+    /// predicate.
+    pub dropped_operators: Vec<Operator>,
+    /// Free-text terms and phrases, which a hard-filter-only compiler has
+    /// nowhere to put (they rank, they do not gate).
+    pub dropped_free_text: Vec<String>,
+}
+
+/// Compile `raw` into a [`Compiled`] predicate over `messages`, scoped to
+/// `account_id`, plus everything in `raw` the compiler could not express.
 #[must_use]
-pub(crate) fn compile(account_id: i64, raw: &str) -> (String, Vec<Value>) {
+pub(crate) fn compile_detailed(account_id: i64, raw: &str) -> Compiled {
     let parsed = parse::parse(raw);
     let mut clauses = vec!["account_id = ?".to_owned()];
     let mut params = vec![Value::Integer(account_id)];
+    let mut applied = 0usize;
+    let mut dropped_operators = Vec::new();
 
     for filter in &parsed.filters {
         let Some((sql, filter_params)) = classify(&filter.op) else {
+            dropped_operators.push(filter.op.clone());
             continue;
         };
+        applied += 1;
         clauses.push(if filter.negated {
             // NULL-safe negation — see `retrieve::lexical::build_negated_clause`
             // for the identical three-valued-logic hazard this closes; every
@@ -55,7 +94,77 @@ pub(crate) fn compile(account_id: i64, raw: &str) -> (String, Vec<Value>) {
         });
         params.extend(filter_params);
     }
-    (clauses.join(" AND "), params)
+
+    let dropped_free_text = parsed
+        .terms
+        .iter()
+        .map(|term| term.text.clone())
+        .chain(parsed.phrases.iter().map(|phrase| phrase.text.clone()))
+        .collect();
+
+    Compiled {
+        where_sql: clauses.join(" AND "),
+        params,
+        applied,
+        dropped_operators,
+        dropped_free_text,
+    }
+}
+
+/// Run a [`Compiled`] predicate and collect the message ids it names,
+/// ascending.
+///
+/// The single statement both `BulkTag`'s selector and a smart folder's
+/// membership go through — a caller supplies its own read wrapper (a plain
+/// [`crate::storage::Database::read`], or
+/// [`crate::retrieve::cancel::interruptible_read`] where a cancellation
+/// token has to reach the in-flight scan), so the two share the query
+/// without sharing a concurrency policy.
+///
+/// `ORDER BY id` is not cosmetic: a smart folder diffs consecutive
+/// evaluations of this list against each other, and an unordered result
+/// would make that diff depend on whatever plan SQLite happened to pick.
+pub(crate) fn select_message_ids(
+    conn: &Connection,
+    compiled: &Compiled,
+) -> rusqlite::Result<Vec<i64>> {
+    select_message_ids_limited(conn, compiled, None)
+}
+
+/// [`select_message_ids`], stopping after `limit` rows.
+///
+/// The bound goes into the SQL rather than being applied to the returned
+/// `Vec`, because the caller that wants one (a paged
+/// `ListSmartFolderMembers`) is asking a folder that may hold every message
+/// in the account for its first twenty — materializing all of them first
+/// would make the bound cost exactly what it exists to avoid.
+pub(crate) fn select_message_ids_limited(
+    conn: &Connection,
+    compiled: &Compiled,
+    limit: Option<usize>,
+) -> rusqlite::Result<Vec<i64>> {
+    // `limit` is an integer this crate computed, never caller text, so
+    // formatting it is not an injection surface — and it cannot be bound as
+    // a parameter without disturbing the positional `?` order `compiled`
+    // already owns.
+    let bound = match limit {
+        Some(limit) => format!(" LIMIT {limit}"),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT id FROM messages WHERE {} ORDER BY id{bound}",
+        compiled.where_sql
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let bind: Vec<&dyn rusqlite::ToSql> = compiled
+        .params
+        .iter()
+        .map(|v| v as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt
+        .query_map(bind.as_slice(), |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(rows)
 }
 
 /// Classify one operator's positive form into a SQL predicate over

@@ -27,6 +27,8 @@ pub mod query;
 pub mod rank;
 pub mod repo;
 pub mod retrieve;
+pub mod saved_search;
+pub mod smart_folder;
 pub mod storage;
 pub mod sync;
 pub mod tags;

@@ -481,23 +481,53 @@ impl TagStore {
     /// rather than one round trip per message — prd.md: "bulk tag = single
     /// transaction + coalesced IMAP `STORE` UID sets".
     ///
+    /// Applications are recorded as [`TagSource::User`]; an automated
+    /// applier wants [`bulk_tag_with_source`](Self::bulk_tag_with_source)
+    /// instead.
+    ///
     /// # Errors
     /// [`Error::InvalidArgument`] if `names` is empty. Otherwise a mapped
     /// storage error, or the IMAP mutator's error under `sync_mode = imap`.
-    #[tracing::instrument(
-        skip(self, selector, names),
-        fields(
-            account_id = account_id,
-            names = names.len(),
-            by_query = matches!(selector, BulkSelector::Query(_)),
-        ),
-        err
-    )]
     pub async fn bulk_tag(
         &self,
         account_id: i64,
         selector: BulkSelector,
         names: &[String],
+    ) -> Result<BulkOutcome, Error> {
+        self.bulk_tag_with_source(account_id, selector, names, TagSource::User)
+            .await
+    }
+
+    /// [`bulk_tag`](Self::bulk_tag) with an explicit [`TagSource`] — the
+    /// entry point an automated applier uses so its rows are distinguishable
+    /// from a human's.
+    ///
+    /// `bulk_tag` itself is the `BulkTag` RPC's path and always records
+    /// [`TagSource::User`], because that RPC is only ever a person asking.
+    /// [`crate::smart_folder`]'s `auto_tag` action calls this instead with
+    /// [`TagSource::Rule`]: prd.md's tag model distinguishes who applied a
+    /// tag (`user`/`ai`/`rule`/`imap`), and task 57's rule-learning pass
+    /// reads exactly that column — a rule-applied tag indistinguishable from
+    /// a hand-applied one would be training signal that never happened.
+    ///
+    /// # Errors
+    /// As [`bulk_tag`](Self::bulk_tag).
+    #[tracing::instrument(
+        skip(self, selector, names),
+        fields(
+            account_id = account_id,
+            names = names.len(),
+            source = ?source,
+            by_query = matches!(selector, BulkSelector::Query(_)),
+        ),
+        err
+    )]
+    pub async fn bulk_tag_with_source(
+        &self,
+        account_id: i64,
+        selector: BulkSelector,
+        names: &[String],
+        source: TagSource,
     ) -> Result<BulkOutcome, Error> {
         if names.is_empty() {
             return Err(Error::invalid_argument("at least one tag name is required"));
@@ -553,7 +583,7 @@ impl TagStore {
                             &NewMessageTag {
                                 tag_id: tag.id,
                                 target: Target::Message(*message_id),
-                                source: TagSource::User,
+                                source,
                                 state: TagState::Applied,
                                 confidence: None,
                                 rationale: None,
@@ -760,22 +790,18 @@ impl TagStore {
 
     /// Resolve a filter-only query string into its matching message ids,
     /// scoped to `account_id` — [`BulkSelector::Query`]'s resolution. See
-    /// [`query`]'s own module docs for exactly what it understands.
+    /// [`query`]'s own module docs for exactly what it understands, and its
+    /// "Two consumers, one compiler" section for why
+    /// [`query::select_message_ids`] is a shared function rather than a
+    /// statement written out here.
     ///
     /// # Errors
     /// A mapped storage error.
     async fn resolve_query(&self, account_id: i64, raw: &str) -> Result<Vec<i64>, Error> {
-        let (where_sql, params) = query::compile(account_id, raw);
-        let sql = format!("SELECT id FROM messages WHERE {where_sql}");
+        let compiled = query::compile_detailed(account_id, raw);
         Ok(self
             .db
-            .read(move |conn| {
-                let mut stmt = conn.prepare(&sql)?;
-                let bind: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-                let rows = stmt.query_map(bind.as_slice(), |row| row.get::<_, i64>(0))?;
-                rows.collect::<rusqlite::Result<Vec<i64>>>()
-            })
+            .read(move |conn| query::select_message_ids(conn, &compiled))
             .await?)
     }
 

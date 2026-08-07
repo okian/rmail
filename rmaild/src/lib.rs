@@ -2,9 +2,9 @@
 //!
 //! [`serve_uds`] boots the tonic server on a Unix domain socket exposing gRPC
 //! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and the
-//! `AccountService`/`SyncService`/`AdminService`/`MailService`/
-//! `SearchService`/`AiService`/`HookService` handlers — all wrapped in a
-//! `SearchService`/`AiService`/`TagService` handlers — all wrapped in a
+//! `AccountService`/`SyncService`/`AdminService`/`AuditService`/
+//! `MailService`/`NoteService`/`TagService`/`SearchService`/
+//! `SavedSearchService`/`AiService`/`HookService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -19,6 +19,7 @@ mod auth;
 mod hook_service;
 mod mail_service;
 mod note_service;
+mod saved_search_service;
 mod search_service;
 mod sync_service;
 mod tag_service;
@@ -32,6 +33,7 @@ pub use auth::AuthLayer;
 pub use hook_service::HookApi;
 pub use mail_service::MailApi;
 pub use note_service::NoteApi;
+pub use saved_search_service::SavedSearchApi;
 pub use search_service::SearchApi;
 pub use sync_service::SyncApi;
 pub use tag_service::TagApi;
@@ -58,6 +60,8 @@ use rmail_core::index::{IndexQueue, QueueOptions as IndexQueueOptions};
 use rmail_core::mail::MailStore;
 use rmail_core::notes::NoteStore;
 use rmail_core::rank::l1::Weights;
+use rmail_core::saved_search::SavedSearchStore;
+use rmail_core::smart_folder::{SmartFolderEvaluator, SmartFolderStore};
 use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::tags::TagStore;
 use rmail_core::{Config, Database};
@@ -69,6 +73,7 @@ use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::hook_service_server::HookServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::note_service_server::NoteServiceServer;
+use rmail_proto::v1::saved_search_service_server::SavedSearchServiceServer;
 use rmail_proto::v1::search_service_server::SearchServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
 use rmail_proto::v1::tag_service_server::TagServiceServer;
@@ -523,7 +528,7 @@ where
     let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
     let mail_service = MailServiceServer::new(MailApi::new(mail_store, stopping.clone()));
-    let tag_service = TagServiceServer::new(TagApi::new(tag_store));
+    let tag_service = TagServiceServer::new(TagApi::new(tag_store.clone()));
 
     // A dedicated `IndexQueue` handle rather than reusing the AI subsystem's
     // (below) — `IndexQueue` is a cheap, stateless wrapper over `db` (see its
@@ -586,14 +591,38 @@ where
             // with `vec_chunks` unpopulated either way, it costs nothing real.
             Arc::new(HashEmbedder::new(VECTOR_DIM)) as Arc<dyn Embedder>
         });
-    let search_service = SearchServiceServer::new(SearchApi::new(
+    let search_api = SearchApi::new(
         db.clone(),
         embedder,
         rank_weights,
         config.search.clone(),
         &config.index.semantic,
         stopping.clone(),
+    );
+    let search_service = SearchServiceServer::new(search_api.clone());
+
+    // Saved searches + deterministic smart folders (task 35). `SavedSearchApi`
+    // holds a clone of the *same* `SearchApi` the `SearchService` above
+    // serves, so `RunSavedSearch` re-runs a saved query through the one
+    // pipeline in this process rather than a second one of its own.
+    //
+    // The smart folder store applies its `auto_tag` action through the same
+    // `TagStore` `TagService` uses (so a rule-applied tag honours the tag's
+    // own IMAP sync mode) and publishes `notify` actions to the same
+    // `EventLog` every other subsystem consumes.
+    let smart_folder_store = SmartFolderStore::new(db.clone(), tag_store, events.clone());
+    let saved_search_service = SavedSearchServiceServer::new(SavedSearchApi::new(
+        db.clone(),
+        SavedSearchStore::new(db.clone()),
+        smart_folder_store.clone(),
+        search_api,
+        stopping.clone(),
     ));
+    // Membership is always live on read, so this loop exists only to keep
+    // *actions* following sync — see `rmail_core::smart_folder`'s docs.
+    let smart_folder_handle = SmartFolderEvaluator::new(smart_folder_store, events.clone())
+        .spawn(stopping.clone())
+        .await;
 
     // AI subsystem: the durable queue, the two pass handlers, the worker
     // pool/batch coordinator that drive them, and the dispatch loop that
@@ -758,6 +787,7 @@ where
         .add_service(note_service)
         .add_service(tag_service)
         .add_service(search_service)
+        .add_service(saved_search_service)
         .add_service(ai_service)
         .add_service(ai_policy_service)
         .add_service(hook_service)
@@ -772,6 +802,7 @@ where
     if let Some(handle) = hook_dispatch_handle {
         let _ = handle.await;
     }
+    let _ = smart_folder_handle.await;
 
     // Best-effort cleanup so the next boot starts clean regardless of outcome.
     let _ = std::fs::remove_file(&path);

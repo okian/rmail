@@ -37,19 +37,13 @@ impl Drop for TempDb {
     }
 }
 
-/// Run `compile(account_id, raw)` against a real database and return the
-/// matching message ids.
+/// Compile `raw` and run it against a real database, through the same
+/// `select_message_ids` statement `BulkTag` and `smart_folder` both use --
+/// so these cases cover the shared query, not a test-local copy of it.
 fn run(db: &Database, account_id: i64, raw: &str) -> Vec<i64> {
-    let (where_sql, params) = compile(account_id, raw);
-    let sql = format!("SELECT id FROM messages WHERE {where_sql} ORDER BY id");
-    db.with_read(|conn| {
-        let mut stmt = conn.prepare(&sql)?;
-        let bind: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(bind.as_slice(), |row| row.get::<_, i64>(0))?;
-        rows.collect::<rusqlite::Result<Vec<i64>>>()
-    })
-    .unwrap()
+    let compiled = compile_detailed(account_id, raw);
+    db.with_read(move |conn| select_message_ids(conn, &compiled))
+        .unwrap()
 }
 
 /// Seed an account with two mailboxes and messages `(from, subject, flags)`,

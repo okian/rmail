@@ -207,7 +207,10 @@ fn to_proto_snippet(snippet: &present::Snippet) -> ProtoSnippet {
     }
 }
 
-fn to_proto_message(message: &repo::Message, flags: Vec<String>) -> ProtoMessage {
+/// `pub(crate)` so `saved_search_service`'s member stream renders a message
+/// identically to a search hit's, rather than growing a second translation
+/// that could drift field by field.
+pub(crate) fn to_proto_message(message: &repo::Message, flags: Vec<String>) -> ProtoMessage {
     ProtoMessage {
         id: message.id,
         account_id: message.account_id,
@@ -320,10 +323,24 @@ impl SearchApi {
     /// planning/retrieval work has even started, which is what makes the
     /// generation-token race in the module docs' "Cancellation" section
     /// actually favor the newer request.
-    async fn start_stream(
+    /// Run `req` through the pipeline and stream its hits, stopping when
+    /// `cancel` fires.
+    ///
+    /// The token is a parameter rather than taken from [`Generation`] here so
+    /// the *supersede* policy stays with the caller. `Search`/`Semantic` pass
+    /// `self.generation.begin(&self.shutdown)`, which cancels whichever
+    /// stream held the interactive slot before — the right answer for a
+    /// search box. `SavedSearchService.RunSavedSearch` (`pub(crate)` is what
+    /// lets it reuse *this* pipeline rather than assembling a second, subtly
+    /// different one) passes a plain shutdown child instead: a named query is
+    /// not a keystroke, and a cancelled stream ends cleanly rather than
+    /// erroring, so sharing the slot would silently return a short page under
+    /// an `OK`.
+    pub(crate) async fn start_stream(
         &self,
         req: SearchRequest,
         dense_only: bool,
+        cancel: CancellationToken,
     ) -> Result<
         Response<
             Pin<
@@ -336,7 +353,6 @@ impl SearchApi {
         >,
         Status,
     > {
-        let cancel = self.generation.begin(&self.shutdown);
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BUFFER);
         let this = self.clone();
         tokio::spawn(
@@ -797,7 +813,8 @@ impl SearchService for SearchApi {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<Self::SearchStream>, Status> {
-        self.start_stream(request.into_inner(), false).await
+        let cancel = self.generation.begin(&self.shutdown);
+        self.start_stream(request.into_inner(), false, cancel).await
     }
 
     type SemanticStream =
@@ -807,7 +824,8 @@ impl SearchService for SearchApi {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<Self::SemanticStream>, Status> {
-        self.start_stream(request.into_inner(), true).await
+        let cancel = self.generation.begin(&self.shutdown);
+        self.start_stream(request.into_inner(), true, cancel).await
     }
 
     async fn explain(
