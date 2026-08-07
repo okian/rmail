@@ -53,7 +53,20 @@ V15 and V17 are permanently unused, which costs nothing. **Next free: V21.**
   be a cold rebuild, and expect it to be the run most likely to fail: linking
   several crates at once in a 7.7 GB container OOM-killed `ld` (signal 9)
   immediately after one such prune. Re-running resumes from the compiled
-  artifacts and succeeds, so a single retry is the fix, not a code change.
+  artifacts, so it is never a code change — but a plain retry only buys one
+  more linked binary per run, and this workspace has 21 test binaries. Drive
+  the whole link phase through serially instead, then run the suite normally:
+  `scripts/docker-test.sh -- sh -c 'CARGO_BUILD_JOBS=1 cargo nextest run
+  --locked --workspace --all-features --no-run'`. (`docker-test.sh` passes no
+  env through, hence the `--` escape hatch.)
+- **A green suite is not a race-free suite.** The full parallel run is the
+  only thing on this project that has ever exercised enough scheduling
+  pressure to expose a boot-ordering race — it caught one in the hook
+  dispatcher (fixed in `d04ad5e`) that every targeted run had passed for
+  many tasks. When a test that has never failed suddenly fails once under the
+  full suite, suspect a latent race before suspecting the merge that happened
+  to be in flight, and reproduce it by asserting on ordering directly rather
+  than on the downstream side effect.
 - **Do not union-merge structured code by deduplicating lines.** A script that
   keeps "lines from theirs not already in ours" silently drops repeated closing
   braces and attributes, which are exactly what Rust has a lot of. It happened
