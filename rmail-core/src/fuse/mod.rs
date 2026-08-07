@@ -427,6 +427,85 @@ pub fn fuse_scores(
     out
 }
 
+/// Whether `plan` expresses real free-text search intent: a non-empty
+/// [`QueryPlan::lexical_terms`]/[`QueryPlan::phrases`], or a
+/// [`QueryPlan::query_vector`] to search against.
+///
+/// This is the guard [`drop_prior_only_candidates`] checks before removing
+/// anything: a filters-only query (`is:flagged`, `from:alice`, or a
+/// genuinely empty query) has no free text for lexical/dense/fuzzy/entity to
+/// have matched in the first place, so a structured/recency-only result
+/// *is* the intended answer, not noise — prd.md's own "Empty query ->
+/// recency-ranked recent mail" edge case, generalized to "filters-only
+/// query" the same way.
+fn has_free_text_intent(plan: &QueryPlan) -> bool {
+    !plan.lexical_terms.is_empty() || !plan.phrases.is_empty() || plan.query_vector.is_some()
+}
+
+/// Drop fused candidates that only a "prior" source found —
+/// [`Source::Recency`] and/or [`Source::Structured`] — when the query
+/// expressed real free-text search intent ([`has_free_text_intent`]) that no
+/// free-text-matching retriever ([`Source::Lexical`], [`Source::Dense`],
+/// [`Source::Fuzzy`], [`Source::Entity`]) actually satisfied for that
+/// candidate. A no-op (`fused` returned unchanged) when the query has no
+/// free text at all.
+///
+/// # Why this exists
+///
+/// [`crate::retrieve::recency::RecencyRetriever`] is deliberately
+/// unconditional: prd.md's own retriever table describes it as "recent mail
+/// with **weak** textual match," and its implementation returns up to
+/// `candidates_per_source` of the mailbox — subject only to hard filters,
+/// with no notion of whether the query's free text appears anywhere in a
+/// candidate at all — ordered by date (see that module's own docs: it
+/// exists so fusion "can credit a candidate that... is unusually recent,"
+/// evidence the free-text retrievers never look at). That is the right
+/// shape for what it is meant to *augment* — a real but weak match earns a
+/// recency boost on top of it — but composed with every other stage
+/// unmodified, it also means a query whose free text matches nothing still
+/// returns a full page of "recent mail": on a real mailbox, *every* query
+/// would present up to `candidates_per_source` results, almost all of which
+/// never matched a single word the user typed, with the Stage 4 top-K/
+/// `SearchRequest.limit` cut the only thing hiding that from view. That
+/// directly contradicts this system's own stated bar ("the right message is
+/// in the top 3, always" — prd.md, Part 0) and the retriever table's own
+/// description of recency as evidence that *augments* a match, not an
+/// unconditional recall path in its own right. (Task 33's `SearchService`
+/// integration tests are what actually surfaced this — a two-message
+/// mailbox with one obviously-irrelevant recent message made an otherwise
+/// negligible low-score artifact visible; see that crate's `search_service`
+/// module docs.)
+///
+/// [`Source::Structured`] gets the identical treatment, not a carve-out:
+/// this module's own docs already call it "a hard gate rather than a
+/// ranking source in its own right" — every retriever, `Source::Structured`
+/// included, is already gated by the same hard filters (see
+/// `retrieve::mod`'s "`hard_filters`, not `scope`" section), so a
+/// structured-only candidate is not new *filter* evidence, only a message
+/// that happens to satisfy the filter with no free-text support — the exact
+/// same shape of noise recency-only contributes, for the exact same reason.
+/// A genuinely filters-only query (no free text at all) is unaffected:
+/// [`has_free_text_intent`] returns `false`, and `is:flagged`/`from:alice`
+/// alone still returns every message that satisfies it, which *is* the
+/// correct answer to a query with nothing else to match against.
+#[must_use]
+fn drop_prior_only_candidates(fused: Vec<FusedCandidate>, plan: &QueryPlan) -> Vec<FusedCandidate> {
+    if !has_free_text_intent(plan) {
+        return fused;
+    }
+    fused
+        .into_iter()
+        .filter(|candidate| {
+            candidate.hits.iter().any(|hit| {
+                matches!(
+                    hit.source,
+                    Source::Lexical | Source::Dense | Source::Fuzzy | Source::Entity
+                )
+            })
+        })
+        .collect()
+}
+
 /// Per-message metadata the collapse steps need beyond what [`fuse_scores`]
 /// already computed: `thread_id` for [`collapse_threads`]; `body` for
 /// [`collapse_near_duplicates`] (what gets SimHash-fingerprinted). `date` is
@@ -697,6 +776,7 @@ impl Fuser {
             intent = ?plan.intent,
             fusion = ?cfg.fusion,
             thread_collapse = thread_collapse,
+            prior_only_dropped,
             fused,
             thread_collapsed_n,
             near_dup_collapsed_n
@@ -710,13 +790,23 @@ impl Fuser {
         thread_collapse: bool,
         cancel: &CancellationToken,
     ) -> Vec<FusedCandidate> {
-        let mut fused = fuse_scores(
+        let fused = fuse_scores(
             &candidates,
             plan.intent,
             cfg.fusion,
             cfg.rrf_k,
             &cfg.fusion_weights,
         );
+        // Drop candidates only a "prior" source (recency/structured) found
+        // when the query had real free text none of the free-text-matching
+        // retrievers satisfied for them — see `drop_prior_only_candidates`'s
+        // own docs for why this runs before the collapse steps below (a
+        // candidate dropped here should not consume a metadata-fetch slot,
+        // let alone occupy a thread's "+N" or a near-dup cluster's "N
+        // similar" count for a match nobody asked for).
+        let before_prior_drop = fused.len();
+        let mut fused = drop_prior_only_candidates(fused, plan);
+        tracing::Span::current().record("prior_only_dropped", before_prior_drop - fused.len());
         // `!fused.is_empty()`, not `fused.len() >= 2`: even a single
         // candidate benefits from the `thread_id` annotation below when
         // `thread_collapse` is off, and a lone candidate simply can't

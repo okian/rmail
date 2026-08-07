@@ -25,7 +25,7 @@ use rmail_core::index::{extract_message, IndexQueue, QueueOptions, PRIORITY_NORM
 use rmail_core::repo;
 use rmail_core::{Config, Database};
 use rmail_proto::v1::search_service_client::SearchServiceClient;
-use rmail_proto::v1::{ExplainRequest, SearchHit, SearchRequest};
+use rmail_proto::v1::{ExplainRequest, Intent as ProtoIntent, SearchHit, SearchRequest};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
@@ -184,15 +184,18 @@ impl TestServer {
     }
 
     /// Seed `count` messages that all lexically match `term` (in the body,
-    /// padded to a realistic size), for the timing/cancellation tests that
-    /// need a corpus large enough for multi-candidate pipeline work to take
+    /// padded to `body_repeats` copies of a filler line — bigger for tests
+    /// that need Stage 6 presentation work, per candidate, to be heavy
+    /// enough to dominate channel/scheduling noise, not just a large
+    /// candidate count), for the timing/cancellation tests that need a
+    /// corpus large enough for multi-candidate pipeline work to take
     /// measurable time.
-    async fn seed_bulk(&self, count: usize, term: &str) -> Vec<i64> {
+    async fn seed_bulk(&self, count: usize, term: &str, body_repeats: usize) -> Vec<i64> {
         let mut ids = Vec::with_capacity(count);
         for i in 0..count {
             let body =
                 format!("Quarterly {term} review line item number {i}, filed for the record. ")
-                    .repeat(6);
+                    .repeat(body_repeats);
             let id = self
                 .index(repo::NewMessage {
                     subject: Some(format!("{term} note {i}")),
@@ -557,43 +560,95 @@ async fn explain_rpc_not_found_for_a_message_the_query_never_matched() {
 
 #[tokio::test]
 async fn streaming_first_hit_arrives_before_the_full_page_is_computed() {
+    // Comparing "time to the first hit" against "time for everything after
+    // it" (an earlier version of this test did exactly that) is contaminated
+    // by a large *shared* one-time cost neither phase is responsible for:
+    // `QueryPlanner::plan_at` alone makes several sequential DB round trips
+    // (spell-fix, entity resolution, PMI synonym expansion, query embedding)
+    // before Phase 1 even starts, so "time to first" is dominated by query
+    // *understanding*, not by whether presentation is incremental — on a
+    // small/fast corpus that setup cost can legitimately exceed Phase 2's
+    // own work and make an otherwise-correct implementation look wrong.
+    //
+    // The signature this test actually needs to detect is narrower and does
+    // not require subtracting that shared cost out: with the two-phase
+    // design (see `rmaild::search_service`'s own module docs), hit 2 is the
+    // *first* item Phase 2's single batched `Presenter::present` call
+    // produces, so the whole batch's cost lands in the gap between hit 1 and
+    // hit 2 — while hits 2..N are all already computed by the time hit 2 is
+    // sent, so the gaps *between* them are just channel/scheduling overhead.
+    // A "compute everything, then send it all" implementation would show the
+    // opposite: a uniformly small gap everywhere, hit 1 included.
+    //
+    // Phase 2's batch has to be *heavy enough per item* to clear the noise
+    // floor of channel/scheduling overhead — a small corpus of short bodies
+    // makes `Presenter::present`'s own batch (metadata fetch, snippet
+    // extraction, MMR fingerprinting) fast enough in a warm, cached SQLite
+    // file that it is indistinguishable from microsecond-scale channel
+    // sends. Bodies near `present::snippet::MAX_SOURCE_CHARS`, a page sized
+    // to `top_k_rerank`, and `Intent::Exploratory` (which turns on MMR —
+    // SimHash-fingerprinting every selected candidate, real CPU work Phase 2
+    // would otherwise skip) all push Phase 2's actual cost well above that
+    // floor without changing what property is being proven.
     let server = TestServer::start().await;
-    server.seed_bulk(80, "budgetary").await;
+    server.seed_bulk(100, "budgetary", 40).await;
 
     let mut client = server.client().await;
 
+    let heavy_page = || SearchRequest {
+        query: "budgetary".to_owned(),
+        limit: 50,
+        intent: ProtoIntent::Exploratory as i32,
+        ..Default::default()
+    };
+
     // Warm-up: prime connection pools/caches so the timed run below is not
     // skewed by one-time setup cost unrelated to per-request pipeline work.
-    let mut warm = client
-        .search(search_request("budgetary"))
-        .await
-        .unwrap()
-        .into_inner();
+    let mut warm = client.search(heavy_page()).await.unwrap().into_inner();
     let _ = drain(&mut warm).await;
 
-    let t0 = Instant::now();
-    let mut stream = client
-        .search(search_request("budgetary"))
-        .await
-        .unwrap()
-        .into_inner();
-    let _first = next(&mut stream).await;
-    let t1 = Instant::now();
-    let rest = drain(&mut stream).await;
-    let t2 = Instant::now();
+    let mut stream = client.search(heavy_page()).await.unwrap().into_inner();
 
-    let time_to_first = t1 - t0;
-    let time_for_rest = t2 - t1;
+    let _first = next(&mut stream).await;
+    let t_first = Instant::now();
+    let _second = next(&mut stream).await;
+    let t_second = Instant::now();
+    let gap_first_to_second = t_second - t_first;
+
+    let mut rest_arrivals = Vec::new();
+    loop {
+        match tokio::time::timeout(STREAM_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(_))) => rest_arrivals.push(Instant::now()),
+            Ok(Some(Err(status))) => panic!("stream item was an error: {status}"),
+            Ok(None) => break,
+            Err(_) => panic!("timed out draining stream"),
+        }
+    }
     assert!(
-        !rest.is_empty(),
-        "the corpus is large enough that more than one hit should page through"
+        rest_arrivals.len() >= 5,
+        "the corpus is large enough that several more hits should page through \
+         after the second, got {}",
+        rest_arrivals.len()
     );
+
+    // The average per-item gap *within* Phase 2's already-computed batch —
+    // hits 3, 4, 5, ... were all produced by the same `present()` call that
+    // produced hit 2, so delivering them costs essentially nothing more.
+    let mut previous = t_second;
+    let mut total_rest_gap = Duration::ZERO;
+    for &arrival in &rest_arrivals {
+        total_rest_gap += arrival.duration_since(previous);
+        previous = arrival;
+    }
+    let avg_rest_gap = total_rest_gap / u32::try_from(rest_arrivals.len()).unwrap_or(1).max(1);
+
     assert!(
-        time_to_first < time_for_rest,
-        "the first hit ({time_to_first:?}) should reach the client faster than the \
-         remaining {} hits take to compute and stream ({time_for_rest:?}) — streaming \
-         must be incremental, not \"compute everything, then send it all\"",
-        rest.len()
+        gap_first_to_second > avg_rest_gap.saturating_mul(3),
+        "the gap between hit 1 and hit 2 ({gap_first_to_second:?}) should reflect Phase \
+         2's whole batch computation, and be well above the average per-item gap once \
+         that batch is already computed ({avg_rest_gap:?} across {} later hits) — \
+         otherwise hits are not being streamed incrementally",
+        rest_arrivals.len()
     );
 
     server.stop().await;
@@ -606,7 +661,7 @@ async fn streaming_first_hit_arrives_before_the_full_page_is_computed() {
 #[tokio::test]
 async fn a_fresh_search_request_cancels_the_prior_stream() {
     let server = TestServer::start().await;
-    server.seed_bulk(150, "budgetary").await;
+    server.seed_bulk(150, "budgetary", 6).await;
     server
         .index(repo::NewMessage {
             subject: Some("aquarium maintenance".to_owned()),

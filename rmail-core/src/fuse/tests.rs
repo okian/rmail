@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::config::{FusionSourceWeights, SearchConfig};
-use crate::query::{Intent, QueryPlan, Scope, SortSpec};
+use crate::embed::Embedding;
+use crate::query::{Intent, Mode, Phrase, PlanTerm, QueryPlan, Scope, SortSpec, TermOrigin};
 use crate::repo;
 
 const EPSILON: f64 = 1e-9;
@@ -76,6 +77,25 @@ fn fc(message_id: i64, fused_score: f64) -> FusedCandidate {
         thread_collapsed: Vec::new(),
         near_duplicates: Vec::new(),
     }
+}
+
+/// As [`fc`], with `hits` populated from `sources` (one [`SourceHit`] per
+/// entry, arbitrary but distinct rank/score — [`drop_prior_only_candidates`]
+/// only reads `hit.source`) — what its own tests need that the collapse
+/// tests' bare `fc` does not.
+fn fc_from(message_id: i64, fused_score: f64, sources: &[Source]) -> FusedCandidate {
+    let mut candidate = fc(message_id, fused_score);
+    candidate.hits = sources
+        .iter()
+        .enumerate()
+        .map(|(i, &source)| SourceHit {
+            source,
+            rank: u32::try_from(i + 1).unwrap_or(u32::MAX),
+            score: 1.0,
+            mean_score: None,
+        })
+        .collect();
+    candidate
 }
 
 fn meta(thread_id: Option<i64>, date: Option<i64>, body: Option<&str>) -> MessageMeta {
@@ -380,6 +400,91 @@ fn prefix_stacked_on_lexical_no_longer_overrides_a_strong_dense_hit() {
     assert_eq!(
         out[0].message_id, 2,
         "dense recall must still win over a stacked lexical+prefix hit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// drop_prior_only_candidates: recency/structured alone is not a match
+// ---------------------------------------------------------------------------
+
+#[test]
+fn has_free_text_intent_is_false_for_an_empty_plan() {
+    let plan = plan_with_intent(Intent::Navigational);
+    assert!(!has_free_text_intent(&plan));
+}
+
+#[test]
+fn has_free_text_intent_is_true_for_lexical_terms() {
+    let mut plan = plan_with_intent(Intent::Navigational);
+    plan.lexical_terms = vec![PlanTerm {
+        text: "budgetary".to_owned(),
+        negated: false,
+        mode: Mode::Auto,
+        weight: 1.0,
+        origin: TermOrigin::Original,
+    }];
+    assert!(has_free_text_intent(&plan));
+}
+
+#[test]
+fn has_free_text_intent_is_true_for_phrases() {
+    let mut plan = plan_with_intent(Intent::Navigational);
+    plan.phrases = vec![Phrase {
+        text: "office move".to_owned(),
+        negated: false,
+        mode: Mode::Auto,
+    }];
+    assert!(has_free_text_intent(&plan));
+}
+
+#[test]
+fn has_free_text_intent_is_true_for_a_query_vector() {
+    let mut plan = plan_with_intent(Intent::Navigational);
+    plan.query_vector = Some(Embedding::new(vec![1.0; 8]));
+    assert!(has_free_text_intent(&plan));
+}
+
+#[test]
+fn a_filters_only_query_keeps_recency_and_structured_only_candidates() {
+    // `is:flagged`/`from:alice` with no free text: recency/structured-only
+    // results *are* the intended answer (nothing else could have matched
+    // free text that was never typed), so the drop must be a no-op.
+    let plan = plan_with_intent(Intent::Navigational);
+    let fused = vec![
+        fc_from(1, 1.0, &[Source::Recency]),
+        fc_from(2, 0.9, &[Source::Structured]),
+        fc_from(3, 0.8, &[Source::Structured, Source::Recency]),
+    ];
+    let out = drop_prior_only_candidates(fused, &plan);
+    assert_eq!(out.len(), 3, "no free text means nothing to have missed");
+}
+
+#[test]
+fn free_text_intent_drops_recency_only_and_structured_only_candidates() {
+    let mut plan = plan_with_intent(Intent::Navigational);
+    plan.lexical_terms = vec![PlanTerm {
+        text: "budgetary".to_owned(),
+        negated: false,
+        mode: Mode::Auto,
+        weight: 1.0,
+        origin: TermOrigin::Original,
+    }];
+    let fused = vec![
+        fc_from(1, 1.0, &[Source::Recency]),
+        fc_from(2, 0.9, &[Source::Structured]),
+        fc_from(3, 0.8, &[Source::Structured, Source::Recency]),
+        fc_from(4, 0.5, &[Source::Lexical]),
+        fc_from(5, 0.4, &[Source::Lexical, Source::Recency]),
+        fc_from(6, 0.3, &[Source::Dense]),
+        fc_from(7, 0.2, &[Source::Fuzzy]),
+        fc_from(8, 0.1, &[Source::Entity]),
+    ];
+    let out = drop_prior_only_candidates(fused, &plan);
+    let ids: Vec<i64> = out.iter().map(|c| c.message_id).collect();
+    assert_eq!(
+        ids,
+        vec![4, 5, 6, 7, 8],
+        "only candidates with at least one free-text-matching source survive"
     );
 }
 
@@ -1009,6 +1114,53 @@ async fn fuse_end_to_end_honors_fusion_linear_from_config() {
     approx_eq(out[0].fused_score, 1.0);
     assert_eq!(out[1].message_id, weak);
     approx_eq(out[1].fused_score, 0.0);
+}
+
+#[tokio::test]
+async fn fuse_end_to_end_drops_a_recency_only_match_when_the_query_has_free_text() {
+    // The exact regression task 33's own `SearchService` integration tests
+    // surfaced: a mailbox with one message that actually matches the query
+    // and one that does not, where the recency retriever (unconditional,
+    // gated only by hard filters) still returns *both* — without this drop,
+    // the irrelevant message would reach presentation.
+    let fx = Fixture::open().await;
+    let matching = fx
+        .insert_message(None, Some(1_000), Some("budgetary review"))
+        .await;
+    let irrelevant = fx
+        .insert_message(None, Some(2_000), Some("lunch plans"))
+        .await;
+
+    let candidates = vec![
+        cand(Source::Lexical, matching, 5.0, 1),
+        cand(Source::Recency, matching, 1.0, 2),
+        cand(Source::Recency, irrelevant, 1.0, 1),
+    ];
+    let mut plan = plan_with_intent(Intent::Navigational);
+    plan.lexical_terms = vec![PlanTerm {
+        text: "budgetary".to_owned(),
+        negated: false,
+        mode: Mode::Auto,
+        weight: 1.0,
+        origin: TermOrigin::Original,
+    }];
+    let out = fx
+        .fuser()
+        .fuse(
+            candidates,
+            &plan,
+            &SearchConfig::default(),
+            false,
+            &Fixture::no_cancel(),
+        )
+        .await;
+
+    assert_eq!(
+        out.len(),
+        1,
+        "the recency-only, lexically-unrelated message must not survive fusion"
+    );
+    assert_eq!(out[0].message_id, matching);
 }
 
 #[tokio::test]
