@@ -364,7 +364,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core cache::` (hit/miss, corpus-version invalidation, fresh-mail bypass)
 
 ## 37. Evaluation harness + CI regression guard
-- [ ] status
+- [x] status
 - **depends-on:** 33
 - **parallel-safe:** yes
 - **acceptance:**

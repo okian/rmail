@@ -42,6 +42,25 @@ service SearchService {
   // prior page) can still be explained even if it would not have made this
   // request's own `limit`/`top_k_rerank` cut.
   rpc Explain (ExplainRequest) returns (RankExplanation);
+
+  // Score a golden set against this corpus — prd.md's "Relevance is
+  // measured, not asserted" harness (task 37). Each `EvaluateRequest.queries`
+  // entry is run through the identical pipeline `Search` uses, its results
+  // scored against that entry's judgments, and the per-query plus aggregate
+  // NDCG@10 / MRR / Recall@50 / P@3 returned.
+  //
+  // Unary rather than streaming: a report is only meaningful once every
+  // query in the set has run (the headline numbers are macro-averages), so
+  // there is nothing a caller could usefully do with a partial one.
+  //
+  // Judgments arrive by value rather than as a path to a golden-set file so
+  // the daemon needs no filesystem access to whatever directory the client
+  // happens to be running in — the client parses and validates the file
+  // (`rmail_core::eval::GoldenSet`) and sends its contents.
+  //
+  // Read-only, like every other RPC here: evaluating a golden set never
+  // writes to the index or the feedback log.
+  rpc Evaluate (EvaluateRequest) returns (EvalReport);
 }
 
 // Execution mode: which candidate sources contribute. `MODE_UNSPECIFIED`
@@ -154,4 +173,80 @@ message ExplainRequest {
   int64 message_id = 4;
   bool thread_collapse = 5;
   int64 account_id = 6;
+}
+
+// One relevance judgment: a message the golden set says is a correct answer,
+// and how correct.
+message Judgment {
+  // RFC 5322 `Message-ID` header, verbatim (`"<abc@example.com>"`) — not a
+  // `messages.id`. Row ids are assigned by insertion order and change on any
+  // resync, so a *versioned* golden set keyed on them would keep parsing
+  // fine while silently scoring different mail; see
+  // `rmail_core::eval::golden`'s module docs.
+  string message_id = 1;
+  // Relevance grade, 1..=3 (`rmail_core::eval::metrics::MAX_GAIN`). 0 is
+  // read as "unset" and treated as 1 — proto3 cannot distinguish an absent
+  // scalar from a zero one, and an ungraded golden set (the common case)
+  // sends no gain at all.
+  uint32 gain = 2;
+}
+
+// One judged query from a golden set.
+message GoldenQuery {
+  // Stable short name, unique within the request — how a per-query metric is
+  // reported and how a regression is attributed.
+  string name = 1;
+  // The query string, exactly as `mail search` would take it.
+  string query = 2;
+  // Restrict to one account; 0 = every account.
+  int64 account_id = 3;
+  repeated Judgment judgments = 4;
+}
+
+message EvaluateRequest {
+  // Free-form name of the corpus the judgments were made against, echoed
+  // back on the report. Never interpreted — it exists so a stored report
+  // says which mailbox produced it, since these metrics are corpus-relative
+  // and a number from one corpus says nothing about another.
+  string corpus = 1;
+  repeated GoldenQuery queries = 2;
+  // Which retrievers contribute, as `Search`. MODE_UNSPECIFIED defers to the
+  // daemon's `search.default_mode` — evaluating the shipped configuration is
+  // the default because that is the thing a regression guard is guarding.
+  Mode mode = 3;
+  // Results to fetch per query. Clamped up to 50: Recall@50 over a shorter
+  // page is unmeasurable rather than merely low. 0 = 50.
+  uint32 limit = 4;
+}
+
+// The four metrics prd.md names, for one query or macro-averaged over a set.
+message EvalMetrics {
+  double ndcg_at_10 = 1;
+  double mrr = 2;
+  double recall_at_50 = 3;
+  double p_at_3 = 4;
+}
+
+message QueryEval {
+  string name = 1;
+  string query = 2;
+  EvalMetrics metrics = 3;
+  // Results the pipeline returned, before any metric cutoff.
+  uint32 returned = 4;
+  // Judged-relevant messages that resolved against this corpus.
+  uint32 relevant = 5;
+  // Golden `Message-ID`s no message in this corpus matched. Non-empty means
+  // the metrics above understate the ranker — the fixture did not seed, or
+  // the mailbox is not fully synced — which is a corpus failure, not a
+  // relevance one, and is surfaced rather than silently scored as a miss.
+  repeated string unresolved = 6;
+}
+
+message EvalReport {
+  string corpus = 1;
+  // One entry per request query, in request order.
+  repeated QueryEval per_query = 2;
+  // Macro-average across queries: every query weighted equally regardless of
+  // how many relevant messages it has.
+  EvalMetrics aggregate = 3;
 }

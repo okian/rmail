@@ -1,0 +1,81 @@
+# rmail relevance golden set — the ground truth the regression guard gates on.
+#
+# prd.md, "Evaluation Harness & Metrics": *Relevance is measured, not
+# asserted.* This file is that measurement's ground truth, and
+# `rmaild/tests/eval_service.rs` both seeds the corpus it describes and gates
+# on the resulting NDCG@10. Editing a judgment here changes what CI considers
+# correct, so treat it as you would a test assertion.
+#
+# ## Judgments name RFC Message-IDs, never row ids
+#
+# `messages.id` is assigned by insertion order and changes on any resync or
+# rebuild, so a versioned file keyed on it would keep parsing while silently
+# scoring different mail. See `rmail_core::eval::golden`'s module docs.
+#
+# ## Grades
+#
+# `gain` is 1..=3 (TREC-style), defaulting to 1 when omitted:
+#   3 — the message the user was unambiguously looking for
+#   2 — clearly relevant, but not the target
+#   1 — marginally relevant
+# NDCG uses exponential gain (2^g - 1), so a 3 is worth 7 and a 1 is worth 1:
+# grade deliberately, because the spread is not linear.
+#
+# ## Adding a query
+#
+# A query needs at least one judgment with a non-zero gain — a query with no
+# relevant message has an undefined NDCG and is refused at load. Add the
+# message to the fixture corpus in `rmaild/tests/eval_service.rs` in the same
+# change, or the judgment will not resolve and the guard will fail (loudly, on
+# purpose: a fixture that did not seed must not look like a ranking
+# regression).
+
+version = 1
+corpus = "rmail-fixture-v1"
+
+# --- Navigational: a specific known message ---------------------------------
+
+[[queries]]
+name = "security-alert"
+query = "security alert sign-in"
+judgments = [{ message_id = "<security@example.com>", gain = 3 }]
+
+[[queries]]
+name = "job-offer"
+query = "job offer"
+judgments = [{ message_id = "<offer@example.com>", gain = 3 }]
+
+# --- Lookup: a small known set ----------------------------------------------
+
+[[queries]]
+name = "aws-invoices"
+query = "aws invoice"
+judgments = [
+  { message_id = "<aws-jul@example.com>", gain = 3 },
+  { message_id = "<aws-aug@example.com>", gain = 3 },
+]
+
+[[queries]]
+name = "office-move"
+query = "office move"
+judgments = [
+  { message_id = "<office-move@example.com>", gain = 3 },
+  { message_id = "<office-move-2@example.com>", gain = 2 },
+]
+
+# --- Operator grammar: the parser is part of retrieval quality --------------
+
+[[queries]]
+name = "from-operator"
+query = "from:alice office move"
+judgments = [{ message_id = "<office-move@example.com>", gain = 3 }]
+
+# --- Exploratory: a topic rather than a target ------------------------------
+
+[[queries]]
+name = "rust-newsletter"
+query = "rust weekly"
+judgments = [
+  { message_id = "<newsletter-1@example.com>", gain = 2 },
+  { message_id = "<newsletter-2@example.com>", gain = 2 },
+]

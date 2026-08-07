@@ -85,6 +85,19 @@ jobs:
           # developer's metered connection.
           RMAIL_ONNX_TESTS: "1"
 
+      # prd.md's regression guard: "CI runs the golden set; a drop in NDCG
+      # fails the build." The `test` step above already ran this — it is an
+      # ordinary integration test, hermetic and containerized like the rest —
+      # but relevance is the product's headline claim, and a drop in it
+      # deserves its own red step in the CI UI rather than one failure among
+      # sixteen hundred. `--no-capture` so the per-query NDCG breakdown lands
+      # in the log on a pass too, which is what makes a *gradual* slide
+      # visible across runs instead of only the moment it crosses the floor.
+      - name: relevance regression guard (golden set)
+        run: cargo nextest run --locked --all-features -p rmaild --test eval_service --no-capture
+        env:
+          RMAIL_ONNX_TESTS: "1"
+
       # The documented degraded build: no ONNX, semantic search falls back to
       # deterministic hashed vectors. It has its own `#[cfg]` paths, so a build
       # that only ever compiles with every feature on does not cover it.

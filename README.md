@@ -200,6 +200,7 @@ product and nothing downstream carries a normalization step it could skip.
 | `grpc.health.v1.Health` | `Check` (reports `SERVING`) |
 | `rmail.v1.AccountService` | `Create` `List` `Get` `Delete` `TestConnection` |
 | `rmail.v1.SyncService` | `SyncFolder` `Status` `Pause` `Resume` `WatchEvents` |
+| `rmail.v1.SearchService` | `Search` `Semantic` `Explain` `Evaluate` |
 
 `WatchEvents` is a server-stream over the durable event log. It subscribes to
 the live tail *before* reading the backlog, so a client resuming from a cursor
@@ -213,6 +214,47 @@ mail sync --account 1              # delta pass over every folder
 mail sync --account 1 --full       # force the initial UID-window walk
 mail sync --account 1 --watch      # sync, then follow the event stream
 ```
+
+## Relevance evaluation
+
+Search is the product, so relevance is measured rather than asserted. A
+versioned golden set of `(query, judged-relevant Message-ID)` pairs lives in
+[`eval/golden.toml`](eval/golden.toml); `SearchService.Evaluate` runs each
+query through the *same* pipeline `Search` uses and reports **NDCG@10, MRR,
+Recall@50 and P@3**, per query and macro-averaged.
+
+```sh
+mail search eval                              # score the committed golden set
+mail search eval --golden path/to/set.toml    # a different one
+mail search eval --mode lexical               # compare a mode against the default
+mail search eval --json                       # one JSON object, for tooling
+mail search eval --min-ndcg 0.75              # gate: exit 1 on a regression
+```
+
+With no `--min-*` flag it reports and exits 0. Passing any threshold turns it
+into a gate: every threshold is checked, and a judgment naming a message the
+corpus does not contain also fails (pass `--allow-unresolved` for a
+partially-synced mailbox). That distinction is the point — a fixture that did
+not seed must not be mistakable for a ranker that got worse.
+
+Judgments reference the RFC 5322 `Message-ID`, never `messages.id`: row ids
+are assigned by insertion order and change on any resync, so a versioned file
+keyed on them would keep parsing while silently scoring different mail.
+
+Grades are TREC-style 1–3 and default to 1. NDCG uses exponential gain
+(`2^g - 1`), so a 3 is worth seven times a 1 — grade deliberately.
+
+The regression guard itself is `rmaild/tests/eval_service.rs`: it seeds the
+fixture corpus the golden set describes, runs the set over gRPC, and fails
+below the floor. It runs in the ordinary test suite and again as its own
+named CI step so a relevance drop is legible rather than buried.
+
+Offline replay and shadow ranking over logged impressions
+(`rmail_core::eval::replay`) score a candidate ranker against real behavior —
+CTR, MRR of the engaged result, success@1/@3, abandonment — before it is ever
+shown to anyone. The `search_impression`/`search_action` tables that feed it
+arrive with feedback logging (task 64); the scoring math is here now because
+the model hot-swap guardrail (task 65) gates on it.
 
 ## Quality gates
 

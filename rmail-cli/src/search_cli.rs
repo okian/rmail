@@ -133,15 +133,18 @@
 //! different, wider problem than this task's acceptance criterion names.
 
 use std::io::{IsTerminal, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
+use rmail_core::eval::{EvalReport, EvalThresholds, GoldenSet, Metrics, QueryEval};
 use rmail_proto::v1::mail_service_client::MailServiceClient;
 use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::{
-    ByteRange, FeatureContribution, FullMessage, GetMessageRequest, Intent as ProtoIntent,
-    Mode as ProtoMode, RankExplanation, SearchHit, SearchRequest, Snippet,
+    ByteRange, EvalMetrics as WireEvalMetrics, EvalReport as WireEvalReport, EvaluateRequest,
+    FeatureContribution, FullMessage, GetMessageRequest, GoldenQuery as WireGoldenQuery,
+    Intent as ProtoIntent, Judgment as WireJudgment, Mode as ProtoMode, RankExplanation, SearchHit,
+    SearchRequest, Snippet,
 };
 use tokio_stream::StreamExt;
 
@@ -151,7 +154,19 @@ use tokio_stream::StreamExt;
 /// `explore` field on the wire — `explore` *is* the exploratory intent), and
 /// `query`/`filter` are passed through unparsed (see the module docs).
 #[derive(Debug, clap::Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct SearchArgs {
+    /// `mail search eval` and friends. When absent, `search` is a plain
+    /// ranked query over `query`.
+    ///
+    /// A subcommand name shadows that word as a query: `mail search eval`
+    /// runs the harness rather than searching for "eval". Searching for the
+    /// literal term is `mail search -- eval`. That trade is deliberate —
+    /// prd.md and tasks.md both spell the verb `mail search eval`, and a
+    /// one-word collision with an escape hatch is a smaller cost than
+    /// inventing a different name for the command the spec names.
+    #[command(subcommand)]
+    action: Option<SearchAction>,
     /// Query text: free words, quoted phrases, `key:value` operators, and
     /// `~`/`=` sigils — parsed entirely server-side. Never inspected here.
     ///
@@ -161,8 +176,11 @@ pub struct SearchArgs {
     /// pass it through as query text — forcing every negated query onto the
     /// `mail search -- -tag:newsletter` escape hatch would make the CLI's
     /// hyphen behavior stricter than the grammar it is a client for.
-    #[arg(allow_hyphen_values = true)]
-    query: String,
+    ///
+    /// `Option` only because a subcommand replaces it (`subcommand_negates_reqs`);
+    /// clap still requires it for a plain `mail search`.
+    #[arg(allow_hyphen_values = true, required = true)]
+    query: Option<String>,
     /// Additional operator-DSL text, space-joined onto `query` before the
     /// server parses it (`SearchRequest.filter`). Same `allow_hyphen_values`
     /// reasoning as `query`.
@@ -215,6 +233,58 @@ pub struct SimilarArgs {
     json: bool,
 }
 
+/// Verbs that live under `mail search` rather than being a query.
+#[derive(Debug, clap::Subcommand)]
+enum SearchAction {
+    /// Score a golden set against the local corpus and report NDCG@10, MRR,
+    /// Recall@50 and P@3 (`SearchService.Evaluate`).
+    Eval(EvalArgs),
+}
+
+/// `mail search eval` flags.
+#[derive(Debug, clap::Args)]
+pub struct EvalArgs {
+    /// Path to the versioned golden-set TOML.
+    #[arg(long, default_value = DEFAULT_GOLDEN_SET)]
+    golden: PathBuf,
+    /// Restrict candidate generation to one retrieval strategy; omit to
+    /// evaluate the daemon's configured `search.default_mode` — which is
+    /// what a regression guard should normally measure, since that is the
+    /// configuration users actually get.
+    #[arg(long, value_enum)]
+    mode: Option<SearchModeArg>,
+    /// Results to fetch per query. Clamped up to 50 server-side: Recall@50
+    /// over a shorter page is unmeasurable rather than merely low.
+    #[arg(long)]
+    limit: Option<u32>,
+    /// Fail (exit 1) if aggregate NDCG@10 falls below this.
+    #[arg(long)]
+    min_ndcg: Option<f64>,
+    /// Fail if aggregate MRR falls below this.
+    #[arg(long)]
+    min_mrr: Option<f64>,
+    /// Fail if aggregate Recall@50 falls below this.
+    #[arg(long)]
+    min_recall: Option<f64>,
+    /// Fail if aggregate P@3 falls below this.
+    #[arg(long)]
+    min_p3: Option<f64>,
+    /// Do not fail when a golden judgment names a message the corpus does
+    /// not have. For a partially-synced developer mailbox that is expected;
+    /// in CI against a seeded fixture it is a broken fixture, so gating runs
+    /// treat it as a failure by default.
+    #[arg(long)]
+    allow_unresolved: bool,
+    /// Emit the report as a single JSON object instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Where `mail search eval` looks for a golden set when `--golden` is
+/// omitted. Repo-relative on purpose: the committed fixture set lives here,
+/// so running the harness from a checkout needs no flags at all.
+const DEFAULT_GOLDEN_SET: &str = "eval/golden.toml";
+
 /// `SearchRequest.mode`, spelled the way a terminal user types it.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum SearchModeArg {
@@ -242,13 +312,20 @@ impl SearchModeArg {
 /// the daemon (surfaced as a plain [`anyhow::Error`] — the CLI has no
 /// gRPC-status-aware caller to hand a typed error back to).
 pub async fn search(socket: &Path, args: SearchArgs) -> Result<()> {
+    if let Some(SearchAction::Eval(eval_args)) = args.action {
+        return eval(socket, eval_args).await;
+    }
+
     let channel = rmail_core::connect_uds(socket)
         .await
         .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
     let mut client = SearchServiceClient::new(channel);
 
     let request = SearchRequest {
-        query: args.query,
+        // `required = true` on the arg; clap rejects a plain `mail search`
+        // with no query before this runs, so the fallback is unreachable
+        // rather than a silent empty-query search.
+        query: args.query.unwrap_or_default(),
         filter: args.filter.unwrap_or_default(),
         mode: args
             .mode
@@ -281,6 +358,233 @@ pub async fn search(socket: &Path, args: SearchArgs) -> Result<()> {
         println!("no results");
     }
     Ok(())
+}
+
+/// `mail search eval` — score the golden set and, when asked to gate, fail
+/// the process on a regression (prd.md: "Relevance is measured, not
+/// asserted"; task 37).
+///
+/// The golden-set file is parsed and validated **here**, client-side, before
+/// anything is sent: `rmail_core::eval::GoldenSet` is a shared type, so the
+/// daemon would reject the same violations anyway, and catching a typo'd
+/// TOML file locally gives a message about a path the user can see rather
+/// than an `INVALID_ARGUMENT` about a request they did not hand-write.
+///
+/// # Gating
+///
+/// With no `--min-*` flag this reports and exits 0 — the mode for a
+/// developer reading numbers. Passing any threshold turns it into a gate:
+/// every threshold is checked, unresolved judgments count as a failure
+/// unless `--allow-unresolved`, and a violation exits non-zero so CI stops.
+///
+/// # Errors
+///
+/// A missing or malformed golden set, connection failure, an `Evaluate` RPC
+/// error, or — when gating — a threshold violation.
+async fn eval(socket: &Path, args: EvalArgs) -> Result<()> {
+    let set = GoldenSet::load(&args.golden)
+        .with_context(|| format!("loading golden set {}", args.golden.display()))?;
+
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let mut client = SearchServiceClient::new(channel);
+
+    let request = EvaluateRequest {
+        corpus: set.corpus.clone(),
+        queries: set
+            .queries
+            .iter()
+            .map(|q| WireGoldenQuery {
+                name: q.name.clone(),
+                query: q.query.clone(),
+                account_id: q.account_id,
+                judgments: q
+                    .judgments
+                    .iter()
+                    .map(|j| WireJudgment {
+                        message_id: j.message_id.clone(),
+                        gain: j.gain,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        mode: args
+            .mode
+            .map_or(ProtoMode::Unspecified, SearchModeArg::into_proto) as i32,
+        limit: args.limit.unwrap_or(0),
+    };
+
+    let report = client
+        .evaluate(request)
+        .await
+        .context("Evaluate RPC failed")?
+        .into_inner();
+
+    if args.json {
+        print_eval_json(&report)?;
+    } else {
+        print_eval_table(&report);
+    }
+
+    let gating = args.min_ndcg.is_some()
+        || args.min_mrr.is_some()
+        || args.min_recall.is_some()
+        || args.min_p3.is_some();
+    if !gating {
+        // Not a gate, but an unresolved judgment still means the numbers
+        // just printed understate the ranker — worth saying out loud rather
+        // than leaving someone to wonder why NDCG looks low.
+        let unresolved: Vec<&str> = report
+            .per_query
+            .iter()
+            .flat_map(|q| q.unresolved.iter().map(String::as_str))
+            .collect();
+        if !unresolved.is_empty() {
+            eprintln!(
+                "warning: {} judged message(s) are not in this corpus, so these \
+                 metrics understate the ranker: {}",
+                unresolved.len(),
+                unresolved.join(", ")
+            );
+        }
+        return Ok(());
+    }
+
+    let core = to_core_report(&report);
+    let thresholds = EvalThresholds {
+        min_ndcg_at_10: args.min_ndcg.unwrap_or(0.0),
+        min_mrr: args.min_mrr,
+        min_recall_at_50: args.min_recall,
+        min_p_at_3: args.min_p3,
+        require_resolved: !args.allow_unresolved,
+    };
+
+    match thresholds.check(&core) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Print the worst queries alongside the failure: the aggregate
+            // says a regression happened, and these say where to look.
+            eprintln!("\nworst queries by NDCG@10:");
+            for q in core.worst(5) {
+                eprintln!(
+                    "  {:<28} ndcg@10={:.4} mrr={:.4} returned={} relevant={}",
+                    q.name, q.metrics.ndcg_at_10, q.metrics.mrr, q.returned, q.relevant
+                );
+            }
+            Err(anyhow!("{error}"))
+        }
+    }
+}
+
+/// Rebuild the core report from the wire one so the *same*
+/// `EvalThresholds::check` that gates a test also gates the CLI — a second
+/// threshold implementation here could disagree with the first, and the one
+/// place that must never happen is the code that decides whether to fail a
+/// build.
+fn to_core_report(report: &WireEvalReport) -> EvalReport {
+    let metrics_of = |m: Option<&WireEvalMetrics>| Metrics {
+        ndcg_at_10: m.map_or(0.0, |m| m.ndcg_at_10),
+        mrr: m.map_or(0.0, |m| m.mrr),
+        recall_at_50: m.map_or(0.0, |m| m.recall_at_50),
+        p_at_3: m.map_or(0.0, |m| m.p_at_3),
+    };
+    EvalReport {
+        corpus: report.corpus.clone(),
+        aggregate: metrics_of(report.aggregate.as_ref()),
+        per_query: report
+            .per_query
+            .iter()
+            .map(|q| QueryEval {
+                name: q.name.clone(),
+                query: q.query.clone(),
+                metrics: metrics_of(q.metrics.as_ref()),
+                returned: q.returned as usize,
+                relevant: q.relevant as usize,
+                unresolved: q.unresolved.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn print_eval_table(report: &WireEvalReport) {
+    println!("corpus: {}", report.corpus);
+    println!(
+        "\n{:<28} {:>9} {:>9} {:>11} {:>7} {:>9}",
+        "query", "ndcg@10", "mrr", "recall@50", "p@3", "returned"
+    );
+    for q in &report.per_query {
+        let m = q.metrics.unwrap_or_default();
+        println!(
+            "{:<28} {:>9.4} {:>9.4} {:>11.4} {:>7.4} {:>9}",
+            truncate(&q.name, 28),
+            m.ndcg_at_10,
+            m.mrr,
+            m.recall_at_50,
+            m.p_at_3,
+            q.returned
+        );
+        if !q.unresolved.is_empty() {
+            println!("  ! not in corpus: {}", q.unresolved.join(", "));
+        }
+    }
+
+    let agg = report.aggregate.unwrap_or_default();
+    println!(
+        "\n{:<28} {:>9.4} {:>9.4} {:>11.4} {:>7.4}",
+        format!("AGGREGATE ({} queries)", report.per_query.len()),
+        agg.ndcg_at_10,
+        agg.mrr,
+        agg.recall_at_50,
+        agg.p_at_3
+    );
+}
+
+/// One JSON object for the whole report — unlike `mail search`, which emits
+/// newline-delimited per-hit objects. A report is a single value with a
+/// single aggregate, and splitting it across lines would make a consumer
+/// reassemble something that was never a stream.
+fn print_eval_json(report: &WireEvalReport) -> Result<()> {
+    let value = serde_json::json!({
+        "corpus": report.corpus,
+        "aggregate": metrics_json(report.aggregate.as_ref()),
+        "per_query": report
+            .per_query
+            .iter()
+            .map(|q| serde_json::json!({
+                "name": q.name,
+                "query": q.query,
+                "metrics": metrics_json(q.metrics.as_ref()),
+                "returned": q.returned,
+                "relevant": q.relevant,
+                "unresolved": q.unresolved,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let mut out = std::io::stdout().lock();
+    serde_json::to_writer(&mut out, &value).context("serializing eval report")?;
+    writeln!(out).context("writing eval report")?;
+    Ok(())
+}
+
+fn metrics_json(m: Option<&WireEvalMetrics>) -> serde_json::Value {
+    let m = m.copied().unwrap_or_default();
+    serde_json::json!({
+        "ndcg_at_10": m.ndcg_at_10,
+        "mrr": m.mrr,
+        "recall_at_50": m.recall_at_50,
+        "p_at_3": m.p_at_3,
+    })
+}
+
+/// Clip a name to `max` characters so one long golden-query name cannot
+/// shear the whole table's columns.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 /// `mail similar <id>` — the embedding-kNN neighbors of an already-indexed

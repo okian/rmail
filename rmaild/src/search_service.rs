@@ -85,6 +85,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use chrono::Utc;
 use rmail_core::config::{IndexSemanticConfig, RetrieversConfig, SearchConfig, SearchMode};
 use rmail_core::embed::Embedder;
+use rmail_core::eval::{
+    Evaluator, GoldenQuery as CoreGoldenQuery, GoldenSet, JudgedMessage, Metrics as CoreMetrics,
+    RankedSearch, RECALL_K,
+};
 use rmail_core::features::{CandidateFeatures, FeatureExtractor};
 use rmail_core::fuse::{FusedCandidate, Fuser};
 use rmail_core::index::fts::FtsIndex;
@@ -97,8 +101,9 @@ use rmail_core::retrieve::{Candidate, DenseRetriever, Fanout, Source};
 use rmail_core::{present, repo, Database, Error as RmailError};
 use rmail_proto::v1::search_service_server::SearchService;
 use rmail_proto::v1::{
-    ByteRange as ProtoByteRange, ExplainRequest, FeatureContribution as ProtoFeatureContribution,
-    Intent as ProtoIntent, Message as ProtoMessage, Mode as ProtoMode,
+    ByteRange as ProtoByteRange, EvalMetrics as ProtoEvalMetrics, EvalReport as ProtoEvalReport,
+    EvaluateRequest, ExplainRequest, FeatureContribution as ProtoFeatureContribution,
+    Intent as ProtoIntent, Message as ProtoMessage, Mode as ProtoMode, QueryEval as ProtoQueryEval,
     RankExplanation as ProtoRankExplanation, SearchHit as ProtoSearchHit, SearchRequest,
     Snippet as ProtoSnippet,
 };
@@ -484,6 +489,75 @@ impl SearchApi {
         }
     }
 
+    /// Run the pipeline to completion and return the presented message ids,
+    /// best first — the collected counterpart of [`Self::run_stream`], and
+    /// the one thing `Evaluate` needs.
+    ///
+    /// Deliberately measured *after* `present`, not after `rank`: MMR
+    /// diversification and thread collapsing reorder and drop results, and
+    /// what the metrics have to score is the page a user would actually see.
+    /// Scoring the pre-presentation ranking would produce a number that
+    /// could improve while the shipped experience got worse, which is the
+    /// one failure mode an eval harness exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// [`Status`] from account resolution or query planning. Candidate
+    /// generation degrades to an empty result rather than erroring, matching
+    /// the streaming path.
+    async fn ranked_page(
+        &self,
+        query: &str,
+        account_id: i64,
+        mode: WireMode,
+        limit: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<i64>, Status> {
+        let now = Utc::now();
+        let text = self.effective_query(query, "", account_id).await?;
+        let plan = self
+            .planner
+            .plan_at(&text, now)
+            .await
+            .map_err(Status::from)?;
+
+        let candidates = self
+            .candidates_for_mode(mode, &plan, self.search.candidates_per_source, cancel)
+            .await;
+        let fused = self
+            .fuser
+            .fuse(candidates, &plan, &self.search, false, cancel)
+            .await;
+        let features = self
+            .feature_extractor
+            .extract_at(&fused, &plan, now, cancel)
+            .await;
+
+        // `top_k_rerank` bounds what the ranker hands downstream, and it
+        // defaults to 50 — exactly `RECALL_K`. An eval asking for more
+        // results than that would otherwise be silently truncated and would
+        // report the truncation as missing recall, so the rank cut is
+        // widened to whatever this run actually asked for.
+        let keep = self.search.top_k_rerank as usize;
+        let ranked = self.ranker.rank(&features, plan.intent, keep.max(limit));
+        if ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let presented = self
+            .presenter
+            .present(
+                &ranked,
+                &fused,
+                &plan,
+                self.search.mmr_lambda,
+                limit,
+                cancel,
+            )
+            .await;
+        Ok(presented.into_iter().map(|p| p.message_id).collect())
+    }
+
     /// Candidate generation for `Search`, honoring `mode`. `WireMode::Hybrid`
     /// and `WireMode::Lexical` both run through a fresh [`Fanout`] — cheap to
     /// construct (no I/O; see `Fanout::new`'s own docs) — built from a
@@ -804,6 +878,52 @@ impl SearchApi {
     }
 }
 
+/// Adapts [`SearchApi`] to `rmail_core::eval::RankedSearch`, pinning the
+/// mode and cancellation token for one `Evaluate` call.
+///
+/// The adapter exists because [`RankedSearch`] is deliberately narrow —
+/// "query in, ranked ids out" — while the pipeline also needs a mode and a
+/// cancellation token that are constant across an evaluation run. Binding
+/// them here keeps `rmail-core` from having to know either concept, and
+/// keeps evaluation on the identical `SearchApi` that serves `Search`
+/// rather than on a second, drift-prone copy of the pipeline.
+struct EvalSearch<'a> {
+    api: &'a SearchApi,
+    mode: WireMode,
+    cancel: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl RankedSearch for EvalSearch<'_> {
+    async fn ranked_ids(
+        &self,
+        query: &str,
+        account_id: i64,
+        limit: usize,
+    ) -> Result<Vec<i64>, RmailError> {
+        self.api
+            .ranked_page(query, account_id, self.mode, limit, &self.cancel)
+            .await
+            // `ranked_page` speaks `Status` because every other caller is a
+            // gRPC handler; the trait speaks the domain error. Going back
+            // through `RmailError` rather than carrying a `Status` into
+            // `rmail-core` keeps the transport type out of the domain crate,
+            // which is the whole reason the trait is shaped this way.
+            .map_err(|status| {
+                RmailError::Internal(format!("search pipeline: {}", status.message()))
+            })
+    }
+}
+
+fn to_proto_metrics(metrics: &CoreMetrics) -> ProtoEvalMetrics {
+    ProtoEvalMetrics {
+        ndcg_at_10: metrics.ndcg_at_10,
+        mrr: metrics.mrr,
+        recall_at_50: metrics.recall_at_50,
+        p_at_3: metrics.p_at_3,
+    }
+}
+
 #[tonic::async_trait]
 impl SearchService for SearchApi {
     type SearchStream =
@@ -901,6 +1021,100 @@ impl SearchService for SearchApi {
             sources,
             matched,
         )))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(queries, corpus))]
+    async fn evaluate(
+        &self,
+        request: Request<EvaluateRequest>,
+    ) -> Result<Response<ProtoEvalReport>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current()
+            .record("queries", req.queries.len())
+            .record("corpus", req.corpus.as_str());
+
+        // A one-shot report, not a session-shaped stream: `Evaluate` neither
+        // joins nor cancels the Search/Semantic generation slot, for the
+        // same reason `Explain` does not. An eval run superseding an
+        // interactive search — or being superseded by one — would be a
+        // surprising interaction between a background measurement and a
+        // user's search box.
+        let cancel = self.shutdown.child_token();
+
+        let set = GoldenSet {
+            version: rmail_core::eval::golden::SCHEMA_VERSION,
+            corpus: req.corpus,
+            queries: req
+                .queries
+                .into_iter()
+                .map(|q| CoreGoldenQuery {
+                    name: q.name,
+                    query: q.query,
+                    account_id: q.account_id,
+                    judgments: q
+                        .judgments
+                        .into_iter()
+                        .map(|j| JudgedMessage {
+                            message_id: j.message_id,
+                            // proto3 cannot tell an absent scalar from a zero
+                            // one, so a `gain` of 0 on the wire is "unset"
+                            // and means plainly relevant. A golden set that
+                            // genuinely wanted to mark something irrelevant
+                            // would omit the judgment entirely — there is no
+                            // reason to enumerate non-answers.
+                            gain: if j.gain == 0 { 1 } else { j.gain },
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        // Surfaces a malformed request as INVALID_ARGUMENT with the specific
+        // violation, rather than letting it become a mystery zero downstream.
+        set.validate().map_err(Status::from)?;
+
+        let limit = if req.limit == 0 {
+            RECALL_K
+        } else {
+            req.limit as usize
+        };
+        let search = EvalSearch {
+            api: self,
+            mode: resolve_mode(req.mode, self.search.default_mode),
+            cancel,
+        };
+
+        let report = Evaluator::new(self.db.clone())
+            .with_limit(limit)
+            .run(&set, &search)
+            .await
+            .map_err(Status::from)?;
+
+        tracing::info!(
+            corpus = %report.corpus,
+            queries = report.per_query.len(),
+            ndcg_at_10 = report.aggregate.ndcg_at_10,
+            mrr = report.aggregate.mrr,
+            recall_at_50 = report.aggregate.recall_at_50,
+            p_at_3 = report.aggregate.p_at_3,
+            "golden set evaluated"
+        );
+
+        Ok(Response::new(ProtoEvalReport {
+            corpus: report.corpus,
+            aggregate: Some(to_proto_metrics(&report.aggregate)),
+            per_query: report
+                .per_query
+                .into_iter()
+                .map(|q| ProtoQueryEval {
+                    name: q.name,
+                    query: q.query,
+                    metrics: Some(to_proto_metrics(&q.metrics)),
+                    returned: u32::try_from(q.returned).unwrap_or(u32::MAX),
+                    relevant: u32::try_from(q.relevant).unwrap_or(u32::MAX),
+                    unresolved: q.unresolved,
+                })
+                .collect(),
+        }))
     }
 }
 

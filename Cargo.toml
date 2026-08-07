@@ -64,6 +64,12 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 figment = { version = "0.10", features = ["toml", "env"] }
+# Standalone TOML for documents that are *not* layered config: the eval
+# golden set (task 37) is a single committed file parsed on its own, so
+# figment's provider/merge machinery buys nothing and would obscure the
+# schema-version check `eval::golden` needs to make. Already in the tree as a
+# figment dependency, so this adds no third-party code or license surface.
+toml = "0.8"
 # `functions`: application-defined SQL scalar functions. Used by
 # `retrieve::cancel`'s own test (task 28) to make cross-thread
 # `sqlite3_interrupt()` cancellation observable — a custom `tick()` function

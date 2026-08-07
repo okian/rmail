@@ -738,3 +738,365 @@ async fn similar_with_no_neighbors_prints_a_placeholder_in_human_mode() {
 
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// `mail search eval`: the relevance harness and its exit codes
+// ---------------------------------------------------------------------------
+
+/// Write a golden set to a temp file and hand back its path.
+///
+/// Built per-test rather than pointing at the committed `eval/golden.toml`:
+/// this suite's corpus is whatever the individual test seeds, and coupling
+/// these assertions to the repo's real golden set would make an unrelated
+/// judgment edit break CLI tests that are about flag plumbing and exit
+/// codes. `rmaild/tests/eval_service.rs` is where the committed file is
+/// exercised against the fixture corpus it actually describes.
+fn write_golden(body: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("rmail-cli-golden-{}-{n}.toml", std::process::id()));
+    std::fs::write(&path, body).expect("write golden set");
+    path
+}
+
+/// Seed one findable message and judge it — the minimum corpus a golden set
+/// can score against.
+async fn seed_judged(server: &TestServer) -> PathBuf {
+    server
+        .index(repo::NewMessage {
+            message_id: Some("<quarterly@example.com>".to_owned()),
+            subject: Some("Quarterly budget review".to_owned()),
+            body_text: Some(
+                "The quarterly budget review covers headcount and cloud spend.".to_owned(),
+            ),
+            ..Default::default()
+        })
+        .await;
+    write_golden(
+        r#"
+version = 1
+corpus = "cli-fixture"
+[[queries]]
+name = "quarterly"
+query = "quarterly budget"
+judgments = [{ message_id = "<quarterly@example.com>", gain = 3 }]
+"#,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eval_reports_the_four_metrics_in_a_readable_table() {
+    let server = TestServer::start().await;
+    let golden = seed_judged(&server).await;
+
+    let output = server
+        .run(["search", "eval", "--golden", &golden.to_string_lossy()])
+        .await;
+    assert_success(&output, "mail search eval");
+    let text = stdout(&output);
+
+    assert!(
+        text.contains("cli-fixture"),
+        "expected the corpus in: {text}"
+    );
+    for column in ["ndcg@10", "mrr", "recall@50", "p@3"] {
+        assert!(text.contains(column), "expected {column} in: {text}");
+    }
+    assert!(
+        text.contains("quarterly"),
+        "expected the query row in: {text}"
+    );
+    assert!(
+        text.contains("AGGREGATE"),
+        "expected the aggregate in: {text}"
+    );
+
+    let _ = std::fs::remove_file(&golden);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eval_json_is_one_object_with_the_documented_keys() {
+    // Unlike `mail search`, which is newline-delimited per hit: a report is a
+    // single value with a single aggregate, so it is one object.
+    let server = TestServer::start().await;
+    let golden = seed_judged(&server).await;
+
+    let output = server
+        .run([
+            "search",
+            "eval",
+            "--golden",
+            &golden.to_string_lossy(),
+            "--json",
+        ])
+        .await;
+    assert_success(&output, "mail search eval --json");
+
+    let objects = parse_ndjson(&output);
+    assert_eq!(
+        objects.len(),
+        1,
+        "a report is one JSON object, not a stream"
+    );
+    let report = &objects[0];
+
+    let keys: Vec<&str> = report
+        .as_object()
+        .expect("report is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["aggregate", "corpus", "per_query"]);
+
+    let aggregate = report["aggregate"].as_object().expect("aggregate object");
+    let mut metric_keys: Vec<&str> = aggregate.keys().map(String::as_str).collect();
+    metric_keys.sort_unstable();
+    assert_eq!(
+        metric_keys,
+        vec!["mrr", "ndcg_at_10", "p_at_3", "recall_at_50"]
+    );
+
+    let per_query = report["per_query"].as_array().expect("per_query array");
+    assert_eq!(per_query.len(), 1);
+    let mut query_keys: Vec<&str> = per_query[0]
+        .as_object()
+        .expect("query object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    query_keys.sort_unstable();
+    assert_eq!(
+        query_keys,
+        vec![
+            "metrics",
+            "name",
+            "query",
+            "relevant",
+            "returned",
+            "unresolved"
+        ]
+    );
+
+    let _ = std::fs::remove_file(&golden);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eval_without_a_threshold_reports_and_succeeds() {
+    // The developer-reading-numbers mode: no gate, exit 0, even though this
+    // corpus scores nothing like perfectly.
+    let server = TestServer::start().await;
+    server
+        .index(repo::NewMessage {
+            message_id: Some("<decoy@example.com>".to_owned()),
+            subject: Some("Something else entirely".to_owned()),
+            body_text: Some("Unrelated to the judged query.".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    // Judges a message that exists but that the query will not rank first.
+    let golden = write_golden(
+        r#"
+version = 1
+corpus = "cli-fixture"
+[[queries]]
+name = "unfindable"
+query = "wholly unrelated search terms"
+judgments = [{ message_id = "<decoy@example.com>", gain = 3 }]
+"#,
+    );
+
+    let output = server
+        .run(["search", "eval", "--golden", &golden.to_string_lossy()])
+        .await;
+    assert_success(&output, "mail search eval with no threshold");
+
+    let _ = std::fs::remove_file(&golden);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eval_fails_the_process_when_ndcg_falls_below_the_threshold() {
+    // The acceptance criterion: "CI ... fails the build on an NDCG@10 drop
+    // below threshold." A non-zero exit is what makes that true.
+    let server = TestServer::start().await;
+    server
+        .index(repo::NewMessage {
+            message_id: Some("<decoy@example.com>".to_owned()),
+            subject: Some("Something else entirely".to_owned()),
+            body_text: Some("Unrelated to the judged query.".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let golden = write_golden(
+        r#"
+version = 1
+corpus = "cli-fixture"
+[[queries]]
+name = "unfindable"
+query = "wholly unrelated search terms"
+judgments = [{ message_id = "<decoy@example.com>", gain = 3 }]
+"#,
+    );
+
+    let output = server
+        .run([
+            "search",
+            "eval",
+            "--golden",
+            &golden.to_string_lossy(),
+            "--min-ndcg",
+            "0.99",
+        ])
+        .await;
+    assert!(
+        !output.status.success(),
+        "a below-threshold run must exit non-zero\nstdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("NDCG@10"),
+        "the failure should name the metric: {err}"
+    );
+    assert!(
+        err.contains("worst queries"),
+        "a failure should point at which queries regressed: {err}"
+    );
+
+    let _ = std::fs::remove_file(&golden);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eval_passes_when_the_threshold_is_met() {
+    let server = TestServer::start().await;
+    let golden = seed_judged(&server).await;
+
+    let output = server
+        .run([
+            "search",
+            "eval",
+            "--golden",
+            &golden.to_string_lossy(),
+            "--min-ndcg",
+            "0.9",
+            "--min-mrr",
+            "0.9",
+        ])
+        .await;
+    assert_success(&output, "mail search eval meeting its thresholds");
+
+    let _ = std::fs::remove_file(&golden);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unresolved_judgment_fails_a_gating_run_but_is_waivable() {
+    // A fixture that did not seed must not be mistakable for a ranker that
+    // got worse — so it fails even though the resolvable query scores
+    // perfectly, and says so specifically.
+    let server = TestServer::start().await;
+    server
+        .index(repo::NewMessage {
+            message_id: Some("<quarterly@example.com>".to_owned()),
+            subject: Some("Quarterly budget review".to_owned()),
+            body_text: Some("The quarterly budget review covers cloud spend.".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let golden = write_golden(
+        r#"
+version = 1
+corpus = "cli-fixture"
+[[queries]]
+name = "quarterly"
+query = "quarterly budget"
+judgments = [
+  { message_id = "<quarterly@example.com>", gain = 3 },
+  { message_id = "<never-synced@example.com>", gain = 3 },
+]
+"#,
+    );
+
+    let gated = server
+        .run([
+            "search",
+            "eval",
+            "--golden",
+            &golden.to_string_lossy(),
+            "--min-ndcg",
+            "0.1",
+        ])
+        .await;
+    assert!(
+        !gated.status.success(),
+        "an unresolved judgment must fail a gating run"
+    );
+    assert!(
+        stderr(&gated).contains("<never-synced@example.com>"),
+        "the failure should name the missing message: {}",
+        stderr(&gated)
+    );
+
+    let waived = server
+        .run([
+            "search",
+            "eval",
+            "--golden",
+            &golden.to_string_lossy(),
+            "--min-ndcg",
+            "0.1",
+            "--allow-unresolved",
+        ])
+        .await;
+    assert_success(&waived, "--allow-unresolved should waive it");
+
+    let _ = std::fs::remove_file(&golden);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_golden_set_fails_with_the_path_in_the_message() {
+    let server = TestServer::start().await;
+    let output = server
+        .run(["search", "eval", "--golden", "/nonexistent/golden.toml"])
+        .await;
+    assert!(!output.status.success(), "a missing golden set must fail");
+    assert!(
+        stderr(&output).contains("/nonexistent/golden.toml"),
+        "the error should name the path the user gave: {}",
+        stderr(&output)
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_literal_term_eval_is_still_searchable_behind_the_double_dash() {
+    // `eval` as a subcommand shadows it as a query; `--` is the documented
+    // escape hatch, and it has to actually work or the trade is a bug.
+    let server = TestServer::start().await;
+    server
+        .index(repo::NewMessage {
+            subject: Some("Notes on eval methodology".to_owned()),
+            body_text: Some("An eval is only as good as its golden set.".to_owned()),
+            ..Default::default()
+        })
+        .await;
+
+    let output = server.run(["search", "--", "eval"]).await;
+    assert_success(&output, "mail search -- eval");
+    let text = stdout(&output);
+    assert!(
+        text.contains("eval methodology"),
+        "expected the searched message, not a harness report: {text}"
+    );
+    assert!(
+        !text.contains("AGGREGATE"),
+        "`-- eval` must search, not run the harness: {text}"
+    );
+
+    server.stop().await;
+}

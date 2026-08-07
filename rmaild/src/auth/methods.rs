@@ -261,13 +261,13 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.ComposeService/RenderDraft",
         Requirement::Scope(Scope::MailSend),
     ),
-    // -- SearchService (task 33) ----------------------------------------------
+    // -- SearchService (tasks 33, 37) -----------------------------------------
     // Every RPC here is a read-only query over the local index (no IMAP round
     // trip, no mutation — see `search_service`'s own module docs), so
-    // `mail.read` is the right ceiling for all three: `Search`/`Semantic`
+    // `mail.read` is the right ceiling for all four: `Search`/`Semantic`
     // rank and stream messages the caller could already `MailService::List`,
     // and `Explain` only re-derives a rationale for one, already-visible
-    // message. None of the three needs `mail.write`.
+    // message. None of them needs `mail.write`.
     (
         "/rmail.v1.SearchService/Search",
         Requirement::Scope(Scope::MailRead),
@@ -278,6 +278,18 @@ const TABLE: &[(&str, Requirement)] = &[
     ),
     (
         "/rmail.v1.SearchService/Explain",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // `Evaluate` (task 37) runs caller-supplied queries through the same
+    // pipeline and reports aggregate metrics. It reads no more than `Search`
+    // does — but note it *does* let a caller confirm whether a given
+    // `Message-ID` exists in the corpus, by watching whether a judgment
+    // resolves. That is strictly less than `Search` already discloses about
+    // the same message, so it needs no scope of its own; it is called out
+    // here so the inference is a considered decision rather than something
+    // to rediscover later.
+    (
+        "/rmail.v1.SearchService/Evaluate",
         Requirement::Scope(Scope::MailRead),
     ),
     // -- OutboxService (provisional; no task owns it yet) ---------------------
