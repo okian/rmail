@@ -177,25 +177,6 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.MailService/Delete",
         Requirement::Scope(Scope::MailWrite),
     ),
-    // -- SearchService (task 33) ----------------------------------------------
-    // Every RPC here is a read-only query over the local index (no IMAP round
-    // trip, no mutation — see `search_service`'s own module docs), so
-    // `mail.read` is the right ceiling for all three: `Search`/`Semantic`
-    // rank and stream messages the caller could already `MailService::List`,
-    // and `Explain` only re-derives a rationale for one, already-visible
-    // message. None of the three needs `mail.write`.
-    (
-        "/rmail.v1.SearchService/Search",
-        Requirement::Scope(Scope::MailRead),
-    ),
-    (
-        "/rmail.v1.SearchService/Semantic",
-        Requirement::Scope(Scope::MailRead),
-    ),
-    (
-        "/rmail.v1.SearchService/Explain",
-        Requirement::Scope(Scope::MailRead),
-    ),
     // -- OutboxService (provisional; no task owns it yet) ---------------------
     // Still a forward declaration, unlike the `MailService` rows above it:
     // no `OutboxService` proto exists. Kept here (rather than filed with

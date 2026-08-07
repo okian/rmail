@@ -251,37 +251,6 @@ impl Weights {
             self.get(name)
         }
     }
-
-    /// Per-feature `(name, value, weight, weighted_contribution)` quadruples
-    /// for `features` under `intent`, in [`FeatureVector::as_pairs`] order —
-    /// [`Weights::score`]'s sum decomposed into the terms it actually adds,
-    /// for task 33's `Explain` rather than collapsed into one total.
-    ///
-    /// `weighted_contribution` already reflects
-    /// [`bulk_downweight_suppressed`]'s intent gate (via
-    /// [`Weights::effective_weight`], not [`Weights::get`]), so summing every
-    /// quadruple's fourth element reproduces `Weights::score(features,
-    /// intent)` exactly. Reading [`Weights::get`] directly instead — skipping
-    /// the gate — would show a non-zero `is_newsletter`/`is_automated`
-    /// contribution under an intent that actually suppresses it, silently
-    /// contradicting the score this is meant to explain: a plausible-looking
-    /// breakdown that does not reconcile with the real score is worse than no
-    /// breakdown at all.
-    #[must_use]
-    pub fn contributions(
-        &self,
-        features: &FeatureVector,
-        intent: Intent,
-    ) -> Vec<(FeatureName, f64, f64, f64)> {
-        features
-            .as_pairs()
-            .into_iter()
-            .map(|(name, value)| {
-                let weight = self.effective_weight(name, intent);
-                (name, value, weight, weight * value)
-            })
-            .collect()
-    }
 }
 
 impl Default for Weights {
@@ -386,20 +355,6 @@ impl L1Ranker {
     #[must_use]
     pub fn score(&self, features: &FeatureVector, intent: Intent) -> f64 {
         self.weights.score(features, intent)
-    }
-
-    /// [`Weights::contributions`] over this ranker's own weight table — the
-    /// per-feature breakdown task 33's `Explain` reports, guaranteed to sum
-    /// to exactly what [`L1Ranker::score`] would return for the same
-    /// `(features, intent)` pair (both read the same [`Weights`], through the
-    /// same [`Weights::effective_weight`] intent gate).
-    #[must_use]
-    pub fn contributions(
-        &self,
-        features: &FeatureVector,
-        intent: Intent,
-    ) -> Vec<(FeatureName, f64, f64, f64)> {
-        self.weights.contributions(features, intent)
     }
 }
 

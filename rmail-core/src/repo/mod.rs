@@ -8,7 +8,7 @@
 //! contact graph and sync checkpoints need. Richer queries land with the tasks
 //! that consume them (sync, threading, search).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use rusqlite::{named_params, Connection, OptionalExtension, Row};
 
@@ -738,28 +738,6 @@ pub fn get_message(conn: &Connection, id: i64) -> rusqlite::Result<Option<Messag
     .optional()
 }
 
-/// Fetch multiple messages by id, in one round trip — the batched sibling of
-/// [`get_message`] a result-set-shaped caller (task 33's `SearchService`,
-/// presenting up to `search.default_limit` messages spanning arbitrary
-/// mailboxes/threads) needs instead of one query per id. An id with no
-/// matching row is simply absent from the result, the same "no row" contract
-/// [`get_message`] gives a single missing id.
-///
-/// # Errors
-/// Propagates any `rusqlite` error.
-pub fn get_messages(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Message>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-    let sql = format!("SELECT {MESSAGE_COLS} FROM messages WHERE id IN ({placeholders})");
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> =
-        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-    let rows = stmt.query_map(params.as_slice(), Message::from_row)?;
-    rows.collect()
-}
-
 /// Fetch a message by its IMAP identity `(mailbox, uidvalidity, uid)` — the
 /// lookup task 9's idempotent persist keys on.
 ///
@@ -807,35 +785,6 @@ pub fn get_message_text(conn: &Connection, id: i64) -> rusqlite::Result<Option<M
                 body_html: row.get(7)?,
             })
         },
-    )
-    .optional()
-}
-
-/// A message's extracted body text (`index_content` where `part = 'body'`),
-/// if it has been indexed.
-///
-/// The rest of the search pipeline (`fuse::Fuser::fetch_meta`,
-/// `present::Presenter::fetch_meta`, `features::extract`) all read this same
-/// table+part directly via their own inline SQL rather than a shared
-/// accessor — the established convention *inside* `rmail-core`, where every
-/// caller already has `rusqlite` on hand. This function exists for the one
-/// case that convention does not cover: task 33's `SearchService::Explain`
-/// lives in the `rmaild` crate, which has no `rusqlite` dependency of its
-/// own and should not gain one just to read one row for a "why did this
-/// match" snippet — see [`get_messages`]'s identical reasoning for
-/// `SearchHit`'s own message rows.
-///
-/// `None` when the message has no `index_content` row for that part (not yet
-/// indexed) or does not exist at all — the same "no row" contract every
-/// other single-id lookup in this module gives.
-///
-/// # Errors
-/// Propagates any `rusqlite` error.
-pub fn get_body_text(conn: &Connection, message_id: i64) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT text FROM index_content WHERE message_id = ?1 AND part = 'body'",
-        [message_id],
-        |row| row.get::<_, String>(0),
     )
     .optional()
 }
@@ -1050,41 +999,6 @@ pub fn list_flags(conn: &Connection, message_id: i64) -> rusqlite::Result<Vec<St
     let mut stmt = conn.prepare("SELECT flag FROM flags WHERE message_id = ?1 ORDER BY flag")?;
     let rows = stmt.query_map([message_id], |row| row.get::<_, String>(0))?;
     rows.collect()
-}
-
-/// Every flag on every message in `ids`, sorted within each message, one
-/// round trip — the batched sibling of [`list_flags`] a result-set-shaped
-/// caller needs (see [`get_messages`]'s identical reasoning). A message with
-/// no flags at all is simply absent from the map; `.get(id)` and `.get(id)`
-/// on a message that has flags but wasn't in `ids` both read the same to a
-/// caller doing `.cloned().unwrap_or_default()`.
-///
-/// # Errors
-/// Propagates any `rusqlite` error.
-pub fn list_flags_by_message(
-    conn: &Connection,
-    ids: &[i64],
-) -> rusqlite::Result<BTreeMap<i64, Vec<String>>> {
-    if ids.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-    let sql = format!(
-        "SELECT message_id, flag FROM flags WHERE message_id IN ({placeholders}) \
-         ORDER BY message_id, flag"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> =
-        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut out: BTreeMap<i64, Vec<String>> = BTreeMap::new();
-    for row in rows {
-        let (id, flag) = row?;
-        out.entry(id).or_default().push(flag);
-    }
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

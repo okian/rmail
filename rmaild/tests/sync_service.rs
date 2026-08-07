@@ -74,14 +74,7 @@ impl TestServer {
         let server_socket = socket.clone();
         let server_db = db.clone();
         let handle = tokio::spawn(async move {
-            // Semantic indexing off: this suite only exercises `SyncService`,
-            // and an enabled default would make every test here pay to load
-            // (or, on a cold cache, download) an ONNX model purely because
-            // `serve_uds_with_engine` now also wires up `SearchService` —
-            // see `rmaild::serve_uds`'s own identical convention.
-            let mut config = rmail_core::Config::default();
-            config.index.semantic.enabled = false;
-            rmaild::serve_uds_with_engine(&server_socket, server_db, engine, &config, async move {
+            rmaild::serve_uds_with_engine(&server_socket, server_db, engine, async move {
                 let _ = shutdown_rx.await;
             })
             .await

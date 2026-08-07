@@ -2,8 +2,8 @@
 //!
 //! [`serve_uds`] boots the tonic server on a Unix domain socket exposing gRPC
 //! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and the
-//! `AccountService`/`SyncService`/`AdminService`/`MailService`/
-//! `SearchService` handlers — all wrapped in a
+//! `AccountService`/`SyncService`/`AdminService`/`MailService` handlers — all
+//! wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -14,7 +14,6 @@ mod admin_service;
 mod audit_service;
 mod auth;
 mod mail_service;
-mod search_service;
 mod sync_service;
 mod trace;
 
@@ -23,30 +22,23 @@ pub use admin_service::AdminApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
 pub use mail_service::MailApi;
-pub use search_service::SearchApi;
 pub use sync_service::SyncApi;
 pub use trace::RequestTraceLayer;
 
 use std::future::Future;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-use rmail_core::embed::hash::HashEmbedder;
-use rmail_core::embed::Embedder;
 use rmail_core::events::{EventLog, Retention};
 use rmail_core::imap::mutate::LiveImapMutator;
-use rmail_core::index::semantic::VECTOR_DIM;
 use rmail_core::mail::MailStore;
-use rmail_core::rank::l1::Weights;
 use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
-use rmail_proto::v1::search_service_server::SearchServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -84,13 +76,6 @@ pub enum ServeError {
     /// Building the reflection service failed.
     #[error("gRPC reflection setup error: {0}")]
     Reflection(#[from] tonic_reflection::server::Error),
-
-    /// `[search.rank_weights]` named a key that is not a real feature, or
-    /// gave one a non-finite value — caught before the socket is even bound,
-    /// so a typo'd override fails the daemon loudly at startup instead of
-    /// silently reverting every request to the unmodified cold-start table.
-    #[error("invalid search.rank_weights: {0}")]
-    InvalidRankWeights(#[from] rmail_core::rank::l1::RankError),
 }
 
 /// Serve the rmail gRPC surface on a Unix domain socket until `shutdown`
@@ -156,7 +141,15 @@ where
     );
     let engine = SyncEngine::new(db.clone(), events, SyncOptions::default());
 
-    serve_uds_with_engine(socket_path, db, engine, &config, shutdown).await
+    // Held for the lifetime of the server, not just for the warm-up. A model
+    // loaded into an `Arc` that the warming task then drops is a model that is
+    // immediately freed — the load happens, the log line claims success, and
+    // the first query pays for it all over again. Retention *is* the warm-up.
+    let embedder = warm_embedder(&config);
+
+    let result = serve_uds_with_engine(socket_path, db, engine, shutdown).await;
+    drop(embedder);
+    result
 }
 
 /// Build the configured embedder and start loading its model in the background.
@@ -210,20 +203,13 @@ fn warm_embedder(config: &Config) -> Option<WarmEmbedder> {
 /// Keeps a warmed embedder loaded and its warming task bounded by the server's
 /// lifetime.
 struct WarmEmbedder {
+    #[allow(dead_code, reason = "held so the loaded model is not dropped")]
     embedder: std::sync::Arc<dyn rmail_core::embed::Embedder>,
     warming: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl WarmEmbedder {
-    /// The embedder being kept loaded — cloned (an `Arc` bump, not a second
-    /// model load) by `SearchApi`'s own construction so the daemon's search
-    /// path reuses the identical warmed instance instead of building a
-    /// second one.
-    fn embedder(&self) -> &std::sync::Arc<dyn rmail_core::embed::Embedder> {
-        &self.embedder
-    }
-
-    /// The embedder's model id.
+    /// The embedder being kept loaded.
     #[cfg(test)]
     fn model(&self) -> &str {
         self.embedder.model()
@@ -255,21 +241,13 @@ impl Drop for WarmEmbedder {
 /// dial in-process); see [`serve_uds_with_engine_and_mail_store`] for the
 /// entry point that takes a caller-built [`MailStore`].
 ///
-/// `config` is read for `SearchService`'s wiring (task 33) — the embedder to
-/// warm/reuse, `[search]` settings, and `[index.semantic]` — the same
-/// `Config` a caller building its own `SyncEngine` presumably loaded
-/// already, so this takes it by reference rather than re-deriving a default.
-///
 /// # Errors
 ///
-/// As [`serve_uds`], plus [`ServeError::InvalidRankWeights`] if
-/// `config.search.rank_weights` names a key that is not a real feature or
-/// gives one a non-finite value.
+/// As [`serve_uds`].
 pub async fn serve_uds_with_engine<F>(
     socket_path: impl AsRef<Path>,
     db: Database,
     engine: SyncEngine,
-    config: &Config,
     shutdown: F,
 ) -> Result<(), ServeError>
 where
@@ -282,8 +260,7 @@ where
         engine.events().clone(),
         std::sync::Arc::new(LiveImapMutator::new(db.clone())),
     );
-    serve_uds_with_engine_and_mail_store(socket_path, db, engine, mail_store, config, shutdown)
-        .await
+    serve_uds_with_engine_and_mail_store(socket_path, db, engine, mail_store, shutdown).await
 }
 
 /// [`serve_uds_with_engine`] over a caller-supplied [`MailStore`] as well —
@@ -297,36 +274,19 @@ where
 /// `engine` (i.e. `engine.events().clone()`) — see [`serve_uds_with_engine`]'s
 /// docs for why a second `EventLog` over the same database is not equivalent.
 ///
-/// This is also where `SearchService`'s embedder is built and warmed — see
-/// this function's own body: previously (before task 33) the embedder was
-/// warmed one layer up in [`serve_uds_with_config`] and then dropped with
-/// nothing left to hand it to. Consolidating warm-up and `SearchApi`
-/// construction into one place is what keeps a real (ONNX) model from being
-/// loaded twice — once to warm, once for search — since "one embedder serves
-/// the whole process" is [`rmail_core::embed::Embedder`]'s own documented
-/// contract.
-///
 /// # Errors
 ///
-/// As [`serve_uds`], plus [`ServeError::InvalidRankWeights`] under the same
-/// condition [`serve_uds_with_engine`] documents.
+/// As [`serve_uds`].
 pub async fn serve_uds_with_engine_and_mail_store<F>(
     socket_path: impl AsRef<Path>,
     db: Database,
     engine: SyncEngine,
     mail_store: MailStore,
-    config: &Config,
     shutdown: F,
 ) -> Result<(), ServeError>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    // Validated before any socket/filesystem side effect: a typo'd
-    // `[search.rank_weights]` key should fail the daemon loudly at startup,
-    // not bind a socket first and then fail — see
-    // `rank::l1::Weights::from_config`'s own docs on why nothing validated
-    // this automatically before `SearchService` existed to call it.
-    let rank_weights = Weights::from_config(&config.search.rank_weights)?;
     let path = socket_path.as_ref().to_path_buf();
 
     if let Some(parent) = path.parent() {
@@ -433,36 +393,6 @@ where
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
     let mail_service = MailServiceServer::new(MailApi::new(mail_store, stopping.clone()));
 
-    // Held for the lifetime of the server (bound here, dropped only when this
-    // function returns): a model loaded into an `Arc` that a warming task
-    // then drops is a model that is immediately freed — the log line claims
-    // success and the first query pays for the load all over again.
-    // `SearchApi` gets a clone of the *same* `Arc`, not a second embedder, so
-    // a real (ONNX) model is loaded at most once per daemon process.
-    let warm = warm_embedder(config);
-    let embedder: Arc<dyn Embedder> = warm
-        .as_ref()
-        .map(WarmEmbedder::embedder)
-        .cloned()
-        .unwrap_or_else(|| {
-            // Semantic indexing disabled, or the configured backend failed to
-            // build (already logged by `warm_embedder`/`embed::build`) —
-            // search still needs *something* to embed queries with. The
-            // deterministic hash fallback (`embed::hash`'s own docs: "exists
-            // so the retrieval pipeline has one code path instead of two")
-            // keeps the dense retriever's code path live rather than absent;
-            // with `vec_chunks` unpopulated either way, it costs nothing real.
-            Arc::new(HashEmbedder::new(VECTOR_DIM)) as Arc<dyn Embedder>
-        });
-    let search_service = SearchServiceServer::new(SearchApi::new(
-        db.clone(),
-        embedder,
-        rank_weights,
-        config.search.clone(),
-        &config.index.semantic,
-        stopping.clone(),
-    ));
-
     let incoming = UnixListenerStream::new(listener);
     let serve_result = Server::builder()
         // Every RPC runs inside a request-tracing span; the auth layer sits
@@ -477,7 +407,6 @@ where
         .add_service(account_service)
         .add_service(sync_service)
         .add_service(mail_service)
-        .add_service(search_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
