@@ -531,12 +531,118 @@ impl Drop for Fixture {
 /// appends events and then calls `tick()` for the first time would
 /// otherwise have that very first tick treat everything already appended
 /// as pre-existing history and skip it, rather than firing on it as the
-/// test expects. Mirrors what `HookDispatcher::spawn`'s own "runs once
-/// immediately" priming tick does in production.
+/// test expects. Mirrors what `HookDispatcher::spawn` does in production,
+/// where the equivalent seed happens eagerly (and awaited) before `spawn`
+/// returns rather than on the first tick.
 async fn primed_dispatcher(events: &EventLog, config: &HooksConfig) -> HookDispatcher {
     let dispatcher = HookDispatcher::new(events.clone(), config);
     dispatcher.tick(&no_cancel()).await.expect("priming tick");
     dispatcher
+}
+
+/// The eager seed is the whole point of `spawn` being `async`: it pins
+/// "start at now" to the moment the daemon boots rather than to whenever the
+/// runtime first happens to poll the tick task.
+///
+/// Asserting on the cursor directly (rather than on whether a hook fired) is
+/// deliberate — it is the only formulation that fails *deterministically*
+/// against the lazy-seed version rather than only when the scheduler
+/// cooperates, which is exactly how the underlying bug stayed hidden until a
+/// fully-loaded test container finally lost the race.
+#[tokio::test]
+async fn spawn_seeds_the_cursor_to_the_log_head_before_it_returns() {
+    let fx = Fixture::open().await;
+    fx.new_mail().await;
+    fx.new_mail().await;
+    let head = fx
+        .events
+        .latest_seq()
+        .await
+        .expect("latest_seq")
+        .unwrap_or(0);
+    assert!(head > 0, "the fixture appended nothing to seed from");
+
+    let dispatcher = HookDispatcher::new(fx.events.clone(), &HooksConfig::default());
+    assert_eq!(
+        dispatcher.cursor.load(Ordering::SeqCst),
+        HookDispatcher::UNSEEDED_CURSOR,
+        "a freshly constructed dispatcher must not have a seeded cursor yet"
+    );
+    // `spawn` consumes the dispatcher, so keep the shared cursor to observe.
+    let cursor = Arc::clone(&dispatcher.cursor);
+
+    let cancel = no_cancel();
+    let handle = dispatcher.spawn(cancel.clone()).await;
+
+    // Read the cursor with no intervening `.await`: on this (current-thread,
+    // the `#[tokio::test]` default) runtime the tick task has been queued by
+    // `spawn` but cannot have been polled yet. So this observes what `spawn`
+    // itself did, not what a tick did afterwards -- which is precisely the
+    // distinction the lazy-seed version got wrong.
+    let seeded = cursor.load(Ordering::SeqCst);
+    cancel.cancel();
+    let _ = handle.await;
+
+    assert_eq!(
+        seeded, head,
+        "the cursor must be pinned to the log head before the tick loop is ever polled -- \
+         seeding it lazily on the first tick instead means every event appended between \
+         `spawn` and that first poll (on a real daemon: mail synced while it was still \
+         coming up) is swallowed by the seed and, because `EventLog::since` is exclusive, \
+         never fires a hook at all"
+    );
+}
+
+/// The end-to-end counterpart of the above, through the real `spawn` loop:
+/// history stays history, and an event appended strictly *after* `spawn`
+/// returns still fires.
+#[tokio::test]
+async fn an_event_appended_after_spawn_returns_is_still_dispatched() {
+    let fx = Fixture::open().await;
+    // Pre-existing history: must never fire.
+    fx.new_mail().await;
+
+    let marker = unique_path("post-spawn-marker");
+    let _ = std::fs::remove_file(&marker);
+    let config = HooksConfig {
+        hooks: vec![HookConfig {
+            name: "marker".to_owned(),
+            event: HookEvent::OnNewMessage,
+            command: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), format!("touch {}", marker.display())],
+            enabled: true,
+            timeout: None,
+        }],
+        ..HooksConfig::default()
+    };
+    let mut dispatcher = HookDispatcher::new(fx.events.clone(), &config);
+    // Keep the test quick: the production default is 5s, and this test cares
+    // about *which* events a tick sees, not how long the sleep between them is.
+    dispatcher.tick_interval = Duration::from_millis(25);
+
+    let cancel = no_cancel();
+    let handle = dispatcher.spawn(cancel.clone()).await;
+
+    // Strictly after `spawn` returned.
+    fx.new_mail().await;
+
+    let mut fired = false;
+    for _ in 0..200 {
+        if marker.exists() {
+            fired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cancel.cancel();
+    let _ = handle.await;
+
+    assert!(
+        fired,
+        "an event appended after `spawn` returned must be dispatched -- it is not history, \
+         however late the runtime got around to polling the tick task"
+    );
+    let _ = std::fs::remove_file(&marker);
 }
 
 #[tokio::test]

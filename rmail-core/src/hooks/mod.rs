@@ -25,11 +25,16 @@
 //! command" — so starting at `0` would mean every daemon restart re-fires
 //! every enabled hook once per matching event in the last 7 days (the
 //! default retention window): thousands of real process spawns and
-//! thousands of duplicated side effects, not a no-op. [`HookDispatcher::tick`]
-//! instead seeds an uninitialized cursor from
-//! [`crate::events::EventLog::latest_seq`] — the log's current head — the
-//! first time it runs, so a restart only ever fires hooks for events from
-//! that moment forward, never for history. The same reasoning governs the
+//! thousands of duplicated side effects, not a no-op.
+//! [`HookDispatcher::spawn`] instead seeds the cursor from
+//! [`crate::events::EventLog::latest_seq`] — the log's current head —
+//! before it returns, so a restart only ever fires hooks for events from
+//! that moment forward, never for history. Seeding *at spawn* rather than
+//! on the first tick is what makes "that moment" mean boot instead of
+//! whenever the runtime first polled the tick task; see that method's own
+//! docs for the startup-window events the lazier version dropped.
+//! [`HookDispatcher::tick`] retains the same lazy seed as a fallback, which
+//! is also what direct-`tick` callers (the tests) rely on. The same reasoning governs the
 //! retention-gap recovery below: it resets to the *current* head, not to
 //! `0`, for the identical reason.
 //!
@@ -686,9 +691,10 @@ pub struct HookDispatcher {
     max_output_bytes: usize,
     tick_interval: Duration,
     max_batch: usize,
-    /// Negative until the first `tick()` seeds it from
-    /// [`EventLog::latest_seq`] — see the module docs' "The cursor starts
-    /// at 'now'."
+    /// Negative until [`HookDispatcher::spawn`] seeds it from
+    /// [`EventLog::latest_seq`] (or, for a direct-`tick` caller that never
+    /// spawns, until the first `tick()` does) — see the module docs' "The
+    /// cursor starts at 'now'."
     cursor: Arc<AtomicI64>,
 }
 
@@ -925,12 +931,52 @@ impl HookDispatcher {
         Ok(report)
     }
 
+    /// Seed the cursor to the event log's current head, so that "start at
+    /// now" means *now* rather than "whenever the tick task is first
+    /// scheduled". Idempotent: a cursor that has already been seeded (or
+    /// advanced by a `tick`) is left alone.
+    ///
+    /// A failure here is deliberately not fatal — it leaves the cursor
+    /// unseeded, and [`Self::tick`] falls back to seeding it lazily exactly
+    /// as it did before. That costs the boot-window guarantee below on a
+    /// database that is already failing to answer a trivial query, but it
+    /// never takes the daemon down for it.
+    async fn seed_cursor(&self) {
+        if self.cursor.load(Ordering::SeqCst) != Self::UNSEEDED_CURSOR {
+            return;
+        }
+        match self.events.latest_seq().await {
+            Ok(head) => self.cursor.store(head.unwrap_or(0), Ordering::SeqCst),
+            Err(error) => tracing::warn!(
+                %error,
+                "could not seed the hook dispatch cursor at startup; it will be seeded on \
+                 the first tick instead, which may skip events appended in between"
+            ),
+        }
+    }
+
     /// Spawn the periodic tick loop, running once immediately (so a daemon
     /// restarted more often than the tick interval still makes progress —
     /// the same reasoning `AiDispatchLoop::spawn` and the event-log
     /// pruner task both apply to themselves) and then on the configured
     /// interval, until `cancel` fires.
-    pub fn spawn(self, cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
+    ///
+    /// # Why this is `async` rather than a bare `tokio::spawn`
+    ///
+    /// The cursor is seeded here, *before* this returns, rather than inside
+    /// the spawned task. `spawn` only queues the task; on a busy runtime the
+    /// caller (the daemon boot path) goes on to bind its socket and start
+    /// accepting requests well before that task is first polled. Seeding
+    /// lazily on the first tick therefore pinned "now" to a scheduling
+    /// accident: any event appended in that window — mail synced while the
+    /// daemon was still coming up — was swallowed by the seed and, because
+    /// [`EventLog::since`] is exclusive, never fired a hook at all.
+    ///
+    /// Awaiting the seed makes the guarantee the module docs claim actually
+    /// hold: every event appended after `spawn(..).await` returns is dispatched,
+    /// and everything before it is history.
+    pub async fn spawn(self, cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
+        self.seed_cursor().await;
         tokio::spawn(async move {
             loop {
                 match self.tick(&cancel).await {

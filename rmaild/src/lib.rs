@@ -553,7 +553,7 @@ where
         hook_dispatcher.semaphore(),
     ));
     let hook_dispatch_handle = if config.hooks.enabled && hook_dispatcher.hook_count() > 0 {
-        Some(hook_dispatcher.spawn(stopping.clone()))
+        Some(hook_dispatcher.spawn(stopping.clone()).await)
     } else {
         tracing::info!(
             enabled = config.hooks.enabled,
