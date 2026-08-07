@@ -72,21 +72,28 @@
 //! # What a hard filter does when this build cannot evaluate it
 //!
 //! Not every [`Operator`] the parser recognizes is backed by a table today —
-//! `tag:`, `note:`, `ai:`, and `has:note`/`has:tag` name subsystems that land
-//! in later tasks (55, 56, 57). Silently ignoring one of those would let
-//! `tag:work invoice` return every `invoice` hit regardless of tag, which
-//! breaks the "hard filters gate everything" contract just as badly as
-//! misapplying a filter that *is* backed. But the honest answer is not
-//! "unknown" either: with no tags table, *zero* messages currently have any
-//! tag, so `tag:work` provably excludes everything, and this module makes it
-//! do exactly that (see [`RawEffect::Never`]) rather than pretend the
-//! constraint does not exist. Negating one of these
-//! (`-tag:newsletter`) inverts correctly for the same reason: "not tagged
-//! newsletter" is true of every message when nothing is tagged anything, so
-//! it degrades to no constraint instead of excluding everything.
+//! `tag:` and `has:tag` name a subsystem that lands in a later task (55).
+//! Silently ignoring one of those would let `tag:work invoice` return every
+//! `invoice` hit regardless of tag, which breaks the "hard filters gate
+//! everything" contract just as badly as misapplying a filter that *is*
+//! backed. But the honest answer is not "unknown" either: with no tags
+//! table, *zero* messages currently have any tag, so `tag:work` provably
+//! excludes everything, and this module makes it do exactly that (see
+//! [`RawEffect::Never`]) rather than pretend the constraint does not exist.
+//! Negating one of these (`-tag:newsletter`) inverts correctly for the same
+//! reason: "not tagged newsletter" is true of every message when nothing is
+//! tagged anything, so it degrades to no constraint instead of excluding
+//! everything.
+//!
+//! `note:`/`has:note` *are* backed, by the `notes` table (task 56, migration
+//! `V23`) — see [`super::filtermask::note_text_sql`]/
+//! [`super::filtermask::note_exists_sql`], which this module's own
+//! [`classify`] calls rather than re-deriving the same SQL, so this
+//! retriever and [`super::filtermask`]'s (used by every other retriever)
+//! can never disagree about what a note filter matches.
 //!
 //! `is:` is a partial exception: `pinned`/`muted` name concepts with no
-//! backing data at all (same as `tag:`/`note:`), but a value outside the six
+//! backing data at all (same as `tag:`), but a value outside the six
 //! documented flags is not automatically unbacked — `flags` is a general
 //! IMAP keyword table, and [`crate::message::fetch::flag_to_string`] already
 //! persists `\Draft`, `\Deleted`, `\Recent`, and arbitrary custom keywords
@@ -107,7 +114,7 @@ use rusqlite::ToSql;
 use tokio_util::sync::CancellationToken;
 
 use super::cancel::interruptible_read;
-use super::filtermask::ai_predicate_sql;
+use super::filtermask::{ai_predicate_sql, note_exists_sql, note_text_sql};
 use super::{rank_by_score, Candidate, Source};
 use crate::error::Error;
 use crate::index::fts::{self, FtsIndex};
@@ -479,10 +486,9 @@ enum RawEffect {
     /// cannot denote any real row (a `thread:` id that is not an integer,
     /// which no `threads.id` can ever equal; an `ai:` key/value
     /// [`ai_predicate_sql`] does not recognize) or the operator names a
-    /// subsystem this build has no table for yet (`tag:`, `note:`,
-    /// `has:note`, `has:tag`, `is:pinned`, `is:muted`). See the module docs
-    /// for why this degrades to "excludes everything" rather than "no
-    /// constraint".
+    /// subsystem this build has no table for yet (`tag:`, `has:tag`,
+    /// `is:pinned`, `is:muted`). See the module docs for why this degrades to
+    /// "excludes everything" rather than "no constraint".
     Never,
     /// The operator is backed by real columns, but this stage cannot resolve
     /// *this* value with confidence in either direction (a `before:`/
@@ -601,7 +607,11 @@ fn classify(op: &Operator) -> RawEffect {
         Operator::Has(HasTarget::Attachment) => {
             RawEffect::Sql("has_attachments = 1".to_owned(), Vec::new())
         }
-        Operator::Has(HasTarget::Note | HasTarget::Tag | HasTarget::Other(_)) => RawEffect::Never,
+        Operator::Has(HasTarget::Note) => {
+            let (sql, params) = note_exists_sql();
+            RawEffect::Sql(sql, params)
+        }
+        Operator::Has(HasTarget::Tag | HasTarget::Other(_)) => RawEffect::Never,
         Operator::Filename(pattern) => RawEffect::Sql(
             "EXISTS (SELECT 1 FROM attachments WHERE attachments.message_id = messages.id \
              AND lower(attachments.filename) GLOB ?)"
@@ -649,12 +659,16 @@ fn classify(op: &Operator) -> RawEffect {
         Operator::Is(IsFlag::Replied) => flag_predicate("\\Answered", true),
         Operator::Is(IsFlag::Pinned | IsFlag::Muted) => RawEffect::Never,
         Operator::Is(IsFlag::Other(value)) => is_other_flag(value),
-        // `tag:`/`note:` have no backing table yet (tasks 55/56); `ai:` is
-        // backed by `ai_summaries` (task 48) and resolved through the same
-        // classifier `retrieve::filtermask` uses — see [`RawEffect::Never`]'s
-        // docs and [`ai_predicate_sql`] for why this is shared rather than a
-        // second, independently-drifting copy.
-        Operator::Tag(_) | Operator::Note(_) => RawEffect::Never,
+        // `tag:` has no backing table yet (task 55). `note:` and `ai:` are
+        // both resolved through the same classifiers `retrieve::filtermask`
+        // uses — see [`RawEffect::Never`]'s docs and [`ai_predicate_sql`]/
+        // [`note_text_sql`] for why these are shared rather than a second,
+        // independently-drifting copy.
+        Operator::Tag(_) => RawEffect::Never,
+        Operator::Note(value) => {
+            let (sql, params) = note_text_sql(value);
+            RawEffect::Sql(sql, params)
+        }
         Operator::Ai(predicate) => match ai_predicate_sql(predicate) {
             Some((sql, params)) => RawEffect::Sql(sql, params),
             None => RawEffect::Never,

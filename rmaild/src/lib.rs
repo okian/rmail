@@ -15,6 +15,7 @@ mod ai_service;
 mod audit_service;
 mod auth;
 mod mail_service;
+mod note_service;
 mod search_service;
 mod sync_service;
 mod trace;
@@ -25,6 +26,7 @@ pub use ai_service::AiApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
 pub use mail_service::MailApi;
+pub use note_service::NoteApi;
 pub use search_service::SearchApi;
 pub use sync_service::SyncApi;
 pub use trace::RequestTraceLayer;
@@ -47,6 +49,7 @@ use rmail_core::imap::mutate::LiveImapMutator;
 use rmail_core::index::semantic::VECTOR_DIM;
 use rmail_core::index::{IndexQueue, QueueOptions as IndexQueueOptions};
 use rmail_core::mail::MailStore;
+use rmail_core::notes::NoteStore;
 use rmail_core::rank::l1::Weights;
 use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::{Config, Database};
@@ -55,6 +58,7 @@ use rmail_proto::v1::admin_service_server::AdminServiceServer;
 use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
+use rmail_proto::v1::note_service_server::NoteServiceServer;
 use rmail_proto::v1::search_service_server::SearchServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
 use tokio::net::UnixListener;
@@ -456,6 +460,17 @@ where
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
     let mail_service = MailServiceServer::new(MailApi::new(mail_store, stopping.clone()));
 
+    // A dedicated `IndexQueue` handle rather than reusing the AI subsystem's
+    // (below) — `IndexQueue` is a cheap, stateless wrapper over `db` (see its
+    // own docs), so a second instance costs nothing and keeps this task's
+    // wiring independent of the AI subsystem's.
+    let note_store = NoteStore::new(
+        db.clone(),
+        IndexQueue::new(db.clone(), IndexQueueOptions::default()),
+        config.notes.index,
+    );
+    let note_service = NoteServiceServer::new(NoteApi::new(note_store, stopping.clone()));
+
     // Held for the lifetime of the server (bound here, dropped only when this
     // function returns): a model loaded into an `Arc` that a warming task
     // then drops is a model that is immediately freed — the log line claims
@@ -637,6 +652,7 @@ where
         .add_service(account_service)
         .add_service(sync_service)
         .add_service(mail_service)
+        .add_service(note_service)
         .add_service(search_service)
         .add_service(ai_service)
         .serve_with_incoming_shutdown(incoming, shutdown)

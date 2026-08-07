@@ -30,7 +30,8 @@ onnx = ["rmail-core/onnx", "rmaild/onnx"]
 rmail-core.workspace = true
 rmail-proto.workspace = true
 tonic-health.workspace = true
-tokio.workspace = true
+# `note_cli`'s `$EDITOR` flow launches the user's editor as a child process.
+tokio = { workspace = true, features = ["process"] }
 tonic.workspace = true
 tokio-stream.workspace = true
 anyhow.workspace = true

@@ -195,6 +195,25 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Insert a `notes` row directly (task 56, migration V23) -- this
+    /// module is proving `note:`/`has:note` compose with the lexical
+    /// `MATCH`, not re-proving `NoteStore`'s own CRUD (`notes::tests` does
+    /// that). Exactly one of `message_id`/`thread_id` should be `Some`,
+    /// matching the schema's own XOR `CHECK` -- callers here are trusted to
+    /// pass a valid shape since this helper skips straight past `NoteStore`.
+    async fn note(&self, message_id: Option<i64>, thread_id: Option<i64>, body_md: &str) {
+        let body_md = body_md.to_owned();
+        self.db
+            .write(move |c| {
+                c.execute(
+                    "INSERT INTO notes (message_id, thread_id, body_md) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![message_id, thread_id, body_md],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
     async fn thread(&self) -> i64 {
         let account_id = self.account_id;
         self.db
@@ -1179,7 +1198,13 @@ async fn the_hard_filter_mask_is_applied_before_the_limit_not_after() {
 }
 
 #[tokio::test]
-async fn a_filter_for_an_unbuilt_subsystem_excludes_everything_but_its_negation_does_not() {
+async fn a_filter_with_no_matching_rows_excludes_everything_but_its_negation_does_not() {
+    // `tag:`/`has:tag` genuinely name a subsystem this build has no table
+    // for yet (task 55). `ai:needs-reply`/`note:reminder`/`has:note` are all
+    // backed by real tables (`ai_summaries`, `notes`) but this fixture never
+    // writes a row into either, so the *positive* form of every operator
+    // here still provably matches nothing — same externally observable
+    // behavior, whether the cause is "no table" or "table, no rows".
     let fx = Fixture::open().await;
     let msg = fx
         .index(repo::NewMessage {
@@ -1197,12 +1222,12 @@ async fn a_filter_for_an_unbuilt_subsystem_excludes_everything_but_its_negation_
     ] {
         assert!(
             fx.ids(&format!("invoice {op}")).await.is_empty(),
-            "{op} names a subsystem with no data yet, so it must exclude everything"
+            "{op} has no matching data in this fixture, so it must exclude everything"
         );
         assert_eq!(
             fx.ids(&format!("invoice -{op}")).await,
             vec![msg],
-            "negating it is vacuously true: nothing has it, so nothing is excluded"
+            "negating it is vacuously true: nothing matches, so nothing is excluded"
         );
     }
 }
@@ -1239,6 +1264,98 @@ async fn an_ai_predicate_conjoins_with_free_text_instead_of_dropping_every_hit()
         "the lexical arm must still rank the free text, gated by ai:needs-reply, \
          not drop every candidate"
     );
+}
+
+#[tokio::test]
+async fn has_note_and_note_text_gate_by_real_notes_rows_including_thread_targeted_ones() {
+    let fx = Fixture::open().await;
+    let noted = fx
+        .index(repo::NewMessage {
+            body_text: Some("roadmap review needed".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let bare = fx
+        .index(repo::NewMessage {
+            body_text: Some("roadmap status update".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    fx.note(Some(noted), None, "please review by friday").await;
+
+    let thread_id = fx.thread().await;
+    let in_thread = fx
+        .index(repo::NewMessage {
+            body_text: Some("roadmap thread kickoff".to_owned()),
+            thread_id: Some(thread_id),
+            ..Default::default()
+        })
+        .await;
+    // A thread-targeted note counts for every message in the thread -- the
+    // same "effective note" rule `notes::refresh_note_index` uses to feed
+    // the lexical index (see `filtermask::NOTE_TARGET_SQL`'s docs), so
+    // `note:`/`has:note` cannot disagree with what a plain free-text search
+    // over the same note would already surface for that message.
+    fx.note(None, Some(thread_id), "friday deadline reminder")
+        .await;
+
+    let mut with_note = fx.ids("roadmap has:note").await;
+    with_note.sort_unstable();
+    let mut expected = vec![noted, in_thread];
+    expected.sort_unstable();
+    assert_eq!(
+        with_note, expected,
+        "has:note matches a directly-noted message and a thread-effective one, not a bare message"
+    );
+
+    let mut by_text = fx.ids("roadmap note:friday").await;
+    by_text.sort_unstable();
+    assert_eq!(
+        by_text, expected,
+        "note:friday matches text in either a direct or a thread-effective note"
+    );
+    assert!(
+        !by_text.contains(&bare),
+        "a message with no note at all never matches"
+    );
+}
+
+#[tokio::test]
+async fn a_note_predicate_conjoins_with_free_text_instead_of_dropping_every_hit() {
+    // Regression, mirroring `an_ai_predicate_conjoins_with_free_text_instead_of_dropping_every_hit`
+    // above: this module's own `classify` and `retrieve::filtermask`'s both
+    // call the exact same `filtermask::note_text_sql`/`note_exists_sql`, so
+    // a query mixing free text with `note:`/`has:note` cannot silently lose
+    // the BM25 arm the way it would if only one of the two classifiers had
+    // been taught about the `notes` table (`RawEffect::Never` here, applied
+    // to a *positive* filter, turns into `FilterMask::ExcludesEverything` —
+    // see this module's own docs).
+    let fx = Fixture::open().await;
+    let noted = fx
+        .index(repo::NewMessage {
+            body_text: Some("quarterly numbers attached".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let not_noted = fx
+        .index(repo::NewMessage {
+            body_text: Some("quarterly numbers pending".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    fx.note(Some(noted), None, "reviewed and approved").await;
+
+    assert_eq!(
+        fx.ids("quarterly note:approved").await,
+        vec![noted],
+        "the lexical arm must still rank the free text, gated by note:approved, not drop every candidate"
+    );
+    assert_eq!(
+        fx.ids("quarterly has:note").await,
+        vec![noted],
+        "same for has:note"
+    );
+    assert!(!fx.ids("quarterly note:approved").await.contains(&not_noted));
 }
 
 #[tokio::test]

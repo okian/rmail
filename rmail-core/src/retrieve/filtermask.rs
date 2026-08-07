@@ -215,7 +215,11 @@ fn classify(op: &Operator) -> RawEffect {
         Operator::Has(HasTarget::Attachment) => {
             RawEffect::Sql("has_attachments = 1".to_owned(), Vec::new())
         }
-        Operator::Has(HasTarget::Note | HasTarget::Tag | HasTarget::Other(_)) => RawEffect::Never,
+        Operator::Has(HasTarget::Note) => {
+            let (sql, params) = note_exists_sql();
+            RawEffect::Sql(sql, params)
+        }
+        Operator::Has(HasTarget::Tag | HasTarget::Other(_)) => RawEffect::Never,
         Operator::Filename(pattern) => RawEffect::Sql(
             "EXISTS (SELECT 1 FROM attachments WHERE attachments.message_id = messages.id \
              AND lower(attachments.filename) GLOB ?)"
@@ -237,10 +241,17 @@ fn classify(op: &Operator) -> RawEffect {
         Operator::Is(IsFlag::Replied) => flag_predicate("\\Answered", true),
         Operator::Is(IsFlag::Pinned | IsFlag::Muted) => RawEffect::Never,
         Operator::Is(IsFlag::Other(value)) => is_other_flag(value),
-        // `tag:`/`note:` have no backing table yet (tasks 55/56); `ai:` is
-        // backed by `ai_summaries` (task 48, migration V21) and has its own
+        // `tag:` has no backing table yet (task 55). `note:` is backed by
+        // the `notes` table (task 56, migration V23) via [`note_text_sql`],
+        // shared with `retrieve::lexical`'s own classifier so the two can
+        // never disagree about what `note:` matches. `ai:` is backed by
+        // `ai_summaries` (task 48, migration V21) and has its own
         // classifier below.
-        Operator::Tag(_) | Operator::Note(_) => RawEffect::Never,
+        Operator::Tag(_) => RawEffect::Never,
+        Operator::Note(value) => {
+            let (sql, params) = note_text_sql(value);
+            RawEffect::Sql(sql, params)
+        }
         Operator::Ai(predicate) => match ai_predicate_sql(predicate) {
             Some((sql, params)) => RawEffect::Sql(sql, params),
             None => RawEffect::Never,
@@ -364,6 +375,59 @@ fn ai_exists(sql: &str, params: Vec<Value>) -> Option<(String, Vec<Value>)> {
         format!("EXISTS (SELECT 1 FROM ai_summaries WHERE ai_summaries.message_id = messages.id AND {sql})"),
         params,
     ))
+}
+
+/// Correlated condition: does a `notes` row belong to `messages`' own row —
+/// directly (`notes.message_id = messages.id`) or via a thread-targeted note
+/// on the same thread. This is the *same* "effective note" rule
+/// `crate::notes::refresh_note_index` uses to decide which notes feed a
+/// message's `index_content`/`fts_messages.notes` — a message-targeted note
+/// counts for that message alone, a thread-targeted note counts for every
+/// message currently in the thread. `note:`/`has:note` sharing this
+/// definition with the free-text feed is what makes "this message's search
+/// result mentions a note" and "`note:`/`has:note` matched this message"
+/// describe the same thing.
+const NOTE_TARGET_SQL: &str = "(notes.message_id = messages.id \
+     OR (messages.thread_id IS NOT NULL AND notes.thread_id = messages.thread_id))";
+
+/// `has:note`'s SQL: does *some* note (message- or effective-thread-scoped,
+/// see [`NOTE_TARGET_SQL`]) exist for this message.
+///
+/// `pub(crate)`, and returning a plain `(String, Vec<Value>)` rather than
+/// this module's own [`RawEffect`], for the identical reason
+/// [`ai_predicate_sql`] does: [`super::lexical`] classifies `Operator`/
+/// `HasTarget` values from a different input type
+/// ([`crate::query::Filter`] vs [`HardFilter`]) but needs to turn
+/// `HasTarget::Note` into *exactly* the same SQL this module does — sharing
+/// this function is what makes that guaranteed rather than merely intended.
+/// The task 56 acceptance bar this exists to meet: `note:`/`has:note` must
+/// go through both retrievers' filter compilers identically, or a query
+/// mixing free text with one of these operators silently drops the BM25 arm
+/// for one of the two (exactly the bug task 48 shipped and this module's own
+/// sharing of `ai_predicate_sql` already prevents for `ai:`).
+pub(crate) fn note_exists_sql() -> (String, Vec<Value>) {
+    (
+        format!("EXISTS (SELECT 1 FROM notes WHERE {NOTE_TARGET_SQL})"),
+        Vec::new(),
+    )
+}
+
+/// `note:<value>`'s SQL: some note for this message (see [`NOTE_TARGET_SQL`])
+/// contains `value`. A `LIKE` substring match against `notes.body_md` itself
+/// — the same "hard filter reads the real column, not the ranked FTS index"
+/// choice [`classify`]'s `subject:`/`body:` arms make (via [`like_one`]):
+/// `note:` gates candidates, it does not rank them, so it has no reason to
+/// route through `notes_fts`'s BM25 machinery the way a free-text term
+/// would.
+///
+/// `pub(crate)` for the same sharing reason as [`note_exists_sql`].
+pub(crate) fn note_text_sql(value: &str) -> (String, Vec<Value>) {
+    (
+        format!(
+            "EXISTS (SELECT 1 FROM notes WHERE {NOTE_TARGET_SQL} AND notes.body_md LIKE ? ESCAPE '\\')"
+        ),
+        vec![Value::Text(like_pattern(value))],
+    )
 }
 
 fn size_cmp(cmp: &str, bytes: u64) -> RawEffect {

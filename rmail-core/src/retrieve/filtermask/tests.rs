@@ -8,7 +8,7 @@
 use rusqlite::types::Value;
 
 use super::*;
-use crate::query::{parse, AiPredicate, Operator};
+use crate::query::{parse, AiPredicate, HasTarget, Operator};
 
 fn other(op: Operator, negated: bool) -> HardFilter {
     HardFilter::Other(Filter { op, negated })
@@ -266,6 +266,44 @@ fn negating_an_ai_predicate_wraps_it_null_safely() {
         Operator::Ai(AiPredicate::Flag("needs-reply".to_owned())),
         true,
     );
+    let FilterMask::Sql(mask) = compile(&[filter]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert!(mask.sql.starts_with("NOT COALESCE((EXISTS"));
+}
+
+// ---------------------------------------------------------------------------
+// note:/has:note -- decisions only; `retrieve::lexical::tests` proves these
+// select the right messages against a real `notes` table, and that both
+// classifiers agree with each other (they call the exact same
+// `note_text_sql`/`note_exists_sql` this module exports).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn has_note_compiles_to_an_exists_gate_over_notes() {
+    let filter = other(Operator::Has(HasTarget::Note), false);
+    let FilterMask::Sql(mask) = compile(&[filter]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert!(mask.sql.contains("EXISTS (SELECT 1 FROM notes WHERE"));
+    assert!(mask.sql.contains("notes.message_id = messages.id"));
+    assert!(mask.sql.contains("notes.thread_id = messages.thread_id"));
+    assert!(mask.params.is_empty());
+}
+
+#[test]
+fn note_text_filter_binds_a_like_pattern_against_body_md() {
+    let filter = other(Operator::Note("invoice".to_owned()), false);
+    let FilterMask::Sql(mask) = compile(&[filter]) else {
+        unreachable!("expected a compiled predicate");
+    };
+    assert!(mask.sql.contains("notes.body_md LIKE ? ESCAPE '\\'"));
+    assert_eq!(mask.params, vec![Value::Text("%invoice%".to_owned())]);
+}
+
+#[test]
+fn negating_has_note_wraps_it_null_safely() {
+    let filter = other(Operator::Has(HasTarget::Note), true);
     let FilterMask::Sql(mask) = compile(&[filter]) else {
         unreachable!("expected a compiled predicate");
     };

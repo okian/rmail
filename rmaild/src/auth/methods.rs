@@ -183,6 +183,34 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.MailService/Delete",
         Requirement::Scope(Scope::MailWrite),
     ),
+    // -- NoteService (task 56) -------------------------------------------------
+    // Notes are local mail annotations, scoped the same way `MailService`'s
+    // own reads/mutations are: `ListNotes`/`WatchNotes` read the local
+    // database only, so `mail.read` suffices; `AddNote`/`EditNote`/
+    // `DeleteNote` mutate it, so they sit behind `mail.write` — the same
+    // read/write split this table already draws for `MailService.List` vs
+    // `MailService.SetFlags`. Nothing here reaches IMAP or a model provider,
+    // so there is no reason for any row to require more than `mail.write`.
+    (
+        "/rmail.v1.NoteService/AddNote",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.NoteService/EditNote",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.NoteService/DeleteNote",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.NoteService/ListNotes",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.NoteService/WatchNotes",
+        Requirement::Scope(Scope::MailRead),
+    ),
     // -- SearchService (task 33) ----------------------------------------------
     // Every RPC here is a read-only query over the local index (no IMAP round
     // trip, no mutation — see `search_service`'s own module docs), so

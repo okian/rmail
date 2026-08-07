@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+import "google/protobuf/empty.proto";
+
+// NoteService manages freeform markdown notes attached to a message or a
+// thread (prd.md, "III-4. Notes & Tags"). Notes are local-only; they are
+// folded into the field-weighted lexical index (`rmail-core::index::fts`'s
+// `notes` column, weight 3.0 by default) so a plain free-text search
+// surfaces a note the same way it surfaces a subject or a body, and they
+// back the dedicated `note:`/`has:note` hard-filter operators
+// (`rmail-core::retrieve::filtermask`/`retrieve::lexical`).
+service NoteService {
+  // Attach a new note to a message or a thread.
+  rpc AddNote(AddNoteRequest) returns (Note);
+
+  // Replace an existing note's body. Concurrent edits are last-write-wins on
+  // `updated_at` — there is no version/ETag check, so whichever `EditNote`
+  // commits last is what a subsequent `ListNotes` sees.
+  rpc EditNote(EditNoteRequest) returns (Note);
+
+  // Delete a note by id.
+  rpc DeleteNote(DeleteNoteRequest) returns (google.protobuf.Empty);
+
+  // List a target's notes, newest first.
+  rpc ListNotes(ListNotesRequest) returns (ListNotesResponse);
+
+  // Stream live add/edit/delete events as they happen, so an open note view
+  // (TUI preview pane, MCP-driven UI) can stay current. Not resumable —
+  // there is no backlog or cursor, only a live tail from the moment the call
+  // is made (contrast MailService.WatchEvents' durable, replay-then-follow
+  // log — a note change missed while disconnected is recovered with a fresh
+  // ListNotes, not replayed).
+  rpc WatchNotes(WatchNotesRequest) returns (stream NoteEvent);
+}
+
+// A note's target: exactly one of a message or a thread, never both and
+// never neither. Enforced both by this shape (a caller cannot set two
+// fields of a `oneof`) and, independently, by a CHECK constraint on the
+// `notes` table itself — so the invariant holds for every write path to the
+// database, not only requests that went through this RPC.
+//
+// Named `NoteTarget` rather than the bare `Target` prd.md's illustrative
+// snippet uses: `tag.proto` (task 55) names the identical message/thread-id
+// shape for `TagService`, and every `.proto` under this directory compiles
+// into one flat `rmail.v1` symbol table — a second, unqualified `Target`
+// would be a duplicate-message compile error the moment both land.
+message NoteTarget {
+  oneof of {
+    int64 message_id = 1;
+    int64 thread_id = 2;
+  }
+}
+
+// Who wrote a note. A closed, two-value vocabulary — unlike e.g.
+// `ai_summaries.category`, which stays a bare string because its taxonomy is
+// open and user-extensible — so it is a proto enum rather than a string.
+enum NoteAuthor {
+  NOTE_AUTHOR_UNSPECIFIED = 0;
+  NOTE_AUTHOR_USER = 1;
+  NOTE_AUTHOR_AI = 2;
+}
+
+message Note {
+  int64 id = 1;
+  NoteTarget target = 2;
+  string body_md = 3;
+  NoteAuthor author = 4;
+  // Unix seconds.
+  int64 created_at = 5;
+  // Unix seconds. Advances on every `EditNote` — see that RPC's
+  // last-write-wins note.
+  int64 updated_at = 6;
+}
+
+message AddNoteRequest {
+  NoteTarget target = 1;
+  string body_md = 2;
+  // Unset (or NOTE_AUTHOR_UNSPECIFIED) defaults to NOTE_AUTHOR_USER — an
+  // MCP-originated `add_note` call sets NOTE_AUTHOR_AI explicitly (prd.md:
+  // "author defaults to ai when Claude calls").
+  NoteAuthor author = 3;
+}
+
+message EditNoteRequest {
+  int64 note_id = 1;
+  string body_md = 2;
+}
+
+message DeleteNoteRequest {
+  int64 note_id = 1;
+}
+
+message ListNotesRequest {
+  NoteTarget target = 1;
+}
+
+message ListNotesResponse {
+  repeated Note notes = 1;
+}
+
+message WatchNotesRequest {
+  // Unset watches every note change on the daemon; set to restrict the
+  // stream to one target.
+  NoteTarget target = 1;
+}
+
+message NoteEvent {
+  oneof event {
+    Note added = 1;
+    Note edited = 2;
+    DeletedNote deleted = 3;
+  }
+}
+
+// A deleted note's identity — the row is already gone by the time this is
+// sent, so this is the only place a subscriber still learns what it had
+// been attached to.
+message DeletedNote {
+  int64 id = 1;
+  NoteTarget target = 2;
+}

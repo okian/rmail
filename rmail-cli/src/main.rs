@@ -1,5 +1,6 @@
 //! The `mail` CLI — a thin gRPC client for the rmail daemon.
 
+mod note_cli;
 mod search_cli;
 
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use note_cli::{NoteAction, NotesArgs};
 use rmail_core::socket_path_from_env;
 use rmail_proto::v1::admin_service_client::AdminServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
@@ -67,6 +69,13 @@ enum Command {
         #[command(subcommand)]
         action: AiAction,
     },
+    /// Add/edit/delete a note on a message or thread (`NoteService`).
+    Note {
+        #[command(subcommand)]
+        action: NoteAction,
+    },
+    /// List notes on a message or thread (`NoteService.ListNotes`).
+    Notes(NotesArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -180,6 +189,8 @@ async fn main() -> Result<()> {
             AiAction::Resume => ai_set_paused(&socket, false).await,
             AiAction::Cost { month } => ai_cost(&socket, month).await,
         },
+        Command::Note { action } => note_cli::dispatch(&socket, action).await,
+        Command::Notes(args) => note_cli::list(&socket, args).await,
     }
 }
 
