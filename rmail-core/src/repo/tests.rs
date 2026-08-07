@@ -354,6 +354,81 @@ fn flags_add_list_remove() {
 }
 
 #[test]
+fn list_flags_by_message_batches_and_omits_flagless_messages() {
+    let tmp = TempDb::open();
+    let account_id = seed_account(&tmp.db, "Personal");
+    let mailbox_id = tmp
+        .db
+        .with_write(|c| {
+            insert_mailbox(
+                c,
+                &NewMailbox {
+                    account_id,
+                    name: "INBOX".to_owned(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    let flagged = tmp
+        .db
+        .with_write(|c| {
+            insert_message(
+                c,
+                &NewMessage {
+                    account_id,
+                    mailbox_id,
+                    uid: 1,
+                    uidvalidity: 1,
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    let bare = tmp
+        .db
+        .with_write(|c| {
+            insert_message(
+                c,
+                &NewMessage {
+                    account_id,
+                    mailbox_id,
+                    uid: 2,
+                    uidvalidity: 1,
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    tmp.db
+        .with_write(|c| add_flag(c, flagged, "\\Seen"))
+        .unwrap();
+    tmp.db
+        .with_write(|c| add_flag(c, flagged, "\\Flagged"))
+        .unwrap();
+
+    assert!(tmp
+        .db
+        .with_read(|c| list_flags_by_message(c, &[]))
+        .unwrap()
+        .is_empty());
+
+    let by_message = tmp
+        .db
+        .with_read(move |c| list_flags_by_message(c, &[flagged, bare]))
+        .unwrap();
+    assert_eq!(
+        by_message.get(&flagged),
+        Some(&vec!["\\Flagged".to_owned(), "\\Seen".to_owned()])
+    );
+    assert_eq!(
+        by_message.get(&bare),
+        None,
+        "a message with no flags is absent, not an empty Vec entry"
+    );
+}
+
+#[test]
 fn attachments_insert_list() {
     let tmp = TempDb::open();
     let account_id = seed_account(&tmp.db, "Personal");
@@ -564,6 +639,157 @@ fn message_lookup_by_imap_identity() {
         .db
         .with_read(|c| get_message_by_identity(c, mailbox_id, 99, 8))
         .unwrap();
+    assert!(missing.is_none());
+}
+
+#[test]
+fn get_messages_batches_and_skips_missing_ids() {
+    let tmp = TempDb::open();
+    let account_id = seed_account(&tmp.db, "Personal");
+    let mailbox_id = tmp
+        .db
+        .with_write(|c| {
+            insert_mailbox(
+                c,
+                &NewMailbox {
+                    account_id,
+                    name: "INBOX".to_owned(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    let first = tmp
+        .db
+        .with_write(|c| {
+            insert_message(
+                c,
+                &NewMessage {
+                    account_id,
+                    mailbox_id,
+                    uid: 1,
+                    uidvalidity: 1,
+                    subject: Some("First".to_owned()),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    let second = tmp
+        .db
+        .with_write(|c| {
+            insert_message(
+                c,
+                &NewMessage {
+                    account_id,
+                    mailbox_id,
+                    uid: 2,
+                    uidvalidity: 1,
+                    subject: Some("Second".to_owned()),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+    // Empty input, no round trip needed.
+    assert!(tmp
+        .db
+        .with_read(|c| get_messages(c, &[]))
+        .unwrap()
+        .is_empty());
+
+    let nonexistent = first.max(second) + 1_000;
+    let got = tmp
+        .db
+        .with_read(move |c| get_messages(c, &[second, nonexistent, first]))
+        .unwrap();
+    let subjects: Vec<Option<String>> = got.iter().map(|m| m.subject.clone()).collect();
+    assert_eq!(got.len(), 2, "the nonexistent id is simply absent");
+    assert!(subjects.contains(&Some("First".to_owned())));
+    assert!(subjects.contains(&Some("Second".to_owned())));
+}
+
+#[test]
+fn get_body_text_reads_the_body_part_and_is_none_when_unindexed() {
+    let tmp = TempDb::open();
+    let account_id = seed_account(&tmp.db, "Personal");
+    let mailbox_id = tmp
+        .db
+        .with_write(|c| {
+            insert_mailbox(
+                c,
+                &NewMailbox {
+                    account_id,
+                    name: "INBOX".to_owned(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    let indexed = tmp
+        .db
+        .with_write(|c| {
+            insert_message(
+                c,
+                &NewMessage {
+                    account_id,
+                    mailbox_id,
+                    uid: 1,
+                    uidvalidity: 1,
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    let unindexed = tmp
+        .db
+        .with_write(|c| {
+            insert_message(
+                c,
+                &NewMessage {
+                    account_id,
+                    mailbox_id,
+                    uid: 2,
+                    uidvalidity: 1,
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    tmp.db
+        .with_write(move |c| {
+            c.execute(
+                "INSERT INTO index_content (message_id, part, text, chars, content_hash, extractor)
+                 VALUES (?1, 'body', 'hello world', 11, X'00', 'test')",
+                rusqlite::params![indexed],
+            )
+        })
+        .unwrap();
+    // A non-body part must not be picked up.
+    tmp.db
+        .with_write(move |c| {
+            c.execute(
+                "INSERT INTO index_content (message_id, part, text, chars, content_hash, extractor)
+                 VALUES (?1, 'subject', 'not the body', 12, X'00', 'test')",
+                rusqlite::params![unindexed],
+            )
+        })
+        .unwrap();
+
+    let body = tmp
+        .db
+        .with_read(move |c| get_body_text(c, indexed))
+        .unwrap();
+    assert_eq!(body.as_deref(), Some("hello world"));
+
+    let none = tmp
+        .db
+        .with_read(move |c| get_body_text(c, unindexed))
+        .unwrap();
+    assert!(none.is_none(), "a subject-only row is not a body");
+
+    let missing = tmp.db.with_read(|c| get_body_text(c, 999_999)).unwrap();
     assert!(missing.is_none());
 }
 

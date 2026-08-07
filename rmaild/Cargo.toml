@@ -33,6 +33,11 @@ onnx = ["rmail-core/onnx"]
 [dependencies]
 rmail-proto.workspace = true
 rmail-core.workspace = true
+# `search_service.rs` captures one reference instant (`Utc::now()`) per
+# request and threads it through `QueryPlanner::plan_at`/
+# `FeatureExtractor::extract_at` so a replayed request scores identically —
+# see that module's own docs.
+chrono.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
 tonic-reflection.workspace = true
