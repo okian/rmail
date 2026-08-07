@@ -28,6 +28,7 @@ use crate::ai::provider::{ClaudeProvider, Provider};
 use crate::ai::queue::{AiQueue, AiWorkerPool, NewAiJob, QueueOptions};
 use crate::ai::triage::TriagePassHandler;
 use crate::config::{AiConfig, AiLimits, AiPolicyMode, AiPrivacy, AiRetry, Bm25Weights};
+use crate::events::{EventLog, Retention};
 use crate::index::fts::FtsIndex;
 use crate::repo;
 use crate::storage::Database;
@@ -934,6 +935,7 @@ async fn a_second_dispatched_message_builds_on_the_first_summary_rather_than_rec
         AiPrivacy::default(),
         vec![handler(&fx) as Arc<dyn PassHandler>],
         "test-worker",
+        EventLog::new(fx.db.clone(), Retention::unlimited()),
     );
     let summary = pool.dispatch_pending(10, &no_cancel()).await.unwrap();
     assert_eq!(summary.completed, 1, "{summary:?}");
@@ -957,6 +959,7 @@ async fn a_second_dispatched_message_builds_on_the_first_summary_rather_than_rec
         AiPrivacy::default(),
         vec![handler(&fx) as Arc<dyn PassHandler>],
         "test-worker",
+        EventLog::new(fx.db.clone(), Retention::unlimited()),
     );
     let summary = pool.dispatch_pending(10, &no_cancel()).await.unwrap();
     assert_eq!(summary.completed, 1, "{summary:?}");
@@ -1108,6 +1111,7 @@ async fn a_qualifying_triage_dispatch_enqueues_a_deep_job_atomically_through_on_
         AiPrivacy::default(),
         vec![triage_handler as Arc<dyn PassHandler>],
         "test-worker",
+        EventLog::new(fx.db.clone(), Retention::unlimited()),
     );
 
     let summary = pool.dispatch_pending(10, &no_cancel()).await.unwrap();
@@ -1149,6 +1153,7 @@ async fn a_non_qualifying_triage_dispatch_never_enqueues_a_deep_job() {
         AiPrivacy::default(),
         vec![triage_handler as Arc<dyn PassHandler>],
         "test-worker",
+        EventLog::new(fx.db.clone(), Retention::unlimited()),
     );
 
     let summary = pool.dispatch_pending(10, &no_cancel()).await.unwrap();

@@ -33,6 +33,7 @@ use crate::ai::redact::{self, GuardedRequest, TokenMap};
 use crate::config::{AiBatching, AiLimits, AiPrivacy};
 use crate::credential::{CredentialSource, Secret};
 use crate::error::{Error, ErrorReason};
+use crate::events::EventLog;
 use crate::storage::Database;
 
 use super::content::assemble_content;
@@ -492,6 +493,10 @@ pub struct BatchCoordinator {
     batching: AiBatching,
     handlers: Arc<HashMap<String, Arc<dyn PassHandler>>>,
     pending: Mutex<HashMap<String, Vec<InFlightItem>>>,
+    /// Passed straight through to [`finish_call`] from [`Self::poll`] — see
+    /// that function's own docs on why it, not this coordinator, owns
+    /// publishing `AiSummary` events.
+    events: EventLog,
 }
 
 impl std::fmt::Debug for BatchCoordinator {
@@ -523,6 +528,7 @@ impl BatchCoordinator {
         privacy: AiPrivacy,
         batching: AiBatching,
         handlers: Vec<Arc<dyn PassHandler>>,
+        events: EventLog,
     ) -> Result<Self, Error> {
         let api_key_command = api_key_command.into();
         if api_key_command.trim().is_empty() {
@@ -545,6 +551,7 @@ impl BatchCoordinator {
             batching,
             handlers: Arc::new(handlers),
             pending: Mutex::new(HashMap::new()),
+            events,
         })
     }
 
@@ -822,6 +829,7 @@ impl BatchCoordinator {
             let outcome = finish_call(
                 &self.db,
                 &self.queue,
+                &self.events,
                 &lease,
                 &handler,
                 &item.tokens,

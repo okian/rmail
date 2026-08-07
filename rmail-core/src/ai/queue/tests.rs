@@ -28,6 +28,7 @@ use crate::ai::policy::PolicyEngine;
 use crate::ai::provider::{ChatResponse, Provider, ProviderStream, StopReason, Usage};
 use crate::ai::redact::{self, GuardedRequest};
 use crate::config::{AiBatching, AiPolicyMode, AiPolicyRule, AiPrivacy};
+use crate::events::{EventKind, EventLog, Retention};
 use crate::repo;
 use crate::ErrorReason;
 
@@ -40,6 +41,7 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 struct Fixture {
     db: Database,
     queue: AiQueue,
+    events: EventLog,
     path: PathBuf,
     account_id: i64,
     inbox_id: i64,
@@ -92,9 +94,11 @@ impl Fixture {
             .await
             .unwrap();
         let queue = AiQueue::new(db.clone(), opts);
+        let events = EventLog::new(db.clone(), Retention::unlimited());
         Self {
             db,
             queue,
+            events,
             path,
             account_id,
             inbox_id,
@@ -121,6 +125,50 @@ impl Fixture {
                         mailbox_id,
                         uid,
                         uidvalidity: 1,
+                        subject: Some("Test message".to_owned()),
+                        body_text: Some(body),
+                        ..Default::default()
+                    },
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    /// A fresh thread row, for the per-thread `"deep"`-lease serialization
+    /// tests below.
+    async fn thread(&self) -> i64 {
+        let account_id = self.account_id;
+        self.db
+            .write(move |c| {
+                repo::insert_thread(
+                    c,
+                    &repo::NewThread {
+                        account_id,
+                        ..Default::default()
+                    },
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    /// A message in `INBOX`, belonging to `thread_id`.
+    async fn message_in_thread(&self, thread_id: i64, body: &str) -> i64 {
+        let uid = self.next_uid.fetch_add(1, Ordering::Relaxed);
+        let account_id = self.account_id;
+        let mailbox_id = self.inbox_id;
+        let body = body.to_owned();
+        self.db
+            .write(move |c| {
+                repo::insert_message(
+                    c,
+                    &repo::NewMessage {
+                        account_id,
+                        mailbox_id,
+                        uid,
+                        uidvalidity: 1,
+                        thread_id: Some(thread_id),
                         subject: Some("Test message".to_owned()),
                         body_text: Some(body),
                         ..Default::default()
@@ -309,6 +357,7 @@ fn build_pool(
         AiPrivacy::default(),
         handlers,
         "test-worker",
+        fx.events.clone(),
     )
 }
 
@@ -512,6 +561,279 @@ async fn lease_reclaimed_after_expiry_cannot_be_completed_by_original_owner() {
 
     let stats = fx.queue.stats().await.unwrap();
     assert_eq!(stats.done, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread `"deep"`-lease serialization — carried over from task 49, closed
+// in task 50. See `lease_with_ttl`'s own docs for the full reasoning; these
+// tests are the acceptance criterion's direct proof: two `"deep"` jobs for
+// the same thread are never leased at the same time, by one call or across
+// two.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_deep_pass_name_this_module_hardcodes_still_matches_deep_pass() {
+    // `lease_with_ttl`'s SQL hardcodes the literal `'deep'` rather than
+    // importing `crate::ai::deep::PASS` (see that method's own doc comment
+    // for why) — which means nothing stops the two from silently drifting
+    // apart if `deep::PASS` is ever renamed. This is the tripwire: it fails
+    // loudly instead of just quietly disabling every test above it (they
+    // would all still pass against a renamed pass, since they too spell it
+    // `"deep"` literally, and none of them would notice the *queue* no
+    // longer recognizes what the real handler now calls itself).
+    assert_eq!(crate::ai::deep::PASS, "deep");
+}
+
+#[tokio::test]
+async fn at_most_one_deep_job_per_thread_is_leased_in_one_call() {
+    let fx = Fixture::open().await;
+    let thread_id = fx.thread().await;
+    let first = fx.message_in_thread(thread_id, "first message").await;
+    let second = fx.message_in_thread(thread_id, "second message").await;
+    fx.queue
+        .enqueue(vec![
+            NewAiJob::new(first, fx.account_id, "deep"),
+            NewAiJob::new(second, fx.account_id, "deep"),
+        ])
+        .await
+        .unwrap();
+
+    let leased = fx.queue.lease("worker-a", 10, Some("deep")).await.unwrap();
+
+    assert_eq!(
+        leased.len(),
+        1,
+        "only one of the two same-thread deep jobs may be leased at once, \
+         even though the limit had room for both"
+    );
+    let stats = fx.queue.stats().await.unwrap();
+    assert_eq!(
+        stats.ready, 1,
+        "the other stays pending for a later cycle rather than being skipped forever"
+    );
+}
+
+#[tokio::test]
+async fn a_leased_deep_job_blocks_its_thread_across_calls_too() {
+    // Not just "within one lease() call" — a deep job still being worked
+    // from a *previous* call must also hold its thread, since a deep-pass
+    // provider call can easily outlive one dispatch cycle's own interval.
+    let fx = Fixture::open().await;
+    let thread_id = fx.thread().await;
+    let first = fx.message_in_thread(thread_id, "first message").await;
+    let second = fx.message_in_thread(thread_id, "second message").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(first, fx.account_id, "deep")])
+        .await
+        .unwrap();
+
+    let first_lease = fx.queue.lease("worker-a", 10, Some("deep")).await.unwrap();
+    assert_eq!(first_lease.len(), 1, "the first job leases normally");
+
+    // Only now does the second job for the same thread arrive — simulating
+    // a second message in the same conversation being triaged and gated
+    // into a deep pass while the first is still being analyzed.
+    fx.queue
+        .enqueue(vec![NewAiJob::new(second, fx.account_id, "deep")])
+        .await
+        .unwrap();
+
+    let second_lease = fx.queue.lease("worker-b", 10, Some("deep")).await.unwrap();
+    assert!(
+        second_lease.is_empty(),
+        "the thread's first deep job is still leased, so the second must wait"
+    );
+
+    // Once the first completes, the thread opens back up.
+    fx.queue.complete(&first_lease[0], None).await.unwrap();
+    let third_lease = fx.queue.lease("worker-c", 10, Some("deep")).await.unwrap();
+    assert_eq!(
+        third_lease.len(),
+        1,
+        "the thread is free again once the in-flight deep job finished"
+    );
+}
+
+#[tokio::test]
+async fn deep_jobs_in_different_threads_lease_together_normally() {
+    let fx = Fixture::open().await;
+    let thread_a = fx.thread().await;
+    let thread_b = fx.thread().await;
+    let a = fx.message_in_thread(thread_a, "a").await;
+    let b = fx.message_in_thread(thread_b, "b").await;
+    fx.queue
+        .enqueue(vec![
+            NewAiJob::new(a, fx.account_id, "deep"),
+            NewAiJob::new(b, fx.account_id, "deep"),
+        ])
+        .await
+        .unwrap();
+
+    let leased = fx.queue.lease("worker-a", 10, Some("deep")).await.unwrap();
+
+    assert_eq!(
+        leased.len(),
+        2,
+        "the per-thread cap must not throttle unrelated threads"
+    );
+}
+
+#[tokio::test]
+async fn deep_jobs_with_no_thread_are_exempt_from_the_cap() {
+    // A message with no thread_id (a solo message, or one whose thread
+    // assignment has not run yet) has no shared rollup to race over.
+    let fx = Fixture::open().await;
+    let a = fx.message("solo a").await;
+    let b = fx.message("solo b").await;
+    fx.queue
+        .enqueue(vec![
+            NewAiJob::new(a, fx.account_id, "deep"),
+            NewAiJob::new(b, fx.account_id, "deep"),
+        ])
+        .await
+        .unwrap();
+
+    let leased = fx.queue.lease("worker-a", 10, Some("deep")).await.unwrap();
+
+    assert_eq!(leased.len(), 2, "threadless messages never contend");
+}
+
+#[tokio::test]
+async fn a_threadless_deep_job_is_never_confused_with_an_unrelated_thread_of_the_same_numeric_id() {
+    // `threads.id` and `ai_queue.job_id` are independent autoincrement
+    // sequences over separate tables and can (and, early in a fresh
+    // mailbox, routinely do) share numeric values -- a threadless "deep"
+    // job's own per-row partition key must never accidentally collide with
+    // an unrelated thread's key just because both happen to be, say, `1`.
+    // See `lease_with_ttl`'s own SQL comment for the fix this proves.
+    let fx = Fixture::open().await;
+    // The first row in a fresh `threads` table gets id 1.
+    let thread_id = fx.thread().await;
+    assert_eq!(
+        thread_id, 1,
+        "fixture assumption: a fresh threads table starts at 1"
+    );
+    let threaded_message = fx.message_in_thread(thread_id, "threaded").await;
+    let solo_message = fx.message("solo").await;
+
+    // The solo (threadless) job is enqueued first, so it becomes the first
+    // row in a fresh `ai_queue` table and gets job_id 1 -- the same numeric
+    // value as `thread_id` above, reproducing the collision by construction
+    // rather than by chance.
+    fx.queue
+        .enqueue(vec![NewAiJob::new(solo_message, fx.account_id, "deep")])
+        .await
+        .unwrap();
+    fx.queue
+        .enqueue(vec![NewAiJob::new(threaded_message, fx.account_id, "deep")])
+        .await
+        .unwrap();
+
+    let leased = fx.queue.lease("worker-a", 10, Some("deep")).await.unwrap();
+
+    assert_eq!(
+        leased.len(),
+        2,
+        "the threadless job and the threaded job must both lease -- neither is really \
+         contending with the other, and a partition-key collision on the shared numeric \
+         id 1 must not silently exclude one of them: {leased:?}"
+    );
+}
+
+#[tokio::test]
+async fn triage_jobs_in_the_same_thread_are_not_throttled() {
+    // The cap is specific to "deep"'s thread-rollup fold; triage has no
+    // equivalent shared state to race over, so two triage jobs in the same
+    // thread must lease together exactly like before this fix.
+    let fx = Fixture::open().await;
+    let thread_id = fx.thread().await;
+    let first = fx.message_in_thread(thread_id, "first").await;
+    let second = fx.message_in_thread(thread_id, "second").await;
+    fx.queue
+        .enqueue(vec![
+            NewAiJob::new(first, fx.account_id, "triage"),
+            NewAiJob::new(second, fx.account_id, "triage"),
+        ])
+        .await
+        .unwrap();
+
+    let leased = fx.queue.lease("worker-a", 10, None).await.unwrap();
+
+    assert_eq!(leased.len(), 2, "triage jobs never contend on thread");
+}
+
+#[tokio::test]
+async fn a_mixed_lease_call_still_caps_only_the_deep_jobs() {
+    // `dispatch_pending`'s `CapDecision::Open` path leases every pass in one
+    // call (`pass = None`) -- this proves the per-thread cap reaches into
+    // that mixed call correctly rather than only working when a caller
+    // explicitly restricts to `pass = Some("deep")`.
+    let fx = Fixture::open().await;
+    let thread_id = fx.thread().await;
+    let first = fx.message_in_thread(thread_id, "first").await;
+    let second = fx.message_in_thread(thread_id, "second").await;
+    fx.queue
+        .enqueue(vec![
+            NewAiJob::new(first, fx.account_id, "deep"),
+            NewAiJob::new(second, fx.account_id, "deep"),
+            NewAiJob::new(first, fx.account_id, "triage"),
+            NewAiJob::new(second, fx.account_id, "triage"),
+        ])
+        .await
+        .unwrap();
+
+    let leased = fx.queue.lease("worker-a", 10, None).await.unwrap();
+
+    let deep_count = leased.iter().filter(|l| l.pass == "deep").count();
+    let triage_count = leased.iter().filter(|l| l.pass == "triage").count();
+    assert_eq!(deep_count, 1, "only one deep job for the shared thread");
+    assert_eq!(triage_count, 2, "both triage jobs, unaffected by the cap");
+}
+
+#[tokio::test]
+async fn a_backlogged_thread_does_not_starve_other_threads_deep_jobs() {
+    // The per-thread cap must rank-then-limit, not limit-then-filter: a
+    // single thread with more "deep" jobs than one call's `limit` must
+    // still leave room in that same call for *other* threads' deep work,
+    // not fill the whole candidate window with jobs of which only one
+    // survives the dedup while a second thread's job never even entered the
+    // window. This is exactly the batch/initial-sync shape the fix targets
+    // (see `lease_with_ttl`'s own docs) — a thread backlogged from before
+    // this daemon last ran must not starve every other thread's deep pass
+    // out of every cycle until its own backlog is gone one lease at a time.
+    let fx = Fixture::open().await;
+    let busy_thread = fx.thread().await;
+    // Five jobs for the busy thread, enqueued (and therefore ordered)
+    // before the quiet thread's one job -- the shape that would fill an
+    // unranked `LIMIT 3` window entirely with `busy_thread` candidates.
+    for i in 0..5 {
+        let id = fx
+            .message_in_thread(busy_thread, &format!("busy {i}"))
+            .await;
+        fx.queue
+            .enqueue(vec![NewAiJob::new(id, fx.account_id, "deep")])
+            .await
+            .unwrap();
+    }
+    let quiet_thread = fx.thread().await;
+    let quiet_message = fx.message_in_thread(quiet_thread, "quiet").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(quiet_message, fx.account_id, "deep")])
+        .await
+        .unwrap();
+
+    let leased = fx.queue.lease("worker-a", 3, Some("deep")).await.unwrap();
+
+    assert_eq!(
+        leased.len(),
+        2,
+        "one job from the busy thread (capped) plus the quiet thread's one job, \
+         not 1 job total with the quiet thread starved out of the candidate window"
+    );
+    assert!(
+        leased.iter().any(|l| l.message_id == quiet_message),
+        "the quiet thread's job must be among what was leased: {leased:?}"
+    );
 }
 
 #[tokio::test]
@@ -952,6 +1274,77 @@ async fn dispatch_pending_persists_the_rehydrated_response_via_the_handler() {
     assert_eq!(calls[0].status, crate::ai::audit::CallStatus::Ok);
 }
 
+#[tokio::test]
+async fn a_completed_job_publishes_an_ai_summary_event() {
+    // What `rmaild::AiApi::StreamEnrichments`'s live tail subscribes to —
+    // see `finish_call`'s own docs for why this runs only after the queue
+    // row is durably `done`.
+    let fx = Fixture::open().await;
+    let id = fx.message("hello, nothing sensitive here").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(id, fx.account_id, "triage")])
+        .await
+        .unwrap();
+
+    let (provider, _handle) =
+        MockProvider::new(vec![MockReply::Ok("here is your summary".to_owned())]);
+    let handler = triage_handler();
+    let pool = build_pool(
+        &fx,
+        provider,
+        high_rpm_limits(),
+        vec![handler as Arc<dyn PassHandler>],
+    );
+    let summary = pool
+        .dispatch_pending(10, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(summary.completed, 1);
+
+    let page = fx.events.since(0, 10).await.unwrap();
+    let ai_events: Vec<_> = page
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::AiSummary)
+        .collect();
+    assert_eq!(
+        ai_events.len(),
+        1,
+        "exactly one AiSummary event for the completed job"
+    );
+    assert_eq!(ai_events[0].message_id, Some(id));
+    assert_eq!(ai_events[0].account_id, Some(fx.account_id));
+    assert_eq!(ai_events[0].payload["pass"], "triage");
+}
+
+#[tokio::test]
+async fn a_job_that_never_completes_publishes_no_ai_summary_event() {
+    let fx = Fixture::open().await;
+    let id = fx.message("hello, nothing sensitive here").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(id, fx.account_id, "triage")])
+        .await
+        .unwrap();
+
+    let (provider, _handle) = MockProvider::new(vec![MockReply::Unavailable]);
+    let handler = triage_handler();
+    let pool = build_pool(
+        &fx,
+        provider,
+        high_rpm_limits(),
+        vec![handler as Arc<dyn PassHandler>],
+    );
+    pool.dispatch_pending(10, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    let page = fx.events.since(0, 10).await.unwrap();
+    assert!(
+        page.events.iter().all(|e| e.kind != EventKind::AiSummary),
+        "a job that only backed off for retry must not announce a summary that was never written"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Batch mode: a real HTTP server on loopback
 // ---------------------------------------------------------------------------
@@ -1106,6 +1499,7 @@ fn coordinator_with_limits(
         AiPrivacy::default(),
         batching,
         handlers,
+        fx.events.clone(),
     )
     .unwrap()
 }

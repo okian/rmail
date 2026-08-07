@@ -30,6 +30,7 @@ use crate::ai::queue::{
 };
 use crate::config::{AiBatching, AiConfig, AiLimits, AiPolicyMode, AiPrivacy, AiRetry};
 use crate::embed::hash::HashEmbedder;
+use crate::events::{EventLog, Retention};
 use crate::query::QueryPlanner;
 use crate::retrieve::StructuredRetriever;
 use crate::storage::Database;
@@ -598,6 +599,7 @@ async fn dispatch_writes_a_complete_ai_summaries_row_and_populates_ai_fts() {
         AiPrivacy::default(),
         vec![handler(&fx.db) as Arc<dyn PassHandler>],
         "test-worker",
+        EventLog::new(fx.db.clone(), Retention::unlimited()),
     );
 
     let summary = pool.dispatch_pending(10, &no_cancel()).await.unwrap();
@@ -707,6 +709,7 @@ async fn a_schema_invalid_response_is_dead_lettered_not_a_partial_row() {
         AiPrivacy::default(),
         vec![handler(&fx.db) as Arc<dyn PassHandler>],
         "test-worker",
+        EventLog::new(fx.db.clone(), Retention::unlimited()),
     );
 
     let summary = pool.dispatch_pending(10, &no_cancel()).await.unwrap();
@@ -855,6 +858,7 @@ fn batch_coordinator(
             max_batch: 10,
         },
         vec![handler as Arc<dyn PassHandler>],
+        EventLog::new(fx.db.clone(), Retention::unlimited()),
     )
     .unwrap()
 }

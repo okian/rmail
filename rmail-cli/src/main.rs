@@ -9,10 +9,12 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rmail_core::socket_path_from_env;
 use rmail_proto::v1::admin_service_client::AdminServiceClient;
+use rmail_proto::v1::ai_service_client::AiServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
-    EventKind, ListTokensRequest, MintTokenRequest, RevokeTokenRequest, SyncFolderRequest,
-    SyncMode, WatchEventsRequest,
+    analyze_event, AnalyzeMessageRequest, EventKind, GetSummaryRequest, GetUsageRequest,
+    ListTokensRequest, MintTokenRequest, RetryFailedRequest, RevokeTokenRequest, SetPausedRequest,
+    SuggestReplyRequest, Summary, SyncFolderRequest, SyncMode, WatchEventsRequest,
 };
 use search_cli::{SearchArgs, SimilarArgs};
 use tokio_stream::StreamExt;
@@ -60,6 +62,58 @@ enum Command {
     Search(SearchArgs),
     /// Embedding-kNN neighbors of a message (`SearchService.Semantic`).
     Similar(SimilarArgs),
+    /// AI pipeline verbs (`AiService`).
+    Ai {
+        #[command(subcommand)]
+        action: AiAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AiAction {
+    /// Queue depth, today's tokens/cost, headroom, and pause state
+    /// (`AiService.GetUsage`).
+    Status,
+    /// Force a fresh deep-pass (re)analysis of one message, streaming
+    /// progress as it arrives (`AiService.AnalyzeMessage`).
+    Process {
+        /// Message id to analyze.
+        message_id: i64,
+    },
+    /// Print a message's cached AI summary (`AiService.GetSummary`) —
+    /// never triggers a model call.
+    Summary {
+        /// Message id.
+        message_id: i64,
+        /// Print the raw structured result instead of a formatted view.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a message's suggested reply, generating one now if none is
+    /// cached yet (`AiService.SuggestReply`).
+    Reply {
+        /// Message id.
+        message_id: i64,
+    },
+    /// Requeue quarantined AI jobs.
+    Retry {
+        /// Requeue every job that exhausted its retries
+        /// (`AiService.RetryFailed`, `AiQueue::revive_all_dead`) — the only
+        /// retry mode this build supports.
+        #[arg(long)]
+        failed: bool,
+    },
+    /// Pause the daemon's AI dispatch loop (`AiService.SetPaused`). Cached
+    /// results stay readable; nothing new is enqueued or dispatched.
+    Pause,
+    /// Resume the daemon's AI dispatch loop (`AiService.SetPaused`).
+    Resume,
+    /// Token/cost usage against the configured caps (`AiService.GetUsage`).
+    Cost {
+        /// Show this calendar month's rollup instead of today's.
+        #[arg(long)]
+        month: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -116,6 +170,16 @@ async fn main() -> Result<()> {
         },
         Command::Search(args) => search_cli::search(&socket, args).await,
         Command::Similar(args) => search_cli::similar(&socket, args).await,
+        Command::Ai { action } => match action {
+            AiAction::Status => ai_status(&socket).await,
+            AiAction::Process { message_id } => ai_process(&socket, message_id).await,
+            AiAction::Summary { message_id, json } => ai_summary(&socket, message_id, json).await,
+            AiAction::Reply { message_id } => ai_reply(&socket, message_id).await,
+            AiAction::Retry { failed } => ai_retry(&socket, failed).await,
+            AiAction::Pause => ai_set_paused(&socket, true).await,
+            AiAction::Resume => ai_set_paused(&socket, false).await,
+            AiAction::Cost { month } => ai_cost(&socket, month).await,
+        },
     }
 }
 
@@ -350,4 +414,261 @@ async fn token_revoke(socket: &Path, id: i64) -> Result<()> {
         .context("RevokeToken RPC failed")?;
     println!("revoked token {id}");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `mail ai ...`
+// ---------------------------------------------------------------------------
+
+async fn ai_client(socket: &Path) -> Result<AiServiceClient<tonic::transport::Channel>> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    Ok(AiServiceClient::new(channel))
+}
+
+/// Queue depth, today's tokens/cost, headroom, and pause state.
+async fn ai_status(socket: &Path) -> Result<()> {
+    let usage = ai_client(socket)
+        .await?
+        .get_usage(GetUsageRequest {})
+        .await
+        .context("GetUsage RPC failed")?
+        .into_inner();
+
+    println!("enabled: {}", usage.enabled);
+    println!("paused:  {}", usage.paused);
+    if let Some(queue) = &usage.queue {
+        println!(
+            "queue:   {} ready, {} backing off, {} leased, {} dead",
+            queue.ready, queue.backing_off, queue.leased, queue.dead
+        );
+    }
+    if let Some(today) = &usage.today {
+        println!(
+            "today:   {} request(s), {} tokens, ${:.4}",
+            today.requests,
+            today.input_tokens + today.output_tokens,
+            today.cost_usd
+        );
+    }
+    println!(
+        "caps:    ${:.2}/day, ${:.2}/month, {} tokens/day",
+        usage.daily_cost_cap_usd, usage.monthly_cost_cap_usd, usage.daily_token_cap
+    );
+    Ok(())
+}
+
+/// Force a fresh deep-pass analysis, printing tokens as they stream in and
+/// the final structured result once the daemon has persisted it.
+async fn ai_process(socket: &Path, message_id: i64) -> Result<()> {
+    let mut stream = ai_client(socket)
+        .await?
+        .analyze_message(AnalyzeMessageRequest { message_id })
+        .await
+        .context("AnalyzeMessage RPC failed")?
+        .into_inner();
+
+    let mut printed_any_token = false;
+    while let Some(event) = stream.next().await {
+        let event = event.context("analyze stream ended with an error")?;
+        match event.event {
+            Some(analyze_event::Event::Token(token)) => {
+                print!("{token}");
+                printed_any_token = true;
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            Some(analyze_event::Event::ToolUseStart(tool)) => {
+                println!("\n[tool use: {}]", tool.name);
+            }
+            // Streamed live as it arrives; the durable count that matters
+            // (and is billed) lives in the audit ledger, not this echo.
+            Some(analyze_event::Event::Usage(_)) => {}
+            Some(analyze_event::Event::Done(done)) => {
+                if printed_any_token {
+                    println!();
+                }
+                println!("stop_reason: {}", done.stop_reason);
+                if let Some(summary) = done.result {
+                    println!();
+                    print_summary(&summary);
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Print a message's cached AI summary. Never calls the model.
+async fn ai_summary(socket: &Path, message_id: i64, json: bool) -> Result<()> {
+    let summary = ai_client(socket)
+        .await?
+        .get_summary(GetSummaryRequest { message_id })
+        .await
+        .context("GetSummary RPC failed")?
+        .into_inner();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary_to_json(&summary))?
+        );
+    } else {
+        print_summary(&summary);
+    }
+    Ok(())
+}
+
+/// Print a message's suggested reply, generating one now (subject to
+/// `ai.limits`' spend caps) if none is cached yet.
+async fn ai_reply(socket: &Path, message_id: i64) -> Result<()> {
+    let summary = ai_client(socket)
+        .await?
+        .suggest_reply(SuggestReplyRequest { message_id })
+        .await
+        .context("SuggestReply RPC failed")?
+        .into_inner();
+
+    match summary.suggested_reply {
+        Some(reply) if !reply.trim().is_empty() => println!("{reply}"),
+        _ => println!("no suggested reply for this message"),
+    }
+    Ok(())
+}
+
+/// Requeue every quarantined AI job.
+async fn ai_retry(socket: &Path, failed: bool) -> Result<()> {
+    if !failed {
+        bail!("mail ai retry currently only supports `--failed` (requeue every dead job)");
+    }
+    let response = ai_client(socket)
+        .await?
+        .retry_failed(RetryFailedRequest {})
+        .await
+        .context("RetryFailed RPC failed")?
+        .into_inner();
+    println!("revived {} job(s)", response.revived);
+    Ok(())
+}
+
+/// Pause or resume the daemon's AI dispatch loop.
+async fn ai_set_paused(socket: &Path, paused: bool) -> Result<()> {
+    let response = ai_client(socket)
+        .await?
+        .set_paused(SetPausedRequest { paused })
+        .await
+        .context("SetPaused RPC failed")?
+        .into_inner();
+    println!(
+        "ai dispatch loop {}",
+        if response.paused { "paused" } else { "resumed" }
+    );
+    Ok(())
+}
+
+/// Token/cost usage for today or, with `--month`, this calendar month.
+async fn ai_cost(socket: &Path, month: bool) -> Result<()> {
+    let usage = ai_client(socket)
+        .await?
+        .get_usage(GetUsageRequest {})
+        .await
+        .context("GetUsage RPC failed")?
+        .into_inner();
+
+    let Some(period) = (if month { usage.month } else { usage.today }) else {
+        println!("no usage recorded");
+        return Ok(());
+    };
+    println!(
+        "{}: {} request(s), {} input tokens, {} output tokens, ${:.4}",
+        period.day, period.requests, period.input_tokens, period.output_tokens, period.cost_usd
+    );
+    Ok(())
+}
+
+/// A formatted, human-readable rendering of a `Summary` — shared by
+/// `mail ai summary` and the terminal frame of `mail ai process`'s stream.
+fn print_summary(summary: &Summary) {
+    println!("message_id: {}", summary.message_id);
+    println!("status:     {}", status_name(summary.status()));
+    if let Some(tl_dr) = &summary.tl_dr {
+        println!("tl;dr:      {tl_dr}");
+    }
+    if let Some(category) = &summary.category {
+        println!("category:   {category}");
+    }
+    if let Some(priority) = &summary.priority {
+        println!("priority:   {priority}");
+    }
+    if let Some(sentiment) = &summary.sentiment {
+        println!("sentiment:  {sentiment}");
+    }
+    if let Some(needs_reply) = summary.needs_reply {
+        println!("needs_reply: {needs_reply}");
+    }
+    if !summary.suggested_tags.is_empty() {
+        println!("tags:       {}", summary.suggested_tags.join(", "));
+    }
+    if let Some(text) = &summary.summary {
+        println!("\nsummary:\n{text}");
+    }
+    if !summary.key_points.is_empty() {
+        println!("\nkey points:");
+        for point in &summary.key_points {
+            println!("  - {point}");
+        }
+    }
+    if !summary.todos.is_empty() {
+        println!("\ntodos:");
+        for todo in &summary.todos {
+            let due = todo.due.as_deref().unwrap_or("no due date");
+            let owner = todo.owner.as_deref().unwrap_or("unassigned");
+            println!("  - {} (due: {due}, owner: {owner})", todo.text);
+        }
+    }
+    if let Some(reply) = &summary.suggested_reply {
+        println!("\nsuggested reply:\n{reply}");
+    }
+}
+
+fn status_name(status: rmail_proto::v1::SummaryStatus) -> &'static str {
+    status.as_str_name().trim_start_matches("SUMMARY_STATUS_")
+}
+
+/// `Summary` as `serde_json::Value` — the generated proto type does not
+/// derive `Serialize` (`build.rs` does not enable prost-build's serde
+/// support, and `build.rs` is off limits — see that file's own header), so
+/// `mail ai summary --json` builds one by hand rather than leaving `--json`
+/// unimplemented.
+fn summary_to_json(summary: &Summary) -> serde_json::Value {
+    serde_json::json!({
+        "message_id": summary.message_id,
+        "thread_id": summary.thread_id,
+        "status": status_name(summary.status()),
+        "triage_model": summary.triage_model,
+        "tl_dr": summary.tl_dr,
+        "sentiment": summary.sentiment,
+        "category": summary.category,
+        "priority": summary.priority,
+        "needs_reply": summary.needs_reply,
+        "suggested_tags": summary.suggested_tags,
+        "deep_model": summary.deep_model,
+        "summary": summary.summary,
+        "thread_summary": summary.thread_summary,
+        "key_points": summary.key_points,
+        "todos": summary.todos.iter().map(|t| serde_json::json!({
+            "text": t.text,
+            "due": t.due,
+            "owner": t.owner,
+        })).collect::<Vec<_>>(),
+        "entities": summary.entities.iter().map(|e| serde_json::json!({
+            "kind": e.kind,
+            "value": e.value,
+            "iso": e.iso,
+            "amount": e.amount,
+            "currency": e.currency,
+        })).collect::<Vec<_>>(),
+        "suggested_reply": summary.suggested_reply,
+    })
 }

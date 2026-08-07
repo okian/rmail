@@ -50,34 +50,33 @@
 //! number for it, so `V22__ai_entities.sql` claims the next one — see that
 //! migration's own comment for the numbering rationale.
 //!
-//! # A known, accepted race: two deep passes in the same thread, same cycle
+//! # A once-open race, now closed in the queue: two deep passes in the same
+//! thread, same cycle
 //!
 //! [`DeepPassHandler::build_request`] reads the thread's prior state once,
 //! before the semaphore permit that bounds concurrency and before the
 //! provider call itself — see [`crate::ai::queue::AiWorkerPool::process_one`]'s
-//! own ordering. If two messages from the *same* thread are both leased in
+//! own ordering. If two messages from the *same* thread were both leased in
 //! the same [`crate::ai::queue::AiWorkerPool::dispatch_pending`] cycle (or
 //! the same [`crate::ai::queue::BatchCoordinator`] submission, where every
-//! item's request is built before any of them is sent), both read the same
-//! prior rollup concurrently, and whichever finishes last simply overwrites
-//! the other's contribution in `ai_summaries.thread_summary` — the earlier
-//! one's content is not lost from the mailbox (its own row still holds its
-//! own `summary`), only from the *rollup*.
+//! item's request is built before any of them is sent), both would read the
+//! same prior rollup concurrently, and whichever finished last would simply
+//! overwrite the other's contribution to `ai_summaries.thread_summary` — the
+//! earlier one's content would not be lost from the mailbox (its own row
+//! still holds its own `summary`), only from the *rollup*.
 //!
-//! This is left open rather than fixed here because closing it properly
-//! means the queue itself serializing dispatch per thread — a leasing-order
-//! change that belongs to [`crate::ai::queue`] (tasks 47/50), not something
-//! this handler can do by, say, taking a lock local to this process (a
-//! second daemon instance, or a second [`crate::ai::queue::AiWorkerPool`],
-//! would not see it).
-//! It matters most for the batch path — the primary route for backlog and
-//! initial-sync catch-up, exactly where a thread is likely to have several
-//! messages queued at once — and is the reason the acceptance criterion's
-//! incrementality is proven here only across *separate* dispatch cycles
-//! (see the tests), not within one. Whoever wires the daemon dispatch loop
-//! (task 50) should account for this — e.g. capping concurrent `"deep"`
-//! leases to one per thread per cycle — before treating batch-mode deep
-//! analysis of a multi-message thread as trustworthy.
+//! This could not be fixed inside this handler — a lock local to this
+//! process would not bind a second daemon instance or a second
+//! [`crate::ai::queue::AiWorkerPool`] — so it is fixed where the module docs
+//! for [`crate::ai::queue::AiQueue::lease_with_ttl`] describe: that method
+//! now excludes a `"deep"` candidate whenever its thread already has a
+//! `"deep"` job `leased` (by anyone, live or batch, from a previous call too,
+//! not just this one), and additionally admits at most one `"deep"`
+//! candidate per thread from the candidates a single call considers. Between
+//! the two, at most one `"deep"` job per thread is ever in flight at a time,
+//! which is what makes the incremental fold this module performs safe on the
+//! batch path too — the primary route for backlog and initial-sync catch-up,
+//! exactly where a thread is likely to have several messages queued at once.
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};

@@ -20,6 +20,16 @@
 //! that was deliberate when only it existed, and still holds now that
 //! everything around it does too.
 //!
+//! [`dispatch::AiDispatchLoop`] (task 50) is the piece that makes the
+//! diagram at the top of this section literally true rather than aspirational
+//! documentation: `Sync Engine ──▶ AI Queue` was, until this module landed,
+//! two boxes on a diagram with no arrow between them in code — every stage
+//! after enqueue worked and was unit-tested, but nothing ever called
+//! [`queue::AiQueue::enqueue`] when a message synced, and nothing called
+//! [`queue::AiWorkerPool::dispatch_pending`] on any schedule. See that
+//! module's own docs for the wiring and why it polls the durable event log
+//! rather than holding a live subscription.
+//!
 //! One consequence, no longer hypothetical: [`ClaudeProvider`] enforces none
 //! of `ai.limits` (`max_concurrency`, `requests_per_minute`, the token/cost
 //! caps) and [`provider::build`] does not consult `ai.enabled`. Those are
@@ -41,6 +51,7 @@
 
 pub mod audit;
 pub mod deep;
+pub mod dispatch;
 pub mod policy;
 pub mod provider;
 pub mod queue;
@@ -52,6 +63,9 @@ pub use audit::{
     CallOutcome, CallRecord, CallStatus, DayUsage, LedgerEntry,
 };
 pub use deep::{DeepPassGate, DeepPassHandler};
+pub use dispatch::{
+    AiDispatchLoop, AiPauseFlag, TickReport, DEFAULT_LEASE_LIMIT, DEFAULT_TICK_INTERVAL,
+};
 pub use provider::{
     build, ChatMessage, ChatRequest, ChatResponse, ClaudeProvider, OutputFormat, Provider,
     ProviderStream, Role, StopReason, StreamFrame, Usage,
@@ -62,10 +76,10 @@ pub use policy::{
     RuleMatch,
 };
 pub use queue::{
-    AiLease, AiQueue, AiWorkerPool, BatchClient, BatchCoordinator, BatchHandle, BatchOutcome,
-    BatchPollOutcome, BatchRequestCounts, BatchRequestItem, BatchResult, BatchStatus, CapDecision,
-    CostGate, DeadLetter, DispatchSummary, Failure, JobState, MessageContent, NewAiJob,
-    PassHandler, QueueOptions, QueueStats, RateLimiter,
+    payload_bytes, AiLease, AiQueue, AiWorkerPool, BatchClient, BatchCoordinator, BatchHandle,
+    BatchOutcome, BatchPollOutcome, BatchRequestCounts, BatchRequestItem, BatchResult, BatchStatus,
+    CapDecision, CostGate, DeadLetter, DispatchSummary, Failure, JobState, MessageContent,
+    NewAiJob, PassHandler, QueueOptions, QueueStats, RateLimiter,
 };
 pub use redact::{
     guard, preview, rehydrate, GuardedRequest, RedactPreview, RedactionKind, TokenMap,

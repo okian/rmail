@@ -1,0 +1,273 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// AiService surfaces the local, cached results of the two-pass Claude
+// pipeline (rmail-core::ai::{triage,deep}, tasks 47-49) plus on-demand
+// (re)analysis and spend controls. Every RPC here answers from — or writes
+// into — the same `ai_summaries`/`ai_entities`/`ai_queue`/`ai_usage` tables
+// the background pipeline uses; there is no separate code path for "what the
+// API returns" versus "what the TUI's local AI panel reads."
+//
+// GetSummary/StreamEnrichments never call the model — they are cache reads
+// over what the background pipeline (rmail-core::ai::dispatch, task 50) has
+// already produced, matching prd.md's "TUI reads local ai_summaries in
+// <5 ms." AnalyzeMessage/SuggestReply are the two RPCs that *can* call the
+// model, on demand, outside the queue — see rmaild's own `ai_service.rs`
+// module docs for why bypassing the queue is deliberate for these two.
+service AiService {
+  // A message's cached AI summary — whichever of the triage/deep passes have
+  // run, merged into one view. Never calls the model; a message with no
+  // cached analysis yet gets a Summary with status NOT_QUEUED or PENDING,
+  // never an error.
+  rpc GetSummary(GetSummaryRequest) returns (Summary);
+
+  // Force a fresh deep-pass analysis of one message — the RPC behind
+  // `mail ai process`. Streams the model's tokens as they arrive (Token,
+  // ToolUseStart, Usage frames) and finishes with a Done frame carrying the
+  // persisted, merged Summary. A client disconnecting or the request's
+  // deadline passing aborts the upstream Claude call, not merely the stream
+  // to the client — see rmaild's own docs on how the cancellation reaches
+  // the SSE reader.
+  rpc AnalyzeMessage(AnalyzeMessageRequest) returns (stream AnalyzeEvent);
+
+  // A live subscription to every enrichment (triage or deep) as it is
+  // written — the long-lived stream an agent holds to watch the mailbox
+  // becoming smarter in real time. Resumable by the last message_id already
+  // seen; see StreamEnrichmentsRequest's own docs for why that cursor is
+  // coarser than SyncService.WatchEvents' seq-based one, and what that costs.
+  rpc StreamEnrichments(StreamEnrichmentsRequest) returns (stream Enrichment);
+
+  // The deep pass's suggested reply for a message. Returns the cached one if
+  // a deep pass has already run; otherwise runs one now (subject to
+  // `ai.limits`' spend caps) and returns the freshly persisted result.
+  rpc SuggestReply(SuggestReplyRequest) returns (Summary);
+
+  // Today's and this month's token/cost usage against the configured caps,
+  // plus the AI queue's current depth and the dispatch loop's pause state.
+  rpc GetUsage(GetUsageRequest) returns (UsageStats);
+
+  // Pause or resume the daemon's AI dispatch loop — the RPC behind
+  // `mail ai pause`/`mail ai resume`. A paused loop enqueues nothing new and
+  // dispatches nothing pending; already-cached results remain readable via
+  // GetSummary regardless.
+  rpc SetPaused(SetPausedRequest) returns (SetPausedResponse);
+
+  // Move every quarantined (`dead`) AI job back to `pending` — the RPC
+  // behind `mail ai retry --failed`. Maps directly to
+  // rmail_core::ai::AiQueue::revive_all_dead; the next dispatch tick picks
+  // the revived jobs up like any other pending work.
+  rpc RetryFailed(RetryFailedRequest) returns (RetryFailedResponse);
+}
+
+// Where a Summary's data came from — every set field is honest about which
+// pass produced it, but this status also covers the case where no pass has
+// run at all, which no combination of null fields could otherwise express
+// unambiguously (a message triage hasn't reached yet looks identical to one
+// where the operator disabled AI for that folder, unless something says so).
+enum SummaryStatus {
+  SUMMARY_STATUS_UNSPECIFIED = 0;
+  // At least one pass (triage and/or deep) has written a result.
+  SUMMARY_STATUS_OK = 1;
+  // No cached result yet, but a job is queued (pending or leased) — a
+  // GetSummary retry shortly should see it land.
+  SUMMARY_STATUS_PENDING = 2;
+  // No cached result and nothing queued — either the message is brand new
+  // and the dispatch loop has not yet enqueued it, or AI is disabled for
+  // this account/folder.
+  SUMMARY_STATUS_NOT_QUEUED = 3;
+}
+
+// One to-do the deep pass extracted.
+message Todo {
+  string text = 1;
+  optional string due = 2;
+  optional string owner = 3;
+}
+
+// One entity the deep pass extracted. kind is one of
+// date|amount|person|organization|other.
+message Entity {
+  string kind = 1;
+  string value = 2;
+  optional string iso = 3;
+  optional double amount = 4;
+  optional string currency = 5;
+}
+
+// A message's AI analysis, merged across both passes. Triage fields
+// (tl_dr/sentiment/category/priority/needs_reply/suggested_tags) and deep
+// fields (summary/thread_summary/key_points/todos/entities/suggested_reply)
+// coexist here because a caller asking "what does the AI know about this
+// message" wants both without a second round trip — `triage_model` and
+// `deep_model` are separate because the two passes can, and by default do,
+// run under different models (`ai.models.triage` vs `ai.models.deep`).
+//
+// Per-call token/cost accounting is deliberately not repeated here — it
+// already has an authoritative home in AuditService.QueryAiCalls (the
+// append-only ledger every call is recorded to, keyed by the same
+// message_id), and duplicating it onto every Summary would give two answers
+// to "what did this call cost" that could drift apart on a pricing-table
+// update (see rmail-core::ai::audit's own docs on why cost is computed at
+// query time, not stored).
+message Summary {
+  int64 message_id = 1;
+  optional int64 thread_id = 2;
+  SummaryStatus status = 3;
+
+  // -- Triage (cheap, always-run pass) --
+  optional string triage_model = 4;
+  optional string tl_dr = 5;
+  optional string sentiment = 6;
+  optional string category = 7;
+  optional string priority = 8;
+  optional bool needs_reply = 9;
+  repeated string suggested_tags = 10;
+
+  // -- Deep (conditional, expensive pass) --
+  optional string deep_model = 11;
+  optional string summary = 12;
+  optional string thread_summary = 13;
+  repeated string key_points = 14;
+  repeated Todo todos = 15;
+  repeated Entity entities = 16;
+  optional string suggested_reply = 17;
+}
+
+message GetSummaryRequest {
+  int64 message_id = 1;
+}
+
+message AnalyzeMessageRequest {
+  int64 message_id = 1;
+}
+
+message ToolUseStart {
+  string id = 1;
+  string name = 2;
+}
+
+// Final token accounting for one AnalyzeMessage stream — the live-call
+// equivalent of what AuditService.QueryAiCalls records durably for the same
+// call once it is over; this is only the in-flight echo a streaming client
+// sees before that ledger write lands.
+message Usage {
+  int64 input_tokens = 1;
+  int64 output_tokens = 2;
+  int64 cache_creation_input_tokens = 3;
+  int64 cache_read_input_tokens = 4;
+}
+
+// Terminal frame of an AnalyzeMessage stream: why the model stopped, and the
+// Summary as durably persisted by the time this frame is sent (never a
+// summary of tokens the client has not itself already seen — the write to
+// ai_summaries happens before this frame goes out).
+message Done {
+  // end_turn | max_tokens | stop_sequence | tool_use | pause_turn.
+  string stop_reason = 1;
+  Summary result = 2;
+}
+
+// One frame of an AnalyzeMessage stream, mirroring
+// rmail-core::ai::provider::StreamFrame's vocabulary — see "Token-streaming
+// AI RPCs" in prd.md. Concatenating every `token` in arrival order
+// reproduces the model's full answer.
+message AnalyzeEvent {
+  oneof event {
+    string token = 1;
+    ToolUseStart tool_use_start = 2;
+    Usage usage = 3;
+    Done done = 4;
+  }
+}
+
+message StreamEnrichmentsRequest {
+  // 0 (or unset) means every account.
+  int64 account_id = 1;
+  // Resume cursor for the *backlog* phase only: it replays every enrichment
+  // for a message with a strictly greater message_id. This is coarser than
+  // SyncService.WatchEvents' seq-based resume, and unlike WatchEvents the
+  // backlog here is never subject to a retention gap — `ai_summaries` is
+  // never pruned, so since_message_id = 0 always replays every enrichment
+  // ever produced.
+  //
+  // The live tail that follows the backlog does not filter by message_id at
+  // all: passes do not complete in message_id order (a deep pass commonly
+  // finishes after several newer messages' triage passes already have, more
+  // so once per-thread deep-pass serialization is in play), so gating live
+  // delivery on "message_id >= this cursor" would silently and permanently
+  // drop enrichments rather than merely resume coarsely. The contract is
+  // therefore at-least-once, not exactly-once: a client may occasionally see
+  // one enrichment from the narrow window between subscribing and the
+  // backlog finishing delivered twice, but StreamEnrichments never silently
+  // drops one once a subscription is open.
+  int64 since_message_id = 2;
+}
+
+message Enrichment {
+  int64 message_id = 1;
+  // "triage" | "deep" -- which pass just completed and triggered this event.
+  string pass = 2;
+  // The merged view as of this event (both passes' fields, whichever have
+  // run so far) -- not just the one pass named above.
+  Summary summary = 3;
+}
+
+message SuggestReplyRequest {
+  int64 message_id = 1;
+}
+
+message GetUsageRequest {}
+
+// One day's (or one month's) rolled-up usage. `day` is "YYYY-MM-DD" for
+// `today` and "YYYY-MM" for `month`.
+message DayUsage {
+  string day = 1;
+  int64 requests = 2;
+  int64 input_tokens = 3;
+  int64 output_tokens = 4;
+  int64 cache_creation_input_tokens = 5;
+  int64 cache_read_input_tokens = 6;
+  double cost_usd = 7;
+}
+
+message QueueStats {
+  int64 ready = 1;
+  int64 backing_off = 2;
+  int64 leased = 3;
+  int64 done = 4;
+  int64 error = 5;
+  int64 dead = 6;
+}
+
+message UsageStats {
+  DayUsage today = 1;
+  DayUsage month = 2;
+  QueueStats queue = 3;
+  bool paused = 4;
+  double daily_cost_cap_usd = 5;
+  double monthly_cost_cap_usd = 6;
+  uint64 daily_token_cap = 7;
+  // Whether the AI subsystem is active at all (`ai.enabled = true` and a
+  // provider was built successfully) — distinct from `paused`, which is an
+  // operator's deliberate, reversible "stop dispatching for now." A daemon
+  // with `enabled = false` never spawns the dispatch loop in the first
+  // place, so `paused` stays `false` here rather than lying that a
+  // `SetPaused(false)`/`mail ai resume` would make anything start running.
+  bool enabled = 8;
+}
+
+message SetPausedRequest {
+  bool paused = 1;
+}
+
+message SetPausedResponse {
+  bool paused = 1;
+}
+
+message RetryFailedRequest {}
+
+message RetryFailedResponse {
+  // How many jobs moved from `dead` back to `pending`.
+  int64 revived = 1;
+}

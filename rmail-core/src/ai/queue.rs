@@ -575,6 +575,48 @@ impl AiQueue {
     /// [`BatchCoordinator`] uses to take out [`BATCH_LEASE`]-long leases
     /// instead of the ordinary live-worker duration.
     ///
+    /// # Per-thread serialization of `"deep"` leases — carried over from
+    /// task 49
+    ///
+    /// [`crate::ai::deep::DeepPassHandler::build_request`] reads a thread's
+    /// prior rollup once, before the semaphore permit and before the
+    /// provider call — see that module's own docs for the full "known,
+    /// accepted race" it describes and why the fix has to live here, in the
+    /// query that decides what gets leased, rather than in the handler. Two
+    /// `"deep"` jobs for the *same* thread leased out of the same call would
+    /// both read that identical prior state and race to overwrite each
+    /// other's contribution to `ai_summaries.thread_summary`; the candidate
+    /// query below closes that off from two directions at once:
+    ///
+    /// - The `NOT EXISTS` guard excludes a thread that already has a
+    ///   `"deep"` job `leased` — i.e. still being worked by a *previous*
+    ///   lease call, live or batch — so this call cannot double-lease a
+    ///   thread whose earlier deep pass has not finished yet.
+    /// - A `ROW_NUMBER() OVER (PARTITION BY ...)` window, evaluated over
+    ///   *every* eligible candidate before `LIMIT` is ever applied, admits
+    ///   only the single best (by priority/enqueued_at/job_id) `"deep"`
+    ///   candidate per thread within this call — see the query's own inline
+    ///   comment for why this has to rank-then-limit rather than the
+    ///   simpler-looking limit-then-filter-in-Rust an earlier version of
+    ///   this method did, and why that earlier shape quietly collapsed
+    ///   throughput on exactly the backlog case this fix targets.
+    ///
+    /// Together these mean at most one `"deep"` job per thread is ever
+    /// leased (by anyone) at a time — the acceptance criterion's "cap
+    /// concurrent deep leases to one per thread per cycle," extended to
+    /// cover overlap *across* cycles too, since a deep-pass provider call can
+    /// easily outlive one cycle's own interval. A thread with several
+    /// `"deep"` jobs queued at once (the batch path's own worst case — see
+    /// `ai::deep`'s docs on why backlog/initial-sync is exactly where this
+    /// happens) simply drains one lease at a time, across as many calls as
+    /// it has messages, rather than all at once. Jobs of any other pass
+    /// (`"triage"`) are never restricted by this — the race is specific to
+    /// `"deep"`'s thread-rollup fold, which no other pass performs.
+    ///
+    /// A message with no thread (`messages.thread_id IS NULL`) is exempt:
+    /// there is no shared rollup for a solo message to race against itself
+    /// over.
+    ///
     /// # Errors
     /// A mapped storage error.
     pub async fn lease_with_ttl(
@@ -595,11 +637,81 @@ impl AiQueue {
             .write(move |conn| {
                 let now = chrono::Utc::now().timestamp();
                 let tx = conn.transaction()?;
+                // The per-thread "deep" dedup is done entirely in SQL, via
+                // `ROW_NUMBER() OVER (PARTITION BY ...)`, and *before* the
+                // final `LIMIT` — not a `LIMIT`-then-filter-in-Rust pass, an
+                // earlier version of this query's own mistake. `LIMIT`-then-
+                // filter means "how many distinct threads appear in the
+                // first `limit` rows by priority order," which is not the
+                // same question as "the `limit` best distinct-thread
+                // candidates" — a single thread with more backlog than
+                // `limit` (exactly the batch/initial-sync case this fix
+                // targets, per the module docs) would fill the whole
+                // candidate window and starve every other thread's "deep"
+                // job out of this call entirely, and the batch path would
+                // observe a large `depth_for_pass` but keep submitting
+                // near-empty batches under a 26h `BATCH_LEASE` each. Ranking
+                // first and limiting after admits the true `limit` best
+                // distinct-thread candidates instead.
+                //
+                // The partition key is `(pass, 'job:'||job_id)` for every
+                // non-"deep" row and every threadless "deep" row — each
+                // alone in its own partition, so `thread_rank` is always 1
+                // and neither is ever restricted by this — and
+                // `(pass, 'thread:'||thread_id)` only for a "deep" row with
+                // a real thread, which is the one case
+                // `ORDER BY q.priority, q.enqueued_at, q.job_id` inside the
+                // window actually caps at one admitted row. The `'job:'`/
+                // `'thread:'` text prefixes are load-bearing, not
+                // decoration: `threads.id` and `ai_queue.job_id` are
+                // independent autoincrement sequences over separate tables
+                // and routinely share numeric values, especially early in a
+                // fresh mailbox's life (both start at 1). Partitioning on
+                // the bare integer would silently put a threadless "deep"
+                // job (keyed by its own job_id) in the same window
+                // partition as an unrelated thread whose thread_id happens
+                // to equal that number, capping the threadless job as if it
+                // belonged to that thread — the text prefixes make the two
+                // id spaces disjoint at the partition-key level, not merely
+                // usually-disjoint by chance. `'deep'` is a literal, not
+                // `crate::ai::deep::PASS`, deliberately — see this method's
+                // own doc comment for why this module does not otherwise
+                // know pass names, and treats this one as a narrow,
+                // documented exception rather than an excuse to import a
+                // sibling pass module into the queue.
                 let candidates: Vec<i64> = {
                     let mut stmt = tx.prepare(
-                        "SELECT job_id FROM ai_queue
-                         WHERE state = 'pending' AND next_attempt_at <= ?1
-                           AND (?2 IS NULL OR pass = ?2)
+                        "WITH candidates AS (
+                             SELECT
+                                 q.job_id,
+                                 q.priority,
+                                 q.enqueued_at,
+                                 ROW_NUMBER() OVER (
+                                     PARTITION BY
+                                         q.pass,
+                                         CASE WHEN q.pass = 'deep' AND m.thread_id IS NOT NULL
+                                              THEN 'thread:' || m.thread_id
+                                              ELSE 'job:' || q.job_id
+                                         END
+                                     ORDER BY q.priority, q.enqueued_at, q.job_id
+                                 ) AS thread_rank
+                             FROM ai_queue q
+                             LEFT JOIN messages m ON m.id = q.message_id
+                             WHERE q.state = 'pending' AND q.next_attempt_at <= ?1
+                               AND (?2 IS NULL OR q.pass = ?2)
+                               AND (
+                                 q.pass <> 'deep'
+                                 OR m.thread_id IS NULL
+                                 OR NOT EXISTS (
+                                   SELECT 1 FROM ai_queue lq
+                                   JOIN messages lm ON lm.id = lq.message_id
+                                   WHERE lq.pass = 'deep' AND lq.state = 'leased'
+                                     AND lm.thread_id = m.thread_id
+                                 )
+                               )
+                         )
+                         SELECT job_id FROM candidates
+                         WHERE thread_rank = 1
                          ORDER BY priority, enqueued_at, job_id
                          LIMIT ?3",
                     )?;
@@ -1287,10 +1399,13 @@ fn day_key(unix_ts: i64) -> String {
 /// this trait does not expose to callers by design, and the ledger's job is
 /// to prove the *content* was redacted, not to reproduce one specific
 /// provider's exact HTTP framing. This is the one canonical serialization
-/// both the live dispatch path and [`BatchCoordinator::maybe_submit`] hash,
-/// so a message processed once live and once via batch produces a
-/// comparable audit record either way.
-pub(crate) fn payload_bytes(request: &ChatRequest) -> Vec<u8> {
+/// every path that audits a call hashes — the live dispatch path,
+/// [`BatchCoordinator::maybe_submit`], and (task 50) `rmaild::AiApi`'s own
+/// forced `AnalyzeMessage`/`SuggestReply` calls, which run outside this
+/// queue entirely but must still produce a comparable audit record. `pub`,
+/// not `pub(crate)`: that third caller lives in the `rmaild` crate, not this
+/// one.
+pub fn payload_bytes(request: &ChatRequest) -> Vec<u8> {
     let messages: Vec<serde_json::Value> = request
         .messages
         .iter()

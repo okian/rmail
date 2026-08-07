@@ -16,22 +16,28 @@
 //!
 //! # Extending this table
 //!
-//! Add one `(method, Requirement)` row per new RPC below. The `AiService` rows
-//! are still **provisional**, and so — despite sitting in the `MailService`
-//! section below, next to `Send`'s acceptance case — is `OutboxService/Send`:
-//! neither service exists yet (they land in tasks 50 and, for `OutboxService`,
-//! not yet assigned), so their rows exist only to prove the table's
-//! *mechanism* — including the acceptance case that a `mail.read`-only token
-//! is physically denied a send/delete-shaped call — against a shape close to
-//! what they will actually need. When a real service lands, treat its rows as
-//! a starting point to confirm against the real proto, not as settled fact:
-//! rename/add/remove rather than assuming these are exactly right.
+//! Add one `(method, Requirement)` row per new RPC below. `OutboxService/Send`
+//! is still **provisional** — despite sitting in the `MailService` section
+//! below, next to `Send`'s acceptance case, no `OutboxService` proto exists
+//! yet (not yet assigned to a task), so its row exists only to prove the
+//! table's *mechanism* — including the acceptance case that a
+//! `mail.read`-only token is physically denied a send/delete-shaped call —
+//! against a shape close to what it will actually need. When a real service
+//! lands, treat its rows as a starting point to confirm against the real
+//! proto, not as settled fact: rename/add/remove rather than assuming these
+//! are exactly right.
 //!
 //! The `MailService` rows below were provisional the same way until task 39
 //! landed the real `proto/rmail/v1/mail.proto`; they turned out to need no
 //! changes — every RPC the real service exposes (`List`, `Get`, `GetThread`,
 //! `Move`, `Copy`, `SetFlags`, `Delete`, `GetAttachment`, `WatchEvents`) is
-//! named here with the scope its handler actually needs.
+//! named here with the scope its handler actually needs. The `AiService` rows
+//! were provisional the same way until task 50 landed the real
+//! `proto/rmail/v1/ai.proto`; unlike `MailService`, they *did* need to change
+//! — the provisional `Summarize`/`AskMailbox` guesses matched neither the real
+//! service's RPC names nor, in `AskMailbox`'s case, this service at all (that
+//! one belongs to task 52) — see the `AiService` section below for the real
+//! six rows and their scope justifications.
 use rmail_core::auth::Scope;
 
 /// What a method needs from the caller.
@@ -205,14 +211,72 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.OutboxService/Send",
         Requirement::Scope(Scope::MailSend),
     ),
-    // -- AiService (task 50, provisional) ------------------------------------
+    // -- AiService (task 50) --------------------------------------------------
+    // The provisional `Summarize`/`AskMailbox` rows this table carried before
+    // task 50 landed the real `proto/rmail/v1/ai.proto` did not survive
+    // contact with it — neither method exists on the real service (`AskMailbox`
+    // is task 52's "Mailbox RAG `ask_mailbox`", not this one) — replaced here
+    // with the six RPCs `AiService` actually exposes, per this table's own
+    // "confirm against the real proto... rename/add/remove" note above.
+    //
+    // GetSummary/StreamEnrichments never call the model — they read
+    // `ai_summaries` exactly as cached, the same local-mirror-read shape
+    // `MailService`'s reads have, so `mail.read` is the right ceiling: a
+    // routine mail-reading token can see what the AI already produced without
+    // being able to spend anything new.
     (
-        "/rmail.v1.AiService/Summarize",
+        "/rmail.v1.AiService/GetSummary",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.AiService/StreamEnrichments",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // AnalyzeMessage/SuggestReply are the two RPCs that can actually call the
+    // provider (a forced, on-demand deep pass — see `rmaild::ai_service`'s own
+    // module docs) — `ai.invoke` is exactly the scope this table's own header
+    // note anticipated for "the analyze/reply paths."
+    (
+        "/rmail.v1.AiService/AnalyzeMessage",
         Requirement::Scope(Scope::AiInvoke),
     ),
     (
-        "/rmail.v1.AiService/AskMailbox",
+        "/rmail.v1.AiService/SuggestReply",
         Requirement::Scope(Scope::AiInvoke),
+    ),
+    // GetUsage is arguably `mail.read` (it is, after all, a read), but it is
+    // scoped `admin` instead: unlike GetSummary/StreamEnrichments, which
+    // answer about one message a caller already named, GetUsage exposes
+    // *aggregate spend* — the same "the trail exists to hold the operator to
+    // account, not for routine mail access to enumerate" reasoning
+    // `AuditService.QueryAiCalls`'s row above gives for the identical
+    // question at the per-call level. A token minted to summarize messages
+    // should not also be able to read the account's total AI dollar spend.
+    (
+        "/rmail.v1.AiService/GetUsage",
+        Requirement::Scope(Scope::Admin),
+    ),
+    // SetPaused is a daemon-wide control-plane toggle — it does not name an
+    // account or a message, it turns the *entire* AI pipeline on or off for
+    // every account this daemon serves. That is squarely the same class of
+    // action `AccountService.Create`/`Delete` sit behind `admin` for: it
+    // mutates shared, global state a token minted for one caller's own AI use
+    // should not be able to disable (denying every other caller's AI
+    // features) or silently re-enable out from under a deliberate pause.
+    (
+        "/rmail.v1.AiService/SetPaused",
+        Requirement::Scope(Scope::Admin),
+    ),
+    // RetryFailed is scoped like SetPaused, not AnalyzeMessage/SuggestReply,
+    // despite reading like a request to do more work: `revive_all_dead`
+    // (rmail_core::ai::AiQueue) is un-scoped by message *or account* — it
+    // requeues every quarantined job across the whole daemon, causing spend
+    // on accounts the calling token may have nothing to do with. That is the
+    // same "mutates shared, global state" test SetPaused's row above applies,
+    // not "asks the pipeline to attempt work for a message I named."
+    (
+        "/rmail.v1.AiService/RetryFailed",
+        Requirement::Scope(Scope::Admin),
     ),
 ];
 

@@ -28,6 +28,7 @@ use crate::ai::provider::{ChatRequest, ChatResponse, Provider};
 use crate::ai::redact::{self, GuardedRequest, TokenMap};
 use crate::config::{AiLimits, AiPrivacy};
 use crate::error::{Error, ErrorReason};
+use crate::events::{EventKind, EventLog, NewEvent};
 use crate::storage::Database;
 
 use super::content::assemble_content;
@@ -133,12 +134,20 @@ pub struct AiWorkerPool {
     rate_limiter: Arc<RateLimiter>,
     handlers: Arc<HashMap<String, Arc<dyn PassHandler>>>,
     worker: Arc<str>,
+    /// Where a completed pass announces itself — see [`finish_call`]'s own
+    /// docs for why this is the one place that publish belongs, shared with
+    /// the batch path via the identical function.
+    events: EventLog,
 }
 
 impl AiWorkerPool {
     /// Build a pool. `worker` is this pool's identity in `ai_queue.leased_by`
     /// — give each running daemon (or, in tests, each pool instance) a
     /// distinct one, the same discipline `index::queue`'s callers follow.
+    /// `events` is the daemon's durable event log — every successfully
+    /// completed pass publishes an [`EventKind::AiSummary`] to it (see
+    /// [`finish_call`]), which is what the daemon's `AiService.StreamEnrichments`
+    /// (task 50, `rmaild`) subscribes to for its live feed.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -150,6 +159,7 @@ impl AiWorkerPool {
         privacy: AiPrivacy,
         handlers: Vec<Arc<dyn PassHandler>>,
         worker: impl Into<Arc<str>>,
+        events: EventLog,
     ) -> Self {
         let max_concurrency = limits.max_concurrency.max(1);
         let requests_per_minute = limits.requests_per_minute;
@@ -168,7 +178,27 @@ impl AiWorkerPool {
             rate_limiter: Arc::new(RateLimiter::new(requests_per_minute)),
             handlers: Arc::new(handlers),
             worker: worker.into(),
+            events,
         }
+    }
+
+    /// This pool's `Semaphore(max_concurrency)` — shared, not cloned-fresh,
+    /// with a caller (`rmaild::AiApi`) that also dispatches provider calls
+    /// outside the queue (a forced `AnalyzeMessage`/`SuggestReply`) and
+    /// needs those calls bounded by the *same* concurrency budget this pool
+    /// enforces for its own queued dispatch, rather than a second,
+    /// independent budget that could double `ai.limits.max_concurrency`'s
+    /// real ceiling in practice.
+    #[must_use]
+    pub fn semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.semaphore)
+    }
+
+    /// This pool's RPM [`RateLimiter`] — shared for the identical reason
+    /// [`Self::semaphore`] is.
+    #[must_use]
+    pub fn rate_limiter(&self) -> Arc<RateLimiter> {
+        Arc::clone(&self.rate_limiter)
     }
 
     /// Reap expired leases, consult the cost gate, lease up to `limit`
@@ -378,6 +408,7 @@ impl AiWorkerPool {
         finish_call(
             &self.db,
             &self.queue,
+            &self.events,
             &lease,
             &handler,
             &tokens,
@@ -490,10 +521,28 @@ fn is_terminal(error: &Error) -> bool {
 /// batch result — the Message Batches API's discount — passed straight
 /// through to [`audit::record_call_priced`], which is what actually prices
 /// `ai_ledger.cost_usd`/`ai_usage.cost_usd`.
+///
+/// On a successful completion, this also publishes an
+/// [`EventKind::AiSummary`] to `events` — the one choke point both dispatch
+/// paths already share, so this is the only place that needs to know an AI
+/// artifact became available rather than every caller of `PassHandler`
+/// remembering to say so itself. Published *after* [`AiQueue::complete`]
+/// succeeds, matching the durable-log-first discipline
+/// [`crate::events::EventLog::append_all`]'s own docs describe: a subscriber
+/// that reacted to this event by reading `ai_summaries`/`ai_queue` must find
+/// both already reflecting the completed job, never a job the event claims
+/// is done but the queue still shows `leased`. A publish failure (an
+/// oversized payload, which cannot happen here since the payload is a
+/// two-field object, or the log itself erroring) is logged and does not fail
+/// the job — the artifact is already durably written and the queue row
+/// already `done`; losing the live notification only costs
+/// `StreamEnrichments`' resumable backlog a beat, not correctness, since that
+/// backlog reads `ai_summaries` directly rather than replaying this event.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finish_call(
     db: &Database,
     queue: &AiQueue,
+    events: &EventLog,
     lease: &AiLease,
     handler: &Arc<dyn PassHandler>,
     tokens: &TokenMap,
@@ -530,7 +579,10 @@ pub(super) async fn finish_call(
                         return fail_after_success(queue, lease, &e.to_string()).await;
                     }
                     match queue.complete(lease, Some(ledger_entry_id)).await {
-                        Ok(true) => Outcome::Completed,
+                        Ok(true) => {
+                            announce(events, lease).await;
+                            Outcome::Completed
+                        }
                         Ok(false) | Err(_) => Outcome::Skipped,
                     }
                 }
@@ -578,5 +630,25 @@ async fn fail_after_success(queue: &AiQueue, lease: &AiLease, reason: &str) -> O
         Ok(Some(super::Failure::Quarantined { .. })) => Outcome::Dead,
         Ok(Some(super::Failure::Retrying { .. })) => Outcome::Retried,
         Ok(None) | Err(_) => Outcome::Skipped,
+    }
+}
+
+/// Publish the `AiSummary` event for a just-completed job — see
+/// [`finish_call`]'s own docs for why this runs after
+/// [`AiQueue::complete`] succeeds, and why a publish failure here does not
+/// fail the job.
+async fn announce(events: &EventLog, lease: &AiLease) {
+    let event = NewEvent::new(EventKind::AiSummary)
+        .account(lease.account_id)
+        .message(lease.message_id)
+        .payload(serde_json::json!({ "pass": lease.pass }));
+    if let Err(e) = events.append(event).await {
+        tracing::warn!(
+            job_id = lease.job_id,
+            message_id = lease.message_id,
+            error = %e,
+            "failed to publish the ai summary event; StreamEnrichments' live tail will miss \
+             this one, but its resumable backlog reads ai_summaries directly and is unaffected"
+        );
     }
 }

@@ -3,7 +3,7 @@
 //! [`serve_uds`] boots the tonic server on a Unix domain socket exposing gRPC
 //! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and the
 //! `AccountService`/`SyncService`/`AdminService`/`MailService`/
-//! `SearchService` handlers — all wrapped in a
+//! `SearchService`/`AiService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -11,6 +11,7 @@
 
 mod account_service;
 mod admin_service;
+mod ai_service;
 mod audit_service;
 mod auth;
 mod mail_service;
@@ -20,6 +21,7 @@ mod trace;
 
 pub use account_service::AccountApi;
 pub use admin_service::AdminApi;
+pub use ai_service::AiApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
 pub use mail_service::MailApi;
@@ -33,17 +35,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rmail_core::ai::{
+    self, AiDispatchLoop, AiPauseFlag, AiQueue, AiWorkerPool, BatchClient, BatchCoordinator,
+    DeepPassGate, DeepPassHandler, PassHandler, PolicyEngine, Provider as AiProvider,
+    QueueOptions as AiQueueOptions, TriagePassHandler,
+};
 use rmail_core::embed::hash::HashEmbedder;
 use rmail_core::embed::Embedder;
 use rmail_core::events::{EventLog, Retention};
 use rmail_core::imap::mutate::LiveImapMutator;
 use rmail_core::index::semantic::VECTOR_DIM;
+use rmail_core::index::{IndexQueue, QueueOptions as IndexQueueOptions};
 use rmail_core::mail::MailStore;
 use rmail_core::rank::l1::Weights;
 use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
+use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::search_service_server::SearchServiceServer;
@@ -91,6 +100,20 @@ pub enum ServeError {
     /// silently reverting every request to the unmodified cold-start table.
     #[error("invalid search.rank_weights: {0}")]
     InvalidRankWeights(#[from] rmail_core::rank::l1::RankError),
+
+    /// `ai.policy` named an account that is not configured, or carries a
+    /// malformed rule — caught here, before any socket is bound, for the
+    /// same reason `InvalidRankWeights` is: a misconfigured policy should
+    /// fail the daemon loudly at startup, not silently protect nothing.
+    ///
+    /// Deliberately not `#[from]`: this function's own `rmail_core::Error`
+    /// source is exactly one call
+    /// ([`rmail_core::ai::PolicyEngine::from_config`]), mapped explicitly at
+    /// that call site — a blanket `#[from] rmail_core::Error` would silently
+    /// re-label *any* future `?` on that type anywhere else in this
+    /// function as "invalid ai.policy," which is not what it would mean.
+    #[error("invalid ai.policy: {0}")]
+    InvalidAiPolicy(#[source] rmail_core::Error),
 }
 
 /// Serve the rmail gRPC surface on a Unix domain socket until `shutdown`
@@ -463,6 +486,143 @@ where
         stopping.clone(),
     ));
 
+    // AI subsystem: the durable queue, the two pass handlers, the worker
+    // pool/batch coordinator that drive them, and the dispatch loop that
+    // closes the loop between "a message synced" and "a triage job ran" —
+    // see `rmail_core::ai::dispatch`'s own module docs for why task 50 owns
+    // that wiring and what gap it closes.
+    //
+    // `AiService` is always registered (reflection and the auth scope table
+    // must see every RPC regardless of runtime config); `ai_active` gates
+    // real *work*, not registration. A disabled or misconfigured AI
+    // subsystem falls back to `ai_service::NullProvider`, so every
+    // provider-calling RPC fails fast with `FAILED_PRECONDITION` instead of
+    // ever dialing out, and the dispatch loop is simply never spawned —
+    // prd.md's "AI down → AiService health NOT_SERVING, mail features
+    // unaffected" (health-service granularity is left for a later task; the
+    // effect on served behavior is already correct).
+    let ai_policy =
+        Arc::new(PolicyEngine::from_config(config).map_err(ServeError::InvalidAiPolicy)?);
+    let (ai_provider, ai_active): (Arc<dyn AiProvider>, bool) = if config.ai.enabled {
+        match ai::provider::build(&config.ai) {
+            Ok(provider) => (provider, true),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not build the configured AI provider; AI features are disabled \
+                     until this is fixed"
+                );
+                (Arc::new(ai_service::NullProvider), false)
+            }
+        }
+    } else {
+        tracing::info!("ai.enabled = false; AI features are disabled on this daemon");
+        (Arc::new(ai_service::NullProvider), false)
+    };
+
+    let ai_queue = AiQueue::new(db.clone(), AiQueueOptions::default());
+    let index_queue = IndexQueue::new(db.clone(), IndexQueueOptions::default());
+    let deep_handler = Arc::new(DeepPassHandler::new(
+        db.clone(),
+        index_queue,
+        config.ai.models.deep.clone(),
+        config.ai.deep_pass.clone(),
+    ));
+    let triage_handler: Arc<dyn PassHandler> = Arc::new(
+        TriagePassHandler::new(db.clone(), config.ai.models.triage.clone())
+            .with_deep_pass_gate(DeepPassGate::new(config.ai.deep_pass.clone())),
+    );
+    let ai_handlers: Vec<Arc<dyn PassHandler>> = vec![
+        triage_handler,
+        Arc::clone(&deep_handler) as Arc<dyn PassHandler>,
+    ];
+
+    let ai_worker_pool = AiWorkerPool::new(
+        db.clone(),
+        ai_queue.clone(),
+        Arc::clone(&ai_provider),
+        Arc::clone(&ai_policy),
+        config.ai.limits.clone(),
+        config.ai.privacy.clone(),
+        ai_handlers.clone(),
+        "rmaild-ai-worker",
+        events.clone(),
+    );
+    // Shared with `AiApi` below — a forced `AnalyzeMessage`/`SuggestReply`
+    // call must draw from the *same* concurrency/RPM budget this pool
+    // enforces for its own queued dispatch, not a second, independent one
+    // that would let the two paths together exceed `ai.limits` in practice.
+    // See `AiWorkerPool::semaphore`/`AiApi::new`'s own docs.
+    let ai_semaphore = ai_worker_pool.semaphore();
+    let ai_rate_limiter = ai_worker_pool.rate_limiter();
+
+    // Always starts unpaused, regardless of `ai_active` — a disabled daemon
+    // is reported via `GetUsage.enabled = false`, not by pretending it is
+    // "paused" (which would misleadingly imply `mail ai resume` could make
+    // it start running).
+    let ai_pause = AiPauseFlag::new(false);
+    let ai_service = AiServiceServer::new(AiApi::new(
+        db.clone(),
+        ai_queue.clone(),
+        events.clone(),
+        Arc::clone(&deep_handler),
+        Arc::clone(&ai_provider),
+        Arc::clone(&ai_policy),
+        config.ai.privacy.clone(),
+        config.ai.limits.clone(),
+        ai_pause.clone(),
+        ai_active,
+        ai_semaphore,
+        ai_rate_limiter,
+        stopping.clone(),
+    ));
+
+    // Only spawned when the subsystem is actually active — a disabled/
+    // misconfigured daemon must not poll the event log and lease an empty
+    // queue forever for nothing, and must never try to build a batch client
+    // pointed at a provider that was just declared unusable.
+    let ai_dispatch_handle = if ai_active {
+        let mut dispatch = AiDispatchLoop::new(events.clone(), ai_queue.clone(), ai_worker_pool)
+            .with_pause_flag(ai_pause);
+        if config.ai.batching.enabled {
+            match BatchClient::new() {
+                Ok(client) => match BatchCoordinator::new(
+                    db.clone(),
+                    ai_queue.clone(),
+                    client,
+                    config.ai.api_key_command.clone(),
+                    Arc::clone(&ai_policy),
+                    config.ai.limits.clone(),
+                    config.ai.privacy.clone(),
+                    config.ai.batching.clone(),
+                    ai_handlers,
+                    events.clone(),
+                ) {
+                    Ok(coordinator) => {
+                        dispatch = dispatch.with_batch(
+                            Arc::new(coordinator),
+                            vec![
+                                ai_service::TRIAGE_PASS.to_owned(),
+                                ai_service::DEEP_PASS.to_owned(),
+                            ],
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "could not build the ai batch coordinator; batch mode disabled"
+                    ),
+                },
+                Err(error) => tracing::warn!(
+                    %error,
+                    "could not build the ai batch client; batch mode disabled"
+                ),
+            }
+        }
+        Some(dispatch.spawn(stopping.clone()))
+    } else {
+        None
+    };
+
     let incoming = UnixListenerStream::new(listener);
     let serve_result = Server::builder()
         // Every RPC runs inside a request-tracing span; the auth layer sits
@@ -478,11 +638,15 @@ where
         .add_service(sync_service)
         .add_service(mail_service)
         .add_service(search_service)
+        .add_service(ai_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
     stopping.cancel();
     let _ = pruner.await;
+    if let Some(handle) = ai_dispatch_handle {
+        let _ = handle.await;
+    }
 
     // Best-effort cleanup so the next boot starts clean regardless of outcome.
     let _ = std::fs::remove_file(&path);

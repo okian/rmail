@@ -49,6 +49,18 @@ http.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+# `ai_service.rs` relays `rmail_core::ai::provider::ProviderStream` frames
+# (a `futures::Stream`) and implements `Provider` for its `NullProvider`
+# fallback.
+futures.workspace = true
+async-trait.workspace = true
+# `ai_service.rs` reads `ai_summaries`/`ai_entities`/`ai_usage`/`ai_queue`
+# directly for GetSummary/StreamEnrichments/GetUsage — the same "a service
+# handler runs its own narrow SQL through `Database::read`" pattern
+# `search_service.rs`/`mail_service.rs` already use.
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tonic-types.workspace = true
@@ -60,8 +72,3 @@ tokio = { workspace = true, features = ["test-util"] }
 # Only used by the AuditService integration test, to verify a ledger entry's
 # `payload_sha256` against an independently computed hash.
 sha2.workspace = true
-# `mail_service.rs`'s integration test implements `rmail_core::imap::mutate::
-# ImapMutator` with a fake, so `MailService`'s IMAP-reflection ordering is
-# testable without a live server — the trait is `#[async_trait::async_trait]`
-# for dyn-compatibility, so implementing it needs the same macro.
-async-trait.workspace = true
