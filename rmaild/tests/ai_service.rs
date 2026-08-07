@@ -811,18 +811,33 @@ async fn stream_enrichments_delivers_a_live_enrichment_for_an_older_message_id()
     server
         .write_deep_row_and_announce(older, account_id, "older summary")
         .await;
-    let second = tokio::time::timeout(STREAM_TIMEOUT, stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        second.message_id, older,
+
+    // Drain until the older enrichment appears rather than demanding it be
+    // literally the next frame. `StreamEnrichments` is documented at-least-
+    // once (see the RPC's proto comment): an enrichment the backlog scan
+    // already delivered can be re-delivered by the live tail, because the
+    // tail deliberately does not filter on message_id — that filter is the
+    // very bug this test guards against. Insisting on exactly-once ordering
+    // here asserts a contract the service never promised, and fails on a
+    // duplicate rather than on the drop it is meant to catch.
+    let mut older_seen = None;
+    for _ in 0..4 {
+        let item = tokio::time::timeout(STREAM_TIMEOUT, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if item.message_id == older {
+            older_seen = Some(item);
+            break;
+        }
+    }
+    let older_item = older_seen.expect(
         "an enrichment for a lower message_id must still be delivered live, \
-         not silently dropped because a higher one already went out"
+         not silently dropped because a higher one already went out",
     );
     assert_eq!(
-        second.summary.unwrap().summary.as_deref(),
+        older_item.summary.unwrap().summary.as_deref(),
         Some("older summary")
     );
 

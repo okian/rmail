@@ -42,6 +42,20 @@ V15 and V17 are permanently unused, which costs nothing. **Next free: V21.**
   `rmail-cli` tests use to exec `mail` — resolves to it. See
   `.claude/BUILD_BRIEF.md`. A worktree `target/` costs 3–8 GB; delete it after
   merging the branch.
+- **Reclaim Docker volumes, not just host `target/` directories.** The container
+  builds into named volumes (`rmail-test-target-*`), one per worktree, which
+  deleting a worktree's host-side `target/` never touches. Nine of them reached
+  98.8 GB and failed a gate with "No space left on device" *inside* the
+  container while the host still showed 106 GiB free. After merging a branch:
+  `docker volume rm -f $(docker volume ls -q --filter name=^rmail-test-target-)`.
+  Keep `rmail-test-cargo-registry`/`-cargo-git` — those are the expensive
+  dependency downloads and are shared.
+- **Do not union-merge structured code by deduplicating lines.** A script that
+  keeps "lines from theirs not already in ours" silently drops repeated closing
+  braces and attributes, which are exactly what Rust has a lot of. It happened
+  to be safe for single-line `pub mod` conflicts and corrupted `main.rs` the
+  first time two tasks both added subcommands. Use `git merge-file` (three-way)
+  and resolve what it actually flags.
 - **Quota is the binding constraint, not the machine.** Ten concurrent agents
   exhausted the session limit twice. Each agent costs roughly 0.5–0.9M tokens
   including its reviewer pass. Three or four long-lived agents get further per

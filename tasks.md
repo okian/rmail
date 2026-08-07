@@ -481,7 +481,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core ai::deep` (gating logic, thread rollup incrementality, index feed)
 
 ## 50. AiService gRPC + streaming RPCs
-- [ ] status
+- [x] status
 - **depends-on:** 48, 49
 - **parallel-safe:** no
 - **acceptance:**
