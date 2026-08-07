@@ -348,7 +348,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-cli search_cli` (json schema, flags map to request fields)
 
 ## 35. Saved searches & deterministic smart folders
-- [ ] status
+- [x] status
 - **depends-on:** 33, 6
 - **parallel-safe:** yes
 - **acceptance:**
@@ -576,7 +576,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core finder::score finder::rank` · `cargo nextest run -p rmaild finder_service` (streamed batches, cancellation)
 
 ## 60. Compose & drafts
-- [ ] status
+- [x] status
 - **depends-on:** 6, 39
 - **parallel-safe:** no
 - **acceptance:**

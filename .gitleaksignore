@@ -8,8 +8,11 @@
 # `rmail-core/src/ai/redact/tests.rs` is the PII/secret redaction firewall's
 # own test suite. Its job is proving that credential-shaped strings get
 # tokenized before anything leaves the machine, which means it necessarily
-# contains credential-shaped strings (`api_key: abcdef123456`). The
-# alternative is a secret detector nobody can test.
+# contains credential-shaped strings. The alternative is a secret detector
+# nobody can test.
+#
+# Do not quote the offending literal in this comment: an earlier revision did,
+# and the allowlist file became a finding of its own.
 #
 # The in-file `gitleaks:allow` annotation covers working-tree scans; these
 # fingerprints cover `gitleaks detect`'s history scan, which reads the blob as
