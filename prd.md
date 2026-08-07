@@ -346,7 +346,7 @@ Reranking is gated by `search.rerank` (`off | cross_encoder | claude | auto`). `
 - **MMR (Maximal Marginal Relevance)** for exploratory intent: greedily pick results maximizing `λ·relevance − (1−λ)·max_similarity_to_already_picked` so the top-10 isn't ten near-identical newsletters. `λ` default 0.7; disabled for navigational intent (where the user wants the single best match first).
 - **Thread grouping:** in thread-mode, collapse a thread to its best-scoring message with an inline count; expandable.
 - **Near-duplicate collapse:** SimHash clusters; show the canonical (usually newest) with a "N similar" chip.
-- **Snippet + highlight:** best-matching span extracted (FTS5 `snippet()` for lexical, best chunk for semantic), query terms highlighted using match positions.
+- **Snippet + highlight:** best-matching span extracted, query terms highlighted using match positions. Extraction reads `index_content` directly for both the lexical and semantic paths, with a per-message best chunk (cosine against the query vector) for semantic-only hits. Note FTS5's `snippet()`/`highlight()` are **not** available here and never were: `fts_messages` is declared `content=''` (contentless, see `V9__fts_messages.sql`), so the table stores an inverted index and no text for those functions to quote. This bullet previously specified `snippet()` for lexical; that is not implementable against the index this system actually builds, and the split it implied — one extraction path per retriever — would also have produced visibly different snippet shapes for the same message depending on which retriever surfaced it.
 - **Streaming:** results flush best-first in score-ordered batches so the top result paints in <30 ms even while lower ranks are still being reranked.
 
 ---

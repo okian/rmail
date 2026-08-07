@@ -322,7 +322,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core rank::l1` (weighted score, top-K cut, intent gating)
 
 ## 32. Diversify & present
-- [ ] status
+- [x] status
 - **depends-on:** 31
 - **parallel-safe:** no
 - **acceptance:**
