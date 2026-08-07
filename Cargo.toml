@@ -152,6 +152,11 @@ unicode-normalization = "0.1"
 nucleo-matcher = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
+# The TUI (task 83). 0.29, not 0.30: every 0.30 release declares a
+# `rust-version` above this workspace's own 1.80, and 0.29 declares 1.74.
+# crossterm is deliberately not listed — the TUI uses `ratatui::crossterm`;
+# see `rmail-cli/src/tui.rs`'s module docs.
+ratatui = "0.29"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Perf-budget benchmarks (`rmail-core/benches/`) only; not a runtime dep of

@@ -32,9 +32,16 @@ rmail-proto.workspace = true
 tonic-health.workspace = true
 # `note_cli`'s `$EDITOR` flow launches the user's editor as a child process.
 tokio = { workspace = true, features = ["process"] }
+# `tui::grpc` cancels its in-flight background RPC tasks (and the long-lived
+# WatchEvents stream) when the TUI exits, rather than leaving them to notice
+# their result channel closed at some later point.
+tokio-util.workspace = true
 tonic.workspace = true
 tokio-stream.workspace = true
 anyhow.workspace = true
+# The TUI shell (task 83). Its crossterm backend is `ratatui::crossterm`; see
+# the workspace dependency's own note for why crossterm is not listed here.
+ratatui.workspace = true
 clap.workspace = true
 chrono.workspace = true
 serde.workspace = true
@@ -46,3 +53,6 @@ rmaild.workspace = true
 rmail-core.workspace = true
 rmail-proto.workspace = true
 tokio = { workspace = true, features = ["process"] }
+# `tui::grpc`'s tests implement `rmail_core::imap::mutate::ImapMutator`, which
+# is an `#[async_trait]` trait, so the impl needs the same attribute.
+async-trait.workspace = true

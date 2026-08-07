@@ -1,0 +1,543 @@
+//! Transport tests: drive [`GrpcExec`] against a **real in-process `rmaild`**
+//! over a real Unix socket, and assert the [`Msg`]s that come back.
+//!
+//! Not a mock of the transport (`CLAUDE.md`: "Integration tests run against an
+//! in-process `tonic` server, not mocks of the transport"). The point is
+//! exactly the layer the model tests cannot reach: that each [`Cmd`] names the
+//! RPC it claims to, that the wire types map onto the model's, and that a
+//! `tonic::Status` becomes a string a status line can show rather than being
+//! swallowed.
+//!
+//! These live inside the binary crate rather than in `rmail-cli/tests/`
+//! because `rmail-cli` has no lib target — `search_cli`'s own unit tests give
+//! the same reason — so `tests/` can only exec the built `mail` binary, which
+//! cannot reach [`GrpcExec`] at all.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use rmail_core::events::{EventLog, Retention};
+use rmail_core::imap::mutate::ImapMutator;
+use rmail_core::mail::MailStore;
+use rmail_core::repo::{self, NewAccount, NewMailbox, NewMessage};
+use rmail_core::sync::{SyncEngine, SyncOptions};
+use rmail_core::{Config, Database, Error};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
+
+use super::*;
+use crate::tui::model::{Folder, MessageRow, OpenMessage};
+
+static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// How long a test waits for a background task to answer. Generous: the gate
+/// runs several test binaries at once in a memory-constrained container.
+const DEADLINE: Duration = Duration::from_secs(30);
+
+/// A quoted-printable, RFC 2047-encoded message — the same shape
+/// `wire::tests` uses, so what lands here has genuinely crossed the wire
+/// after `parse_message` decoded it daemon-side.
+const RAW: &[u8] = b"From: =?UTF-8?Q?Zo=C3=AB?= <zoe@example.com>\r\n\
+To: me@example.com\r\n\
+Subject: =?UTF-8?B?SW52b2ljZSDigqwxMA==?=\r\n\
+Content-Type: multipart/alternative; boundary=\"b\"\r\n\
+\r\n\
+--b\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+Total: =E2=82=AC10 =3D cheap\r\n\
+--b\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<p>Total: &euro;10</p>\r\n\
+--b--\r\n";
+
+/// An `ImapMutator` that accepts everything without a network.
+///
+/// The mutating RPCs (`SetFlags`/`Move`/`Copy`/`Delete`) reflect to IMAP
+/// *before* touching the local mirror, so against a default daemon every one
+/// of them fails `FAILED_PRECONDITION: account has no IMAP server configured`
+/// and the local half of the contract — the half the TUI actually reacts to —
+/// is never reached. `rmaild/tests/mail_service.rs` stands up the same fake
+/// for the same reason; `rmail_core::imap::mutate`'s own tests already prove
+/// the real wire commands.
+#[derive(Debug, Default)]
+struct AcceptingImap;
+
+#[async_trait::async_trait]
+impl ImapMutator for AcceptingImap {
+    async fn set_flags(&self, _: i64, _: &str, _: i64, _: i64, _: &[String]) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn move_message(&self, _: i64, _: &str, _: i64, _: i64, _: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn copy_message(&self, _: i64, _: &str, _: i64, _: i64, _: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn delete_message(&self, _: i64, _: &str, _: i64, _: i64) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Tagging's keyword push. Nothing in this suite tags anything, but the
+    /// trait is what `MailStore` takes, so it has to be complete.
+    async fn store_keyword(
+        &self,
+        _: i64,
+        _: &str,
+        _: i64,
+        _: &[i64],
+        _: &str,
+        _: bool,
+        _: bool,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+struct Daemon {
+    socket: PathBuf,
+    db_path: PathBuf,
+    account_id: i64,
+    inbox_id: i64,
+    archive_id: i64,
+    message_id: i64,
+    shutdown: oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<Result<(), rmaild::ServeError>>,
+}
+
+impl Daemon {
+    async fn start() -> Self {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        // A short path: a Unix socket's `sun_path` is ~104 bytes, and the
+        // per-test temp dir this workspace's helpers build elsewhere is long
+        // enough to matter.
+        let socket = PathBuf::from("/tmp").join(format!("rmail-tui-{pid}-{n}.sock"));
+        let db_path = std::env::temp_dir().join(format!("rmail-tui-{pid}-{n}.db"));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+        }
+        let db = Database::open(&db_path).expect("open db");
+
+        let (account_id, inbox_id, archive_id, message_id) = db
+            .with_write(move |c| {
+                let account_id = repo::insert_account(
+                    c,
+                    &NewAccount {
+                        name: format!("personal-{n}"),
+                        username: Some("me@example.com".to_owned()),
+                        ..Default::default()
+                    },
+                )?;
+                let inbox_id = repo::insert_mailbox(
+                    c,
+                    &NewMailbox {
+                        account_id,
+                        name: "INBOX".to_owned(),
+                        ..Default::default()
+                    },
+                )?;
+                let archive_id = repo::insert_mailbox(
+                    c,
+                    &NewMailbox {
+                        account_id,
+                        name: "Archive".to_owned(),
+                        ..Default::default()
+                    },
+                )?;
+                let parsed = rmail_core::message::parse::parse_message(RAW);
+                let message_id = repo::insert_message(
+                    c,
+                    &NewMessage {
+                        account_id,
+                        mailbox_id: inbox_id,
+                        uid: 1,
+                        uidvalidity: 1,
+                        subject: parsed.subject.clone(),
+                        from_addr: parsed.from_addr.clone(),
+                        from_name: parsed.from_name.clone(),
+                        date: Some(1_700_000_000),
+                        body_text: parsed.body_text.clone(),
+                        body_html: parsed.body_html.clone(),
+                        raw: Some(RAW.to_vec()),
+                        ..Default::default()
+                    },
+                )?;
+                Ok((account_id, inbox_id, archive_id, message_id))
+            })
+            .expect("seed");
+
+        let log = EventLog::new(db.clone(), Retention::default());
+        let engine = SyncEngine::new(db.clone(), log.clone(), SyncOptions::default());
+        let mail_store = MailStore::new(
+            db.clone(),
+            log,
+            Arc::new(AcceptingImap) as Arc<dyn ImapMutator>,
+        );
+
+        let (shutdown, rx) = oneshot::channel::<()>();
+        let server_socket = socket.clone();
+        let handle = tokio::spawn(async move {
+            let mut config = Config::default();
+            config.index.semantic.enabled = false;
+            rmaild::serve_uds_with_engine_and_mail_store(
+                &server_socket,
+                db,
+                engine,
+                mail_store,
+                &config,
+                async move {
+                    let _ = rx.await;
+                },
+            )
+            .await
+        });
+
+        for _ in 0..500 {
+            if rmail_core::connect_uds(&socket).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        Self {
+            socket,
+            db_path,
+            account_id,
+            inbox_id,
+            archive_id,
+            message_id,
+            shutdown,
+            handle,
+        }
+    }
+
+    async fn exec(&self) -> GrpcExec {
+        GrpcExec::connect(&self.socket)
+            .await
+            .expect("connect to the in-process daemon")
+    }
+
+    async fn stop(self) {
+        let _ = self.shutdown.send(());
+        let _ = tokio::time::timeout(DEADLINE, self.handle).await;
+        let _ = std::fs::remove_file(&self.socket);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.db_path.display()));
+        }
+    }
+}
+
+fn channel() -> (UnboundedSender<Msg>, UnboundedReceiver<Msg>) {
+    mpsc::unbounded_channel()
+}
+
+/// The next message, or a failure naming what was being waited for.
+async fn next(rx: &mut UnboundedReceiver<Msg>, what: &str) -> Msg {
+    match tokio::time::timeout(DEADLINE, rx.recv()).await {
+        Ok(Some(msg)) => msg,
+        Ok(None) => unreachable!("the executor dropped the channel waiting for {what}"),
+        Err(_) => unreachable!("timed out waiting for {what}"),
+    }
+}
+
+#[tokio::test]
+async fn load_accounts_folders_and_messages_come_back_as_model_types() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(Cmd::LoadAccounts, tx.clone());
+    let accounts = match next(&mut rx, "accounts").await {
+        Msg::Accounts(Ok(accounts)) => accounts,
+        other => unreachable!("expected accounts, got {other:?}"),
+    };
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, daemon.account_id);
+    assert_eq!(
+        accounts[0].username.as_deref(),
+        Some("me@example.com"),
+        "the reply's From address is carried through"
+    );
+
+    exec.exec(
+        Cmd::LoadFolders {
+            account_id: daemon.account_id,
+        },
+        tx.clone(),
+    );
+    let folders: Vec<Folder> = match next(&mut rx, "folders").await {
+        Msg::Folders(Ok(folders)) => folders,
+        other => unreachable!("expected folders, got {other:?}"),
+    };
+    // Proves the folder pane's source of truth: `SyncService.Status` lists
+    // every mailbox, including ones sync has never touched.
+    let names: Vec<&str> = folders.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        names.contains(&"INBOX") && names.contains(&"Archive"),
+        "{names:?}"
+    );
+
+    exec.exec(
+        Cmd::LoadMessages {
+            mailbox_id: daemon.inbox_id,
+        },
+        tx.clone(),
+    );
+    let rows: Vec<MessageRow> = match next(&mut rx, "messages").await {
+        Msg::Messages {
+            mailbox_id,
+            result: Ok(rows),
+        } => {
+            assert_eq!(mailbox_id, daemon.inbox_id, "the reply names its folder");
+            rows
+        }
+        other => unreachable!("expected messages, got {other:?}"),
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, daemon.message_id);
+    assert_eq!(rows[0].subject, "Invoice €10", "decoded, over the wire");
+    assert_eq!(rows[0].from, "Zoë");
+    assert_eq!(rows[0].from_addr.as_deref(), Some("zoe@example.com"));
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn open_returns_the_decoded_body_the_daemon_parsed() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Open {
+            message_id: daemon.message_id,
+        },
+        tx,
+    );
+    let open: OpenMessage = match next(&mut rx, "the opened message").await {
+        Msg::Opened {
+            message_id,
+            result: Ok(open),
+        } => {
+            assert_eq!(message_id, daemon.message_id, "the reply names its request");
+            open
+        }
+        other => unreachable!("expected an opened message, got {other:?}"),
+    };
+
+    let body = open.body.join("\n");
+    assert!(body.contains("€10"), "quoted-printable decoded: {body:?}");
+    assert!(open.has_html, "the HTML alternative reached the client");
+    assert!(open
+        .headers
+        .iter()
+        .any(|(name, value)| name == "Subject" && value == "Invoice €10"));
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_status_error_reaches_the_status_line_instead_of_being_swallowed() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Open {
+            message_id: 999_999,
+        },
+        tx,
+    );
+    match next(&mut rx, "the failed open").await {
+        Msg::Opened {
+            message_id,
+            result: Err(error),
+        } => {
+            assert_eq!(message_id, 999_999);
+            assert!(
+                error.contains("999999") || error.to_lowercase().contains("not found"),
+                "the daemon's own words survive the trip: {error:?}"
+            );
+        }
+        other => unreachable!("expected a NOT_FOUND, got {other:?}"),
+    }
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn set_flags_reaches_the_daemon_and_reports_the_set_it_applied() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::SetFlags {
+            message_id: daemon.message_id,
+            flags: vec![crate::tui::model::SEEN.to_owned()],
+            label: "marked read".to_owned(),
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "the flag update").await {
+        Msg::Done {
+            label,
+            result: Ok(Effect::Flags { message_id, flags }),
+        } => {
+            assert_eq!(label, "marked read");
+            assert_eq!(message_id, daemon.message_id);
+            assert_eq!(flags, vec![crate::tui::model::SEEN.to_owned()]);
+        }
+        other => unreachable!("expected a flag effect, got {other:?}"),
+    }
+
+    // And the list now reads it back, which is what proves the write landed
+    // rather than the client merely echoing what it sent.
+    exec.exec(
+        Cmd::LoadMessages {
+            mailbox_id: daemon.inbox_id,
+        },
+        tx,
+    );
+    match next(&mut rx, "the reloaded list").await {
+        Msg::Messages {
+            result: Ok(rows), ..
+        } => assert!(
+            rows[0].has_flag(crate::tui::model::SEEN),
+            "flags after the round trip: {:?}",
+            rows[0].flags
+        ),
+        other => unreachable!("expected messages, got {other:?}"),
+    }
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_reply_becomes_a_draft_composeservice_actually_stored() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Draft {
+            kind: crate::tui::model::DraftKind::Reply,
+            account_id: daemon.account_id,
+            from: "me@example.com".to_owned(),
+            to: "zoe@example.com".to_owned(),
+            message_id: daemon.message_id,
+        },
+        tx,
+    );
+    let draft_id = match next(&mut rx, "the created draft").await {
+        Msg::Done {
+            result: Ok(Effect::Drafted(id)),
+            ..
+        } => id,
+        other => unreachable!("expected a draft, got {other:?}"),
+    };
+
+    // Read it back through the service, not the database: the TUI's claim is
+    // that reply/forward go through `ComposeService`, and this is what makes
+    // that checkable.
+    let channel = rmail_core::connect_uds(&daemon.socket).await.unwrap();
+    let draft = rmail_proto::v1::compose_service_client::ComposeServiceClient::new(channel)
+        .get_draft(rmail_proto::v1::GetDraftRequest { draft_id })
+        .await
+        .expect("GetDraft")
+        .into_inner();
+
+    assert_eq!(draft.subject, "Re: Invoice €10");
+    assert_eq!(
+        draft.to.first().map(|a| a.address.as_str()),
+        Some("zoe@example.com")
+    );
+    assert_eq!(
+        draft.in_reply_to_message_id,
+        Some(daemon.message_id),
+        "the reply threads onto the message it answers"
+    );
+    assert!(
+        draft.body_text.contains("> Total: €10"),
+        "the decoded original is quoted: {:?}",
+        draft.body_text
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_move_removes_the_row_and_the_listing_agrees() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Move {
+            message_id: daemon.message_id,
+            dest_mailbox_id: daemon.archive_id,
+            label: "archived".to_owned(),
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "the move").await {
+        Msg::Done {
+            label,
+            result: Ok(Effect::Removed(id)),
+        } => {
+            assert_eq!(label, "archived");
+            assert_eq!(id, daemon.message_id);
+        }
+        other => unreachable!("expected a move result, got {other:?}"),
+    }
+
+    exec.exec(
+        Cmd::LoadMessages {
+            mailbox_id: daemon.inbox_id,
+        },
+        tx,
+    );
+    match next(&mut rx, "the reloaded list").await {
+        Msg::Messages {
+            result: Ok(rows), ..
+        } => assert!(rows.is_empty(), "the moved message left the source folder"),
+        other => unreachable!("expected messages, got {other:?}"),
+    }
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn shutdown_stops_the_event_stream_rather_than_leaving_it_running() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Watch {
+            account_id: daemon.account_id,
+        },
+        tx.clone(),
+    );
+    // Let the subscription establish, then tear it down. `WatchEvents` never
+    // completes on its own, so if cancellation did not reach it the task would
+    // outlive the session.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    exec.shutdown();
+    drop(tx);
+
+    // The only sender left is the stream task's clone; the channel closing is
+    // therefore proof that task is gone.
+    let closed = tokio::time::timeout(DEADLINE, async { while rx.recv().await.is_some() {} }).await;
+    assert!(closed.is_ok(), "the WatchEvents task outlived shutdown");
+
+    daemon.stop().await;
+}

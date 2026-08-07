@@ -4,6 +4,7 @@ mod hook_cli;
 mod note_cli;
 mod search_cli;
 mod tag_cli;
+mod tui;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -65,6 +66,8 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// The terminal UI: folders, message list, preview (`tui`).
+    Tui(tui::TuiArgs),
     /// Ranked search over the local index (`SearchService.Search`).
     Search(SearchArgs),
     /// Embedding-kNN neighbors of a message (`SearchService.Semantic`).
@@ -296,6 +299,7 @@ async fn main() -> Result<()> {
             TokenAction::List => token_list(&socket).await,
             TokenAction::Revoke { id } => token_revoke(&socket, id).await,
         },
+        Command::Tui(args) => tui::run(&socket, args).await,
         Command::Search(args) => search_cli::search(&socket, args).await,
         Command::Similar(args) => search_cli::similar(&socket, args).await,
         Command::Ai { action } => match action {
