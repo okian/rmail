@@ -28,15 +28,23 @@ fn no_filters_is_unconstrained() {
 
 #[test]
 fn an_unbacked_filter_excludes_everything_but_its_negation_does_not() {
-    // `note:` still has no backing table (task 56) -- `tag:` used to be the
-    // example here too, until task 55 gave it a real one; see
-    // `tag_filters_compile_to_a_real_predicate` below for its current
-    // (backed) behavior.
-    let note = other(Operator::Note("contract".to_owned()), false);
-    assert!(matches!(compile(&[note]), FilterMask::ExcludesEverything));
+    // `is:pinned` has no backing column: nothing in the schema records a pin,
+    // so *zero* messages are pinned and `is:pinned` provably matches none.
+    //
+    // This test has now outlived two of its own examples — it used `tag:`
+    // until task 55 backed it, then `note:` until task 56 did. That churn is
+    // the point rather than an annoyance: the property under test is about
+    // what an *unbacked* filter does, so the example has to be swapped every
+    // time a subsystem lands, and the swap failing loudly is what proves the
+    // fail-closed default is still reachable at all rather than having
+    // quietly become dead code.
+    let pinned = other(Operator::Is(IsFlag::Pinned), false);
+    assert!(matches!(compile(&[pinned]), FilterMask::ExcludesEverything));
 
-    let not_note = other(Operator::Note("contract".to_owned()), true);
-    assert!(matches!(compile(&[not_note]), FilterMask::Unconstrained));
+    // ...and its negation degrades to no constraint, because "not pinned" is
+    // true of every message when nothing can be pinned.
+    let not_pinned = other(Operator::Is(IsFlag::Pinned), true);
+    assert!(matches!(compile(&[not_pinned]), FilterMask::Unconstrained));
 }
 
 #[test]

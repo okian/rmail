@@ -1444,15 +1444,18 @@ fn day_start_parses_plain_iso_dates_only() {
 
 #[test]
 fn compile_filters_excludes_everything_only_for_a_positive_unbacked_filter() {
-    // `note:` still has no backing table (task 56) -- `tag:` is now backed
-    // (task 55); see `tag_query_combined_with_free_text_still_ranks_by_bm25`
-    // below for its own, real-database-backed test.
+    // `is:pinned` has no backing column — nothing in the schema records a
+    // pin — so it is the one still-unbacked filter left to demonstrate this
+    // with. `tag:` (task 55) and `note:` (task 56) each served as the example
+    // here until their subsystem landed; the mirror of this test in
+    // `retrieve::filtermask::tests` carries the same note and the same
+    // example, deliberately, since both compilers must agree.
     assert!(matches!(
-        compile_filters(&query::parse("note:contract").filters),
+        compile_filters(&query::parse("is:pinned").filters),
         FilterMask::ExcludesEverything
     ));
     assert!(!matches!(
-        compile_filters(&query::parse("-note:contract").filters),
+        compile_filters(&query::parse("-is:pinned").filters),
         FilterMask::ExcludesEverything
     ));
     assert!(!matches!(
