@@ -540,6 +540,42 @@ async fn primed_dispatcher(events: &EventLog, config: &HooksConfig) -> HookDispa
     dispatcher
 }
 
+#[tokio::test]
+async fn a_zero_tick_interval_is_floored_rather_than_becoming_a_busy_loop() {
+    let fx = Fixture::open().await;
+    let config = HooksConfig {
+        tick_interval: HumanDuration::new(Duration::ZERO),
+        ..HooksConfig::default()
+    };
+
+    let dispatcher = HookDispatcher::new(fx.events.clone(), &config);
+
+    assert_eq!(
+        dispatcher.tick_interval, MIN_TICK_INTERVAL,
+        "a `tick_interval = \"0s\"` typo must degrade to the floor -- a zero sleep \
+         re-queries the event log as fast as the runtime allows, which is a busy \
+         loop against SQLite for no gain"
+    );
+}
+
+#[tokio::test]
+async fn the_configured_tick_interval_reaches_the_dispatcher() {
+    let fx = Fixture::open().await;
+    let config = HooksConfig {
+        tick_interval: HumanDuration::new(Duration::from_millis(250)),
+        ..HooksConfig::default()
+    };
+
+    let dispatcher = HookDispatcher::new(fx.events.clone(), &config);
+
+    assert_eq!(
+        dispatcher.tick_interval,
+        Duration::from_millis(250),
+        "the operator-facing knob must actually drive the loop; it is the upper \
+         bound on hook latency"
+    );
+}
+
 /// The eager seed is the whole point of `spawn` being `async`: it pins
 /// "start at now" to the moment the daemon boots rather than to whenever the
 /// runtime first happens to poll the tick task.

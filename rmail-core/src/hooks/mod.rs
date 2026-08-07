@@ -172,6 +172,12 @@ const DRAIN_PAGE: i64 = 500;
 /// second for nothing.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Floor on [`crate::config::HooksConfig::tick_interval`]. Small enough that a
+/// test (or an operator who genuinely wants near-immediate hooks) can ask for
+/// a fast loop, large enough that a `tick_interval = "0s"` typo cannot turn
+/// the dispatcher into a busy loop against the event log.
+pub const MIN_TICK_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Default cap on how many hook matches one [`HookDispatcher::tick`] queues
 /// before stopping — see the module docs' "One tick's matches are capped."
 /// Matches `ai::dispatch::DEFAULT_LEASE_LIMIT`'s order of magnitude times a
@@ -728,7 +734,10 @@ impl HookDispatcher {
             hooks,
             semaphore: Arc::new(Semaphore::new(config.max_concurrency.max(1) as usize)),
             max_output_bytes: config.max_output_bytes as usize,
-            tick_interval: DEFAULT_TICK_INTERVAL,
+            // A zero interval would spin the dispatch loop as fast as the
+            // runtime allows, hammering the event log with no gain — a config
+            // typo degrades to "tick as fast as is sane", never to a busy loop.
+            tick_interval: config.tick_interval.as_duration().max(MIN_TICK_INTERVAL),
             max_batch: DEFAULT_MAX_BATCH,
             cursor: Arc::new(AtomicI64::new(Self::UNSEEDED_CURSOR)),
         }

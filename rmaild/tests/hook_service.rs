@@ -463,6 +463,14 @@ async fn the_real_daemon_boot_wires_the_hook_dispatcher_end_to_end() {
     let mut config = Config::default();
     config.index.semantic.enabled = false;
     config.ai.enabled = false;
+    // The production default is 5s, which left this test's fixed 12s budget
+    // room for only two ticks -- on a loaded machine (the full suite in one
+    // container) a `sleep(5s)` overruns far enough that the budget can elapse
+    // having contained only the boot tick, and the test failed for reasons
+    // that had nothing to do with the wiring it exists to prove. Ticking
+    // quickly here decouples "is the dispatcher wired in" from "did the
+    // scheduler hit a 5s deadline on time".
+    config.hooks.tick_interval = HumanDuration::new(Duration::from_millis(50));
     config.hooks.hooks = vec![HookConfig {
         name: "marker".to_owned(),
         event: HookEvent::OnNewMessage,
@@ -471,6 +479,10 @@ async fn the_real_daemon_boot_wires_the_hook_dispatcher_end_to_end() {
         enabled: true,
         timeout: None,
     }];
+
+    // Kept for the failure diagnostics below: `config` itself is moved into
+    // the daemon task.
+    let hooks_cfg = config.hooks.clone();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_socket = socket.clone();
@@ -507,19 +519,80 @@ async fn the_real_daemon_boot_wires_the_hook_dispatcher_end_to_end() {
     // The dispatch loop ticks once immediately on spawn and then every
     // `DEFAULT_TICK_INTERVAL` (5s) after -- poll well past that so an event
     // appended just after the first tick is still caught by the second.
+    // Wait against a wall-clock deadline rather than an iteration count: on a
+    // contended machine a `sleep(100ms)` overruns, so a fixed 120 iterations
+    // is not the 12s it looks like.
+    //
+    // And re-append periodically rather than betting everything on the first
+    // event. `HookDispatcher` deliberately does not retry a hook that failed
+    // to *spawn* -- there is no idempotency key for "ran an operator's shell
+    // command", so one attempt per event is the documented design (see the
+    // `hooks` module docs). That is correct behaviour, but it means a single
+    // `fork`/`exec` losing to memory pressure would fail this test for a
+    // reason that has nothing to do with the wiring it exists to prove. Each
+    // fresh event is a fresh dispatch, so the assertion below is "the daemon
+    // boot dispatches NewMail to hooks", not "one fork succeeded first try".
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut found = false;
-    for _ in 0..120 {
+    let mut appended = 1_u32;
+    let mut next_append = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
         if marker.exists() {
             found = true;
             break;
         }
+        if std::time::Instant::now() >= next_append {
+            events
+                .append(
+                    NewEvent::new(EventKind::NewMail)
+                        .account(1)
+                        .mailbox(1)
+                        .message(1),
+                )
+                .await
+                .unwrap();
+            appended += 1;
+            next_append = std::time::Instant::now() + Duration::from_secs(3);
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    // Diagnostics captured only on failure, to tell the plausible causes apart
+    // rather than guessing: is the event even in the log, and would a
+    // dispatcher built the same way fire on it right now?
+    let diagnosis = if found {
+        String::new()
+    } else {
+        let page = events.since(0, 64).await;
+        let in_log = match &page {
+            Ok(p) => format!("{} event(s) readable from seq 0", p.events.len()),
+            Err(e) => format!("event log unreadable: {e}"),
+        };
+        let probe = rmail_core::hooks::HookDispatcher::new(events.clone(), &hooks_cfg);
+        let probe_marker = marker.exists();
+        let ticked = probe
+            .tick(&tokio_util::sync::CancellationToken::new())
+            .await;
+        let fired = match ticked {
+            // A fresh dispatcher seeds its cursor lazily on this first tick,
+            // so it reports 0 fired even on a healthy log -- what matters is
+            // whether it errored.
+            Ok(r) => format!("probe tick ok (fired={}, capped={})", r.fired, r.capped),
+            Err(e) => format!("probe tick FAILED: {e}"),
+        };
+        format!(
+            " -- diagnostics: {in_log}; marker before probe={probe_marker}; {fired}; \
+             hooks.enabled={}, hook count={}, events appended={appended}",
+            hooks_cfg.enabled,
+            hooks_cfg.hooks.len()
+        )
+    };
+
     assert!(
         found,
         "the real daemon boot must run the configured hook for a synced NewMail event -- if \
          this fails, HookDispatcher::spawn was likely removed from \
-         serve_uds_with_engine_and_mail_store"
+         serve_uds_with_engine_and_mail_store{diagnosis}"
     );
 
     let _ = shutdown_tx.send(());

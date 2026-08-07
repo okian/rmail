@@ -314,6 +314,13 @@ timeout = "5s"
             cfg.hooks.default_timeout.as_duration(),
             Duration::from_secs(10)
         );
+        // Unset above, so this is the documented default rather than a value
+        // the file supplied.
+        assert_eq!(
+            cfg.hooks.tick_interval.as_duration(),
+            crate::hooks::DEFAULT_TICK_INTERVAL,
+            "the hook tick interval must default to the documented 5s"
+        );
         assert_eq!(cfg.hooks.hooks.len(), 2);
 
         let first = &cfg.hooks.hooks[0];

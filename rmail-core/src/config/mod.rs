@@ -1462,6 +1462,14 @@ pub struct HooksConfig {
     /// Default per-hook execution timeout, overridable per hook
     /// (`[[hooks.hooks]] timeout = "..."`).
     pub default_timeout: HumanDuration,
+    /// How often the dispatch loop re-reads the event log.
+    ///
+    /// This is the *upper bound on hook latency*: an event appended just
+    /// after a tick waits nearly a full interval before its hooks fire (see
+    /// the `hooks` module docs on why this polls rather than holding a live
+    /// subscription open). Lowering it trades a query per tick against that
+    /// latency; raising it is reasonable for hooks that only do bookkeeping.
+    pub tick_interval: HumanDuration,
     /// Maximum bytes of stdout/stderr retained per run. Output past this
     /// cap is still drained (never left to back up the pipe, which would
     /// stall the hook and, transitively, the dispatcher — see the `hooks`
@@ -1477,6 +1485,7 @@ impl Default for HooksConfig {
             enabled: true,
             max_concurrency: 4,
             default_timeout: HumanDuration::new(secs(30)),
+            tick_interval: HumanDuration::new(crate::hooks::DEFAULT_TICK_INTERVAL),
             max_output_bytes: 64 * 1024,
             hooks: Vec::new(),
         }
