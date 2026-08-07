@@ -1,0 +1,157 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+import "rmail/v1/mail.proto";
+
+// SearchService is the ranked-retrieval surface described in prd.md Part I:
+// query understanding -> multi-source candidate generation -> fusion ->
+// feature extraction -> L1 ranking -> diversify/present, streamed back
+// best-first. `Search` runs the full cascade (respecting `SearchRequest.mode`
+// and the daemon's configured retrievers); `Semantic` is the dense-only
+// subset prd.md calls out as its own entry point; `Explain` re-derives a
+// specific message's ranking rationale for the identical query without
+// truncating to the L1 top-K, so a message outside the presented page can
+// still be explained.
+//
+// Every RPC here is read-only over the local index — no IMAP round trip, no
+// mutation — so the daemon can answer as fast as SQLite allows.
+service SearchService {
+  // Streams ranked hits best-first as the pipeline produces them. The first
+  // hit is flushed as soon as it has been fully presented, before the rest of
+  // the page has been diversified/snippeted — see `rmaild::search_service`'s
+  // module docs for why that ordering is safe for every intent, not just
+  // navigational.
+  //
+  // A fresh `Search`/`Semantic` call cancels whichever `Search`/`Semantic`
+  // stream is still running (a single shared "current query" slot, the same
+  // shape a TUI's debounced keystroke-driven search box needs) — the older
+  // call's stream simply ends, yielding whatever it had already produced.
+  rpc Search (SearchRequest) returns (stream SearchHit);
+
+  // As `Search`, but candidate generation is restricted to the dense-vector
+  // retriever alone (prd.md: "dense only") regardless of `SearchRequest.mode`
+  // — paraphrase/semantic recall with no lexical/fuzzy/entity contribution.
+  // Participates in the same generation-token cancellation as `Search`.
+  rpc Semantic (SearchRequest) returns (stream SearchHit);
+
+  // Why a specific message ranked where it did for `query` — the full
+  // per-feature contribution breakdown, computed directly from that
+  // candidate's own feature vector rather than truncated to the streamed
+  // page's top-K, so a message the client already knows about (e.g. from a
+  // prior page) can still be explained even if it would not have made this
+  // request's own `limit`/`top_k_rerank` cut.
+  rpc Explain (ExplainRequest) returns (RankExplanation);
+}
+
+// Execution mode: which candidate sources contribute. `MODE_UNSPECIFIED`
+// defers to the daemon's configured `search.default_mode`.
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_LEXICAL = 1;
+  MODE_SEMANTIC = 2;
+  MODE_HYBRID = 3;
+}
+
+// Search intent, as prd.md's Stage 0 classifies it. `INTENT_UNSPECIFIED`
+// lets the query planner classify it from the query text; a client that sets
+// one of the other values overrides that classification (e.g. a `--explore`
+// CLI flag forcing EXPLORATORY to force MMR diversification on).
+enum Intent {
+  INTENT_UNSPECIFIED = 0;
+  INTENT_NAVIGATIONAL = 1;
+  INTENT_EXPLORATORY = 2;
+  INTENT_LOOKUP = 3;
+}
+
+message SearchRequest {
+  // Free text plus inline operators (`from:alice -tag:newsletter "office
+  // move"`) — the same grammar `mail search` accepts at the CLI.
+  string query = 1;
+  // Additional operator-DSL text, space-joined onto `query` before parsing.
+  // Exists so a caller that already keeps `query` and `filter` as separate UI
+  // fields (a search box plus an operator picker) does not have to
+  // string-build one field itself; the grammar has no distinct "filter
+  // language" of its own — a `filter` value is parsed by the identical rules
+  // as free-typed query text.
+  string filter = 2;
+  Mode mode = 3;
+  // Overrides the classified intent; INTENT_UNSPECIFIED lets the planner
+  // decide.
+  Intent intent = 4;
+  // Results to present, after ranking/diversification. 0 = search.default_limit.
+  uint32 limit = 5;
+  // Include a RankExplanation on every SearchHit.
+  bool explain = 6;
+  // Collapse a thread to its best-scoring message (fuse::Fuser::fuse's own
+  // `thread_collapse` argument — a per-request presentation choice, not a
+  // deployment-wide config default).
+  bool thread_collapse = 7;
+  // Restrict to one account; 0 = every configured account.
+  int64 account_id = 8;
+}
+
+// A byte range into a Snippet's `text` — never embedded markup, so every
+// client renders its own highlighting instead of inheriting one renderer's
+// escaping bugs. `end` is exclusive.
+message ByteRange {
+  uint32 start = 1;
+  uint32 end = 2;
+}
+
+message Snippet {
+  string text = 1;
+  repeated ByteRange highlights = 2;
+}
+
+message SearchHit {
+  Message message = 1;
+  // Stage 4's relevance score. Comparable only within this one streamed
+  // response — never across two different queries, rerank passes, or
+  // intents (see rank::RankedCandidate's own doc comment).
+  double score = 2;
+  Snippet snippet = 3;
+  // Which retrievers surfaced this message ("lexical", "dense", "fuzzy",
+  // "entity", "structured", "prefix", "recency").
+  repeated string sources = 4;
+  // Present only when SearchRequest.explain was set.
+  RankExplanation why = 5;
+  optional int64 thread_id = 6;
+  // Sibling messages collapsed into this one by thread_collapse.
+  repeated int64 thread_collapsed = 7;
+  // Sibling messages collapsed as SimHash near-duplicates.
+  repeated int64 near_duplicates = 8;
+}
+
+message FeatureContribution {
+  // FeatureName::as_str()'s stable string — the same key [search.rank_weights]
+  // overrides on, never a positional index.
+  string name = 1;
+  double value = 2;
+  double weight = 3;
+  // weight * value; summing every contribution's weighted_contribution
+  // reproduces RankExplanation.score exactly.
+  double weighted_contribution = 4;
+}
+
+message RankExplanation {
+  repeated FeatureContribution features = 1;
+  // Sum of every FeatureContribution.weighted_contribution — the same score
+  // the L1 ranker actually produced for this candidate under this query's
+  // intent.
+  double score = 2;
+  repeated string sources = 3;
+  // The matched span(s) prd.md's explainability section asks for.
+  Snippet matched = 4;
+  // Set when an L2 Claude rerank ran; always empty until that stage exists.
+  string claude_reason = 5;
+}
+
+message ExplainRequest {
+  string query = 1;
+  string filter = 2;
+  Intent intent = 3;
+  int64 message_id = 4;
+  bool thread_collapse = 5;
+  int64 account_id = 6;
+}
