@@ -19,3 +19,7 @@
 # it was committed and so cannot see a later-added annotation.
 5b818403b31f612f791373c478c9a4515c9b5143:rmail-core/src/ai/redact/tests.rs:generic-api-key:197
 6b71dfd4d80e5916e78da862f8f672673c2f2d83:rmail-core/src/ai/redact/tests.rs:generic-api-key:197
+
+# The revision of this file that quoted the fixture literal (fixed in the
+# next commit; the blob keeps it, so the fingerprint stays).
+5dec4cfee8026929f7c90a19f9e3c4ed9b0ce31b:.gitleaksignore:generic-api-key:11
