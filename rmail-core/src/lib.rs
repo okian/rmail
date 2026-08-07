@@ -20,6 +20,7 @@ pub mod imap;
 pub mod index;
 pub mod mail;
 pub mod message;
+pub mod present;
 pub mod query;
 pub mod rank;
 pub mod repo;
