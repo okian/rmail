@@ -16,7 +16,7 @@
 //! dimension, so it cannot answer the questions this module asks.
 //!
 //! The one thing the ledger could not previously say is *which budget* a call
-//! was charged to, so `V27__ai_budget.sql` adds `ai_ledger.work_class` and
+//! was charged to, so `V25__ai_budget.sql` adds `ai_ledger.work_class` and
 //! [`crate::ai::audit::record_call_charged`] writes it. Attribution lives with
 //! the evidence, not in a side table that could drift from it.
 //!

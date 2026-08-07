@@ -40,7 +40,7 @@
 //!
 //! # `work_class` is attribution, and it lives here for a reason
 //!
-//! `V27__ai_budget.sql` adds `ai_ledger.work_class`, written by
+//! `V25__ai_budget.sql` adds `ai_ledger.work_class`, written by
 //! [`record_call_charged`]. [`crate::ai::budget`] derives every spend figure
 //! it enforces from this table — there is no counter table beside it — and
 //! deriving a *bulk* sub-budget requires knowing which calls were bulk. That
