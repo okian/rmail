@@ -49,7 +49,11 @@ V15 and V17 are permanently unused, which costs nothing. **Next free: V21.**
   container while the host still showed 106 GiB free. After merging a branch:
   `docker volume rm -f $(docker volume ls -q --filter name=^rmail-test-target-)`.
   Keep `rmail-test-cargo-registry`/`-cargo-git` — those are the expensive
-  dependency downloads and are shared.
+  dependency downloads and are shared. Expect the *next* run after a prune to
+  be a cold rebuild, and expect it to be the run most likely to fail: linking
+  several crates at once in a 7.7 GB container OOM-killed `ld` (signal 9)
+  immediately after one such prune. Re-running resumes from the compiled
+  artifacts and succeeds, so a single retry is the fix, not a code change.
 - **Do not union-merge structured code by deduplicating lines.** A script that
   keeps "lines from theirs not already in ours" silently drops repeated closing
   braces and attributes, which are exactly what Rust has a lot of. It happened
