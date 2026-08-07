@@ -331,7 +331,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core present::` (MMR diversity, snippet/highlight, streaming order)
 
 ## 33. SearchService gRPC (streaming) + Explain
-- [ ] status
+- [x] status
 - **depends-on:** 32
 - **parallel-safe:** no
 - **acceptance:**
