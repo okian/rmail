@@ -44,6 +44,16 @@ written as `cargo nextest run …` for readability — translate them. **Never r
 fallback. The script is worktree-aware and keeps a per-worktree target volume, so your
 first run is slow and later ones are incremental.
 
+**Run your targeted verify, not the full workspace suite.** The orchestrator runs the
+full suite on the combined tree after merging you — running it yourself costs 4+ minutes
+warm and 20+ cold, and several agents have stalled waiting on it. Your scope is: your own
+task's `verify` filter, plus any test file you changed.
+
+**Container commands are foreground.** Pass `timeout: 3600000` to the Bash tool and read
+the output when it returns. Do not background them, do not use Monitor, do not poll a
+result file, and never run two containers at once — Docker here has limited memory and a
+second concurrent build is OOM-killed.
+
 `cargo fmt` and `cargo clippy` still run on the host — they are fast and touch nothing
 outside the source tree.
 
