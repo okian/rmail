@@ -222,7 +222,7 @@ impl PassHandler for RecordingHandler {
         &self.pass
     }
 
-    fn build_request(&self, content: &MessageContent) -> Result<ChatRequest, Error> {
+    async fn build_request(&self, content: &MessageContent) -> Result<ChatRequest, Error> {
         Ok(ChatRequest::new("mock-model", 256)
             .system("You are a test fixture.")
             .user(content.body.clone()))
@@ -244,6 +244,53 @@ impl PassHandler for RecordingHandler {
 
 fn triage_handler() -> Arc<RecordingHandler> {
     Arc::new(RecordingHandler::new("triage"))
+}
+
+// ---------------------------------------------------------------------------
+// A `build_request`-failing PassHandler — proves `process_one`'s
+// `ErrorReason`-based classification of a `build_request` failure (see
+// `PassHandler::build_request`'s own docs): `NotFound` terminates, anything
+// else is retried. Nothing before this handler ever exercised either
+// branch — `RecordingHandler::build_request` never fails.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct FailingBuildRequestHandler {
+    pass: String,
+    error: fn() -> Error,
+}
+
+impl FailingBuildRequestHandler {
+    fn new(pass: &str, error: fn() -> Error) -> Self {
+        Self {
+            pass: pass.to_owned(),
+            error,
+        }
+    }
+}
+
+#[async_trait]
+impl PassHandler for FailingBuildRequestHandler {
+    fn pass(&self) -> &str {
+        &self.pass
+    }
+
+    async fn build_request(&self, _content: &MessageContent) -> Result<ChatRequest, Error> {
+        Err((self.error)())
+    }
+
+    async fn on_success(
+        &self,
+        _lease: &AiLease,
+        _text: &str,
+        _ledger_entry_id: i64,
+    ) -> Result<(), Error> {
+        // Never reached: `build_request` always fails first, so the
+        // provider is never called and `on_success` never runs.
+        Err(Error::internal(
+            "FailingBuildRequestHandler::on_success should be unreachable",
+        ))
+    }
 }
 
 fn build_pool(
@@ -754,6 +801,84 @@ async fn policy_forbidden_terminates_without_calling_provider() {
 }
 
 #[tokio::test]
+async fn a_not_found_build_request_error_terminates_the_job_not_retries_it() {
+    let fx = Fixture::open().await;
+    let id = fx.message("body").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(id, fx.account_id, "triage")])
+        .await
+        .unwrap();
+
+    let (provider, handle) = MockProvider::new(Vec::new());
+    let handler = Arc::new(FailingBuildRequestHandler::new("triage", || {
+        Error::not_found("simulated: message vanished before build_request ran")
+    }));
+    let pool = build_pool(
+        &fx,
+        provider,
+        high_rpm_limits(),
+        vec![handler as Arc<dyn PassHandler>],
+    );
+
+    let summary = pool
+        .dispatch_pending(10, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.terminated, 1, "{summary:?}");
+    assert_eq!(summary.retried, 0, "{summary:?}");
+    assert_eq!(
+        handle.call_count(),
+        0,
+        "a build_request failure must never reach the provider"
+    );
+    let stats = fx.queue.stats().await.unwrap();
+    assert_eq!(
+        stats.error, 1,
+        "NotFound must land the job in the terminal `error` state, not backed off"
+    );
+}
+
+#[tokio::test]
+async fn a_transient_build_request_error_is_retried_not_terminated() {
+    let fx = Fixture::open().await;
+    let id = fx.message("body").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(id, fx.account_id, "triage")])
+        .await
+        .unwrap();
+
+    let (provider, handle) = MockProvider::new(Vec::new());
+    let handler = Arc::new(FailingBuildRequestHandler::new("triage", || {
+        Error::unavailable("simulated: transient storage hiccup during build_request")
+    }));
+    let pool = build_pool(
+        &fx,
+        provider,
+        high_rpm_limits(),
+        vec![handler as Arc<dyn PassHandler>],
+    );
+
+    let summary = pool
+        .dispatch_pending(10, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.retried, 1, "{summary:?}");
+    assert_eq!(summary.terminated, 0, "{summary:?}");
+    assert_eq!(
+        handle.call_count(),
+        0,
+        "a build_request failure must never reach the provider"
+    );
+    let stats = fx.queue.stats().await.unwrap();
+    assert_eq!(
+        stats.backing_off, 1,
+        "a non-NotFound build_request failure must be retried, not terminated"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_pending_quarantines_after_provider_failures_and_revive_requeues() {
     let opts = QueueOptions {
         max_attempts: 1,
@@ -1090,6 +1215,94 @@ async fn batch_does_not_flip_below_threshold() {
     assert_eq!(stats.ready, 1, "the job is untouched, still pending live");
 }
 
+// ---------------------------------------------------------------------------
+// `prepare_item`'s `build_request` classification mirrors `worker.rs`'s live
+// path (see `a_not_found_build_request_error_terminates_the_job_not_retries_it`
+// and `a_transient_build_request_error_is_retried_not_terminated` above) —
+// these two are the batch-path counterparts, proving the two dispatch paths
+// actually agree rather than merely reading as though they do.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn batch_prepare_item_terminates_on_a_not_found_build_request_error() {
+    let fx = Fixture::open().await;
+    let id = fx.message("hello, nothing sensitive here").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(id, fx.account_id, "triage")])
+        .await
+        .unwrap();
+
+    let http = MockHttp::queued(vec![]).await;
+    let handler = Arc::new(FailingBuildRequestHandler::new("triage", || {
+        Error::not_found("simulated: message vanished before build_request ran")
+    }));
+    let coord = coordinator(
+        &fx,
+        &http.endpoint,
+        AiBatching {
+            enabled: true,
+            threshold: 1,
+            max_batch: 10,
+        },
+        vec![handler as Arc<dyn PassHandler>],
+    );
+
+    let result = coord.maybe_submit("triage").await.unwrap();
+    assert_eq!(
+        result, None,
+        "a batch with nothing left to submit after prepare_item terminates its one item \
+         submits nothing"
+    );
+    assert!(
+        http.requests().is_empty(),
+        "a NotFound build_request failure must never reach the batch submit endpoint"
+    );
+    let stats = fx.queue.stats().await.unwrap();
+    assert_eq!(
+        stats.error, 1,
+        "NotFound must land the job in the terminal `error` state on the batch path too, \
+         matching worker.rs's live-dispatch classification"
+    );
+}
+
+#[tokio::test]
+async fn batch_prepare_item_backs_off_a_transient_build_request_error_not_terminate() {
+    let fx = Fixture::open().await;
+    let id = fx.message("hello, nothing sensitive here").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(id, fx.account_id, "triage")])
+        .await
+        .unwrap();
+
+    let http = MockHttp::queued(vec![]).await;
+    let handler = Arc::new(FailingBuildRequestHandler::new("triage", || {
+        Error::unavailable("simulated: transient storage hiccup during build_request")
+    }));
+    let coord = coordinator(
+        &fx,
+        &http.endpoint,
+        AiBatching {
+            enabled: true,
+            threshold: 1,
+            max_batch: 10,
+        },
+        vec![handler as Arc<dyn PassHandler>],
+    );
+
+    let result = coord.maybe_submit("triage").await.unwrap();
+    assert_eq!(result, None);
+    assert!(
+        http.requests().is_empty(),
+        "a build_request failure must never reach the batch submit endpoint"
+    );
+    let stats = fx.queue.stats().await.unwrap();
+    assert_eq!(
+        stats.backing_off, 1,
+        "a non-NotFound build_request failure must be retried, not terminated, on the batch \
+         path too"
+    );
+}
+
 #[tokio::test]
 async fn batch_poll_completes_succeeded_and_backs_off_errored_items() {
     let fx = Fixture::open().await;
@@ -1402,7 +1615,7 @@ async fn dispatch_pending_audits_the_redacted_payload_not_the_raw_one() {
     let content = assemble_content(&fx.db, id, &AiPrivacy::default())
         .await
         .unwrap();
-    let raw_request = handler.build_request(&content).unwrap();
+    let raw_request = handler.build_request(&content).await.unwrap();
     let raw_hash = Sha256::digest(payload_bytes(&raw_request)).to_vec();
     let redacted_request = match redact::guard(&raw_request, &AiPrivacy::default()) {
         GuardedRequest::Redacted { request, .. } => request,

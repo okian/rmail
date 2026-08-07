@@ -624,7 +624,16 @@ fn hash(text: &str) -> Vec<u8> {
 /// stage over a header the indexes never see. Part keys go into the hash too,
 /// so a part appearing or disappearing changes it even when the surviving text
 /// does not.
-fn message_hash(parts: &[(String, Vec<u8>)]) -> Vec<u8> {
+///
+/// `pub(crate)`, not private: `ai::deep::feed_index` (task 49) writes a
+/// `Part::Summary` row outside this module's own `store` and must enqueue its
+/// `IndexKind::Lexical`/`IndexKind::Semantic` follow-on jobs with a
+/// `content_hash` in the *same* domain `index_state` already records — the
+/// hash of every part currently stored for the message, not a hash of the
+/// one part that just changed. Reusing this function rather than a second
+/// copy is what keeps a deep-pass-triggered re-index and a routine extract
+/// sweep agreeing on whether a message's indexed content actually changed.
+pub(crate) fn message_hash(parts: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     // Sorted, because the stored set is a set: two runs that leave the same
     // parts in a different row order have left the same content.

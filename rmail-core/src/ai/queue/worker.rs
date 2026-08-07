@@ -52,13 +52,27 @@ pub trait PassHandler: Send + Sync + std::fmt::Debug {
     /// this pool contributes only the redaction, dispatch, and audit that
     /// wrap around whatever request comes back.
     ///
+    /// Async so a handler may consult its own durable state while building
+    /// the request — e.g. [`crate::ai::deep::DeepPassHandler`] reads a
+    /// prior thread summary off `ai_summaries` before it can render the user
+    /// turn. A handler with nothing to look up, like triage's, simply
+    /// returns immediately; nothing about this signature requires a handler
+    /// to actually await anything.
+    ///
     /// # Errors
-    /// Any handler-specific failure building the request (e.g. a schema
-    /// that fails to compile). Treated as non-retryable — the queue calls
-    /// [`AiQueue::terminate`] on a `build_request` error, since a request
-    /// this handler cannot build once is not going to build itself on a
-    /// later attempt with the same content.
-    fn build_request(&self, content: &super::MessageContent) -> Result<ChatRequest, Error>;
+    /// Any handler-specific failure building the request. Classified by
+    /// [`crate::error::ErrorReason`] the same way
+    /// [`super::content::assemble_content`]'s own failures are, two steps
+    /// earlier in [`AiWorkerPool::process_one`]: [`ErrorReason::NotFound`]
+    /// (the message vanished in the same narrow window) is terminated via
+    /// [`AiQueue::terminate`], since a later attempt cannot succeed against
+    /// content that no longer exists; anything else is backed off via
+    /// [`AiQueue::fail`] and retried. A handler with a purely structural
+    /// `build_request` (triage's, which never actually errors) is
+    /// unaffected either way; a handler whose `build_request` also does a
+    /// durable-state lookup (deep's) gets a transient storage hiccup
+    /// retried rather than the job being lost to it permanently.
+    async fn build_request(&self, content: &super::MessageContent) -> Result<ChatRequest, Error>;
 
     /// Persist whatever this pass produces, once the provider call
     /// succeeded, its response has been through [`crate::ai::redact::rehydrate`],
@@ -90,8 +104,10 @@ pub struct DispatchSummary {
     pub retried: u64,
     /// Jobs that failed and were quarantined to `dead`.
     pub dead: u64,
-    /// Jobs terminated as unrecoverable (policy, `redacted_skip`, refusal, a
-    /// handler that could not build a request).
+    /// Jobs terminated as unrecoverable (policy, `redacted_skip`, refusal, or
+    /// a handler's `build_request` failing with [`ErrorReason::NotFound`] —
+    /// see that method's own docs for why only that reason terminates and
+    /// every other `build_request` failure is retried instead).
     pub terminated: u64,
     /// Jobs leased and immediately terminated because `on_cap = "drop"` and
     /// today's/this month's spend cap was reached.
@@ -310,10 +326,18 @@ impl AiWorkerPool {
             Err(e) => return self.fail_outcome(&lease, e.to_string()).await,
         };
 
-        // 3. The handler turns bounded content into a request.
-        let request = match handler.build_request(&content) {
+        // 3. The handler turns bounded content into a request. Classified
+        // the same way step 2 just was, immediately above — see
+        // `PassHandler::build_request`'s own docs for why this method can
+        // now fail transiently (a durable-state lookup, not just a
+        // structural build) and why that must not be lumped in with a
+        // definite "this content can never produce a request."
+        let request = match handler.build_request(&content).await {
             Ok(request) => request,
-            Err(e) => return self.terminate_outcome(&lease, e.to_string()).await,
+            Err(e) if e.reason() == ErrorReason::NotFound => {
+                return self.terminate_outcome(&lease, e.to_string()).await
+            }
+            Err(e) => return self.fail_outcome(&lease, e.to_string()).await,
         };
 
         // 4. Redact — mandatory, unconditional.

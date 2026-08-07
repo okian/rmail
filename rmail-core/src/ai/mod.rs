@@ -40,6 +40,7 @@
 //! from wiring in, not a redesign.
 
 pub mod audit;
+pub mod deep;
 pub mod policy;
 pub mod provider;
 pub mod queue;
@@ -50,6 +51,7 @@ pub use audit::{
     estimate_cost_usd, query_calls, record_call, record_call_priced, usage_for_day, AuditFilter,
     CallOutcome, CallRecord, CallStatus, DayUsage, LedgerEntry,
 };
+pub use deep::{DeepPassGate, DeepPassHandler};
 pub use provider::{
     build, ChatMessage, ChatRequest, ChatResponse, ClaudeProvider, OutputFormat, Provider,
     ProviderStream, Role, StopReason, StreamFrame, Usage,

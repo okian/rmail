@@ -87,8 +87,9 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 
+use crate::ai::deep::DeepPassGate;
 use crate::ai::provider::{ChatRequest, OutputFormat};
-use crate::ai::queue::{AiLease, MessageContent, PassHandler};
+use crate::ai::queue::{AiLease, MessageContent, NewAiJob, PassHandler};
 use crate::error::Error;
 use crate::storage::Database;
 
@@ -118,7 +119,12 @@ const CATEGORIES: [&str; 8] = [
     "other",
 ];
 
-const PRIORITIES: [&str; 4] = ["low", "normal", "high", "critical"];
+/// `pub(crate)`, not private: [`crate::ai::deep`]'s own priority-threshold
+/// gating (`DeepPassGate`/`priority_at_least`) ranks a triage verdict's
+/// `priority` field against an operator-configured threshold, and must rank
+/// it against exactly this vocabulary — a second, hand-maintained copy would
+/// silently drift the moment this one gains or renames a value.
+pub(crate) const PRIORITIES: [&str; 4] = ["low", "normal", "high", "critical"];
 
 const SENTIMENTS: [&str; 4] = ["positive", "neutral", "negative", "urgent"];
 
@@ -172,6 +178,13 @@ pub struct TriagePassHandler {
     db: Database,
     model: String,
     max_tokens: u32,
+    /// Enqueues a deep pass once a triage verdict this handler just wrote
+    /// qualifies under `ai.deep_pass`'s thresholds — see
+    /// [`crate::ai::deep::DeepPassGate`]. `None` when no gate was
+    /// configured (every call site before task 49, and any test that only
+    /// cares about the triage verdict itself): `on_success` simply skips
+    /// the check, exactly as if this field did not exist.
+    deep_gate: Option<DeepPassGate>,
 }
 
 impl TriagePassHandler {
@@ -183,6 +196,7 @@ impl TriagePassHandler {
             db,
             model: model.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            deep_gate: None,
         }
     }
 
@@ -193,6 +207,20 @@ impl TriagePassHandler {
         self.max_tokens = max_tokens;
         self
     }
+
+    /// Wire this handler to enqueue a deep pass whenever a triage verdict
+    /// it just wrote qualifies under `gate`'s configured thresholds — what
+    /// the daemon dispatch loop must call once it registers both this
+    /// handler and [`crate::ai::deep::DeepPassHandler`] with the same
+    /// [`crate::ai::queue::AiWorkerPool`]. Triage itself needs to know
+    /// nothing about the deep pass beyond "call this when done" — see
+    /// [`crate::ai::deep`]'s module docs for why gating lives there, not
+    /// here.
+    #[must_use]
+    pub fn with_deep_pass_gate(mut self, gate: DeepPassGate) -> Self {
+        self.deep_gate = Some(gate);
+        self
+    }
 }
 
 #[async_trait]
@@ -201,7 +229,7 @@ impl PassHandler for TriagePassHandler {
         PASS
     }
 
-    fn build_request(&self, content: &MessageContent) -> Result<ChatRequest, Error> {
+    async fn build_request(&self, content: &MessageContent) -> Result<ChatRequest, Error> {
         Ok(ChatRequest::new(self.model.clone(), self.max_tokens)
             .system(SYSTEM_PROMPT)
             .user(render_user_message(content))
@@ -210,7 +238,7 @@ impl PassHandler for TriagePassHandler {
 
     #[tracing::instrument(
         skip(self, lease, text),
-        fields(message_id = lease.message_id, category, priority, needs_reply)
+        fields(message_id = lease.message_id, category, priority, needs_reply, deep_queued)
     )]
     async fn on_success(
         &self,
@@ -224,15 +252,17 @@ impl PassHandler for TriagePassHandler {
         span.record("priority", tracing::field::display(&result.priority));
         span.record("needs_reply", result.needs_reply);
         let thread_id = thread_id_for(&self.db, lease.message_id).await?;
-        write_summary(
+        let deep_queued = write_summary(
             &self.db,
             lease,
             thread_id,
             &self.model,
             &result,
             ledger_entry_id,
+            self.deep_gate.as_ref(),
         )
         .await?;
+        span.record("deep_queued", deep_queued);
         tracing::debug!("triage verdict written");
         Ok(())
     }
@@ -377,6 +407,28 @@ async fn thread_id_for(db: &Database, message_id: i64) -> Result<Option<i64>, Er
 /// regardless of outcome). `ai_fts` is kept in sync by the migration's own
 /// triggers, not by this function — see V21's module comment for why that
 /// is a trigger's job rather than application code's.
+///
+/// # Atomic with the deep-pass gate
+///
+/// When `deep_gate` is `Some` and `result`'s fields qualify (see
+/// [`DeepPassGate::qualifies`]), the resulting `ai_queue` row for the deep
+/// pass is inserted (via [`crate::ai::queue::enqueue_one`]) in the *same*
+/// write transaction as this triage row, not as a separate step afterward.
+/// This is deliberate: an earlier version of this function wrote the triage
+/// row, then made a best-effort, log-and-continue call to enqueue the deep
+/// job as a second, independently-failable step. That trades one problem
+/// for a worse one — a transient failure in the *enqueue* (not the
+/// already-successful triage write) would silently and *permanently* lose a
+/// message's deep pass, since nothing re-evaluates a `done` triage job and
+/// [`crate::ai::queue::AiQueue::enqueue`]'s own dedup on `(message_id,
+/// pass)` means a later retry attempt would not even try again. Folding
+/// both writes into one transaction removes that failure mode entirely
+/// rather than shrinking its window: either both rows land, or (on any
+/// error) neither does and the whole triage call is retried from scratch,
+/// which will re-evaluate the gate identically next time.
+///
+/// Returns whether a deep pass was queued, for [`TriagePassHandler::on_success`]
+/// to record on its own tracing span.
 async fn write_summary(
     db: &Database,
     lease: &AiLease,
@@ -384,7 +436,8 @@ async fn write_summary(
     model: &str,
     result: &TriageResult,
     ledger_entry_id: i64,
-) -> Result<(), Error> {
+    deep_gate: Option<&DeepPassGate>,
+) -> Result<bool, Error> {
     let message_id = lease.message_id;
     let account_id = lease.account_id;
     let model = model.to_owned();
@@ -400,46 +453,56 @@ async fn write_summary(
     let priority = result.priority.clone();
     let sentiment = result.sentiment.clone();
     let needs_reply = result.needs_reply;
-    db.write(move |conn| {
-        conn.execute(
-            "INSERT INTO ai_summaries (
-                 message_id, account_id, thread_id, model, pass, schema_version,
-                 tl_dr, sentiment, category, priority, needs_reply, suggested_tags,
-                 ledger_entry_id, created_at
-             ) VALUES (
-                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, unixepoch()
-             )
-             ON CONFLICT(message_id, pass, model) DO UPDATE SET
-                 account_id = excluded.account_id,
-                 thread_id = excluded.thread_id,
-                 schema_version = excluded.schema_version,
-                 tl_dr = excluded.tl_dr,
-                 sentiment = excluded.sentiment,
-                 category = excluded.category,
-                 priority = excluded.priority,
-                 needs_reply = excluded.needs_reply,
-                 suggested_tags = excluded.suggested_tags,
-                 ledger_entry_id = excluded.ledger_entry_id,
-                 created_at = excluded.created_at",
-            rusqlite::params![
-                message_id,
-                account_id,
-                thread_id,
-                model,
-                PASS,
-                SCHEMA_VERSION,
-                tl_dr,
-                sentiment,
-                category,
-                priority,
-                needs_reply,
-                suggested_tags,
-                ledger_entry_id,
-            ],
-        )
-    })
-    .await?;
-    Ok(())
+    let deep_job = deep_gate
+        .filter(|gate| gate.qualifies(&result.priority, result.needs_reply, &result.category))
+        .map(|_| NewAiJob::new(message_id, account_id, crate::ai::deep::PASS));
+    Ok(db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO ai_summaries (
+                     message_id, account_id, thread_id, model, pass, schema_version,
+                     tl_dr, sentiment, category, priority, needs_reply, suggested_tags,
+                     ledger_entry_id, created_at
+                 ) VALUES (
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, unixepoch()
+                 )
+                 ON CONFLICT(message_id, pass, model) DO UPDATE SET
+                     account_id = excluded.account_id,
+                     thread_id = excluded.thread_id,
+                     schema_version = excluded.schema_version,
+                     tl_dr = excluded.tl_dr,
+                     sentiment = excluded.sentiment,
+                     category = excluded.category,
+                     priority = excluded.priority,
+                     needs_reply = excluded.needs_reply,
+                     suggested_tags = excluded.suggested_tags,
+                     ledger_entry_id = excluded.ledger_entry_id,
+                     created_at = excluded.created_at",
+                rusqlite::params![
+                    message_id,
+                    account_id,
+                    thread_id,
+                    model,
+                    PASS,
+                    SCHEMA_VERSION,
+                    tl_dr,
+                    sentiment,
+                    category,
+                    priority,
+                    needs_reply,
+                    suggested_tags,
+                    ledger_entry_id,
+                ],
+            )?;
+            let queued = match &deep_job {
+                Some(job) => crate::ai::queue::enqueue_one(&tx, job)?,
+                None => false,
+            };
+            tx.commit()?;
+            Ok(queued)
+        })
+        .await?)
 }
 
 #[cfg(test)]

@@ -904,7 +904,22 @@ impl BatchCoordinator {
             }
             Err(e) => return Err(e),
         };
-        let request = handler.build_request(&content)?;
+        // Classified the same way as `assemble_content`'s own failures
+        // immediately above, and the same way `worker.rs`'s live path now
+        // classifies this identical call (see `PassHandler::build_request`'s
+        // own docs) — a message deleted between lease and here is terminal,
+        // anything else (a handler's own durable-state lookup hitting a
+        // transient storage error, for a handler like the deep pass's that
+        // has one) propagates for this function's caller to back off and
+        // retry via its own catch-all `fail`.
+        let request = match handler.build_request(&content).await {
+            Ok(request) => request,
+            Err(e) if e.reason() == ErrorReason::NotFound => {
+                self.queue.terminate(lease, &e.to_string()).await?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         match redact::guard(&request, &self.privacy) {
             GuardedRequest::RedactedSkip => {
                 self.queue.terminate(lease, "redacted_skip").await?;

@@ -472,7 +472,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core ai::triage` (schema-valid output, ai_fts populated, `ai:needs-reply` filter)
 
 ## 49. Deep pass + thread-aware summary
-- [ ] status
+- [x] status
 - **depends-on:** 48
 - **parallel-safe:** no
 - **acceptance:**
@@ -487,6 +487,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - `AiService.GetSummary`, `AnalyzeMessage(stream)`, `StreamEnrichments(stream, resume-by-message_id)`, `SuggestReply`, `GetUsage`, `SetPaused`; token-streaming RPCs abort upstream on cancel.
   - `mail ai status|process|summary|reply|retry|pause|resume|cost` verbs.
+  - **Per-thread deep-pass serialization — carried over from task 49.** `build_request` reads a thread's prior rollup *before* the concurrency semaphore and before the provider call, so two messages of the same thread leased in one dispatch cycle both read the same prior state and the last writer overwrites the other's contribution to `ai_summaries.thread_summary`. No content is lost from the mailbox (each row keeps its own `summary`), only from the rollup. It cannot be fixed inside the handler — a process-local lock would not bind a second daemon or worker pool — so the queue must serialize dispatch per thread, e.g. capping concurrent `"deep"` leases to one per thread per cycle. This bites hardest on the batch path, which is exactly where a thread most often has several messages queued at once (backlog, initial sync).
   - **Daemon dispatch loop — carried over from task 48.** Task 48 built the triage `PassHandler` and task 47 the queue, but *nothing enqueues a triage job when a message syncs*: the PRD's "every newly synced message runs one Haiku call" has no wiring. This task owns it — subscribe the daemon to the sync event bus (`rmail-core/src/events/`), enqueue via `AiQueue::enqueue`, and run `AiWorkerPool::dispatch_pending` / `BatchCoordinator::maybe_submit`+`poll` on a schedule. Without this the whole AI pipeline is inert in production however green its unit tests are, so cover it with a test that syncs a message and asserts a job appears.
 - **verify:** `cargo nextest run -p rmaild ai_service` (cached get, force analyze stream, enrichment resume)
 

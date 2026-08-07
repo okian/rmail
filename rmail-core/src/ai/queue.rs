@@ -1022,7 +1022,16 @@ impl AiQueue {
 
 /// Queue one job unless `(message_id, pass)` is already present in any
 /// state. Returns whether it was queued.
-fn enqueue_one(conn: &Connection, job: &NewAiJob) -> rusqlite::Result<bool> {
+///
+/// `pub(crate)`, not private: `ai::triage::write_summary` (task 49) calls
+/// this directly, inside the very transaction that persists a triage
+/// verdict, to enqueue a qualifying deep pass atomically with that write —
+/// see that function's own docs for why "durable verdict" and "a qualifying
+/// verdict earns a deep job" must not be two separately-failable steps. That
+/// caller does not go through [`AiQueue::enqueue`] because it does not have
+/// (and must not need) an `AiQueue` handle to run inside someone else's
+/// transaction.
+pub(crate) fn enqueue_one(conn: &Connection, job: &NewAiJob) -> rusqlite::Result<bool> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
         [job.message_id],

@@ -456,7 +456,7 @@ async fn build_request_uses_the_configured_model_and_a_json_schema_output_format
         attachments_included: false,
     };
 
-    let request = h.build_request(&content).unwrap();
+    let request = h.build_request(&content).await.unwrap();
 
     assert_eq!(request.model, "claude-haiku-4-5");
     assert_eq!(request.messages.len(), 1);
@@ -504,7 +504,7 @@ async fn build_request_notes_a_truncated_body_and_honors_a_custom_token_ceiling(
         attachments_included: false,
     };
 
-    let request = h.build_request(&content).unwrap();
+    let request = h.build_request(&content).await.unwrap();
 
     assert_eq!(
         request.max_tokens, 256,
