@@ -584,7 +584,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core compose::mime` · `cargo nextest run -p rmaild compose_service`
 
 ## 61. Scheduled send & durable outbox (III-5)
-- [ ] status
+- [x] status
 - **depends-on:** 60, 7
 - **parallel-safe:** no
 - **acceptance:**

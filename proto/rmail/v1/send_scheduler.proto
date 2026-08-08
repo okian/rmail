@@ -1,0 +1,349 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// SendSchedulerService owns everything between "this message is finished" and
+// "this message has been delivered" (prd.md, "III-5. Send Later / Scheduled
+// Send"; task 61): the durable outbox, undo-send, scheduled send, retries, and
+// follow-up reminders.
+//
+// prd.md's own proto sketch names it `SendScheduler`. The `Service` suffix is
+// added here because every other service in this package carries one and
+// `buf lint`'s STANDARD ruleset requires it; nothing else about the shape
+// differs.
+//
+// Its relationship to ComposeService is one-way. ComposeService owns drafts —
+// the editable source — and renders them; this service takes those exact
+// octets, freezes them as `OutboxEntry.raw_mime`, and transmits them
+// unmodified. Nothing here re-renders a message, and nothing in
+// ComposeService transmits one.
+//
+// Two properties are worth reading the outbox's own docs for, because they
+// shape every RPC below:
+//
+//   * Delivery is at-most-once. The Message-ID is committed to the database
+//     before the SMTP DATA command, so a process that dies mid-transmission
+//     leaves proof that a copy may already be on the wire; recovery treats
+//     that as sent rather than delivering a second one.
+//   * A send is never silently dropped. A message that came due while rmail
+//     was not running still goes out, flagged `sent_late` if it was more than
+//     `send.late_tolerance` overdue.
+service SendSchedulerService {
+  // Schedule a message, or send one now.
+  //
+  // "Now" is not a special case: an immediate send is scheduled at
+  // `now + undo_window`, which is what makes undo a cancel rather than a
+  // recall. A send with `origin = "ai"` always gets such a window, whatever
+  // the request or the configuration asks for — see ScheduleSendRequest.
+  rpc ScheduleSend(ScheduleSendRequest) returns (OutboxEntry);
+
+  // Cancel a scheduled send (this is what undo does).
+  //
+  // Transactional against the sender: once the message has been claimed for
+  // transmission this returns ALREADY_EXISTS rather than racing it. Cancelling
+  // an already-cancelled entry succeeds and returns it unchanged.
+  rpc CancelScheduled(CancelRequest) returns (OutboxEntry);
+
+  // Move a scheduled send to a different time.
+  rpc RescheduleSend(RescheduleRequest) returns (OutboxEntry);
+
+  // Replace a scheduled message's body and re-render it.
+  //
+  // Only entries scheduled from a draft can be edited: the stored octets are
+  // frozen, and rebuilding a message from the outbox row alone would silently
+  // drop attachments and any HTML alternative. Anything else returns
+  // FAILED_PRECONDITION — cancel it and compose again.
+  rpc UpdateScheduledBody(UpdateBodyRequest) returns (OutboxEntry);
+
+  // Make a scheduled send due immediately, cancelling any undo window.
+  rpc SendNow(IdRequest) returns (OutboxEntry);
+
+  // Return a failed send to the queue with a fresh attempt budget. The
+  // scheduler never does this on its own — a permanently-rejected message
+  // retried forever is just a slower way of not telling the user.
+  rpc RetryFailed(IdRequest) returns (OutboxEntry);
+
+  // List the outbox, newest first.
+  rpc ListOutbox(ListOutboxRequest) returns (ListOutboxResponse);
+
+  // Stream every state transition as it happens.
+  //
+  // Not resumable: there is no cursor and no backlog, only a live tail from
+  // the moment the call is made (the same contract NoteService.WatchNotes
+  // gives, and for the same reason — the durable record is the outbox table,
+  // which a reconnecting client re-reads with ListOutbox). Durable send
+  // outcomes are also appended to the event log as SEND_RESULT, which
+  // MailService.WatchEvents replays.
+  rpc WatchOutbox(WatchOutboxRequest) returns (stream OutboxEvent);
+
+  // Propose a send time inside the configured business-hours guardrails.
+  //
+  // Side-effect free by design: it proposes, and the caller schedules. This
+  // build's suggestion is deterministic — the next moment inside
+  // `[send.optimal] earliest`..`latest` in the requested zone. Model-chosen
+  // times (recipient history, reply-rate learning, a rationale and
+  // alternatives) narrow the same window rather than replacing it, so a
+  // suggestion is inside the guardrails whether or not a model produced it.
+  rpc SuggestSendTime(SuggestSendTimeRequest) returns (SuggestSendTimeResponse);
+
+  // Arm a reminder: "nudge me if nobody replies to this".
+  rpc CreateFollowup(CreateFollowupRequest) returns (Followup);
+
+  // List reminders.
+  rpc ListFollowups(ListFollowupsRequest) returns (ListFollowupsResponse);
+
+  // Dismiss a reminder. Idempotent.
+  rpc DismissFollowup(IdRequest) returns (Followup);
+}
+
+// Where an outbox entry stands.
+enum OutboxState {
+  OUTBOX_STATE_UNSPECIFIED = 0;
+  // Waiting for its send_at, or backing off after a transient failure.
+  OUTBOX_STATE_SCHEDULED = 1;
+  // Leased by a worker that is transmitting it.
+  OUTBOX_STATE_SENDING = 2;
+  // Delivered — or, on the at-most-once recovery path, assumed delivered.
+  // `last_error` says which.
+  OUTBOX_STATE_SENT = 3;
+  // Permanently rejected, or out of retries.
+  OUTBOX_STATE_FAILED = 4;
+  // Cancelled before it was claimed.
+  OUTBOX_STATE_CANCELED = 5;
+  // The SMTP session died without a reply, so whether the peer queued the
+  // message is unknown. Neither sent nor failed: retrying may deliver a
+  // second copy, and reporting it sent would claim a delivery that may not
+  // have happened. Needs a human.
+  OUTBOX_STATE_UNCERTAIN = 6;
+}
+
+// Who asked for a message to be sent.
+enum SendOrigin {
+  SEND_ORIGIN_UNSPECIFIED = 0;
+  // A human.
+  SEND_ORIGIN_USER = 1;
+  // Claude, through MCP. Always given an interception window.
+  SEND_ORIGIN_AI = 2;
+  // Raised by the follow-up tracker.
+  SEND_ORIGIN_FOLLOWUP = 3;
+  // The undo-window leg of an immediate send.
+  SEND_ORIGIN_UNDO = 4;
+}
+
+// Where a follow-up reminder stands.
+enum FollowupState {
+  FOLLOWUP_STATE_UNSPECIFIED = 0;
+  // Waiting for its remind_at.
+  FOLLOWUP_STATE_ARMED = 1;
+  // Due and raised.
+  FOLLOWUP_STATE_FIRED = 2;
+  // Cancelled by the user, or automatically because a reply arrived.
+  FOLLOWUP_STATE_DISMISSED = 3;
+}
+
+// One message in the outbox.
+//
+// The rendered octets are deliberately not carried here: an entry is listed
+// and watched far more often than it is inspected, and a listing that dragged
+// every message's full MIME along would be megabytes per page.
+message OutboxEntry {
+  int64 id = 1;
+  int64 account_id = 2;
+  // The draft this was rendered from, if it still exists. Its presence is what
+  // makes UpdateScheduledBody possible.
+  optional int64 draft_id = 3;
+  // The From addr-spec.
+  string from_addr = 4;
+  repeated string to = 5;
+  repeated string cc = 6;
+  // Blind recipients. They reach the SMTP envelope as RCPT TO commands and
+  // never appear as a header in the message — which is why the copy filed in
+  // IMAP Sent needs no stripping pass.
+  repeated string bcc = 7;
+  string subject = 8;
+  // A short plain-text excerpt, for listings.
+  string body_preview = 9;
+  // The parent's Message-ID, bare, if this is a reply.
+  optional string in_reply_to = 10;
+  optional int64 thread_id = 11;
+  // The absolute instant this goes out, unix seconds. Frozen when the message
+  // was scheduled — never re-derived from `tz` and a wall-clock time, which is
+  // how a message scheduled across a DST boundary goes out an hour wrong.
+  int64 send_at = 12;
+  // The IANA zone it was scheduled in. Display only.
+  string tz = 13;
+  OutboxState state = 14;
+  SendOrigin origin = 15;
+  int64 attempts = 16;
+  int64 max_retries = 17;
+  // When a backed-off entry becomes eligible again, unix seconds.
+  optional int64 next_attempt_at = 18;
+  // The last failure, verbatim.
+  optional string last_error = 19;
+  // The Message-ID committed before DATA. Present once transmission has been
+  // attempted; it is the at-most-once fence.
+  optional string smtp_message_id = 20;
+  optional int64 sent_at = 21;
+  // True when the message went out more than `send.late_tolerance` past its
+  // send_at because rmail was not running. It still went out.
+  bool sent_late = 22;
+  // Until when an undo is offered, unix seconds. Absent for a genuine future
+  // schedule, which is cancelable right up to its lease anyway.
+  optional int64 undo_deadline = 23;
+  int64 created_at = 24;
+  int64 updated_at = 25;
+}
+
+message ScheduleSendRequest {
+  int64 account_id = 1;
+  // Send an existing draft. When set, the recipient/subject/body fields below
+  // are ignored — the draft is the message.
+  optional int64 draft_id = 2;
+  // Inline recipients, for a send that never needed a stored draft. Ignored
+  // when draft_id is set.
+  repeated string to = 3;
+  repeated string cc = 4;
+  repeated string bcc = 5;
+  optional string subject = 6;
+  optional string body = 7;
+  // The parent's Message-ID, bare, for a reply composed inline.
+  optional string in_reply_to = 8;
+
+  // The absolute instant to send at, unix seconds. Absent (and with no
+  // send_at_nl) means "now", which is really "now + undo_window".
+  optional int64 send_at = 9;
+  // A time expression resolved server-side against `tz`: an RFC 3339 instant,
+  // "tomorrow 9am", "next monday 8:30am", "in 30m". Deterministic — an
+  // expression the grammar does not cover is INVALID_ARGUMENT rather than a
+  // guess. Ignored when send_at is set.
+  optional string send_at_nl = 10;
+  // Ask SuggestSendTime for the instant instead of naming one.
+  optional bool optimal = 11;
+  // IANA zone bare wall-clock expressions are read in. Empty uses
+  // `send.default_timezone`.
+  string tz = 12;
+  // Lengthen the undo window for this send, in seconds. It can only lengthen:
+  // an AI-originated send has a floor that neither this field nor
+  // `send.ai_requires_confirmation` can go below.
+  optional int64 undo_window_secs = 13;
+  // Who is asking. Defaults to the user. MCP passes SEND_ORIGIN_AI, which is
+  // what earns the mandatory interception window.
+  SendOrigin origin = 14;
+}
+
+message CancelRequest {
+  // The entry to cancel. Absent means "the most recent one that still can
+  // be" — what a bare `mail undo` does.
+  optional int64 id = 1;
+  // Scope a bare cancel to one account.
+  optional int64 account_id = 2;
+}
+
+message RescheduleRequest {
+  int64 id = 1;
+  // The new absolute instant, unix seconds.
+  optional int64 send_at = 2;
+  // Or a time expression, resolved as in ScheduleSendRequest.
+  optional string send_at_nl = 3;
+  string tz = 4;
+}
+
+message UpdateBodyRequest {
+  int64 id = 1;
+  string body = 2;
+}
+
+message IdRequest {
+  int64 id = 1;
+}
+
+message ListOutboxRequest {
+  optional int64 account_id = 1;
+  // Filter by state. UNSPECIFIED means every state.
+  OutboxState state = 2;
+  // 0 uses the server default (50); the server caps this at 500 rather than
+  // rejecting a larger value, matching prd.md's pagination rule.
+  int32 page_size = 3;
+}
+
+message ListOutboxResponse {
+  repeated OutboxEntry entries = 1;
+}
+
+message WatchOutboxRequest {
+  // Only stream transitions for this account.
+  optional int64 account_id = 1;
+}
+
+// One state transition.
+message OutboxEvent {
+  // The entry as it now stands. A whole entry rather than a delta, so a
+  // client never has to re-derive the state machine to know where a message
+  // is.
+  OutboxEntry entry = 1;
+}
+
+message SuggestSendTimeRequest {
+  int64 account_id = 1;
+  // IANA zone to suggest in. Empty uses `send.default_timezone`.
+  string tz = 2;
+  // Never suggest a time before this instant, unix seconds. Absent means now.
+  optional int64 not_before = 3;
+}
+
+message SuggestSendTimeResponse {
+  // The suggested instant, unix seconds.
+  int64 send_at = 1;
+  // The zone it was computed in.
+  string tz = 2;
+  // The instant rendered in `tz`, RFC 3339 — the string prd.md's time picker
+  // echoes back so a user confirms an instant rather than an expression.
+  string display = 3;
+  // Why this time, in one line.
+  string rationale = 4;
+}
+
+// A follow-up reminder.
+message Followup {
+  int64 id = 1;
+  int64 account_id = 2;
+  optional int64 thread_id = 3;
+  // The RFC 5322 Message-ID being followed up, bare.
+  string message_id = 4;
+  // When to nudge, unix seconds.
+  int64 remind_at = 5;
+  string tz = 6;
+  // Whether a detected reply dismisses it.
+  bool cancel_on_reply = 7;
+  FollowupState state = 8;
+  optional string note = 9;
+  int64 created_at = 10;
+}
+
+message CreateFollowupRequest {
+  int64 account_id = 1;
+  // The Message-ID to follow up. Angle brackets are stripped.
+  string message_id = 2;
+  optional int64 thread_id = 3;
+  // When to nudge, unix seconds.
+  optional int64 remind_at = 4;
+  // Or a time expression ("3d", "next monday"), resolved as in
+  // ScheduleSendRequest. Absent along with remind_at uses
+  // `send.followup.default_delay`.
+  optional string remind_in = 5;
+  string tz = 6;
+  optional string note = 7;
+  // Absent uses `send.followup.cancel_on_reply`.
+  optional bool cancel_on_reply = 8;
+}
+
+message ListFollowupsRequest {
+  optional int64 account_id = 1;
+  // Filter by state. UNSPECIFIED means every state.
+  FollowupState state = 2;
+  int32 page_size = 3;
+}
+
+message ListFollowupsResponse {
+  repeated Followup followups = 1;
+}

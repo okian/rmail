@@ -16,28 +16,21 @@
 //!
 //! # Extending this table
 //!
-//! Add one `(method, Requirement)` row per new RPC below. `OutboxService/Send`
-//! is still **provisional** — despite sitting in the `MailService` section
-//! below, next to `Send`'s acceptance case, no `OutboxService` proto exists
-//! yet (not yet assigned to a task), so its row exists only to prove the
-//! table's *mechanism* — including the acceptance case that a
-//! `mail.read`-only token is physically denied a send/delete-shaped call —
-//! against a shape close to what it will actually need. When a real service
-//! lands, treat its rows as a starting point to confirm against the real
-//! proto, not as settled fact: rename/add/remove rather than assuming these
-//! are exactly right.
+//! Add one `(method, Requirement)` row per new RPC below. A row may be
+//! written *ahead* of the service it governs, so a task can land its RPCs
+//! into a table that already expects them — but a provisional row is a guess,
+//! and when the real service lands it is a starting point to confirm against
+//! the real proto rather than settled fact: rename/add/remove rather than
+//! assuming it was right.
 //!
-//! The `MailService` rows below were provisional the same way until task 39
-//! landed the real `proto/rmail/v1/mail.proto`; they turned out to need no
-//! changes — every RPC the real service exposes (`List`, `Get`, `GetThread`,
-//! `Move`, `Copy`, `SetFlags`, `Delete`, `GetAttachment`, `WatchEvents`) is
-//! named here with the scope its handler actually needs. The `AiService` rows
-//! were provisional the same way until task 50 landed the real
-//! `proto/rmail/v1/ai.proto`; unlike `MailService`, they *did* need to change
-//! — the provisional `Summarize`/`AskMailbox` guesses matched neither the real
-//! service's RPC names nor, in `AskMailbox`'s case, this service at all (that
-//! one belongs to task 52) — see the `AiService` section below for the real
-//! six rows and their scope justifications.
+//! Three rounds of that have now happened. The `MailService` rows were
+//! provisional until task 39 landed `proto/rmail/v1/mail.proto` and turned
+//! out to need no changes. The `AiService` rows were provisional until task
+//! 50 and *did* need changing — the guessed `Summarize`/`AskMailbox` matched
+//! neither the real RPC names nor, for `AskMailbox`, this service at all. The
+//! provisional `OutboxService/Send` row was replaced wholesale by task 61's
+//! `SendSchedulerService` section: the real service is named differently and has no
+//! method called `Send`, so that row could never have matched anything.
 use rmail_core::auth::Scope;
 
 /// What a method needs from the caller.
@@ -292,14 +285,86 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SearchService/Evaluate",
         Requirement::Scope(Scope::MailRead),
     ),
-    // -- OutboxService (provisional; no task owns it yet) ---------------------
-    // Still a forward declaration, unlike the `MailService` rows above it:
-    // no `OutboxService` proto exists. Kept here (rather than filed with
-    // `AiService` below) because it is part of the same acceptance case —
-    // a `mail.read`-only token must be denied a send, not just a delete.
+    // -- SendSchedulerService (task 61) ----------------------------------------------
+    // Replaces the provisional `OutboxService/Send` row this table carried
+    // until task 61 landed the real `proto/rmail/v1/send_scheduler.proto` —
+    // per this table's own "confirm against the real proto... rename/add/
+    // remove" note above. The real service is named `SendScheduler` (prd.md
+    // III-5's proto sketch) and has no method called `Send`, so the old row
+    // could never have matched anything; the acceptance case it existed for
+    // (a `mail.read`-only token is physically denied a send) now runs against
+    // `ScheduleSend` below.
+    //
+    // Anything that can put octets on the wire — now or later — is
+    // `mail.send`. `ScheduleSend` is the obvious one; `SendNow` and
+    // `RescheduleSend` are the same capability with a delay attached, and
+    // `RetryFailed` re-arms a message the server already refused once.
+    // `UpdateScheduledBody` changes *what* will be transmitted, which is the
+    // send capability in the only sense that matters to a recipient.
     (
-        "/rmail.v1.OutboxService/Send",
+        "/rmail.v1.SendSchedulerService/ScheduleSend",
         Requirement::Scope(Scope::MailSend),
+    ),
+    (
+        "/rmail.v1.SendSchedulerService/RescheduleSend",
+        Requirement::Scope(Scope::MailSend),
+    ),
+    (
+        "/rmail.v1.SendSchedulerService/UpdateScheduledBody",
+        Requirement::Scope(Scope::MailSend),
+    ),
+    (
+        "/rmail.v1.SendSchedulerService/SendNow",
+        Requirement::Scope(Scope::MailSend),
+    ),
+    (
+        "/rmail.v1.SendSchedulerService/RetryFailed",
+        Requirement::Scope(Scope::MailSend),
+    ),
+    // `CancelScheduled` is the deliberate exception, at `mail.write`. It is
+    // the only RPC here that can *stop* a transmission, and it is the
+    // mechanism prd.md gives a human for intercepting an AI-originated send
+    // ("always subject to the undo window so a human can intercept"). Scoping
+    // it to `mail.send` would mean the only tokens able to intervene are
+    // exactly the ones already able to send — the intervention would be
+    // available to everyone except the operator who minted a deliberately
+    // send-less token. Granting cancel to a non-sending token is strictly
+    // risk-reducing: the worst a caller can do with it is prevent mail.
+    (
+        "/rmail.v1.SendSchedulerService/CancelScheduled",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    // Reads over the local outbox: subjects, recipients, and state, which is
+    // the same class of thing `MailService::List` returns for inbound mail.
+    // `SuggestSendTime` is a read too — it proposes an instant and persists
+    // nothing (prd.md: "no side effects — propose then `schedule_send`").
+    (
+        "/rmail.v1.SendSchedulerService/ListOutbox",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.SendSchedulerService/WatchOutbox",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.SendSchedulerService/SuggestSendTime",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // Follow-ups are local reminders. Nothing about them reaches IMAP, SMTP,
+    // or a model provider, so they take the same read/write split
+    // `NoteService`'s rows do rather than borrowing `mail.send` from the
+    // outbox they happen to share a service with.
+    (
+        "/rmail.v1.SendSchedulerService/CreateFollowup",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.SendSchedulerService/DismissFollowup",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.SendSchedulerService/ListFollowups",
+        Requirement::Scope(Scope::MailRead),
     ),
     // -- AiService (task 50) --------------------------------------------------
     // The provisional `Summarize`/`AskMailbox` rows this table carried before
@@ -647,7 +712,9 @@ mod tests {
             "/rmail.v1.MailService/Move",
             "/rmail.v1.MailService/Copy",
             "/rmail.v1.MailService/SetFlags",
-            "/rmail.v1.OutboxService/Send",
+            "/rmail.v1.SendSchedulerService/ScheduleSend",
+            "/rmail.v1.SendSchedulerService/SendNow",
+            "/rmail.v1.SendSchedulerService/RetryFailed",
         ] {
             let Some(Requirement::Scope(required)) = lookup(method) else {
                 unreachable!("{method} should require a scope");

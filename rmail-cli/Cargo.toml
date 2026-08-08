@@ -44,6 +44,9 @@ anyhow.workspace = true
 ratatui.workspace = true
 clap.workspace = true
 chrono.workspace = true
+# `outbox_cli` renders a scheduled send's instant in the IANA zone it was
+# scheduled in, which the entry carries as a name.
+chrono-tz.workspace = true
 serde.workspace = true
 # `mail ai summary --json`.
 serde_json.workspace = true

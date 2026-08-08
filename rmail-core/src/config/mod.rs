@@ -204,6 +204,42 @@ pub enum GrpcAuth {
     Mtls,
 }
 
+/// How SMTP submission is secured (task 61).
+///
+/// [`Self::Auto`] is the default and never resolves to [`Self::Plaintext`]:
+/// downgrading a submission silently, on a heuristic, is how credentials end
+/// up on the wire. An operator who genuinely relays through a local MTA on
+/// port 25 says so by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpSecurity {
+    /// Implicit TLS on port 465, STARTTLS everywhere else.
+    Auto,
+    /// Always STARTTLS (the submission default, port 587).
+    Starttls,
+    /// TLS from the first byte (SMTPS, port 465).
+    ImplicitTls,
+    /// No TLS. For a trusted local relay only — everything, credentials
+    /// included, travels in the clear.
+    Plaintext,
+}
+
+impl SmtpSecurity {
+    /// Resolve [`Self::Auto`] against the port actually configured.
+    ///
+    /// Returns a concrete variant, never `Auto`.
+    #[must_use]
+    pub fn resolve(self, port: u16) -> Self {
+        match self {
+            // 465 is SMTPS: TLS begins before the greeting, so STARTTLS
+            // would hang waiting for a banner that is already encrypted.
+            Self::Auto if port == 465 => Self::ImplicitTls,
+            Self::Auto => Self::Starttls,
+            other => other,
+        }
+    }
+}
+
 /// Default tag ⇄ IMAP synchronization mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1664,7 +1700,20 @@ pub struct SendConfig {
     /// Append sent mail to the IMAP Sent folder.
     pub append_to_sent: bool,
     /// MCP-originated sends always get an undo window.
+    ///
+    /// Setting this `false` shortens that window to
+    /// [`crate::outbox::MIN_AI_UNDO_WINDOW`]; it cannot remove it. See
+    /// `rmail_core::outbox::policy`'s module docs for why that floor is not
+    /// negotiable.
     pub ai_requires_confirmation: bool,
+    /// Bounded SMTP worker pool: how many messages may be in flight at once.
+    ///
+    /// prd.md's default is 2. `0` is coerced up to `1` by
+    /// [`crate::outbox::SendPolicy::from_config`] — a typo here should make
+    /// the daemon slow, not silently stop sending mail.
+    pub workers: u32,
+    /// How SMTP submission is secured. See [`SmtpSecurity`].
+    pub smtp_security: SmtpSecurity,
     /// Optimal-send-time settings.
     pub optimal: SendOptimal,
     /// Follow-up tracker settings.
@@ -1683,6 +1732,8 @@ impl Default for SendConfig {
             backoff_max: HumanDuration::new(mins(30)),
             append_to_sent: true,
             ai_requires_confirmation: true,
+            workers: 2,
+            smtp_security: SmtpSecurity::Auto,
             optimal: SendOptimal::default(),
             followup: SendFollowup::default(),
         }

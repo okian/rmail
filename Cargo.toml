@@ -151,6 +151,26 @@ unicode-normalization = "0.1"
 # narrower use (subject/sender fields only, see `retrieve::fuzzy`).
 nucleo-matcher = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# The IANA zone database, for scheduled send (task 61). `chrono` alone knows
+# fixed offsets and the *system* local zone; neither can answer "09:00 on
+# March 8th in America/Los_Angeles", which is precisely what freezing a
+# scheduled send into an absolute instant requires. Without a zone database a
+# DST transition is invisible and the message goes out an hour early or late.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+# SMTP submission (task 61). `default-features = false` drops `builder` — we
+# render RFC 5322 ourselves in `compose::mime` and hand those octets to
+# `AsyncTransport::send_raw` verbatim — and `native-tls`, since the workspace
+# is rustls/`ring` throughout (see the `tokio-rustls` note above; lettre's
+# rustls feature selects `ring` as well, so no second crypto provider enters
+# the tree). `pool` is what gives prd.md's "per-account connection reuse".
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "pool",
+    "tokio1",
+    "tokio1-rustls-tls",
+    "hostname",
+    "tracing",
+] }
 clap = { version = "4", features = ["derive", "env"] }
 # The TUI (task 83). 0.29, not 0.30: every 0.30 release declares a
 # `rust-version` above this workspace's own 1.80, and 0.29 declares 1.74.
