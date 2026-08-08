@@ -295,13 +295,33 @@ impl SmtpSender for LettreSender {
     ) -> Result<(), SendFailure> {
         let envelope = to_lettre_envelope(envelope)?;
         let transport = self.transport(account_id).await?;
-        transport
+        let outcome = transport
             .send_raw(&envelope, raw_mime)
             .await
             .map(|response| {
                 tracing::debug!(code = ?response.code(), "SMTP accepted the message");
             })
-            .map_err(|error| classify_smtp_error(&error))
+            .map_err(|error| classify_smtp_error(&error));
+
+        // A permanent failure is what a rotated password looks like: the
+        // server answers 535 against a credential this transport captured
+        // when it was built. Without evicting, the operator fixes the
+        // credential, calls `RetryFailed`, and fails again on the same cached
+        // secret -- with nothing in the error to suggest that only a daemon
+        // restart would help. Evicting costs one rebuild on the next attempt
+        // and is the difference between recoverable and not.
+        if matches!(outcome, Err(SendFailure::Permanent(_)))
+            && self.lock().remove(&account_id).is_some()
+        {
+            {
+                tracing::info!(
+                    account_id,
+                    "dropped the cached SMTP transport after a permanent failure; the next \
+                     attempt re-resolves the credential and server settings"
+                );
+            }
+        }
+        outcome
     }
 }
 

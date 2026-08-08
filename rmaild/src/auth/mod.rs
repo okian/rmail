@@ -153,7 +153,8 @@ async fn authorize(
 ) -> Result<(), Status> {
     let required = match methods::lookup(method) {
         Some(Requirement::Public) => return Ok(()),
-        Some(Requirement::Scope(scope)) => scope,
+        Some(Requirement::Scope(scope)) => std::slice::from_ref(scope),
+        Some(Requirement::AnyOf(scopes)) => *scopes,
         None => {
             tracing::warn!(
                 method,
@@ -166,11 +167,19 @@ async fn authorize(
     };
 
     let granted = principal_scopes(db, peer_admin, bearer).await?;
-    if rmail_core::auth::satisfies(&granted, required) {
+    if required
+        .iter()
+        .any(|scope| rmail_core::auth::satisfies(&granted, scope))
+    {
         Ok(())
     } else {
+        let wanted = required
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" or ");
         Err(Status::from(RmailError::permission_denied(format!(
-            "method {method} requires scope {required}, which this token does not grant"
+            "method {method} requires scope {wanted}, which this token does not grant"
         ))))
     }
 }

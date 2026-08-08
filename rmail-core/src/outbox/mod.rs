@@ -237,22 +237,21 @@ impl Origin {
 
     /// Parse a wire/stored value.
     ///
-    /// Unlike [`OutboxState::parse`] this is also the request-boundary
-    /// parser (`ScheduleSendRequest.origin` is a free-form string in
-    /// prd.md's proto), so an unrecognized value is a client mistake.
+    /// Only ever reads a value this code previously stored: the shipped proto
+    /// uses an enum, and the request boundary is `origin_from_proto`. So an
+    /// unrecognized value here is a corrupt row or a newer build's database,
+    /// not a client mistake — the same class `OutboxState::parse` reports as
+    /// [`Error::Internal`], and reported the same way rather than telling a
+    /// caller their request was invalid when it was not.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidArgument`] for anything outside the vocabulary.
+    /// [`Error::Internal`] for anything outside the vocabulary.
     pub fn parse(value: &str) -> Result<Self, Error> {
         Self::ALL
             .into_iter()
             .find(|origin| origin.as_str() == value)
-            .ok_or_else(|| {
-                Error::invalid_argument(format!(
-                    "unknown origin {value:?} (expected user, ai, followup, or undo)"
-                ))
-            })
+            .ok_or_else(|| Error::internal(format!("unknown outbox origin: {value}")))
     }
 }
 
@@ -1050,7 +1049,8 @@ impl OutboxStore {
     ///
     /// Returns whether the lease still held. This is its own committed write
     /// rather than part of the claim, because the guarantee is temporal: the
-    /// fence must be durable on disk before any octet reaches the peer, and a
+    /// fence must survive this process dying before any octet reaches the
+    /// peer, and a
     /// write that shares the claim's transaction would still be correct only
     /// by accident of ordering.
     ///
@@ -1352,10 +1352,23 @@ impl OutboxStore {
             .db
             .write(move |conn| {
                 let mut stmt = conn.prepare(
+                    // The CASE is what bounds this. A row whose worker dies
+                    // *before* `begin_transmit` never reaches
+                    // `mark_transient_failure`, which is where the attempt
+                    // budget is otherwise spent -- so without it, a send that
+                    // reliably kills its worker is reclaimed, re-leased, and
+                    // killed again forever, one round per lease, with
+                    // `attempts` climbing and nothing ever looking at it.
+                    // (The post-fence crash already terminates, via
+                    // `mark_recovered`.)
                     "UPDATE outbox
-                     SET state = 'scheduled', lease_expires_at = NULL, leased_by = NULL,
+                     SET state = CASE WHEN attempts >= max_retries THEN 'failed'
+                                      ELSE 'scheduled' END,
+                         lease_expires_at = NULL, leased_by = NULL,
                          next_attempt_at = NULL,
-                         last_error = 'the sending worker vanished; lease expired',
+                         last_error = CASE WHEN attempts >= max_retries
+                             THEN 'the sending worker vanished repeatedly; out of attempts'
+                             ELSE 'the sending worker vanished; lease expired' END,
                          updated_at = unixepoch()
                      WHERE state = 'sending' AND lease_expires_at <= ?1
                      RETURNING id",

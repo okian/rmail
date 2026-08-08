@@ -41,6 +41,15 @@ pub enum Requirement {
     /// The caller's granted scopes must satisfy this one
     /// (see [`rmail_core::auth::satisfies`]).
     Scope(Scope),
+    /// The caller's granted scopes must satisfy **at least one** of these.
+    ///
+    /// `rmail_core::auth::satisfies` has no scope hierarchy — only `Admin`
+    /// covers anything else — so an RPC that two different kinds of operator
+    /// legitimately need cannot be expressed as a single scope. Reach for
+    /// this only where widening is genuinely risk-reducing (the one use is
+    /// `CancelScheduled`, which can only ever *prevent* mail); a disjunction
+    /// on an RPC with real authority is a way to accidentally grant it twice.
+    AnyOf(&'static [Scope]),
 }
 
 /// method path -> requirement. See the module docs for the fail-closed
@@ -321,18 +330,23 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SendSchedulerService/RetryFailed",
         Requirement::Scope(Scope::MailSend),
     ),
-    // `CancelScheduled` is the deliberate exception, at `mail.write`. It is
-    // the only RPC here that can *stop* a transmission, and it is the
-    // mechanism prd.md gives a human for intercepting an AI-originated send
-    // ("always subject to the undo window so a human can intercept"). Scoping
-    // it to `mail.send` would mean the only tokens able to intervene are
-    // exactly the ones already able to send — the intervention would be
-    // available to everyone except the operator who minted a deliberately
-    // send-less token. Granting cancel to a non-sending token is strictly
-    // risk-reducing: the worst a caller can do with it is prevent mail.
+    // `CancelScheduled` is the deliberate exception, and it takes *either*
+    // scope. It is the only RPC here that can *stop* a transmission, and it
+    // is the mechanism prd.md gives a human for intercepting an AI-originated
+    // send ("always subject to the undo window so a human can intercept").
+    //
+    // `mail.write` alone was wrong in the other direction: with no scope
+    // hierarchy, a `mail.send` token could schedule a send with a mandatory
+    // undo window and then be unable to use it — the safety property exists
+    // precisely for AI-originated sends, which are exactly the ones holding a
+    // send-scoped token. `mail.send` alone would have the symmetric problem,
+    // leaving a deliberately send-less operator unable to intervene.
+    //
+    // Widening here is strictly risk-reducing: the worst a caller can do with
+    // cancel is prevent mail.
     (
         "/rmail.v1.SendSchedulerService/CancelScheduled",
-        Requirement::Scope(Scope::MailWrite),
+        Requirement::AnyOf(&[Scope::MailWrite, Scope::MailSend]),
     ),
     // Reads over the local outbox: subjects, recipients, and state, which is
     // the same class of thing `MailService::List` returns for inbound mail.
@@ -698,6 +712,36 @@ mod tests {
         assert_eq!(
             lookup("/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"),
             Some(&Requirement::Public)
+        );
+    }
+
+    #[test]
+    fn a_send_scoped_token_can_use_the_undo_window_it_was_given() {
+        // The mandatory undo window on an AI-originated send exists so a
+        // human can intercept it. AI-originated sends are exactly the ones
+        // made with a send-scoped token, and `satisfies` has no hierarchy --
+        // so scoping cancel to `mail.write` alone left the caller holding an
+        // undo window it could not use. Both scopes have to work.
+        let Some(Requirement::AnyOf(required)) =
+            lookup("/rmail.v1.SendSchedulerService/CancelScheduled")
+        else {
+            unreachable!("CancelScheduled should accept either scope");
+        };
+        for scope in [Scope::MailSend, Scope::MailWrite] {
+            assert!(
+                required
+                    .iter()
+                    .any(|want| rmail_core::auth::satisfies(std::slice::from_ref(&scope), want)),
+                "{scope:?} must be able to cancel a scheduled send"
+            );
+        }
+        // ...but it is still not open to a read-only token.
+        let read_only = Scope::MailRead;
+        assert!(
+            !required
+                .iter()
+                .any(|want| rmail_core::auth::satisfies(std::slice::from_ref(&read_only), want)),
+            "mail.read alone must not be able to cancel"
         );
     }
 
