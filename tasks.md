@@ -772,7 +772,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core export::` (each format round-trips, raw RFC822 preserved, --with-ai)
 
 ## 83. TUI shell (folders / list / preview)
-- [ ] status
+- [x] status
 - **depends-on:** 39, 33
 - **parallel-safe:** no
 - **acceptance:**
