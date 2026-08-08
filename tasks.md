@@ -251,7 +251,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core attach::ocr` (fixture image → text, provenance flag)
 
 ## 24. IndexService gRPC + `mail index` CLI
-- [ ] status
+- [x] status
 - **depends-on:** 16, 18, 19, 21
 - **parallel-safe:** no
 - **acceptance:**
