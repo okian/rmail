@@ -959,14 +959,20 @@ fn every_state_and_origin_round_trips_through_its_wire_string() {
     for origin in Origin::ALL {
         assert_eq!(Origin::parse(origin.as_str()).unwrap(), origin);
     }
-    // An unknown state is corrupt data; an unknown origin is a bad request.
+    // Both are corrupt data. `Origin::parse` used to report
+    // `InvalidArgument` on the premise that it also parsed
+    // `ScheduleSendRequest.origin` -- but the shipped proto uses an enum and
+    // the request boundary is `origin_from_proto`, so this only ever reads a
+    // value some earlier version of this code wrote. Telling a caller their
+    // request was invalid, when the request never carried this string, sends
+    // them looking in the wrong place.
     assert_eq!(
         OutboxState::parse("wat").unwrap_err().reason(),
         ErrorReason::Internal
     );
     assert_eq!(
         Origin::parse("wat").unwrap_err().reason(),
-        ErrorReason::InvalidArgument
+        ErrorReason::Internal
     );
 }
 

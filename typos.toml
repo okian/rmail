@@ -42,3 +42,7 @@ ands = "ands"
 # A deliberately mangled token: `rehydrate` must leave an unrecognized token
 # verbatim rather than guessing which real one was meant.
 EMAILL = "EMAILL"
+
+# The SMTP greeting verb (RFC 5321), not a misspelling of "hello". The mock
+# server in `outbox::mock` has to answer both EHLO and HELO.
+HELO = "HELO"
