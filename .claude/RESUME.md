@@ -98,9 +98,12 @@ costs nothing. Merged through V28. **Next free: V29.**
   Clearing every stale worktree's `target/` took `.claude/worktrees` from
   13 GB to 92 MB; dropping the main `target/` bought another 9 GB. All three
   are pure build output — deleting them costs a rebuild and nothing else, so
-  do it freely, but delete only the *build output*, never the worktree
-  checkouts: `git worktree remove` would also drop branches that still hold
-  preserved WIP commits.
+  do it freely. Removing the *checkouts* is safe too, and this note used to
+  say otherwise: `git worktree remove` deletes the working directory and its
+  admin files but leaves the branch alone — verified by removing one and
+  confirming its ref survived, then pruning 31 more with all 35
+  `worktree-agent-*` branches still present afterwards. What would lose
+  preserved WIP is deleting the *branch*, which nothing here needs to do.
 - **Do not union-merge structured code by deduplicating lines.** A script that
   keeps "lines from theirs not already in ours" silently drops repeated closing
   braces and attributes, which are exactly what Rust has a lot of. It happened
