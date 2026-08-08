@@ -38,6 +38,10 @@ rmail-core.workspace = true
 # `FeatureExtractor::extract_at` so a replayed request scores identically —
 # see that module's own docs.
 chrono.workspace = true
+# `send_scheduler_service.rs` resolves a request's IANA zone (`tz`) before
+# handing it to `rmail_core::outbox::schedule`, so the handler names the type
+# that carries it.
+chrono-tz.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
 tonic-reflection.workspace = true

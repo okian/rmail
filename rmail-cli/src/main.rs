@@ -2,6 +2,7 @@
 
 mod hook_cli;
 mod note_cli;
+mod outbox_cli;
 mod search_cli;
 mod tag_cli;
 
@@ -11,6 +12,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use note_cli::{NoteAction, NotesArgs};
+use outbox_cli::{FollowupAction, OutboxArgs, SendArgs, UndoArgs};
 use rmail_core::socket_path_from_env;
 use rmail_proto::v1::admin_service_client::AdminServiceClient;
 use rmail_proto::v1::ai_policy_service_client::AiPolicyServiceClient;
@@ -131,6 +133,19 @@ enum Command {
     RejectTags {
         #[arg(required = true)]
         message_tag_ids: Vec<i64>,
+    },
+    /// Send a message now (undoable) or schedule it for later
+    /// (`SendSchedulerService.ScheduleSend`).
+    Send(SendArgs),
+    /// Cancel a send inside its undo window, or any scheduled message
+    /// (`SendSchedulerService.CancelScheduled`).
+    Undo(UndoArgs),
+    /// Inspect and manage the outbox (`SendSchedulerService`).
+    Outbox(OutboxArgs),
+    /// Follow-up reminders on sent mail (`SendSchedulerService`).
+    Followup {
+        #[command(subcommand)]
+        action: FollowupAction,
     },
 }
 
@@ -321,6 +336,10 @@ async fn main() -> Result<()> {
         Command::Untag(args) => tag_cli::untag(&socket, args).await,
         Command::Tags(args) => tag_cli::tags(&socket, args).await,
         Command::SuggestTags { message_id } => tag_cli::suggest_tags(&socket, message_id).await,
+        Command::Send(args) => outbox_cli::send(&socket, args).await,
+        Command::Undo(args) => outbox_cli::undo(&socket, args).await,
+        Command::Outbox(args) => outbox_cli::outbox(&socket, args).await,
+        Command::Followup { action } => outbox_cli::followup(&socket, action).await,
         Command::AcceptTags { message_tag_ids } => {
             tag_cli::resolve_suggestions(&socket, message_tag_ids, true).await
         }

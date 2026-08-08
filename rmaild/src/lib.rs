@@ -4,7 +4,8 @@
 //! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and the
 //! `AccountService`/`SyncService`/`AdminService`/`AuditService`/
 //! `MailService`/`NoteService`/`TagService`/`SearchService`/
-//! `SavedSearchService`/`AiService`/`HookService` handlers — all wrapped in a
+//! `SavedSearchService`/`ComposeService`/`SendSchedulerService`/`AiService`/
+//! `AiPolicyService`/`HookService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -22,6 +23,7 @@ mod mail_service;
 mod note_service;
 mod saved_search_service;
 mod search_service;
+mod send_scheduler_service;
 mod sync_service;
 mod tag_service;
 mod trace;
@@ -37,6 +39,7 @@ pub use mail_service::MailApi;
 pub use note_service::NoteApi;
 pub use saved_search_service::SavedSearchApi;
 pub use search_service::SearchApi;
+pub use send_scheduler_service::SendSchedulerApi;
 pub use sync_service::SyncApi;
 pub use tag_service::TagApi;
 pub use trace::RequestTraceLayer;
@@ -62,6 +65,9 @@ use rmail_core::index::semantic::VECTOR_DIM;
 use rmail_core::index::{IndexQueue, QueueOptions as IndexQueueOptions};
 use rmail_core::mail::MailStore;
 use rmail_core::notes::NoteStore;
+use rmail_core::outbox::{
+    FollowupStore, ImapSentAppender, LettreSender, OutboxStore, SendPolicy, SendScheduler,
+};
 use rmail_core::rank::l1::Weights;
 use rmail_core::saved_search::SavedSearchStore;
 use rmail_core::smart_folder::{SmartFolderEvaluator, SmartFolderStore};
@@ -79,6 +85,7 @@ use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::note_service_server::NoteServiceServer;
 use rmail_proto::v1::saved_search_service_server::SavedSearchServiceServer;
 use rmail_proto::v1::search_service_server::SearchServiceServer;
+use rmail_proto::v1::send_scheduler_service_server::SendSchedulerServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
 use rmail_proto::v1::tag_service_server::TagServiceServer;
 use tokio::net::UnixListener;
@@ -538,6 +545,40 @@ where
     // so there is no client, pool, or background loop to wire up here.
     let compose_service = ComposeServiceServer::new(ComposeApi::new(DraftStore::new(db.clone())));
 
+    // Scheduled send (task 61). `SendScheduler` is always registered — the
+    // reflection set and the auth scope table must see every RPC regardless of
+    // runtime config, the convention `AiService`/`HookService` established —
+    // and the *loop* is what config gates. The loop is always spawned, though,
+    // because unlike the AI dispatcher it has durable work waiting for it: an
+    // outbox row scheduled by a previous run is mail the user has already
+    // pressed send on, and a daemon that declines to drain it is a daemon that
+    // silently swallows outgoing mail.
+    let outbox_store = OutboxStore::new(db.clone());
+    let followup_store = FollowupStore::new(db.clone());
+    let send_scheduler_service = SendSchedulerServiceServer::new(SendSchedulerApi::new(
+        outbox_store.clone(),
+        followup_store.clone(),
+        db.clone(),
+        config.send.clone(),
+        stopping.clone(),
+    ));
+    let send_handle = SendScheduler::new(
+        outbox_store,
+        followup_store,
+        Arc::new(LettreSender::new(db.clone(), config.send.smtp_security)),
+        events.clone(),
+        SendPolicy::from_config(&config.send),
+        // Stable across restarts on purpose: the worker name is the fence a
+        // completion is checked against, and a per-boot random one would make
+        // every restart look like a different worker to a lease that is still
+        // live.
+        "rmaild-send",
+    )
+    // A fresh IMAP connection per append, the same shape `LiveImapMutator`
+    // uses. Filing is best effort — see `rmail_core::outbox::sent`.
+    .with_sent_appender(Arc::new(ImapSentAppender::new(db.clone())))
+    .spawn(stopping.clone());
+
     // A dedicated `IndexQueue` handle rather than reusing the AI subsystem's
     // (below) — `IndexQueue` is a cheap, stateless wrapper over `db` (see its
     // own docs), so a second instance costs nothing and keeps this task's
@@ -795,6 +836,7 @@ where
         .add_service(note_service)
         .add_service(tag_service)
         .add_service(compose_service)
+        .add_service(send_scheduler_service)
         .add_service(search_service)
         .add_service(saved_search_service)
         .add_service(ai_service)
@@ -812,6 +854,11 @@ where
         let _ = handle.await;
     }
     let _ = smart_folder_handle.await;
+    // Awaited rather than dropped: an in-flight SMTP conversation that is
+    // abandoned mid-`DATA` is exactly the crash the at-most-once fence exists
+    // to survive, and paying for a recovery on every clean shutdown would be
+    // a self-inflicted one.
+    let _ = send_handle.await;
 
     // Best-effort cleanup so the next boot starts clean regardless of outcome.
     let _ = std::fs::remove_file(&path);
