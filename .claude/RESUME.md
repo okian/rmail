@@ -6,33 +6,36 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**51 of 86 done, 35 remaining.** `tasks.md` is authoritative — count with
+**53 of 86 done, 33 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **1932/1932** tests,
-clippy clean, `buf lint`, `cargo deny`, gitleaks and typos all clean.
+after merge, never on the agent's own report: currently **2101/2101** tests,
+with clippy, `buf lint`, `cargo deny`, gitleaks and typos all clean.
 
-Three defects in already-merged work have been found by the post-merge
-full-suite run rather than by the task that introduced them (a hook-dispatcher
-boot race, a budget enforcer that did not bound in-flight batches, a
-misspelled test name the typos hook caught only once its false positives were
-allowlisted). Re-running the whole suite after each merge is what catches
-those; do not skip it.
+Four defects in already-merged work have been found by the post-merge
+full-suite run or by orchestrator review rather than by the task that
+introduced them: a hook-dispatcher boot race, a budget enforcer that did not
+bound in-flight batches, a misspelled test name, and — the worst — an outbox
+that retransmitted after an unacknowledged `DATA`, i.e. duplicate mail. Two
+more were structural: **nothing in the running daemon had ever enqueued an
+index job** (tasks 16–21 shipped an inert pipeline, each passing its own
+gate), and `MailService.Move` silently orphans tags and notes. Re-running the
+whole suite after each merge, and reading the safety-critical paths yourself,
+is what catches these.
 
 ## Unfinished work preserved on branches
 
-Committed as `wip(...)` on each branch — nothing is lost, but **none of it is
-reviewed or verified on the combined tree.** Resume by checking out the
-branch, finishing the work, running the `reviewer` subagent, then merging.
-
 | Task | Branch | State |
 |---|---|---|
-| 23 OCR path | `worktree-agent-a92770680c94c9608` | Vision + Tesseract backends, migration and config written; untested, unreviewed |
-| 61 Scheduled send & outbox | `worktree-agent-ae114c9814c89befc` @ `372ae04` | Agent reported **its own gate green** then died to the session limit before review. Outbox module, `V30__outbox.sql`, `send_scheduler.proto`, service, CLI, tests all present. **Unreviewed** — and this is the send path, so the at-most-once crash test is the thing to scrutinise first. |
-| 24 IndexService + `mail index` | `worktree-agent-a42a75f93e2bbe773` @ `9ade429` | Stalled while linking; completeness unknown. `index.proto`, `index/admin.rs`, `index/pipeline.rs`, service, CLI and tests present. Unreviewed, gate never confirmed. |
+| 23 OCR path | `worktree-agent-a92770680c94c9608` | Vision + Tesseract backends, migration and config written; untested, unreviewed. The only surviving WIP. |
 
-**Do not merge any of these on the strength of the agent's own report.** Two
-of the three never reached their reviewer, and every rmail task so far has had
-at least one P0 found at review.
+Tasks 24 and 61 were previously listed here; **both are now merged and
+verified** — do not re-merge them. Tasks 40, 51 and 84 were dispatched and
+died to a session limit before writing anything, so there is nothing to
+resume: start them fresh.
+
+**Do not merge preserved WIP on the strength of an agent's own report.** Task
+61 reported its own gate green and still contained a duplicate-mail defect
+and a bypassable safety guarantee, both found at review.
 
 ## Migration numbering — assign at MERGE, not at dispatch
 
@@ -46,8 +49,7 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V27. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V28.** Note the preserved branches already use
-V30 (task 61); renumber at merge as always.
+costs nothing. Merged through V28. **Next free: V29.**
 
 ## Orchestration notes worth not relearning
 
