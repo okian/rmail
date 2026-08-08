@@ -1,6 +1,7 @@
 //! The `mail` CLI — a thin gRPC client for the rmail daemon.
 
 mod hook_cli;
+mod index_cli;
 mod note_cli;
 mod outbox_cli;
 mod search_cli;
@@ -93,6 +94,14 @@ enum Command {
         #[command(subcommand)]
         action: hook_cli::HookAction,
     },
+    /// Index maintenance: coverage, drain, verify, gc, rebuild
+    /// (`IndexService`).
+    Index {
+        #[command(subcommand)]
+        action: index_cli::IndexAction,
+    },
+    /// Entities extracted from mail, by kind (`IndexService.ListEntities`).
+    Entities(index_cli::EntitiesArgs),
     /// Apply one or more tags to a message, thread, or bulk selection
     /// (`TagService.AddTag`/`BulkTag`).
     Tag(TagArgs),
@@ -331,6 +340,8 @@ async fn main() -> Result<()> {
         Command::Note { action } => note_cli::dispatch(&socket, action).await,
         Command::Notes(args) => note_cli::list(&socket, args).await,
         Command::Hook { action } => hook_cli::run(&socket, action).await,
+        Command::Index { action } => index_cli::run(&socket, action).await,
+        Command::Entities(args) => index_cli::entities(&socket, args).await,
         Command::Tag(args) => tag_cli::tag(&socket, args).await,
         Command::TagBulk {
             query,

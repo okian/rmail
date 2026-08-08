@@ -282,6 +282,65 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SearchService/Explain",
         Requirement::Scope(Scope::MailRead),
     ),
+    // -- IndexService (task 24) -----------------------------------------------
+    // The index is a derived artifact over mail the caller can already read, so
+    // the read-only RPCs sit at `mail.read` for the same reason `SearchService`'s
+    // do: `Status` reports coverage and queue depth, `Verify` reports drift
+    // without repairing any of it, and `ListEntities` enumerates things
+    // extracted from messages a `mail.read` token could already fetch. None of
+    // the three writes anything.
+    (
+        "/rmail.v1.IndexService/Status",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.IndexService/Verify",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.IndexService/ListEntities",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // `Reindex` schedules and runs indexing work. It only ever *recomputes*
+    // what the message store already implies — nothing it does can produce a
+    // fact the mail did not already contain, and nothing it does is visible on
+    // IMAP — so `mail.write` is the right level: the same "mutates local state"
+    // test `SyncService/SyncFolder` sits behind, not the daemon-wide control
+    // plane below.
+    (
+        "/rmail.v1.IndexService/Reindex",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    // `Rebuild` and `Gc` are `admin`, deliberately a step above `Reindex`, and
+    // this is why the two are separate RPCs at all (see `index_service`'s own
+    // module docs): this table is keyed by method path and cannot look at a
+    // request's fields, so a destructive mode *inside* `Reindex` would either
+    // force every routine `mail index run` up to `admin` or leave a full index
+    // wipe reachable with `mail.write`.
+    //
+    // `Rebuild` deletes the derived data for whole stages daemon-wide and
+    // leaves search degraded until it is recomputed — hours, for a large
+    // mailbox with embeddings on. `Gc` deletes rows outright. Both are the
+    // "mutates shared, global state, un-scoped by account" class that
+    // `AiService/SetPaused` and `AiService/RetryFailed` sit behind for exactly
+    // the same reason, and neither is something a token minted to keep one
+    // caller's mail indexed should be able to do to every other caller.
+    (
+        "/rmail.v1.IndexService/Rebuild",
+        Requirement::Scope(Scope::Admin),
+    ),
+    (
+        "/rmail.v1.IndexService/Gc",
+        Requirement::Scope(Scope::Admin),
+    ),
+    // `SetPaused` is the daemon-wide indexing switch — it names no account and
+    // no message, and stopping it stops new mail becoming searchable for every
+    // caller this daemon serves. `AiService/SetPaused`'s row gives the argument
+    // verbatim.
+    (
+        "/rmail.v1.IndexService/SetPaused",
+        Requirement::Scope(Scope::Admin),
+    ),
     // `Evaluate` (task 37) runs caller-supplied queries through the same
     // pipeline and reports aggregate metrics. It reads no more than `Search`
     // does — but note it *does* let a caller confirm whether a given
@@ -713,6 +772,34 @@ mod tests {
             lookup("/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"),
             Some(&Requirement::Public)
         );
+    }
+
+    /// The destructive index verbs sit above the read-only ones.
+    ///
+    /// Checked as a relation rather than as two literal rows: the property that
+    /// matters is "whatever `Status` needs, `Rebuild`/`Gc` need strictly more,"
+    /// and a future re-scoping that raised `Status` to `admin` would silently
+    /// satisfy a pair of literal assertions while flattening the distinction
+    /// this pair of rows exists to draw.
+    #[test]
+    fn the_destructive_index_verbs_need_more_than_reading_index_status() {
+        let Some(Requirement::Scope(status)) = lookup("/rmail.v1.IndexService/Status") else {
+            unreachable!("IndexService/Status should require a scope");
+        };
+        for method in [
+            "/rmail.v1.IndexService/Rebuild",
+            "/rmail.v1.IndexService/Gc",
+            "/rmail.v1.IndexService/SetPaused",
+        ] {
+            let Some(Requirement::Scope(required)) = lookup(method) else {
+                unreachable!("{method} should require a scope");
+            };
+            assert!(
+                !rmail_core::auth::satisfies(std::slice::from_ref(status), required),
+                "{method} (requires {required:?}) must need more than {status:?}, which only \
+                 buys a read of the index's status"
+            );
+        }
     }
 
     #[test]

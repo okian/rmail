@@ -1,0 +1,318 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// IndexService is the operator surface over the indexing subsystem: what the
+// index knows, what it still owes, and the verbs that change that.
+//
+// Nothing here computes an index. The stages themselves (extract, lexical,
+// entities, semantic) and the durable queue that drives them live in
+// rmail-core::index; these RPCs report on that machinery and ask it to run.
+// The split is deliberate — an index is a *derived artifact*, safe to drop and
+// rebuild from the message store, so every operation here is expressible as
+// "enqueue work" or "drop work already done," never as a second, parallel
+// indexer of its own.
+//
+// The four verbs, and how they differ, because two of them destroy data:
+//
+//   Reindex  re-enqueues what is *stale* and drains the queue. Content already
+//            indexed against the same hash and model dedups to nothing, so
+//            re-running it over a current index is free.
+//   Rebuild  DROPS the derived data for the named stages and recomputes it
+//            from scratch. Search is degraded for those stages until the drain
+//            finishes. Requires `confirm`.
+//   Verify   read-only. Reports drift and repairs none of it.
+//   Gc       deletes rows nothing points at any more. Mutating, but it only
+//            ever removes rows whose parent is already gone.
+service IndexService {
+  // Per-stage coverage, queue depth, the configured embedding model, and how
+  // far behind the newest mail each stage is running.
+  rpc Status(IndexStatusRequest) returns (IndexStatusResponse);
+
+  // Re-enqueue stale work and drain the queue, streaming progress as batches
+  // complete rather than blocking until the whole backlog is done.
+  //
+  // The RPC behind `mail index run` (drain only), `mail index reindex`
+  // (select, enqueue, drain) and `mail index embed --backfill` (enqueue every
+  // message whose vectors are missing or from another model, then drain).
+  //
+  // Dropping the stream stops the work behind it: the producer observes the
+  // closed channel and stops leasing, leaving whatever is still queued for the
+  // background worker.
+  rpc Reindex(ReindexRequest) returns (stream IndexProgress);
+
+  // Drop the derived data for the named stages and rebuild it from scratch,
+  // streaming progress the same way Reindex does.
+  //
+  // Destructive: a wipe, not a refresh. Search over the rebuilt stages returns
+  // nothing until the drain catches up, which for a large mailbox is minutes
+  // (lexical) to hours (semantic). `confirm` must be true; the call is
+  // rejected with FAILED_PRECONDITION otherwise and nothing is deleted.
+  rpc Rebuild(RebuildRequest) returns (stream IndexProgress);
+
+  // Reconcile the index against the message store and the configured model,
+  // and report what does not line up. Read-only — it never repairs, enqueues,
+  // or deletes anything, so it is safe to run against a live daemon.
+  rpc Verify(VerifyIndexRequest) returns (IndexDrift);
+
+  // Delete index rows whose parent is gone: vectors whose chunk was removed,
+  // entities nothing mentions any more, lexical rows for deleted mail.
+  //
+  // Only ever removes rows that are already unreachable. A row with a live
+  // parent is never touched, which is the property that makes this safe to run
+  // unattended.
+  rpc Gc(IndexGcRequest) returns (IndexGcReport);
+
+  // Stop or start the background indexing worker — the RPC behind
+  // `mail index stop` and `mail index start`. A stopped worker enqueues
+  // nothing and leases nothing; the queue is durable, so work accumulates and
+  // is picked up when it starts again. Reindex/Rebuild still run while
+  // stopped: those are an operator asking explicitly.
+  rpc SetPaused(SetIndexPausedRequest) returns (SetIndexPausedResponse);
+
+  // Entities extracted from mail, by kind — the RPC behind
+  // `mail entities <kind>`. A read over the entity tables; it runs no
+  // extractor and calls no model.
+  rpc ListEntities(ListEntitiesRequest) returns (ListEntitiesResponse);
+}
+
+// A stage of indexing. The values match the wire strings stored in
+// `index_queue.kind` and `index_state.kind`.
+enum IndexKind {
+  // Never sent and never returned. An *empty* stage list is how a request says
+  // "every stage"; naming this one alongside a real stage is rejected with
+  // INVALID_ARGUMENT, because proto3 cannot tell "the client meant all of them"
+  // from "a default-valued enum got appended" — and for Rebuild the two
+  // readings differ by three whole stages of deleted data.
+  INDEX_KIND_UNSPECIFIED = 0;
+  // Normalize text out of the message and its parts into `index_content`.
+  INDEX_KIND_EXTRACT = 1;
+  // Feed the contentless FTS5 index.
+  INDEX_KIND_LEXICAL = 2;
+  // Pull out entities and their co-occurrence edges.
+  INDEX_KIND_ENTITIES = 3;
+  // Chunk and embed.
+  INDEX_KIND_SEMANTIC = 4;
+}
+
+message IndexStatusRequest {}
+
+// One stage's standing.
+message IndexKindStatus {
+  IndexKind kind = 1;
+  // Whether this stage is switched on in config. A disabled stage reports zero
+  // coverage rather than a fabricated 100%: its jobs are retired without
+  // recording that anything was indexed, precisely so the number stays honest.
+  bool enabled = 2;
+  // Messages this stage could index — the denominator, and every message in
+  // the store, not merely the ones that already reached this stage.
+  int64 eligible = 3;
+  // Messages this stage has actually indexed.
+  int64 indexed = 4;
+  // `indexed / eligible`, 0.0..=1.0. Zero when there is nothing to index, so
+  // an empty mailbox reports 0% rather than a vacuous 100%.
+  double coverage = 5;
+  // Outstanding queue jobs for this stage: ready, backing off, and leased.
+  int64 pending = 6;
+  // Quarantined jobs for this stage — failures that exhausted their attempts
+  // and are waiting for a human.
+  int64 quarantined = 7;
+  // How far behind the newest mail this stage is, in seconds: the arrival time
+  // of the newest message in the store minus that of the newest message this
+  // stage has indexed. Zero means caught up to the newest message. Absent when
+  // the stage has indexed nothing at all — with coverage 0, the pair says
+  // "nothing indexed" without inventing a number.
+  optional int64 lag_seconds = 8;
+}
+
+message IndexStatusResponse {
+  // One row per per-message stage, in pipeline order.
+  repeated IndexKindStatus kinds = 1;
+  // Messages in the store — the denominator every row above shares.
+  int64 messages = 2;
+  // Queue jobs eligible to run right now.
+  int64 queue_ready = 3;
+  // Queue jobs waiting out a retry backoff.
+  int64 queue_backing_off = 4;
+  // Queue jobs currently held by a worker.
+  int64 queue_leased = 5;
+  // Quarantined jobs across every stage.
+  int64 queue_dead = 6;
+  // The embedding model the semantic stage is configured with, and its width.
+  // Reported even when semantic indexing is off, because that is the model a
+  // re-enabled daemon would use.
+  string model = 7;
+  int64 dim = 8;
+  // Chunks stored, and chunk vectors stored. They differ exactly when the
+  // semantic index has drifted; Verify says how.
+  int64 chunks = 9;
+  int64 vectors = 10;
+  // Whether the background worker is stopped.
+  bool paused = 11;
+  // Whether semantic indexing is enabled in config.
+  bool semantic_enabled = 12;
+}
+
+// What a Reindex pass should do before it drains.
+enum ReindexMode {
+  // Treated as REINDEX_MODE_DRAIN.
+  REINDEX_MODE_UNSPECIFIED = 0;
+  // Enqueue nothing; run whatever is already queued. `mail index run`.
+  REINDEX_MODE_DRAIN = 1;
+  // Enqueue the selected messages, then drain. Work already done against the
+  // same content and model dedups away, so this re-runs only what is stale.
+  REINDEX_MODE_SELECTION = 2;
+  // Enqueue the semantic stage for every *chunked* message whose vectors are
+  // missing, stale, or from a different model, then drain. `mail index embed
+  // --backfill`. A mailbox where semantic indexing has only just been switched
+  // on has no chunks yet and is a REINDEX_MODE_SELECTION with
+  // INDEX_KIND_SEMANTIC instead.
+  REINDEX_MODE_EMBED_BACKFILL = 3;
+}
+
+message ReindexRequest {
+  ReindexMode mode = 1;
+  // Which stages to enqueue. Empty means the extract stage, which cascades
+  // into the others as its content hash changes. Ignored by DRAIN and
+  // EMBED_BACKFILL.
+  repeated IndexKind kinds = 2;
+  // Narrow SELECTION to one account, mailbox, or message, and/or to mail no
+  // older than `since` (unix seconds, against the message's date). Absent
+  // fields do not narrow.
+  optional int64 account_id = 3;
+  optional int64 mailbox_id = 4;
+  optional int64 message_id = 5;
+  optional int64 since = 6;
+  // Stop after this many jobs have run. 0 means "until the queue is empty."
+  int64 max_jobs = 7;
+}
+
+message RebuildRequest {
+  // Stages to drop and recompute. Empty means every stage — the `--all` case.
+  repeated IndexKind kinds = 1;
+  // Must be true. Guards a wipe that leaves search degraded until the drain
+  // finishes; without it the call fails with FAILED_PRECONDITION and nothing
+  // is deleted.
+  bool confirm = 2;
+  // Stop the drain after this many jobs. The wipe and the re-enqueue always
+  // complete; only the draining is bounded. 0 means "until the queue is
+  // empty."
+  int64 max_jobs = 3;
+}
+
+// One progress frame. Emitted per batch, plus a final frame with `done` set.
+message IndexProgress {
+  // Jobs enqueued by this pass before draining started.
+  int64 enqueued = 1;
+  // Jobs run so far by this pass.
+  int64 completed = 2;
+  // Jobs that failed and were backed off or quarantined so far.
+  int64 failed = 3;
+  // Outstanding jobs still in the queue at the time of this frame.
+  int64 remaining = 4;
+  // Rows dropped by a Rebuild's wipe. Always zero for Reindex.
+  int64 dropped = 5;
+  // Set on the last frame. A stream that ends without it was cut short — by
+  // the client disconnecting, the daemon stopping, or `max_jobs`.
+  bool done = 6;
+}
+
+message VerifyIndexRequest {}
+
+// What Verify found. Every field is a count of rows that are wrong, so an
+// all-zero report is a clean index.
+message IndexDrift {
+  // `index_state` rows for a downstream stage (lexical/entities/semantic)
+  // whose recorded content hash no longer matches the text now stored in
+  // `index_content` — the stage ran against text that has since moved under
+  // it. This is the state-vs-content-hash drift `mail index verify` exists to
+  // find. Note that an index with queued work looks the same for a moment: a
+  // note added a minute ago changes the hash, and the job to catch up is still
+  // pending. Status' per-stage `pending` count is what tells those apart.
+  int64 content_hash_drift = 1;
+  // Messages with extracted content but no extract-stage state row — nothing
+  // records that the text now stored was ever produced by a run.
+  int64 extract_missing = 2;
+  // Messages the lexical stage claims to have indexed that have no row in the
+  // FTS table. They are silently unfindable.
+  int64 lexical_missing = 3;
+  // FTS rows for messages that no longer exist. Gc removes these.
+  int64 lexical_orphaned = 4;
+  // Entities with no remaining mention. Gc removes these.
+  int64 entity_orphaned = 5;
+  // Chunks with no row in `chunk_embeddings`.
+  int64 chunks_unembedded = 6;
+  // Chunks whose vector is missing from `vec_chunks`.
+  int64 chunks_unvectored = 7;
+  // Chunks embedded by a different model or width than the configured one.
+  int64 chunks_wrong_model = 8;
+  // Chunks whose text changed after they were embedded.
+  int64 chunks_stale = 9;
+  // Vectors whose chunk no longer exists. Gc removes these.
+  int64 vectors_orphaned = 10;
+  // Messages whose centroid is missing, from another model, or averaged over a
+  // different number of chunks than the message now has.
+  int64 message_vectors_stale = 11;
+  // Quarantined queue jobs. Not drift in the index itself, but the reason a
+  // stage's coverage stops climbing.
+  int64 quarantined = 12;
+  // True when every count above is zero.
+  bool clean = 13;
+}
+
+message IndexGcRequest {}
+
+// What Gc deleted. Every count is rows whose parent was already gone.
+message IndexGcReport {
+  // Entities with no remaining mention.
+  int64 entities = 1;
+  // Rows removed from `vec_chunks`/`vec_messages` whose chunk or message no
+  // longer exists — the sweep a virtual table's missing foreign key makes
+  // necessary.
+  int64 vectors = 2;
+  // FTS rows for messages that no longer exist.
+  int64 lexical_rows = 3;
+  // `index_content` rows for messages that no longer exist.
+  int64 content_rows = 4;
+}
+
+message SetIndexPausedRequest {
+  bool paused = 1;
+}
+
+message SetIndexPausedResponse {
+  bool paused = 1;
+}
+
+message ListEntitiesRequest {
+  // Entity kind: email | phone | url | amount | date | tracking_no | order_id
+  // | invoice_id | iban | person | org | address. Required; an unknown kind is
+  // INVALID_ARGUMENT rather than an empty result, because a typo'd kind and a
+  // kind with no entities are very different answers.
+  string kind = 1;
+  // Restrict to entities whose normalized form contains this substring,
+  // case-insensitively.
+  optional string value = 2;
+  // Page size. Clamped to a server maximum.
+  int64 limit = 3;
+}
+
+// One extracted entity.
+message IndexEntity {
+  int64 entity_id = 1;
+  string kind = 2;
+  // As written, for display.
+  string value = 3;
+  // Canonical form — what `UNIQUE(kind, norm)` keys on.
+  string norm = 4;
+  // Kind-specific detail as JSON (currency for an amount, carrier for a
+  // tracking number), exactly as stored. Empty when there is none.
+  string meta = 5;
+  // How many mentions across the mailbox, and in how many distinct messages.
+  int64 mentions = 6;
+  int64 messages = 7;
+}
+
+message ListEntitiesResponse {
+  repeated IndexEntity entities = 1;
+}

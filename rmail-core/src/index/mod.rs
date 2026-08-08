@@ -7,19 +7,28 @@
 //! not stop lexical search from being built, and a laptop closed halfway
 //! through a first index resumes rather than restarts.
 //!
-//! The stages themselves land in the tasks after this one; this module ships
-//! the queue they will be driven from.
+//! [`pipeline`] is what actually drives the stages from that queue, and
+//! [`admin`] is the operator surface over the whole thing — coverage, drift,
+//! garbage collection, and the reindex/rebuild verbs `mail index` exposes.
 
+pub mod admin;
 pub mod chunk;
 pub mod entities;
 pub mod extract;
 pub mod fts;
+pub mod pipeline;
 pub mod queue;
 pub mod semantic;
 
+pub use admin::{
+    EntityRow, GcReport, IndexAdmin, IndexDrift, IndexStatus, KindStatus, RebuildReport, Selection,
+};
 pub use entities::{collect_orphans, extract_entities, EntityKind, EntityReport, Mention};
 pub use extract::{extract_message, ExtractReport, ExtractedPart, Part};
 pub use fts::{FtsIndex, Hit};
+pub use pipeline::{
+    DrainReport, IndexLoop, IndexPauseFlag, IndexPipeline, StageSwitches, TickReport,
+};
 pub use queue::{
     DeadLetter, Failure, IndexKind, IndexQueue, JobState, Lease, NewJob, QueueOptions, QueueStats,
     PRIORITY_BACKFILL, PRIORITY_NORMAL, PRIORITY_RECENT,

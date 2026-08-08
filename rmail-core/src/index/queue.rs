@@ -94,6 +94,21 @@ impl IndexKind {
         Self::Thread,
     ];
 
+    /// The stages that run once per message, and therefore have a coverage
+    /// denominator.
+    ///
+    /// [`Self::Thread`] is the exception and is deliberately absent. A thread
+    /// rollup describes a conversation, not a message, so "how many messages
+    /// have it" is not a question with an answer — and in this schema the
+    /// rollup the PRD sketched as `thread_index` is already maintained by the
+    /// threading subsystem on `threads` itself (V4: `participants`,
+    /// `subject_norm`, `first_message_at`), so there is no per-message job to
+    /// count. Reporting it alongside the others would show a stage that is
+    /// permanently 0% and permanently idle, which reads as a fault rather than
+    /// as "not a thing this pipeline does."
+    pub const PER_MESSAGE: [Self; 4] =
+        [Self::Extract, Self::Lexical, Self::Entities, Self::Semantic];
+
     /// The stable wire string.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -524,6 +539,94 @@ impl IndexQueue {
         Ok(held)
     }
 
+    /// Hand a leased job straight back, unrun and uncharged.
+    ///
+    /// The graceful-stop counterpart to [`Self::reap_expired`]. A worker that
+    /// leased a batch and is asked to stop — the client streaming its progress
+    /// disconnected, or the daemon is shutting down — could simply drop the
+    /// remaining leases and let them lapse, which is correct but takes a
+    /// lease's worth of minutes, during which the next drain sees a queue that
+    /// looks busy and is not.
+    ///
+    /// The attempt is rolled back, unlike on reaping. A lapsed lease means a
+    /// worker died holding the job, which is exactly the kind of job that
+    /// should eventually be quarantined; a released one was never attempted at
+    /// all, and charging it would let a client that repeatedly opens and drops
+    /// a `Reindex` stream quarantine perfectly healthy work.
+    ///
+    /// Returns whether the lease still held.
+    ///
+    /// # Errors
+    ///
+    /// A mapped storage error.
+    pub async fn release(&self, lease: &Lease) -> Result<bool, Error> {
+        let job_id = lease.job_id;
+        let worker = lease.worker.clone();
+        let changed = self
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE index_queue
+                     SET state = 'pending', lease_expires_at = NULL, leased_by = NULL,
+                         attempts = MAX(attempts - 1, 0), next_attempt_at = 0,
+                         updated_at = unixepoch()
+                     WHERE job_id = ?1 AND state = 'leased' AND leased_by = ?2",
+                    rusqlite::params![job_id, worker],
+                )
+            })
+            .await?;
+        Ok(changed > 0)
+    }
+
+    /// Retire a leased job without recording that anything was indexed.
+    ///
+    /// The disabled-stage case, and the one thing [`Self::complete`] must not
+    /// be used for. [`extract_message`](crate::index::extract_message) enqueues
+    /// the lexical, entity and semantic stages unconditionally — it cannot know
+    /// which of them the operator has switched off — so a daemon with
+    /// `[index.semantic] enabled = false` accumulates semantic jobs no worker
+    /// will ever run. Two obvious answers are both wrong: leaving them pending
+    /// grows the queue without bound, and completing them writes an
+    /// `index_state` row claiming the message was embedded, which makes
+    /// coverage report 100% for a stage that did nothing. This is the third:
+    /// the job leaves the queue, `index_state` stays empty, and coverage keeps
+    /// telling the truth. Re-enabling the stage and running
+    /// `mail index reindex --kind semantic` re-queues the work, because the
+    /// dedup in [`Self::enqueue`] has no state row to short-circuit against.
+    ///
+    /// Returns whether the lease still held, fenced exactly as
+    /// [`Self::complete`] is and for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// A mapped storage error.
+    #[tracing::instrument(skip(self, lease), fields(job_id = lease.job_id, kind = lease.kind.as_str()))]
+    pub async fn discard(&self, lease: &Lease) -> Result<bool, Error> {
+        let job_id = lease.job_id;
+        let worker = lease.worker.clone();
+        let held = self
+            .db
+            .write(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE index_queue
+                     SET state = 'done', lease_expires_at = NULL, leased_by = NULL,
+                         last_error = NULL, updated_at = unixepoch()
+                     WHERE job_id = ?1 AND state = 'leased' AND leased_by = ?2",
+                    rusqlite::params![job_id, worker],
+                )?;
+                Ok(changed > 0)
+            })
+            .await?;
+        if !held {
+            tracing::warn!(
+                job_id,
+                "discarded a job this worker no longer holds; the lease was \
+                 reaped and the job belongs to its new owner"
+            );
+        }
+        Ok(held)
+    }
+
     /// Record a failure on a leased job, backing it off or quarantining it.
     ///
     /// Returns `None` if the lease no longer held. Fenced for the same reason
@@ -723,6 +826,89 @@ impl IndexQueue {
             )));
         }
         Ok(stats)
+    }
+
+    /// How many jobs are still to do: pending plus leased.
+    ///
+    /// The same number [`QueueStats::outstanding`] derives, asked far more
+    /// cheaply because it is asked far more often. [`Self::stats`] groups the
+    /// whole table on an *expression* (`next_attempt_at <= ?`), so no index can
+    /// serve it and every row is read — including every `done` row, which after
+    /// a first index is nearly all of them. A drain reporting progress once per
+    /// batch would therefore scan a million rows for every sixteen jobs. This
+    /// counts through `idx_index_queue_ready`, whose leading column is `state`,
+    /// and touches only the rows that are actually outstanding.
+    ///
+    /// # Errors
+    ///
+    /// A mapped storage error.
+    pub async fn outstanding(&self) -> Result<i64, Error> {
+        Ok(self
+            .db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM index_queue WHERE state IN ('pending', 'leased')",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await?)
+    }
+
+    /// Count jobs by state, split by stage.
+    ///
+    /// Separate from [`Self::stats`] rather than derived from it: an operator
+    /// asking why coverage has stopped climbing needs to know *which* stage is
+    /// backed up, and a single total cannot say. Stages with no jobs at all are
+    /// absent from the map rather than present as zeroes — the caller knows
+    /// which stages it cares about, and inventing rows for ones the queue has
+    /// never seen would mean this method deciding that on its behalf.
+    ///
+    /// # Errors
+    ///
+    /// A mapped storage error, or [`Error::Internal`] for a state or kind no
+    /// version of this code wrote.
+    pub async fn stats_by_kind(
+        &self,
+    ) -> Result<std::collections::BTreeMap<IndexKind, QueueStats>, Error> {
+        let rows: Vec<(String, String, bool, i64)> = self
+            .db
+            .read(|conn| {
+                let now = chrono::Utc::now().timestamp();
+                let mut stmt = conn.prepare(
+                    "SELECT kind, state, next_attempt_at <= ?1, count(*)
+                     FROM index_queue GROUP BY kind, state, next_attempt_at <= ?1",
+                )?;
+                let rows = stmt
+                    .query_map([now], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        let mut by_kind: std::collections::BTreeMap<IndexKind, QueueStats> =
+            std::collections::BTreeMap::new();
+        for (kind, state, ready, count) in rows {
+            let stats = by_kind.entry(IndexKind::parse(&kind)?).or_default();
+            match state.as_str() {
+                "pending" if ready => stats.ready += count,
+                "pending" => stats.backing_off += count,
+                "leased" => stats.leased += count,
+                "done" => stats.done += count,
+                "dead" => stats.dead += count,
+                // Same reasoning as `stats`: a queue that looks drained while
+                // work sits in it is worse than an error, because nobody goes
+                // looking.
+                other => {
+                    return Err(Error::internal(format!(
+                        "unknown job state in queue: {other}"
+                    )))
+                }
+            }
+        }
+        Ok(by_kind)
     }
 
     /// Quarantined jobs, newest failure first, for diagnosis.

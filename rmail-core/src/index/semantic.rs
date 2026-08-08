@@ -178,6 +178,18 @@ impl SemanticIndex {
         self.embedder.model()
     }
 
+    /// The width of the vectors that model produces.
+    ///
+    /// Reported rather than assumed to be [`VECTOR_DIM`]: the two agreeing is
+    /// the precondition [`SemanticIndex::index_message`] checks and
+    /// [`SemanticIndex::verify`] counts violations of, so a status view that
+    /// printed the schema's width would hide exactly the misconfiguration those
+    /// two exist to surface.
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.embedder.dim()
+    }
+
     /// Chunk and embed one message.
     ///
     /// Reads the extracted text, splits it, and computes vectors for whatever

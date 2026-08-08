@@ -5,7 +5,7 @@
 //! `AccountService`/`SyncService`/`AdminService`/`AuditService`/
 //! `MailService`/`NoteService`/`TagService`/`SearchService`/
 //! `SavedSearchService`/`ComposeService`/`SendSchedulerService`/`AiService`/
-//! `AiPolicyService`/`HookService` handlers — all wrapped in a
+//! `AiPolicyService`/`IndexService`/`HookService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -19,6 +19,7 @@ mod audit_service;
 mod auth;
 mod compose_service;
 mod hook_service;
+mod index_service;
 mod mail_service;
 mod note_service;
 mod saved_search_service;
@@ -35,6 +36,7 @@ pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
 pub use compose_service::ComposeApi;
 pub use hook_service::HookApi;
+pub use index_service::IndexApi;
 pub use mail_service::MailApi;
 pub use note_service::NoteApi;
 pub use saved_search_service::SavedSearchApi;
@@ -61,8 +63,11 @@ use rmail_core::embed::Embedder;
 use rmail_core::events::{EventLog, Retention};
 use rmail_core::hooks::HookDispatcher;
 use rmail_core::imap::mutate::LiveImapMutator;
-use rmail_core::index::semantic::VECTOR_DIM;
-use rmail_core::index::{IndexQueue, QueueOptions as IndexQueueOptions};
+use rmail_core::index::semantic::{SemanticIndex, VECTOR_DIM};
+use rmail_core::index::{
+    FtsIndex, IndexAdmin, IndexLoop, IndexPauseFlag, IndexPipeline, IndexQueue,
+    QueueOptions as IndexQueueOptions,
+};
 use rmail_core::mail::MailStore;
 use rmail_core::notes::NoteStore;
 use rmail_core::outbox::{
@@ -81,6 +86,7 @@ use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::compose_service_server::ComposeServiceServer;
 use rmail_proto::v1::hook_service_server::HookServiceServer;
+use rmail_proto::v1::index_service_server::IndexServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::note_service_server::NoteServiceServer;
 use rmail_proto::v1::saved_search_service_server::SavedSearchServiceServer;
@@ -642,13 +648,72 @@ where
         });
     let search_api = SearchApi::new(
         db.clone(),
-        embedder,
+        Arc::clone(&embedder),
         rank_weights,
         config.search.clone(),
         &config.index.semantic,
         stopping.clone(),
     );
     let search_service = SearchServiceServer::new(search_api.clone());
+
+    // The indexing subsystem (task 24): the pipeline that runs the stages, the
+    // loop that keeps it fed, and the operator surface over both.
+    //
+    // `IndexService` is always registered — reflection and the scope table must
+    // see every RPC regardless of runtime config, the same convention
+    // `AiService`/`HookService` follow.
+    //
+    // `index.enabled = false` starts the background worker *paused* rather than
+    // not spawning it. One mechanism instead of two: `mail index status` then
+    // reports "stopped" truthfully, and `mail index start` genuinely starts it
+    // — where a not-spawned loop would have made `status` claim the worker was
+    // running and `start` silently do nothing. A paused tick costs one atomic
+    // load every couple of seconds.
+    //
+    // The `FtsIndex`/`SemanticIndex` here are built the same way `SearchApi`
+    // builds its own, over the *same* embedder `Arc`: one model per process,
+    // and one definition of what "indexed" means for the thing that writes the
+    // index and the thing that reads it.
+    let indexer_queue = IndexQueue::new(db.clone(), IndexQueueOptions::default());
+    let indexer_semantic = SemanticIndex::new(db.clone(), embedder, &config.index.semantic);
+    let index_pipeline = IndexPipeline::new(
+        db.clone(),
+        indexer_queue.clone(),
+        FtsIndex::new(db.clone(), config.search.bm25_weights.clone()),
+        indexer_semantic.clone(),
+        &config.index,
+    )
+    .with_pause_flag(IndexPauseFlag::new(!config.index.enabled));
+    if !config.index.enabled {
+        tracing::info!(
+            "index.enabled = false; the background indexer starts stopped (`mail index start` \
+             turns it on, `mail index run` drains on demand regardless)"
+        );
+    }
+    let index_admin = IndexAdmin::new(
+        db.clone(),
+        indexer_queue,
+        indexer_semantic,
+        &config.index,
+        index_pipeline.pause_flag(),
+    );
+    let index_service = IndexServiceServer::new(IndexApi::new(
+        index_admin,
+        index_pipeline.clone(),
+        stopping.clone(),
+    ));
+    // `index.workers` sizes the batch, not a thread pool, and the distinction
+    // is worth stating: every stage writes through SQLite's single writer
+    // connection, so four jobs at once would serialize on it anyway. What the
+    // knob genuinely buys is how much work one pass takes on between polls —
+    // which, since a saturated batch skips the tick interval entirely (see
+    // `IndexLoop::spawn`), is the amount of queue read per lease round trip.
+    let index_handle = IndexLoop::new(events.clone(), index_pipeline)
+        .with_lease_limit(
+            i64::from(config.index.workers.max(1))
+                .saturating_mul(rmail_core::index::pipeline::DEFAULT_LEASE_LIMIT),
+        )
+        .spawn(stopping.clone());
 
     // Saved searches + deterministic smart folders (task 35). `SavedSearchApi`
     // holds a clone of the *same* `SearchApi` the `SearchService` above
@@ -838,6 +903,7 @@ where
         .add_service(compose_service)
         .add_service(send_scheduler_service)
         .add_service(search_service)
+        .add_service(index_service)
         .add_service(saved_search_service)
         .add_service(ai_service)
         .add_service(ai_policy_service)
@@ -853,6 +919,7 @@ where
     if let Some(handle) = hook_dispatch_handle {
         let _ = handle.await;
     }
+    let _ = index_handle.await;
     let _ = smart_folder_handle.await;
     // Awaited rather than dropped: an in-flight SMTP conversation that is
     // abandoned mid-`DATA` is exactly the crash the at-most-once fence exists
