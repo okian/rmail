@@ -155,16 +155,25 @@ pub enum OutboxState {
     Failed,
     /// Canceled by the user before it was claimed.
     Canceled,
+    /// The SMTP session died without a reply, so whether the peer queued the
+    /// message is unknown.
+    ///
+    /// Deliberately neither `sent` nor `failed`. Calling it `failed` would
+    /// invite a retry that may deliver a second copy; calling it `sent` would
+    /// claim a delivery that may never have happened. The row keeps its
+    /// `smtp_message_id` fence and waits for a human — see the module docs.
+    Uncertain,
 }
 
 impl OutboxState {
     /// Every state, for exhaustive iteration in tests and tooling.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Scheduled,
         Self::Sending,
         Self::Sent,
         Self::Failed,
         Self::Canceled,
+        Self::Uncertain,
     ];
 
     /// The stable string stored in `outbox.state`.
@@ -176,6 +185,7 @@ impl OutboxState {
             Self::Sent => "sent",
             Self::Failed => "failed",
             Self::Canceled => "canceled",
+            Self::Uncertain => "uncertain",
         }
     }
 
@@ -713,6 +723,13 @@ impl OutboxStore {
                 OutboxState::Failed => Error::failed_precondition(format!(
                     "outbox entry {id} has failed; cancel does not apply (delete or retry it)"
                 )),
+                // Cancelling would claim the message was stopped, and it may
+                // already have been delivered. Say so rather than implying
+                // either outcome.
+                OutboxState::Uncertain => Error::failed_precondition(format!(
+                    "outbox entry {id} may or may not have been delivered; cancel cannot \
+                     un-send it. Check the recipient, then retry it or discard it."
+                )),
                 // Unreachable in practice: the UPDATE above matches exactly
                 // this state. Reported rather than asserted, because the only
                 // way to get here is another writer resurrecting the row
@@ -768,16 +785,31 @@ impl OutboxStore {
     /// has already been claimed or sent; [`Error::FailedPrecondition`] for a
     /// canceled or failed row. Otherwise a mapped storage error.
     #[tracing::instrument(skip(self))]
-    pub async fn reschedule(&self, id: i64, send_at: i64, tz: &str) -> Result<OutboxEntry, Error> {
+    pub async fn reschedule(
+        &self,
+        id: i64,
+        send_at: i64,
+        tz: &str,
+        ai_floor_secs: i64,
+    ) -> Result<OutboxEntry, Error> {
         let tz = tz.to_owned();
         let changed = self
             .db
             .write(move |conn| {
                 conn.execute(
-                    "UPDATE outbox SET send_at = ?2, tz = ?3, next_attempt_at = NULL,
-                         undo_deadline = NULL, updated_at = unixepoch()
+                    // MAX against the floor rather than trusting `send_at`:
+                    // `RescheduleSend { send_at: 0 }` was the same one-RPC
+                    // bypass `send_now` had. See that method's docs.
+                    "UPDATE outbox SET
+                         send_at = MAX(?2, unixepoch()
+                             + CASE WHEN origin = 'ai' THEN ?4 ELSE 0 END),
+                         tz = ?3,
+                         next_attempt_at = NULL,
+                         undo_deadline = CASE WHEN origin = 'ai' AND ?4 > 0
+                             THEN MAX(?2, unixepoch() + ?4) ELSE NULL END,
+                         updated_at = unixepoch()
                      WHERE id = ?1 AND state = 'scheduled'",
-                    rusqlite::params![id, send_at, tz],
+                    rusqlite::params![id, send_at, tz, ai_floor_secs],
                 )
             })
             .await?;
@@ -851,21 +883,39 @@ impl OutboxStore {
         Ok(entry)
     }
 
-    /// Make a scheduled send due immediately.
+    /// Make a scheduled send due immediately — subject to the mandatory undo
+    /// floor for the row's own origin.
+    ///
+    /// `ai_floor_secs` is [`SendPolicy::mandatory_undo_window`] for
+    /// [`Origin::Ai`]. It is applied here, in SQL, against the row's stored
+    /// `origin`, because that is the only way to make the decision atomic: a
+    /// read-then-clamp-then-write would race the scheduler claiming the row.
+    ///
+    /// Without this, `SendNow` was a one-RPC bypass of the guarantee that an
+    /// AI-originated send always gets a window in which a human can stop it —
+    /// schedule with `origin=ai`, then immediately `SendNow`, and it went out
+    /// at once. `ScheduleSend` had closed the "send_at = now" and
+    /// "undo_window_secs = 0" versions of that bypass; this is the same
+    /// bypass wearing a third hat.
     ///
     /// # Errors
     ///
     /// As [`Self::reschedule`].
     #[tracing::instrument(skip(self))]
-    pub async fn send_now(&self, id: i64) -> Result<OutboxEntry, Error> {
+    pub async fn send_now(&self, id: i64, ai_floor_secs: i64) -> Result<OutboxEntry, Error> {
         let changed = self
             .db
             .write(move |conn| {
                 conn.execute(
-                    "UPDATE outbox SET send_at = unixepoch(), next_attempt_at = NULL,
-                         undo_deadline = NULL, updated_at = unixepoch()
+                    "UPDATE outbox SET
+                         send_at = unixepoch()
+                             + CASE WHEN origin = 'ai' THEN ?2 ELSE 0 END,
+                         next_attempt_at = NULL,
+                         undo_deadline = CASE WHEN origin = 'ai' AND ?2 > 0
+                             THEN unixepoch() + ?2 ELSE NULL END,
+                         updated_at = unixepoch()
                      WHERE id = ?1 AND state = 'scheduled'",
-                    [id],
+                    rusqlite::params![id, ai_floor_secs],
                 )
             })
             .await?;
@@ -1102,6 +1152,60 @@ impl OutboxStore {
             self.publish_id(id).await;
         }
         Ok(held)
+    }
+
+    /// Record an indeterminate outcome: the session died without a reply.
+    ///
+    /// **Keeps the fence.** This is the whole point of the method existing
+    /// separately from [`Self::mark_transient_failure`], which clears it: if
+    /// the peer had already accepted the message and only its `250` was lost,
+    /// clearing the fence and rescheduling delivers a second copy to the
+    /// recipient. Nothing on this side can tell that apart from "it never
+    /// arrived", so the row stops here, keeps the `Message-ID` it committed,
+    /// and waits for a human rather than guessing in either direction.
+    ///
+    /// Returns `None` if the lease no longer held.
+    ///
+    /// # Errors
+    ///
+    /// A mapped storage error.
+    #[tracing::instrument(skip(self, claimed, error), fields(outbox_id = claimed.id))]
+    pub async fn mark_indeterminate(
+        &self,
+        claimed: &ClaimedSend,
+        error: &str,
+        now: i64,
+    ) -> Result<Option<()>, Error> {
+        let (id, worker) = (claimed.id, claimed.worker.clone());
+        let error = truncate_error(error);
+        let logged = error.clone();
+        let _ = now;
+        let changed = self
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE outbox SET state = 'uncertain',
+                         lease_expires_at = NULL, leased_by = NULL, next_attempt_at = NULL,
+                         last_error = ?3, updated_at = unixepoch()
+                     WHERE id = ?1 AND state = 'sending' AND leased_by = ?2",
+                    rusqlite::params![id, worker, error],
+                )
+            })
+            .await?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        tracing::error!(
+            outbox_id = id,
+            message_id = %claimed.message_id,
+            error = %logged,
+            "the SMTP session died without a reply; this send may or may not have been \
+             delivered. Leaving it uncertain with its fence intact rather than retrying \
+             (which could deliver a second copy) or marking it sent (which could claim a \
+             delivery that never happened)."
+        );
+        self.publish_id(id).await;
+        Ok(Some(()))
     }
 
     /// Record a transient failure: back off and stay `scheduled`, or give up

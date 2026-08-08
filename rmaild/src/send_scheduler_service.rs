@@ -109,6 +109,21 @@ impl SendSchedulerApi {
         Ok(parse_timezone(name)?)
     }
 
+    /// The mandatory undo floor for an AI-originated send, in seconds.
+    ///
+    /// Passed into `send_now`/`reschedule` so the clamp is applied in SQL
+    /// against the row's own `origin` rather than here — see
+    /// [`rmail_core::outbox::OutboxStore::send_now`] for why that has to be
+    /// atomic.
+    fn ai_floor_secs(&self) -> i64 {
+        i64::try_from(
+            self.policy
+                .mandatory_undo_window(rmail_core::outbox::Origin::Ai)
+                .as_secs(),
+        )
+        .unwrap_or(i64::MAX)
+    }
+
     /// Resolve the three ways a request can name an instant, most explicit
     /// first. `None` means "now", which the policy turns into an undo window.
     fn resolve_when(
@@ -195,7 +210,13 @@ impl SendSchedulerApi {
             // through `ComposeService`, which resolves and freezes one.
             references: in_reply_to.clone().into_iter().collect(),
         })?;
-        let raw_mime = render_inline(draft)?;
+        // Genuinely off the runtime. This used to call `render_inline`
+        // directly from an async fn while its doc claimed otherwise; body
+        // size is bounded only by tonic's decode limit, so a multi-megabyte
+        // inline body stalled a runtime worker.
+        let raw_mime = tokio::task::spawn_blocking(move || render_inline(draft))
+            .await
+            .map_err(|error| Status::internal(format!("render task failed: {error}")))??;
 
         Ok(Rendered {
             raw_mime,
@@ -319,7 +340,10 @@ impl SendSchedulerService for SendSchedulerApi {
                     "rescheduling needs a time: set send_at or send_at_nl",
                 ))
             })?;
-        let entry = self.store.reschedule(req.id, send_at, tz.name()).await?;
+        let entry = self
+            .store
+            .reschedule(req.id, send_at, tz.name(), self.ai_floor_secs())
+            .await?;
         Ok(Response::new(entry_to_proto(&entry)))
     }
 
@@ -335,7 +359,10 @@ impl SendSchedulerService for SendSchedulerApi {
 
     #[tracing::instrument(skip(self, request))]
     async fn send_now(&self, request: Request<IdRequest>) -> Result<Response<ProtoEntry>, Status> {
-        let entry = self.store.send_now(request.into_inner().id).await?;
+        let entry = self
+            .store
+            .send_now(request.into_inner().id, self.ai_floor_secs())
+            .await?;
         Ok(Response::new(entry_to_proto(&entry)))
     }
 
@@ -600,6 +627,7 @@ fn state_from_proto(state: i32) -> Option<CoreState> {
         Ok(ProtoState::Sent) => Some(CoreState::Sent),
         Ok(ProtoState::Failed) => Some(CoreState::Failed),
         Ok(ProtoState::Canceled) => Some(CoreState::Canceled),
+        Ok(ProtoState::Uncertain) => Some(CoreState::Uncertain),
         Ok(ProtoState::Unspecified) | Err(_) => None,
     }
 }
@@ -611,6 +639,7 @@ fn state_to_proto(state: CoreState) -> ProtoState {
         CoreState::Sent => ProtoState::Sent,
         CoreState::Failed => ProtoState::Failed,
         CoreState::Canceled => ProtoState::Canceled,
+        CoreState::Uncertain => ProtoState::Uncertain,
     }
 }
 

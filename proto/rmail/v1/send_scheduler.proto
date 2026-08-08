@@ -110,6 +110,11 @@ enum OutboxState {
   OUTBOX_STATE_FAILED = 4;
   // Cancelled before it was claimed.
   OUTBOX_STATE_CANCELED = 5;
+  // The SMTP session died without a reply, so whether the peer queued the
+  // message is unknown. Neither sent nor failed: retrying may deliver a
+  // second copy, and reporting it sent would claim a delivery that may not
+  // have happened. Needs a human.
+  OUTBOX_STATE_UNCERTAIN = 6;
 }
 
 // Who asked for a message to be sent.

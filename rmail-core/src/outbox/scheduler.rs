@@ -416,10 +416,12 @@ impl SendScheduler {
         }
     }
 
-    /// Record a returned SMTP failure on its row.
+    /// Record an SMTP failure on its row.
     ///
-    /// Both paths clear the fence: a returned error means the peer answered
-    /// and queued nothing, so a retry is not a duplicate.
+    /// The transient and permanent paths clear the fence: a *returned* error
+    /// means the peer answered and queued nothing, so a retry is not a
+    /// duplicate. The indeterminate path deliberately does not — see
+    /// [`OutboxStore::mark_indeterminate`].
     async fn record_failure(&self, claim: &ClaimedSend, failure: &SendFailure, now: i64) {
         let outcome = match failure {
             SendFailure::Transient(_) => {
@@ -434,6 +436,11 @@ impl SendScheduler {
                     .mark_permanent_failure(claim, failure.message())
                     .await
             }
+            SendFailure::Indeterminate(_) => self
+                .store
+                .mark_indeterminate(claim, failure.message(), now)
+                .await
+                .map(|outcome| outcome.is_some()),
         };
         match outcome {
             Ok(true) => self.publish_send(claim, false, Some(failure)).await,

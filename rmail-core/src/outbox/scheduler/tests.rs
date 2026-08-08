@@ -87,6 +87,29 @@ impl SmtpSender for CrashingSender {
     }
 }
 
+/// Delivers for real and then reports an indeterminate failure — the shape of
+/// a timeout waiting for the `250` that follows `DATA`. The peer has the
+/// message; only the acknowledgement was lost.
+#[derive(Debug)]
+struct LostAckSender {
+    inner: LettreSender,
+}
+
+#[async_trait::async_trait]
+impl SmtpSender for LostAckSender {
+    async fn send(
+        &self,
+        account_id: i64,
+        envelope: &SendEnvelope,
+        raw_mime: &[u8],
+    ) -> Result<(), SendFailure> {
+        self.inner.send(account_id, envelope, raw_mime).await?;
+        Err(SendFailure::Indeterminate(
+            "timed out waiting for the reply to DATA".to_owned(),
+        ))
+    }
+}
+
 /// Answers with a fixed failure, and counts how often it was asked.
 #[derive(Debug)]
 struct FailingSender {
@@ -664,5 +687,66 @@ async fn an_ai_send_is_not_transmitted_inside_its_interception_window() {
     assert_eq!(
         store.cancel(entry.id).await.unwrap().state,
         OutboxState::Canceled
+    );
+}
+
+#[tokio::test]
+async fn a_lost_acknowledgement_after_data_is_never_retransmitted() {
+    // The duplicate-delivery case the fence exists for, and the one a plain
+    // transient classification got wrong: the peer accepted the message and
+    // its `250` never came back. Retrying would put a second copy in the
+    // recipient's mailbox, so the row has to stop rather than reschedule.
+    let fixture = Fixture::open_named("sched-lost-ack");
+    let mock = MockSmtp::start(MockSmtpConfig::default()).await.unwrap();
+    fixture.set_smtp_port(mock.port());
+    let store = fixture.store();
+    let entry = store
+        .schedule(fixture.new_send("Exactly once, even so", now() - 1))
+        .await
+        .unwrap();
+
+    let lossy = Arc::new(LostAckSender {
+        inner: LettreSender::new(fixture.db.clone(), SmtpSecurity::Plaintext),
+    });
+    let first = build_scheduler(&fixture, store.clone(), lossy, policy(), "worker-a");
+    let _ = first.pass().await;
+
+    assert_eq!(
+        mock.accepted_count(),
+        1,
+        "the first attempt did reach the server"
+    );
+    let after = store.get(entry.id).await.unwrap();
+    assert_eq!(
+        after.state,
+        OutboxState::Uncertain,
+        "an unacknowledged send is neither sent nor failed: reporting it sent would claim \
+         a delivery that may not have happened, and reporting it failed invites the retry \
+         that delivers a second copy"
+    );
+    assert!(
+        after.smtp_message_id.is_some(),
+        "the fence must survive -- it is what stops a later pass from re-transmitting"
+    );
+
+    // Now let a perfectly healthy sender run several more passes. The
+    // recipient must still have exactly one copy.
+    let healthy = Arc::new(LettreSender::new(
+        fixture.db.clone(),
+        SmtpSecurity::Plaintext,
+    ));
+    let second = build_scheduler(&fixture, store.clone(), healthy, policy(), "worker-b");
+    for _ in 0..3 {
+        let _ = second.pass().await;
+    }
+
+    assert_eq!(
+        mock.accepted_count(),
+        1,
+        "a second copy was delivered -- the indeterminate outcome was treated as retryable"
+    );
+    assert_eq!(
+        store.get(entry.id).await.unwrap().state,
+        OutboxState::Uncertain
     );
 }

@@ -666,7 +666,7 @@ async fn rescheduling_moves_the_instant_and_send_now_makes_it_due() {
         .unwrap();
 
     let moved = store
-        .reschedule(entry.id, now() + 3600, "Europe/Berlin")
+        .reschedule(entry.id, now() + 3600, "Europe/Berlin", 0)
         .await
         .unwrap();
     assert_eq!(moved.tz, "Europe/Berlin");
@@ -676,7 +676,7 @@ async fn rescheduling_moves_the_instant_and_send_now_makes_it_due() {
         .unwrap()
         .is_empty());
 
-    store.send_now(entry.id).await.unwrap();
+    store.send_now(entry.id, 0).await.unwrap();
     assert!(!store
         .claim_due("worker", 10, now(), Duration::from_secs(60))
         .await
@@ -699,7 +699,7 @@ async fn a_send_already_in_flight_can_no_longer_be_rescheduled_or_edited() {
 
     assert_eq!(
         store
-            .reschedule(entry.id, now() + 60, "UTC")
+            .reschedule(entry.id, now() + 60, "UTC", 0)
             .await
             .unwrap_err()
             .reason(),
@@ -967,5 +967,62 @@ fn every_state_and_origin_round_trips_through_its_wire_string() {
     assert_eq!(
         Origin::parse("wat").unwrap_err().reason(),
         ErrorReason::InvalidArgument
+    );
+}
+
+#[tokio::test]
+async fn send_now_and_reschedule_cannot_strip_an_ai_undo_window() {
+    // `ScheduleSend` already refused "send_at = now" and "undo_window = 0".
+    // These two RPCs move the instant *after* the row exists, and did so with
+    // no reference to `origin` at all -- so schedule-then-SendNow was the same
+    // bypass in two calls instead of one. The floor is enforced in SQL from
+    // the row's own origin, so this asserts against the stored row.
+    let fixture = Fixture::open_named("ai-floor");
+    let store = fixture.store();
+    const FLOOR: i64 = 30;
+
+    let ai = |subject: &str| {
+        let mut send = fixture.new_send(subject, now() + 3600);
+        send.origin = Origin::Ai;
+        send
+    };
+
+    let entry = store.schedule(ai("AI: send now")).await.unwrap();
+    let after = store.send_now(entry.id, FLOOR).await.unwrap();
+    assert!(
+        after.send_at >= now() + FLOOR - 2,
+        "SendNow moved an AI send inside its mandatory undo window: send_at={} now={}",
+        after.send_at,
+        now()
+    );
+    assert!(
+        after.undo_deadline.is_some(),
+        "the window has to be visible, not merely implied by send_at"
+    );
+
+    // The same bypass through the other door: name an instant in the past.
+    let entry = store
+        .schedule(ai("AI: reschedule to the past"))
+        .await
+        .unwrap();
+    let after = store
+        .reschedule(entry.id, now() - 86_400, "UTC", FLOOR)
+        .await
+        .unwrap();
+    assert!(
+        after.send_at >= now() + FLOOR - 2,
+        "RescheduleSend backdated an AI send past its undo window: send_at={} now={}",
+        after.send_at,
+        now()
+    );
+
+    // A human-originated send is untouched by any of this.
+    let mut human = fixture.new_send("Mine, send it", now() + 3600);
+    human.origin = Origin::User;
+    let entry = store.schedule(human).await.unwrap();
+    let after = store.send_now(entry.id, FLOOR).await.unwrap();
+    assert!(
+        after.send_at <= now() + 1,
+        "a user's own SendNow must still be immediate"
     );
 }

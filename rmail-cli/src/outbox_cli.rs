@@ -514,6 +514,10 @@ fn state_name(state: i32) -> &'static str {
         Ok(OutboxState::Sent) => "sent",
         Ok(OutboxState::Failed) => "failed",
         Ok(OutboxState::Canceled) => "canceled",
+        // Spelled out rather than abbreviated: this is the one state a user
+        // has to act on, and "uncertain" alone reads like a warning they can
+        // ignore.
+        Ok(OutboxState::Uncertain) => "uncertain (may have been delivered)",
         Ok(OutboxState::Unspecified) | Err(_) => "unknown",
     }
 }

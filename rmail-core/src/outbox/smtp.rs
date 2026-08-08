@@ -83,18 +83,34 @@ pub struct SendEnvelope {
 
 /// Why a transmission did not happen.
 ///
-/// Both variants mean the same thing about delivery — **nothing was
-/// queued** — and differ only in whether trying again could help.
+/// [`SendFailure::Transient`] and [`SendFailure::Permanent`] both mean the
+/// same thing about delivery — **nothing was queued** — and differ only in
+/// whether trying again could help. [`SendFailure::Indeterminate`] is the
+/// third case, and the reason this is not a two-variant enum: the peer never
+/// answered, so whether it queued the message is *unknown*.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SendFailure {
-    /// Try again later: a 4xx reply, an unreachable server, a timeout, a
-    /// handshake that did not complete.
+    /// Try again later: a 4xx reply, or any failure that happened before the
+    /// session was established. Nothing was queued.
     #[error("temporary SMTP failure: {0}")]
     Transient(String),
     /// Do not try again: a 5xx reply, a rejected credential, an address the
     /// server will never accept, or a request this build cannot form.
     #[error("permanent SMTP failure: {0}")]
     Permanent(String),
+    /// The connection was established and then died without a reply — a
+    /// timeout waiting for a response, a socket closed mid-session, an
+    /// unparseable answer.
+    ///
+    /// This is *not* a transient failure, and treating it as one is how a
+    /// recipient gets two copies: if the peer had already accepted the
+    /// message and only its `250` was lost, retransmitting delivers a
+    /// duplicate. Nothing on this side can distinguish "it never arrived"
+    /// from "the acknowledgement never came back", so the fence is kept and
+    /// the row resolves through the same at-most-once path a process crash
+    /// takes. See the module docs' at-most-once section.
+    #[error("indeterminate SMTP failure: {0}")]
+    Indeterminate(String),
 }
 
 impl SendFailure {
@@ -102,7 +118,9 @@ impl SendFailure {
     #[must_use]
     pub fn message(&self) -> &str {
         match self {
-            Self::Transient(message) | Self::Permanent(message) => message,
+            Self::Transient(message) | Self::Permanent(message) | Self::Indeterminate(message) => {
+                message
+            }
         }
     }
 
@@ -124,6 +142,9 @@ impl From<SendFailure> for Error {
             // RPC that surfaces this (`SendNow`) did nothing wrong — the
             // system is in a state that makes the send impossible.
             SendFailure::Permanent(message) => Error::failed_precondition(message),
+            // The send may or may not have landed; the caller must not be
+            // told it definitely failed, and must not retry on its own.
+            SendFailure::Indeterminate(message) => Error::unavailable(message),
         }
     }
 }
@@ -356,8 +377,17 @@ pub fn classify_smtp_error(error: &lettre::transport::smtp::Error) -> SendFailur
     if error.is_permanent() {
         return SendFailure::Permanent(detail);
     }
-    if error.is_transient() || error.is_timeout() {
+    if error.is_transient() {
         return SendFailure::Transient(detail);
+    }
+    // We waited and the peer never answered. If that wait was for the reply
+    // to `DATA`, the message may already be queued on the far side, and a
+    // retry would be a second copy. Connection-refused and friends fall
+    // through to the transient default below instead, because those provably
+    // never got as far as a session -- calling *those* indeterminate would
+    // trade duplicates for silently undelivered mail, which is worse.
+    if error.is_timeout() {
+        return SendFailure::Indeterminate(detail);
     }
     // Our own request was malformed (an unencodable address, a relay name
     // that is not a hostname). Retrying re-sends the same bytes.

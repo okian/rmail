@@ -95,7 +95,14 @@ CREATE TABLE outbox (
     -- schedule, which is cancelable right up to its lease.
     undo_deadline   INTEGER,
 
-    CHECK (state IN ('scheduled', 'sending', 'sent', 'failed', 'canceled')),
+    -- 'uncertain': the session died without a reply, so whether the peer
+    -- queued the message is unknown. Deliberately its own state rather than
+    -- folded into 'failed': a failed row is safe to retry, an uncertain one
+    -- is not (a retry may deliver a second copy), and it is not 'sent'
+    -- either, because it may never have arrived. It keeps its
+    -- smtp_message_id fence and waits for a human. See the outbox module
+    -- docs' at-most-once section.
+    CHECK (state IN ('scheduled', 'sending', 'sent', 'failed', 'canceled', 'uncertain')),
     CHECK (origin IN ('user', 'ai', 'followup', 'undo')),
     CHECK (sent_late IN (0, 1))
 ) STRICT;
