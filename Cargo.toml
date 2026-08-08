@@ -168,3 +168,29 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # load-bearing: without it, a `[[bench]] harness = false` target does not
 # integrate with the `cargo bench` CLI at all.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# ---------------------------------------------------------------------------
+# Build profiles
+# ---------------------------------------------------------------------------
+# Link-time memory, not compile time, is what constrains this workspace's test
+# gate. `scripts/docker-test.sh` runs in a container the Docker VM caps at
+# 7.7 GB, and a full debug link of this dependency tree — 257 object files per
+# test binary, plus statically-linked onnxruntime, SQLite, ring and the ICU
+# tables — is dominated by DWARF. Twenty-one test binaries linking at `nproc`
+# parallelism reliably got `ld` SIGKILLed by the OOM killer, which reads as a
+# code failure and is not one.
+#
+# `line-tables-only` keeps exactly what a failing test needs — file, line and
+# symbol in a backtrace — and drops the type/variable DWARF that a debugger
+# would want but CI never looks at. It is not "no debug info": `panic!`
+# locations and `RUST_BACKTRACE` output are unchanged. Anyone stepping through
+# under a debugger can override it locally with
+# `CARGO_PROFILE_DEV_DEBUG=full`.
+#
+# `[profile.dev]` covers `[profile.test]` too — test targets inherit dev — but
+# both are stated so neither is changed by accident.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
