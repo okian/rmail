@@ -111,9 +111,22 @@ fn opener_passes_the_path_as_one_argv_entry_never_through_a_shell() {
     let scratch = Scratch::new("argv");
     let recorded = scratch.join("argv.txt");
     let script = scratch.join("fake-open.sh");
+    // Write to a temp file in the same directory and rename it into place
+    // rather than redirecting straight to `recorded`: `>` truncates/creates
+    // the target before `printf` writes to it, so the polling loop below can
+    // observe the file mid-write as empty — a race that widens under
+    // scheduler contention (e.g. the full suite running in parallel) rather
+    // than in isolation. A same-filesystem rename is atomic, so `recorded`
+    // never exists with partial content.
+    let recorded_tmp = scratch.join("argv.txt.tmp");
     std::fs::write(
         &script,
-        format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", recorded.display()),
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$1\" > '{}' && mv '{}' '{}'\n",
+            recorded_tmp.display(),
+            recorded_tmp.display(),
+            recorded.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
