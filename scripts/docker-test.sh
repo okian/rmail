@@ -137,10 +137,19 @@ if [ -d "$host_models" ]; then
   run_args+=(-v "$host_models:/root/.cache/rmail/models:ro")
 fi
 
-# A TTY only when there is one to inherit; the Stop gate captures output from a
-# pipe, where -t would inject control characters into the failure report.
-[ -t 1 ] && run_args+=(-t)
-[ "$mode" = "shell" ] && run_args+=(-i)
+# A TTY only for an interactive shell, and only when there is one on the host
+# to inherit; the Stop gate captures output from a pipe, where -t would inject
+# control characters into the failure report. Test/raw runs never get one:
+# docker's -t allocates the pty for the container's stdin too, even without
+# -i and even with the host's stdin redirected from /dev/null, so a `test`
+# run would make `std::io::IsTerminal::is_terminal()` report true inside the
+# container with nothing ever attached to answer a prompt — any code under
+# test that branches on stdin being a tty (e.g. a confirmation prompt) then
+# blocks forever instead of taking its non-interactive path.
+if [ "$mode" = "shell" ]; then
+  [ -t 1 ] && run_args+=(-t)
+  run_args+=(-i)
+fi
 
 docker run "${run_args[@]}" "$IMAGE" "${cmd[@]}"
 status=$?
