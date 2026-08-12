@@ -294,3 +294,58 @@ fn sqlite_busy_is_transient_but_other_errors_are_internal() {
     let core: crate::Error = other.into();
     assert_eq!(core.reason(), crate::ErrorReason::Internal);
 }
+
+/// Two migrations may never share a version number.
+///
+/// This is a merge hazard, not a coding one, and it has bitten this project
+/// twice: parallel branches each reserve a number at dispatch, land out of
+/// order, and collide. refinery keys applied migrations by version, so a
+/// collision means one of the two files is silently never run and its tables
+/// never exist — on a *fresh* database as much as an upgraded one.
+///
+/// Read off the directory rather than the embedded module so a file that was
+/// added but never picked up still counts. Gaps are fine and deliberate (V15
+/// and V17 are permanently unused); only duplicates are fatal.
+#[test]
+fn every_migration_has_a_version_no_other_migration_claims() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut by_version: std::collections::BTreeMap<u32, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut found = 0usize;
+    let mut unparseable: Vec<String> = Vec::new();
+
+    for entry in std::fs::read_dir(&dir).expect("migrations directory must exist") {
+        let entry = entry.expect("readable directory entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".sql") {
+            continue;
+        }
+        found += 1;
+        // `V<version>__<name>.sql` — refinery's own convention.
+        let version: Option<u32> = name
+            .strip_prefix('V')
+            .and_then(|rest| rest.split("__").next())
+            .and_then(|digits| digits.parse().ok());
+        match version {
+            Some(version) => by_version.entry(version).or_default().push(name),
+            None => unparseable.push(name),
+        }
+    }
+
+    assert!(found > 0, "no migrations found in {}", dir.display());
+    assert!(
+        unparseable.is_empty(),
+        "these do not follow refinery's V<n>__<name>.sql convention, so refinery \
+         will not run them at all: {unparseable:?}"
+    );
+
+    let collisions: Vec<_> = by_version
+        .iter()
+        .filter(|(_, files)| files.len() > 1)
+        .collect();
+    assert!(
+        collisions.is_empty(),
+        "migration version collision — renumber the later-merged one to \
+         max_merged + 1 and fix any `-- Vnn:` references inside it: {collisions:?}"
+    );
+}

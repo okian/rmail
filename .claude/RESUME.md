@@ -60,9 +60,17 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32. V15 and V17 are permanently unused, which
-costs nothing. V29/V30/V31 are **assigned to the in-flight wave** (51, 64, 66
-respectively) and V32 is `moved_annotations`, which landed first because it was
-orchestrator work rather than a task. **Next free: V33.**
+costs nothing. **Next free: V33.**
+
+⚠️ The in-flight wave (51, 64, 66) was dispatched with V29/V30/V31 reserved,
+and then `moved_annotations` landed as V32 ahead of all three. **Those branches
+must be renumbered to V33+ at merge, not left on the numbers they were given.**
+This is the exact trap the rule above describes, arrived at from the other
+direction: refinery only applies migrations *above* the last-applied version,
+so once V32 is in a database, a later-merged V29 is silently skipped and its
+table never exists. Assigning a number at dispatch is what created the hazard —
+the assignment is a hint for avoiding collisions between concurrent agents, never
+a promise the number survives.
 
 ## Orchestration notes worth not relearning
 
