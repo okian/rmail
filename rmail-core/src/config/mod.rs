@@ -875,9 +875,18 @@ pub struct IndexExtractConfig {
     pub strip_html: bool,
     /// Extract attachment text.
     pub attachments: bool,
-    /// OCR images/scanned PDFs (opt-in).
+    /// OCR image attachments and text-less PDFs (`Status::Empty` on native
+    /// extraction) — opt-in and off by default, matching the PRD: OCR is CPU
+    /// and, on macOS, framework-heavy, and a mailbox with a fast-clip
+    /// scanner attached should not pay that cost until it asks to.
+    /// Apple Vision is the backend on macOS (no operator setup — it ships
+    /// with the OS); `tesseract` on `PATH` is the fallback, and the only
+    /// option at all off macOS. See `attach::ocr`.
     pub ocr: bool,
-    /// OCR languages.
+    /// Languages to hint to the OCR backend, as tesseract-style ISO 639-2/T
+    /// codes (`"eng"`) — Tesseract is passed these directly; Vision maps the
+    /// common ones to the BCP-47 tags it expects and otherwise falls back to
+    /// its own automatic language detection.
     pub ocr_langs: Vec<String>,
     /// Maximum attachment size to extract (MiB).
     pub max_attachment_mb: u32,

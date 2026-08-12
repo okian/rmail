@@ -703,7 +703,16 @@ fn join_pages(pages: Vec<String>) -> Extracted {
 /// [`join_pages`], which normalizes page by page so the offsets describe the
 /// text that is actually stored — see that function for why estimating them
 /// afterwards does not work.
-fn finish(text: String) -> Extracted {
+///
+/// `pub(crate)`: `attach::apply_ocr` reuses this for OCR'd text, which is not
+/// a "format" in this module's sense but needs exactly the same treatment —
+/// NFC normalization (search-critical: a decomposed vs. composed accent must
+/// not desync indexing from querying), bidi/control-character stripping (an
+/// image's content is attacker-influenced — a sender picks the picture — and
+/// this is the same untrusted-text-into-a-search-snippet boundary every
+/// other extractor already crosses through here), and the same
+/// [`MAX_TEXT_BYTES`] bound every other extractor's output is held to.
+pub(crate) fn finish(text: String) -> Extracted {
     let normalized = crate::index::extract::normalize(&text);
     let truncated = normalized.len() > MAX_TEXT_BYTES;
     let text = if truncated {

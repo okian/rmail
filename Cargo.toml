@@ -84,6 +84,25 @@ libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 r2d2_sqlite = "0.25"
 refinery = { version = "0.8", features = ["rusqlite"] }
 security-framework = "3"
+# Apple Vision framework bindings for on-device OCR (index.extract.ocr's
+# default backend, macOS only — see rmail-core/src/attach/ocr.rs).
+# `default-features = false` everywhere here: each crate's default feature set
+# pulls in every request/type family it knows about (face detection, body
+# pose, barcode scanning, CoreML, ...), none of which this binary calls; naming
+# only the text-recognition path keeps both the FFI surface and the audit
+# burden to what is actually linked.
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "NSArray", "NSData", "NSDictionary", "NSEnumerator", "NSError", "NSObject",
+    "NSString",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "CFCGTypes",
+] }
+objc2-vision = { version = "0.3", default-features = false, features = [
+    "std", "VNRequest", "VNRequestHandler", "VNRecognizeTextRequest",
+    "VNObservation", "VNTypes", "VNGeometry", "objc2-core-foundation",
+] }
 async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
 # `default-features = false`: the default pulls `aws-lc-rs`, and with `ring`
 # also in the tree (via reqwest and via hf-hub's client) rustls has two

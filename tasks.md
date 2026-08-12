@@ -243,7 +243,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core attach::extract` (per-format fixtures, oversized skip, page offsets)
 
 ## 23. OCR path for images & scanned PDFs
-- [ ] status
+- [x] status
 - **depends-on:** 22
 - **parallel-safe:** yes
 - **acceptance:**
