@@ -6,13 +6,10 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**54 of 86 done, 32 remaining.** `tasks.md` is authoritative — count with
+**55 of 86 done, 31 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **1760/1760** in
-`rmail-core`'s lib suite, with clippy, gitleaks and typos clean. The full
-workspace run (2100+) is owed once the in-flight wave merges — it has been
-skipped in favour of the narrower command below while three agents compete
-for the Docker VM.
+after merge, never on the agent's own report: currently **2180/2180** on the full
+workspace suite, with clippy, `buf lint`, gitleaks and typos clean.
 
 Defects in already-merged work keep being found by the post-merge full-suite
 run or by orchestrator review rather than by the task that introduced them: a
@@ -60,12 +57,14 @@ The rule now is: whatever number a branch used, rename it at merge to
 `max_merged + 1` and fix any `-- Vnn:` references inside the file. Never
 reference a migration version from Rust.
 
-Merged: V1–V14, V16, V18–V28, V32, V33. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V34.**
+Merged: V1–V14, V16, V18–V28, V32–V34. V15 and V17 are permanently unused, which
+costs nothing. **Next free: V35.**
 
-⚠️ The in-flight wave (51, 64, 66) was dispatched with V29/V30/V31 reserved,
-and then `moved_annotations` landed as V32 ahead of all three. **Those branches
-must be renumbered to V34+ at merge, not left on the numbers they were given.**
+⚠️ The in-flight wave (51, 66) was dispatched with V29/V31 reserved, and then
+`moved_annotations` landed as V32 ahead of them. **Those branches must be
+renumbered to V35+ at merge, not left on the numbers they were given.** Task
+64 already hit this — its V30 became V34, and a doc comment naming the old
+number had to move with it.
 This is the exact trap the rule above describes, arrived at from the other
 direction: refinery only applies migrations *above* the last-applied version,
 so once V32 is in a database, a later-merged V29 is silently skipped and its
@@ -159,3 +158,16 @@ a promise the number survives.
 - Bare `cargo nextest run -p rmaild <name>` filters match test *names*, not
   integration-binary ids; use `--test <name>`. Several `tasks.md` verify lines
   are written in the form that matches nothing.
+- **Pruning Docker volumes does not give the *host* its disk back (macOS).**
+  Dropping 28 GB of named volumes took Docker's own accounting from 106.7 GB
+  to 78.7 GB and moved `df` not at all: the VM's disk image is a sparse file
+  that grows and never shrinks. Volume pruning is still worth doing — it is
+  what stops "No space left on device" *inside* the container — but when the
+  **host** is short, the levers are the checkouts' `target/` directories (the
+  main one alone is ~14 GB and rebuilds in minutes) and nothing else.
+- **Map a volume to its worktree before deleting it.** The name is
+  `rmail-test-target-$(printf '%s' "$repo_root" | shasum | cut -c1-12)`, so
+  the owner of each volume is computable rather than guessable. Deleting a
+  running agent's volume forces it into a cold rebuild mid-gate; deleting the
+  main checkout's throws away the 26 GB cache every orchestrator run depends
+  on. Compute the hashes, then remove only the spent ones.
