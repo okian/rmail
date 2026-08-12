@@ -1155,3 +1155,131 @@ async fn an_instrumented_handler_records_its_field_values() {
          auto-recorded argument. Captured: {captured}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A move keeps the annotations the user wrote
+// ---------------------------------------------------------------------------
+
+/// A message carrying a `Message-ID` — the identity a move does not change.
+const MOVED_RAW: &[u8] = b"From: Alice <alice@example.com>\r\n\
+To: bob@example.com\r\n\
+Subject: Invoice 4021\r\n\
+Message-ID: <invoice-4021@example.com>\r\n\
+\r\n\
+the invoice is attached\r\n";
+
+fn fetched(uid: i64) -> crate::message::fetch::FetchedMessage {
+    crate::message::fetch::FetchedMessage {
+        uid,
+        uidvalidity: 1,
+        internaldate: Some(1_700_000_000),
+        size: Some(MOVED_RAW.len() as i64),
+        flags: vec!["\\Seen".to_owned()],
+        raw: MOVED_RAW.to_vec(),
+    }
+}
+
+/// The end-to-end proof for `mail::annotations`: a client-initiated `Move`
+/// deletes the local row (it cannot learn the new UID), so every message-level
+/// tag and note cascades away with it. Both halves — escrow on the way out,
+/// replay on the way back in — have to be wired up for this to pass, and it is
+/// driven through the real `MailStore::move_message` and the real
+/// `persist_fetched` rather than through the escrow API directly, so it fails
+/// if either call site is dropped.
+#[tokio::test]
+async fn a_move_carries_message_level_tags_and_notes_onto_the_resynced_row() {
+    let fx = Fixture::new();
+    let (account_id, inbox_id, archive_id, _seeded) = fx.seed(&[]);
+
+    let old = crate::message::fetch::persist_fetched(&fx.tmp.db, account_id, inbox_id, fetched(1))
+        .await
+        .unwrap()
+        .message_id;
+    // `messages.id` is a plain `INTEGER PRIMARY KEY`, so SQLite reissues a
+    // deleted row's rowid to the next insert. Keeping the counter past `old`
+    // is what makes the "the id really did change" assertion below mean
+    // something rather than pass by accident.
+    fx.tmp
+        .db
+        .with_write(|c| {
+            repo::insert_message(
+                c,
+                &NewMessage {
+                    account_id,
+                    mailbox_id: inbox_id,
+                    uid: 2,
+                    uidvalidity: 1,
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+    // A tag the user applied and a note the user wrote. Neither exists on the
+    // server; neither is recoverable from a resync.
+    let tag_id = fx
+        .tmp
+        .db
+        .with_write(|c| {
+            c.execute(
+                "INSERT INTO tags (account_id, name) VALUES (?1, 'invoices')",
+                [account_id],
+            )?;
+            let tag_id = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO message_tags (tag_id, message_id, source, state)
+                 VALUES (?1, ?2, 'user', 'applied')",
+                rusqlite::params![tag_id, old],
+            )?;
+            c.execute(
+                "INSERT INTO notes (message_id, body_md, author) VALUES (?1, ?2, 'user')",
+                rusqlite::params![old, "chase this on Friday"],
+            )?;
+            Ok(tag_id)
+        })
+        .unwrap();
+
+    fx.store.move_message(old, archive_id).await.unwrap();
+
+    // The local row is gone, and with it the annotation rows that cascaded.
+    assert!(fx
+        .tmp
+        .db
+        .read(move |c| repo::get_message(c, old))
+        .await
+        .unwrap()
+        .is_none());
+
+    // The destination folder syncs the message in under a new UID and a new id.
+    let new =
+        crate::message::fetch::persist_fetched(&fx.tmp.db, account_id, archive_id, fetched(900))
+            .await
+            .unwrap()
+            .message_id;
+    assert_ne!(new, old, "a move does not preserve messages.id");
+
+    let (tags, notes) = fx
+        .tmp
+        .db
+        .read(move |c| {
+            let tags: i64 = c.query_row(
+                "SELECT COUNT(*) FROM message_tags WHERE message_id = ?1 AND tag_id = ?2",
+                rusqlite::params![new, tag_id],
+                |r| r.get(0),
+            )?;
+            let notes: String = c.query_row(
+                "SELECT COALESCE(group_concat(body_md), '') FROM notes WHERE message_id = ?1",
+                [new],
+                |r| r.get(0),
+            )?;
+            Ok((tags, notes))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(tags, 1, "the tag followed the message into Archive");
+    assert_eq!(
+        notes, "chase this on Friday",
+        "the note followed the message into Archive"
+    );
+}

@@ -153,6 +153,32 @@ pub async fn persist_fetched(
             let thread_id = assignment.as_ref().map(|a| a.thread_id);
             let merged_threads = assignment.map(|a| a.merged).unwrap_or_default();
 
+            // After threading, before the commit: this is the far half of a
+            // client-initiated `Move`, which deleted the message's old row and
+            // its user-authored tags and notes with it. If this insert is that
+            // message arriving in its destination, put them back — see
+            // `crate::mail::annotations`. Ordinary syncs pay one indexed probe
+            // for a message that carries a `Message-ID`, and nothing at all for
+            // one that does not.
+            //
+            // Logged rather than propagated: a message that syncs without its
+            // old tags is a bad day, but a message that refuses to sync at all
+            // because re-attaching one went wrong is a broken mailbox. Escrow
+            // rows the failure left behind are still there for the next sync of
+            // this folder to retry, and expire on their own if it never comes.
+            if let Some(header) = new.message_id.as_deref() {
+                if let Err(error) =
+                    crate::mail::annotations::replay(&tx, message_id, mailbox_id, header)
+                {
+                    tracing::warn!(
+                        %error,
+                        message_id,
+                        mailbox_id,
+                        "could not restore annotations escrowed across a move"
+                    );
+                }
+            }
+
             tx.commit()?;
             Ok(PersistOutcome {
                 message_id,

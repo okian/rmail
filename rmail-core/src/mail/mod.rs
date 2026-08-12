@@ -90,6 +90,8 @@ use crate::imap::mutate::ImapMutator;
 use crate::repo;
 use crate::storage::Database;
 
+pub mod annotations;
+
 #[cfg(test)]
 mod tests;
 
@@ -434,10 +436,17 @@ impl MailStore {
         // see the module docs' "Move does not guess a new UID" section for
         // why a plain delete would leave orphaned vectors, entity mentions,
         // and thread aggregates behind.
+        //
+        // `annotations::capture` runs first and inside the same transaction:
+        // the message-level tags and notes about to cascade away are the
+        // user's own work, and unlike flags or bodies the next sync cannot
+        // reconstruct them. See `mail::annotations` for how they get back.
+        let dest_id = dest.id;
         if let Err(error) = self
             .db
             .write(move |conn| {
                 let tx = conn.transaction()?;
+                annotations::capture(&tx, message_id, dest_id)?;
                 crate::sync::remove_messages(&tx, &[message_id])?;
                 tx.commit()?;
                 Ok(())

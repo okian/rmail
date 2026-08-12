@@ -575,7 +575,10 @@ fn affected_messages(tx: &Transaction<'_>, target: Target) -> rusqlite::Result<V
 /// join. A message with no thread (`thread_id IS NULL`) simply never matches
 /// that arm, which is correct — there is no thread for a thread-note to have
 /// been attached to.
-fn refresh_note_index(tx: &Transaction<'_>, message_id: i64) -> rusqlite::Result<Vec<u8>> {
+pub(crate) fn refresh_note_index(
+    tx: &Transaction<'_>,
+    message_id: i64,
+) -> rusqlite::Result<Vec<u8>> {
     let raw: String = tx.query_row(
         "SELECT COALESCE(group_concat(body_md, ' '), '') FROM notes
          WHERE message_id = ?1 OR thread_id = (SELECT thread_id FROM messages WHERE id = ?1)",

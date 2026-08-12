@@ -524,6 +524,7 @@ where
     let pruner = tokio::spawn({
         let events = events.clone();
         let stopping = stopping.clone();
+        let db = db.clone();
         async move {
             loop {
                 // Prune once at startup before sleeping. A daemon restarted
@@ -531,6 +532,22 @@ where
                 // all, which is exactly the machine that most needs it.
                 if let Err(error) = events.prune().await {
                     tracing::warn!(%error, "event log prune failed");
+                }
+                // The move-annotation escrow's safety net. Rows here are
+                // normally consumed within seconds by the destination folder's
+                // next sync; these are the ones whose message never arrived,
+                // and nothing but age will ever clear them. See
+                // `rmail_core::mail::annotations`.
+                match db
+                    .write(|conn| rmail_core::mail::annotations::expire(conn))
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(expired) => tracing::info!(
+                        expired,
+                        "reaped move-annotation escrow rows whose message never arrived"
+                    ),
+                    Err(error) => tracing::warn!(%error, "move-annotation escrow prune failed"),
                 }
                 tokio::select! {
                     () = stopping.cancelled() => return,
