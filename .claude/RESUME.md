@@ -6,10 +6,13 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**53 of 86 done, 33 remaining.** `tasks.md` is authoritative — count with
+**54 of 86 done, 32 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **2101/2101** tests,
-with clippy, `buf lint`, `cargo deny`, gitleaks and typos all clean.
+after merge, never on the agent's own report: currently **1760/1760** in
+`rmail-core`'s lib suite, with clippy, gitleaks and typos clean. The full
+workspace run (2100+) is owed once the in-flight wave merges — it has been
+skipped in favour of the narrower command below while three agents compete
+for the Docker VM.
 
 Defects in already-merged work keep being found by the post-merge full-suite
 run or by orchestrator review rather than by the task that introduced them: a
@@ -35,12 +38,10 @@ left it, because closing it belonged to no single task.
 
 ## Unfinished work preserved on branches
 
-| Task | Branch | State |
-|---|---|---|
-| 23 OCR path | `worktree-agent-a92770680c94c9608` | Vision + Tesseract backends, migration and config written; untested, unreviewed. The only surviving WIP. |
-
-Tasks 24 and 61 were previously listed here; **both are now merged and
-verified** — do not re-merge them. Tasks 40, 51 and 84 were dispatched and
+**None.** Task 23 (OCR) was the last surviving WIP and is now merged and
+verified as V33 — its branch `worktree-agent-a92770680c94c9608` is spent.
+Tasks 24 and 61 were also previously listed here and are likewise merged.
+Do not re-merge any of them. Tasks 40, 51 and 84 were dispatched and
 died to a session limit before writing anything, so there is nothing to
 resume: start them fresh.
 
@@ -59,12 +60,12 @@ The rule now is: whatever number a branch used, rename it at merge to
 `max_merged + 1` and fix any `-- Vnn:` references inside the file. Never
 reference a migration version from Rust.
 
-Merged: V1–V14, V16, V18–V28, V32. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V33.**
+Merged: V1–V14, V16, V18–V28, V32, V33. V15 and V17 are permanently unused, which
+costs nothing. **Next free: V34.**
 
 ⚠️ The in-flight wave (51, 64, 66) was dispatched with V29/V30/V31 reserved,
 and then `moved_annotations` landed as V32 ahead of all three. **Those branches
-must be renumbered to V33+ at merge, not left on the numbers they were given.**
+must be renumbered to V34+ at merge, not left on the numbers they were given.**
 This is the exact trap the rule above describes, arrived at from the other
 direction: refinery only applies migrations *above* the last-applied version,
 so once V32 is in a database, a later-merged V29 is silently skipped and its

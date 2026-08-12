@@ -46,3 +46,8 @@ EMAILL = "EMAILL"
 # The SMTP greeting verb (RFC 5321), not a misspelling of "hello". The mock
 # server in `outbox::mock` has to answer both EHLO and HELO.
 HELO = "HELO"
+
+# ISO 639-2/B ("bibliographic") for French, which is the code tesseract uses
+# and therefore what `attach::ocr::vision` has to map to a BCP 47 tag. Its
+# 639-2/T sibling `fra` is right there on the same line; both are real.
+fre = "fre"
