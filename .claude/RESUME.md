@@ -11,16 +11,27 @@ orchestration rules that were learned the hard way.
 after merge, never on the agent's own report: currently **2101/2101** tests,
 with clippy, `buf lint`, `cargo deny`, gitleaks and typos all clean.
 
-Four defects in already-merged work have been found by the post-merge
-full-suite run or by orchestrator review rather than by the task that
-introduced them: a hook-dispatcher boot race, a budget enforcer that did not
-bound in-flight batches, a misspelled test name, and — the worst — an outbox
-that retransmitted after an unacknowledged `DATA`, i.e. duplicate mail. Two
-more were structural: **nothing in the running daemon had ever enqueued an
-index job** (tasks 16–21 shipped an inert pipeline, each passing its own
-gate), and `MailService.Move` silently orphans tags and notes. Re-running the
-whole suite after each merge, and reading the safety-critical paths yourself,
-is what catches these.
+Defects in already-merged work keep being found by the post-merge full-suite
+run or by orchestrator review rather than by the task that introduced them: a
+hook-dispatcher boot race, a budget enforcer that did not bound in-flight
+batches, a misspelled test name, and — the worst — an outbox that
+retransmitted after an unacknowledged `DATA`, i.e. duplicate mail. Two more
+were structural: **nothing in the running daemon had ever enqueued an index
+job** (tasks 16–21 shipped an inert pipeline, each passing its own gate), and
+`MailService.Move` destroyed every message-level tag and note (fixed in
+`31ab82b` — see below). Re-running the whole suite after each merge, and
+reading the safety-critical paths yourself, is what catches these.
+
+**Where to look for the next one.** These all live in a seam no task owns.
+The productive question is not "is this task correct" but "does anything
+actually drive this subsystem, and what happens to the data at the boundary".
+Two checks that have each paid off: grep the daemon's startup for what it
+spawns and diff that against the subsystems that expose a `spawn`
+(currently five, all wired and all joined at shutdown — that one is clean
+now); and for any path that deletes a `messages` row, ask what cascades with
+it and whether the next sync can reconstruct it. The `Move` bug was the
+second check — the schema comment in V24 had *documented* the data loss and
+left it, because closing it belonged to no single task.
 
 ## Unfinished work preserved on branches
 
@@ -48,8 +59,10 @@ The rule now is: whatever number a branch used, rename it at merge to
 `max_merged + 1` and fix any `-- Vnn:` references inside the file. Never
 reference a migration version from Rust.
 
-Merged: V1–V14, V16, V18–V27. V15 and V17 are permanently unused, which
-costs nothing. Merged through V28. **Next free: V29.**
+Merged: V1–V14, V16, V18–V28, V32. V15 and V17 are permanently unused, which
+costs nothing. V29/V30/V31 are **assigned to the in-flight wave** (51, 64, 66
+respectively) and V32 is `moved_annotations`, which landed first because it was
+orchestrator work rather than a task. **Next free: V33.**
 
 ## Orchestration notes worth not relearning
 
@@ -82,6 +95,16 @@ costs nothing. Merged through V28. **Next free: V29.**
   container slot**, and only got green by narrowing to per-package runs with
   `-j 1|2`. Treat serial linking as the normal procedure, not a workaround,
   until the Docker VM gets more memory.
+- **When even the serial link OOMs, narrow the build instead of retrying.**
+  With three agents active, `--workspace --no-run` was itself SIGKILLed
+  linking `rmaild`'s integration binaries. The escape is to stop building
+  them: `./scripts/docker-test.sh -- sh -c 'CARGO_BUILD_JOBS=1 cargo nextest
+  run --locked --all-features -p rmail-core --lib <filter>'` builds one test
+  binary and links in seconds. For anything whose subject is in `rmail-core`
+  — which is most domain work, and every revert-and-check-the-test-bites
+  probe — this is strictly the better command: it turned a 3-minute link that
+  failed into a sub-minute one that passed, four times in a row. Save the
+  full-workspace run for the post-merge gate, where it is actually the point.
 - **A green suite is not a race-free suite.** The full parallel run is the
   only thing on this project that has ever exercised enough scheduling
   pressure to expose a boot-ordering race — it caught one in the hook
