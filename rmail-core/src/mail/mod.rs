@@ -446,7 +446,13 @@ impl MailStore {
             .db
             .write(move |conn| {
                 let tx = conn.transaction()?;
-                annotations::capture(&tx, message_id, dest_id)?;
+                annotations::capture(
+                    &tx,
+                    message_id,
+                    dest_id,
+                    annotations::Departing::Message(message_id),
+                    &mut std::collections::BTreeSet::new(),
+                )?;
                 crate::sync::remove_messages(&tx, &[message_id])?;
                 tx.commit()?;
                 Ok(())

@@ -140,7 +140,13 @@ impl Fixture {
         self.db
             .with_write(|c| {
                 let tx = c.transaction()?;
-                let escrowed = capture(&tx, message_id, dest)?;
+                let escrowed = capture(
+                    &tx,
+                    message_id,
+                    dest,
+                    Departing::Message(message_id),
+                    &mut BTreeSet::new(),
+                )?;
                 crate::sync::remove_messages(&tx, &[message_id])?;
                 tx.commit()?;
                 Ok(escrowed)
@@ -486,4 +492,165 @@ fn expire_reaps_only_rows_older_than_the_window() {
     let reaped = fx.db.with_write(|c| expire(c)).unwrap();
     assert_eq!(reaped, 1);
     assert_eq!(fx.escrow_rows(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The same loss, at folder scale, without the user asking for anything
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_uidvalidity_purge_escrows_the_folders_annotations_and_replay_restores_them() {
+    let fx = Fixture::open();
+    let old = fx.message(fx.inbox_id, 42, Some(HEADER));
+    let untagged = fx.message(fx.inbox_id, 43, Some("plain@example.com"));
+    let tag_id = fx.tag("invoices");
+    fx.apply_tag(tag_id, old);
+    fx.note(old, "chase this on Friday");
+
+    // The server renumbers the folder. Every row in the old UID space goes.
+    fx.db
+        .with_write(|c| {
+            let tx = c.transaction()?;
+            let mut removed = Vec::new();
+            // Only the real purge path: it escrows internally, so calling
+            // `capture_stale_uid_space` here as well would bank everything
+            // twice and prove nothing about the wiring.
+            crate::sync::purge_other_uidvalidity(&tx, fx.inbox_id, 7, &mut removed)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(fx.escrow_rows(), 2, "the tag and the note, once each");
+    assert_eq!(
+        fx.tags_on(old).len(),
+        0,
+        "the purge really did cascade the originals away"
+    );
+    let _ = untagged;
+
+    // The folder resyncs under the new UIDVALIDITY.
+    let resynced = fx
+        .db
+        .with_write(|c| {
+            repo::insert_message(
+                c,
+                &NewMessage {
+                    account_id: fx.account_id,
+                    mailbox_id: fx.inbox_id,
+                    uid: 1,
+                    uidvalidity: 7,
+                    message_id: Some(HEADER.to_owned()),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(fx.replay_onto(resynced, fx.inbox_id, HEADER), 2);
+    assert_eq!(fx.tags_on(resynced).len(), 1);
+    assert_eq!(fx.notes_on(resynced).len(), 1);
+}
+
+#[test]
+fn a_purge_escrows_a_doomed_threads_annotations_exactly_once() {
+    let fx = Fixture::open();
+    let first = fx.message(fx.inbox_id, 42, Some(HEADER));
+    let second = fx.message(fx.inbox_id, 43, Some("second@example.com"));
+    let tag_id = fx.tag("invoices");
+    let account_id = fx.account_id;
+    fx.db
+        .with_write(|c| {
+            c.execute("INSERT INTO threads (account_id) VALUES (?1)", [account_id])?;
+            let thread_id = c.last_insert_rowid();
+            c.execute(
+                "UPDATE messages SET thread_id = ?1 WHERE id IN (?2, ?3)",
+                rusqlite::params![thread_id, first, second],
+            )?;
+            c.execute(
+                "INSERT INTO message_tags (tag_id, thread_id, source, state)
+                 VALUES (?1, ?2, 'user', 'applied')",
+                rusqlite::params![tag_id, thread_id],
+            )?;
+            c.execute(
+                "INSERT INTO notes (thread_id, body_md, author) VALUES (?1, 'thread note', 'user')",
+                [thread_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Both messages are in the doomed UID space, so the thread is emptied and
+    // reaped. Asking the single-message question would have each see the other
+    // as a survivor and escrow nothing at all.
+    fx.db
+        .with_write(|c| {
+            let tx = c.transaction()?;
+            let mut removed = Vec::new();
+            // Only the real purge path: it escrows internally, so calling
+            // `capture_stale_uid_space` here as well would bank everything
+            // twice and prove nothing about the wiring.
+            crate::sync::purge_other_uidvalidity(&tx, fx.inbox_id, 7, &mut removed)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        fx.escrow_rows(),
+        2,
+        "the thread's tag and note, banked once between the two members — not once each"
+    );
+}
+
+#[test]
+fn a_purge_that_spares_a_threads_other_mailbox_escrows_nothing_for_it() {
+    let fx = Fixture::open();
+    let doomed = fx.message(fx.inbox_id, 42, Some(HEADER));
+    let elsewhere = fx.message(fx.archive_id, 1, Some("elsewhere@example.com"));
+    let tag_id = fx.tag("invoices");
+    let account_id = fx.account_id;
+    let thread_id = fx
+        .db
+        .with_write(|c| {
+            c.execute("INSERT INTO threads (account_id) VALUES (?1)", [account_id])?;
+            let thread_id = c.last_insert_rowid();
+            c.execute(
+                "UPDATE messages SET thread_id = ?1 WHERE id IN (?2, ?3)",
+                rusqlite::params![thread_id, doomed, elsewhere],
+            )?;
+            c.execute(
+                "INSERT INTO message_tags (tag_id, thread_id, source, state)
+                 VALUES (?1, ?2, 'user', 'applied')",
+                rusqlite::params![tag_id, thread_id],
+            )?;
+            Ok(thread_id)
+        })
+        .unwrap();
+
+    fx.db
+        .with_write(|c| {
+            let tx = c.transaction()?;
+            let mut removed = Vec::new();
+            // Only the real purge path: it escrows internally, so calling
+            // `capture_stale_uid_space` here as well would bank everything
+            // twice and prove nothing about the wiring.
+            crate::sync::purge_other_uidvalidity(&tx, fx.inbox_id, 7, &mut removed)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        fx.escrow_rows(),
+        0,
+        "the thread keeps its Archive member, so it is never reaped and nothing was at risk"
+    );
+    let surviving: i64 = fx
+        .db
+        .with_write(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM message_tags WHERE thread_id = ?1",
+                [thread_id],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(surviving, 1);
 }

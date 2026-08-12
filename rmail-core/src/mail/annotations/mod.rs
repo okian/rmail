@@ -38,6 +38,7 @@
 //! annotations it restored and logs anything it could not, and its caller
 //! commits regardless.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use rusqlite::{OptionalExtension, Transaction};
@@ -162,15 +163,52 @@ fn read_notes(tx: &Transaction<'_>, column: &str, id: i64) -> rusqlite::Result<V
     rows.collect()
 }
 
-/// The thread `message_id` belongs to, but only if removing this message will
-/// leave it empty — which is when `sync::repair_threads` deletes it and takes
-/// its thread-level annotations with it.
+/// Which rows the caller is about to delete.
 ///
-/// A thread with other messages still in it survives the move untouched, so
-/// escrowing its annotations would re-apply tags it never lost.
+/// This exists so the thread-orphan test below stays correct for both callers.
+/// A `Move` removes exactly one message, so "does the thread keep anyone" means
+/// "is there a sibling with a different id". A `UIDVALIDITY` purge removes the
+/// whole stale UID space of a mailbox at once, and asking the single-message
+/// question there gets the wrong answer for every thread with two messages in
+/// the doomed folder: each sees the other as a survivor, so neither escrows,
+/// and `repair_threads` then deletes the thread out from under both.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Departing {
+    /// One message, by id.
+    Message(i64),
+    /// Every message of `mailbox_id` whose `uidvalidity` is not `keep`.
+    StaleUidSpace { mailbox_id: i64, keep: i64 },
+}
+
+impl Departing {
+    /// How many messages of `thread_id` this departure leaves behind.
+    fn survivors(self, tx: &Transaction<'_>, thread_id: i64) -> rusqlite::Result<i64> {
+        match self {
+            Self::Message(id) => tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE thread_id = ?1 AND id <> ?2",
+                rusqlite::params![thread_id, id],
+                |row| row.get(0),
+            ),
+            Self::StaleUidSpace { mailbox_id, keep } => tx.query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE thread_id = ?1 AND NOT (mailbox_id = ?2 AND uidvalidity <> ?3)",
+                rusqlite::params![thread_id, mailbox_id, keep],
+                |row| row.get(0),
+            ),
+        }
+    }
+}
+
+/// The thread `message_id` belongs to, but only if the departure described by
+/// `departing` will leave it empty — which is when `sync::repair_threads`
+/// deletes it and takes its thread-level annotations with it.
+///
+/// A thread that keeps a message survives untouched, so escrowing its
+/// annotations would re-apply tags it never lost.
 fn thread_about_to_be_orphaned(
     tx: &Transaction<'_>,
     message_id: i64,
+    departing: Departing,
 ) -> rusqlite::Result<Option<i64>> {
     let thread_id: Option<i64> = tx
         .query_row(
@@ -183,12 +221,7 @@ fn thread_about_to_be_orphaned(
     let Some(thread_id) = thread_id else {
         return Ok(None);
     };
-    let siblings: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM messages WHERE thread_id = ?1 AND id <> ?2",
-        rusqlite::params![thread_id, message_id],
-        |row| row.get(0),
-    )?;
-    Ok((siblings == 0).then_some(thread_id))
+    Ok((departing.survivors(tx, thread_id)? == 0).then_some(thread_id))
 }
 
 /// Copy `message_id`'s message-level tags and notes into escrow, to be
@@ -208,6 +241,8 @@ pub(crate) fn capture(
     tx: &Transaction<'_>,
     message_id: i64,
     dest_mailbox_id: i64,
+    departing: Departing,
+    threads_done: &mut BTreeSet<i64>,
 ) -> rusqlite::Result<usize> {
     let identity: Option<(i64, Option<String>)> = tx
         .query_row(
@@ -230,9 +265,16 @@ pub(crate) fn capture(
         escrowed += insert_escrow(tx, account_id, dest_mailbox_id, &header, KIND_NOTE, note)?;
     }
 
-    // The thread's own annotations, but only when this move is what empties
-    // the thread — see `thread_about_to_be_orphaned`.
-    if let Some(thread_id) = thread_about_to_be_orphaned(tx, message_id)? {
+    // The thread's own annotations, but only when this departure is what
+    // empties the thread — see `thread_about_to_be_orphaned`. `threads_done`
+    // keeps a thread from being escrowed once per doomed member: a purge calls
+    // this for every message in the stale UID space, and a thread with three
+    // of them would otherwise bank three copies of every thread note. (Tags
+    // would survive that on `INSERT OR IGNORE`'s unique index; notes have no
+    // such constraint and would genuinely triple.)
+    if let Some(thread_id) = thread_about_to_be_orphaned(tx, message_id, departing)?
+        .filter(|thread_id| threads_done.insert(*thread_id))
+    {
         for tag in &read_tags(tx, "thread_id", thread_id)? {
             escrowed += insert_escrow(
                 tx,
@@ -261,6 +303,64 @@ pub(crate) fn capture(
             dest_mailbox_id,
             escrowed,
             "held message-level annotations in escrow across a move"
+        );
+    }
+    Ok(escrowed)
+}
+
+/// Escrow the annotations of every message in `mailbox_id` whose `uidvalidity`
+/// is not `keep`, before `sync::purge_other_uidvalidity` deletes them.
+///
+/// A `UIDVALIDITY` bump is the same data loss as a `Move`, without the user
+/// having asked for anything: the server renumbers a folder, every local row in
+/// it is deleted, and every tag and note hanging off those rows cascades away.
+/// The messages themselves come back on the very next pass under new ids — so
+/// the escrow's destination mailbox is simply the mailbox they are already in.
+///
+/// # Cost
+///
+/// Bounded by the number of *annotated* messages in the folder, not its size.
+/// The lead query is a pair of `EXISTS` probes against indexed columns, so the
+/// overwhelmingly common case — a six-figure folder with nothing tagged in it —
+/// is two index lookups and no enumeration at all. That matters: this runs
+/// inside the same write transaction as the purge, holding the single writer.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub(crate) fn capture_stale_uid_space(
+    tx: &Transaction<'_>,
+    mailbox_id: i64,
+    keep: i64,
+) -> rusqlite::Result<usize> {
+    let departing = Departing::StaleUidSpace { mailbox_id, keep };
+    let annotated: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT m.id FROM messages m
+             WHERE m.mailbox_id = ?1 AND m.uidvalidity <> ?2 AND m.message_id IS NOT NULL
+               AND (EXISTS (SELECT 1 FROM message_tags t WHERE t.message_id = m.id)
+                 OR EXISTS (SELECT 1 FROM notes n WHERE n.message_id = m.id)
+                 OR (m.thread_id IS NOT NULL AND (
+                        EXISTS (SELECT 1 FROM message_tags t WHERE t.thread_id = m.thread_id)
+                     OR EXISTS (SELECT 1 FROM notes n WHERE n.thread_id = m.thread_id))))
+             ORDER BY m.id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![mailbox_id, keep], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if annotated.is_empty() {
+        return Ok(0);
+    }
+
+    let mut threads_done = BTreeSet::new();
+    let mut escrowed = 0usize;
+    for message_id in annotated {
+        escrowed += capture(tx, message_id, mailbox_id, departing, &mut threads_done)?;
+    }
+    if escrowed > 0 {
+        tracing::info!(
+            mailbox_id,
+            escrowed,
+            "held annotations in escrow across a UIDVALIDITY purge"
         );
     }
     Ok(escrowed)

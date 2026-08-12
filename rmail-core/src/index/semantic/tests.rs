@@ -1010,7 +1010,10 @@ async fn the_purge_path_sweeps_orphaned_vectors() {
     fx.db
         .write(move |c| {
             let mut removed = Vec::new();
-            crate::sync::purge_other_uidvalidity(c, mailbox_id, 99, &mut removed)
+            let tx = c.transaction()?;
+            let deleted = crate::sync::purge_other_uidvalidity(&tx, mailbox_id, 99, &mut removed)?;
+            tx.commit()?;
+            Ok(deleted)
         })
         .await
         .unwrap();

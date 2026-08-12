@@ -171,11 +171,17 @@ pub(crate) fn remove_messages(conn: &Connection, ids: &[i64]) -> rusqlite::Resul
 /// # Errors
 /// Propagates any `rusqlite` error.
 pub(crate) fn purge_other_uidvalidity(
-    conn: &Connection,
+    tx: &rusqlite::Transaction<'_>,
     mailbox_id: i64,
     keep: i64,
     removed: &mut Vec<(i64, i64)>,
 ) -> rusqlite::Result<usize> {
+    // Before anything is deleted: a renumbered folder loses every tag and note
+    // in it to `ON DELETE CASCADE`, and unlike flags or bodies the resync
+    // cannot rebuild them. Same escrow the client-initiated `Move` uses — see
+    // `crate::mail::annotations`.
+    crate::mail::annotations::capture_stale_uid_space(tx, mailbox_id, keep)?;
+    let conn: &Connection = tx;
     // Collect identities before the delete: a purge removes messages just as
     // surely as an expunge does, and a consumer that indexed them needs to know
     // which ones to drop. Reporting only a count would leave every downstream
