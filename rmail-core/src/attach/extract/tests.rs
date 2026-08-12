@@ -417,13 +417,8 @@ async fn a_zip_bomb_does_not_get_to_declare_its_own_size() {
     let small = build(15_000);
     let double = build(30_000);
 
-    let started = std::time::Instant::now();
     let (status, text) = extract(Format::Docx, small).await.unwrap();
-    let small_elapsed = started.elapsed();
-
-    let started = std::time::Instant::now();
     let (double_status, double_text) = extract(Format::Docx, double).await.unwrap();
-    let double_elapsed = started.elapsed();
 
     assert!(matches!(status, Status::Ok | Status::Empty));
     assert!(matches!(double_status, Status::Ok | Status::Empty));
@@ -444,15 +439,46 @@ async fn a_zip_bomb_does_not_get_to_declare_its_own_size() {
         "twice the archive produced {} bytes",
         double_text.text.len()
     );
-    // 1.6x leaves room for the extra inflate the bigger archive genuinely
-    // costs, while still separating "stopped at the cap" from "read it all":
-    // a read proportional to input would land at ~2x or beyond. Load moves
-    // both measurements together, so the ratio holds on a busy machine.
-    let ratio = double_elapsed.as_secs_f64() / small_elapsed.as_secs_f64().max(0.001);
+    // Output is invariant past the cap: twice the paragraphs yields byte-for-
+    // byte the same text, because the extractor produced all it was ever going
+    // to produce before the archive doubled.
+    //
+    // This replaced a wall-clock ratio (`double_elapsed / small_elapsed < 1.6`)
+    // that was flaky and, on inspection, not measuring what it claimed. The
+    // extractor inflates and decodes a whole entry *before* the XML loop runs,
+    // so the inflate/decode half genuinely does scale with the archive while
+    // the parse half stops at the text cap. The true ratio therefore sits
+    // between 1x and 2x depending on which half dominates on the day; 1.6 was
+    // inside that band rather than above it, and it failed at 1.64x with every
+    // bound working correctly. The comment it carried argued a ratio is
+    // load-tolerant because "load moves both measurements together" — it is
+    // not, because the two runs are sampled at different moments and one
+    // contention spike moves only one of them, with no second sample to
+    // average it away.
+    //
+    // Be clear about what is and is not covered now. Removing the parse loop's
+    // early `break` leaves this test green — verified, not assumed — because
+    // `finish` caps the output either way, so the early break has no
+    // deterministic observable at this level. That is acceptable: it is an
+    // optimization *inside* an already-bounded envelope, not the bound itself.
+    // What actually stops a bomb that lies about its uncompressed size is
+    // `entry.take(budget)` holding total inflation to `MAX_UNZIPPED_BYTES`
+    // (64 MB) and `MAX_ZIP_ENTRIES` bounding the walk — both deterministically
+    // proved by `a_zip_with_an_absurd_number_of_entries_is_bounded`. A test
+    // that fails at random under CI load is worse than no test; a timing
+    // assertion is the wrong instrument for a property whose correctness half
+    // is already pinned elsewhere.
+    assert_eq!(
+        text.text,
+        double_text.text,
+        "twice the archive produced different text, so extraction did not stop \
+         at the same place: {} bytes vs {} bytes",
+        text.text.len(),
+        double_text.text.len()
+    );
     assert!(
-        ratio < 1.6,
-        "cost scaled with the archive rather than stopping at the cap: \
-         {small_elapsed:?} for 15k paragraphs vs {double_elapsed:?} for 30k ({ratio:.2}x)"
+        double_text.truncated,
+        "the doubled fixture must be truncated too, or it is not past the cap"
     );
 }
 
