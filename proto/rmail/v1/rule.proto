@@ -1,0 +1,243 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// RuleService is the rules engine (task 66, prd.md #45/#46/#50): TOML rules
+// pairing deterministic predicates (from/subject/body/header regexes, flag
+// membership, size bounds) with an optional `claude_is` natural-language
+// predicate, plus an action block.
+//
+// Unlike HookService, rules are NOT config-file driven: they are per account,
+// created over this service, and stored in the database. See
+// rmail_core::rules's own module docs and migration V31 for why a rule is a
+// stored document rather than a config table.
+//
+// The split between EvaluateRules and BacktestRule is deliberate and is a
+// scope boundary, not a convenience. EvaluateRules can move mail, run a hook,
+// and create a draft reply; BacktestRule fires none of those. (It is not
+// side-effect free in the absolute sense: it writes the claude_is
+// classification cache and an audit-ledger row, and spends real money at the
+// provider. What it never does is act on mail.) Folding them into one RPC
+// with a `dry_run` flag would mean the capability-scope table -- which is
+// keyed by method path and cannot see a request's fields -- had to grant the
+// mutating privilege to every read-only backtest. IndexService's
+// Reindex/Rebuild split exists for the same reason.
+service RuleService {
+  // Create one rule from a TOML document containing exactly one [[rules]]
+  // entry. The document is validated -- including compiling every regex under
+  // the configured bounds -- before anything is stored, and is kept verbatim
+  // so ListRules returns what the author wrote.
+  rpc CreateRule(CreateRuleRequest) returns (CreateRuleResponse);
+
+  // List an account's rules, enabled and disabled alike.
+  rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
+
+  // Evaluate rules against specific messages and FIRE their actions. A rule
+  // that has already acted on a message does nothing and is reported with
+  // already_fired -- actions are at most once per (rule, message).
+  rpc EvaluateRules(EvaluateRulesRequest) returns (EvaluateRulesResponse);
+
+  // Turn a plain-English instruction into a rule, preferring cheap
+  // deterministic predicates, and return it alongside a dry run over the last
+  // N days showing exactly what it would have hit.
+  rpc SynthesizeRule(SynthesizeRuleRequest) returns (SynthesizeRuleResponse);
+
+  // Dry-run a stored or ad-hoc rule over the last N days: per-message
+  // outcomes, a Claude explanation for each claude_is decision, and aggregate
+  // hit/cost stats. Never fires an action.
+  rpc BacktestRule(BacktestRuleRequest) returns (BacktestRuleResponse);
+
+  // Record a user correction to a claude_is decision. The correction is
+  // authoritative for that message and becomes a few-shot example for every
+  // later classification of the same predicate.
+  rpc RecordCorrection(RecordCorrectionRequest) returns (RecordCorrectionResponse);
+}
+
+// One stored rule.
+message Rule {
+  int64 id = 1;
+  int64 account_id = 2;
+  string name = 3;
+  // The rule document, verbatim as authored.
+  string toml = 4;
+  bool enabled = 5;
+  int64 created_at = 6;
+  int64 updated_at = 7;
+}
+
+// One predicate's contribution to a verdict.
+message PredicateOutcome {
+  // Which predicate, e.g. "from", "header.list-id", "claude_is".
+  string predicate = 1;
+  // False when the predicate was never consulted because the cheaper ones had
+  // already settled the rule. Reported separately from `matched` so a backtest
+  // cannot attribute a miss to the model when the model was never asked.
+  bool evaluated = 2;
+  // Always false when `evaluated` is false.
+  bool matched = 3;
+  // The model's explanation for a claude_is, or why the predicate was skipped.
+  string detail = 4;
+}
+
+// What one action did, or would do.
+message ActionOutcome {
+  // Matches the TOML key: move_to, archive, add_labels, add_flags, notify,
+  // run_hook, draft_reply.
+  string action = 1;
+  // Always false on a dry run, where `detail` says what a real run would do.
+  bool applied = 2;
+  string detail = 3;
+}
+
+// What one rule did for one message.
+message RuleOutcome {
+  string rule = 1;
+  bool matched = 2;
+  repeated PredicateOutcome predicates = 3;
+  // What the rule's actions did. On a real evaluation this is empty when the
+  // rule did not match, and empty when `already_fired` is set (nothing ran).
+  // On a dry run it is populated whenever the rule matched -- including
+  // alongside `already_fired`, since describing what a rule would do is still
+  // useful for one it has already done.
+  repeated ActionOutcome actions = 4;
+  // The rule had already acted on this message, so nothing fired.
+  bool already_fired = 5;
+  // A claude_is was answered by a fresh provider call.
+  bool model_called = 6;
+  // A claude_is was answered without one: the message-id + prompt-hash cache,
+  // or a user correction for this exact message.
+  bool cache_hit = 7;
+  // The one-line Claude explanation for the claude_is decision, when it was
+  // consulted.
+  string explanation = 8;
+}
+
+// What every rule did for one message.
+message MessageOutcome {
+  int64 message_id = 1;
+  // The RFC822 Message-ID header, for correlating with another client. Empty
+  // when the message carries none. Never a key -- the cache and every table
+  // here are keyed by the local message_id above.
+  string rfc_message_id = 2;
+  string subject = 3;
+  string from = 4;
+  repeated RuleOutcome rules = 5;
+  // Set when this message could not be evaluated (it vanished, or a claude_is
+  // could not be answered). One message failing never fails the whole run.
+  string error = 6;
+}
+
+// Aggregate stats for one evaluation, dry run, or backtest.
+message EvaluationStats {
+  // (message, rule) pairs that matched.
+  int64 matches = 1;
+  // Provider calls made.
+  int64 model_calls = 2;
+  // claude_is answers served without a provider call.
+  int64 cache_hits = 3;
+  // Actions applied. Always 0 on a dry run.
+  int64 actions_applied = 4;
+  // Actions attempted and failed. Always 0 on a dry run.
+  int64 actions_failed = 5;
+  // Messages that could not be evaluated.
+  int64 errors = 6;
+  // Messages considered.
+  int64 messages = 7;
+}
+
+message CreateRuleRequest {
+  int64 account_id = 1;
+  // A TOML document with exactly one [[rules]] entry.
+  string toml = 2;
+}
+
+message CreateRuleResponse {
+  Rule rule = 1;
+}
+
+message ListRulesRequest {
+  int64 account_id = 1;
+}
+
+message ListRulesResponse {
+  repeated Rule rules = 1;
+}
+
+message EvaluateRulesRequest {
+  int64 account_id = 1;
+  // The messages to evaluate. Required -- there is deliberately no "every
+  // message in the account" mode on the mutating RPC.
+  repeated int64 message_ids = 2;
+  // Restrict to these rules by name. Empty means every enabled rule. Naming a
+  // *disabled* rule here is FAILED_PRECONDITION: firing it would also burn its
+  // at-most-once claim, so enabling the rule later would never re-fire it for
+  // those messages. Use BacktestRule to see what a disabled rule would do.
+  repeated string rule_names = 3;
+}
+
+message EvaluateRulesResponse {
+  repeated MessageOutcome messages = 1;
+  EvaluationStats stats = 2;
+}
+
+message SynthesizeRuleRequest {
+  int64 account_id = 1;
+  // The plain-English instruction, e.g. "archive newsletters from Substack".
+  string instruction = 2;
+  // Days of mail the dry run covers. 0 uses the configured default.
+  uint32 days = 3;
+}
+
+message SynthesizeRuleResponse {
+  // The synthesized rule, rendered as a document CreateRule would accept
+  // verbatim.
+  string toml = 1;
+  // The rule's chosen name.
+  string name = 2;
+  // Whether the synthesized rule ended up with a claude_is predicate.
+  bool uses_claude_is = 3;
+  // Set when a model-proposed claude_is was dropped because it changed no
+  // outcome over the window, with the reason. See rmail_core::rules::synth.
+  string claude_is_dropped = 4;
+  // The model's own one-line note about the rule it wrote.
+  string notes = 5;
+  // The dry run over the window: what this rule would have done.
+  repeated MessageOutcome dry_run = 6;
+  EvaluationStats stats = 7;
+  uint32 window_days = 8;
+}
+
+message BacktestRuleRequest {
+  int64 account_id = 1;
+  // Exactly one of these two. `rule_name` backtests a stored rule;
+  // `rule_toml` backtests an unsaved document, which is how a rule is
+  // validated against real mail before it is ever created.
+  string rule_name = 2;
+  string rule_toml = 3;
+  // Days of mail to cover. 0 uses the configured default.
+  uint32 days = 4;
+}
+
+message BacktestRuleResponse {
+  repeated MessageOutcome messages = 1;
+  EvaluationStats stats = 2;
+  uint32 window_days = 3;
+}
+
+message RecordCorrectionRequest {
+  int64 account_id = 1;
+  int64 message_id = 2;
+  // The claude_is predicate being corrected, verbatim as the rule writes it.
+  // Matched exactly (after trimming) against the predicate text a rule
+  // carries, because that text is what the classification cache is keyed by --
+  // a correction whose wording differs by a character teaches a predicate no
+  // rule uses. Copy it out of the rule rather than retyping it.
+  string prompt = 3;
+  // What the answer should have been.
+  bool expected = 4;
+}
+
+message RecordCorrectionResponse {
+  // How many corrections now exist for this predicate.
+  int64 example_count = 1;
+}

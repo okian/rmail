@@ -267,6 +267,134 @@ async fn a_token_with_the_right_scope_reaches_inner() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+/// `Requirement::AllOf` is a conjunction, driven through the real layer.
+///
+/// Each half of `EvaluateRules`' requirement on its own is a token that could
+/// otherwise archive an inbox (`automation` alone) or spawn a hook process
+/// (`mail.write` alone). The point of the row is that neither does.
+#[tokio::test]
+async fn neither_half_of_an_all_of_requirement_is_enough_on_its_own() {
+    let tmp = TempDb::open();
+    for (name, scopes) in [
+        ("automation-only", vec![Scope::Automation]),
+        ("write-only", vec![Scope::MailWrite]),
+        (
+            "read-and-automation",
+            vec![Scope::MailRead, Scope::Automation],
+        ),
+    ] {
+        let minted = mint(
+            &tmp.db,
+            NewToken {
+                name: name.to_owned(),
+                scopes,
+                ttl_secs: None,
+            },
+        )
+        .await
+        .expect("mint");
+
+        for method in [
+            "/rmail.v1.RuleService/EvaluateRules",
+            "/rmail.v1.RuleService/CreateRule",
+        ] {
+            let req = with_bearer(synthetic_request(method), &minted.secret);
+            let (response, calls) = run(&tmp.db, 0, req).await;
+            let status = status_of(&response)
+                .unwrap_or_else(|| unreachable!("{name} should be denied {method}"));
+            assert_eq!(
+                status.code(),
+                tonic::Code::PermissionDenied,
+                "{name} on {method}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{name} on {method}: inner must not be called — physically denied"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn holding_every_scope_of_an_all_of_requirement_reaches_inner() {
+    let tmp = TempDb::open();
+    let minted = mint(
+        &tmp.db,
+        NewToken {
+            name: "automation-writer".to_owned(),
+            scopes: vec![Scope::Automation, Scope::MailWrite, Scope::AiInvoke],
+            ttl_secs: None,
+        },
+    )
+    .await
+    .expect("mint");
+
+    let req = with_bearer(
+        synthetic_request("/rmail.v1.RuleService/EvaluateRules"),
+        &minted.secret,
+    );
+    let (response, calls) = run(&tmp.db, 0, req).await;
+    assert!(status_of(&response).is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // ...and dropping any one of the three takes it away again. Asserted per
+    // scope so a future re-scoping that quietly drops one from the row does
+    // not leave this test still passing on the other two.
+    for missing in [Scope::Automation, Scope::MailWrite, Scope::AiInvoke] {
+        let scopes: Vec<Scope> = [Scope::Automation, Scope::MailWrite, Scope::AiInvoke]
+            .into_iter()
+            .filter(|s| *s != missing)
+            .collect();
+        let partial = mint(
+            &tmp.db,
+            NewToken {
+                name: format!("without-{missing}"),
+                scopes,
+                ttl_secs: None,
+            },
+        )
+        .await
+        .expect("mint");
+        let req = with_bearer(
+            synthetic_request("/rmail.v1.RuleService/EvaluateRules"),
+            &partial.secret,
+        );
+        let (response, calls) = run(&tmp.db, 0, req).await;
+        assert_eq!(
+            status_of(&response).map(|s| s.code()),
+            Some(tonic::Code::PermissionDenied),
+            "a token without {missing} must not fire rules"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// Listing rules is deliberately the low-water mark of this service: an
+/// `automation`-only token reads the rule list and can do nothing else here.
+#[tokio::test]
+async fn an_automation_token_may_list_rules_but_not_fire_one() {
+    let tmp = TempDb::open();
+    let minted = mint(
+        &tmp.db,
+        NewToken {
+            name: "read-automation".to_owned(),
+            scopes: vec![Scope::Automation],
+            ttl_secs: None,
+        },
+    )
+    .await
+    .expect("mint");
+
+    let req = with_bearer(
+        synthetic_request("/rmail.v1.RuleService/ListRules"),
+        &minted.secret,
+    );
+    let (response, calls) = run(&tmp.db, 0, req).await;
+    assert!(status_of(&response).is_none(), "listing must be allowed");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn a_mail_scoped_token_cannot_reach_admin_methods() {
     let tmp = TempDb::open();

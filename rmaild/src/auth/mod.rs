@@ -151,10 +151,16 @@ async fn authorize(
     peer_admin: bool,
     bearer: Option<&str>,
 ) -> Result<(), Status> {
-    let required = match methods::lookup(method) {
+    // `every` distinguishes the two quantifiers over the same slice: a
+    // conjunction and a disjunction are otherwise indistinguishable once the
+    // requirement has been flattened to `&[Scope]`, and getting it backwards
+    // would silently widen an `AllOf` row to whichever of its scopes a caller
+    // happened to hold.
+    let (required, every) = match methods::lookup(method) {
         Some(Requirement::Public) => return Ok(()),
-        Some(Requirement::Scope(scope)) => std::slice::from_ref(scope),
-        Some(Requirement::AnyOf(scopes)) => *scopes,
+        Some(Requirement::Scope(scope)) => (std::slice::from_ref(scope), false),
+        Some(Requirement::AnyOf(scopes)) => (*scopes, false),
+        Some(Requirement::AllOf(scopes)) => (*scopes, true),
         None => {
             tracing::warn!(
                 method,
@@ -167,17 +173,27 @@ async fn authorize(
     };
 
     let granted = principal_scopes(db, peer_admin, bearer).await?;
-    if required
-        .iter()
-        .any(|scope| rmail_core::auth::satisfies(&granted, scope))
-    {
+    let satisfied = if every {
+        // An empty `AllOf` would vacuously pass here and grant the method to
+        // any authenticated caller; `methods::tests::no_all_of_row_is_empty`
+        // is what keeps one from ever being written.
+        !required.is_empty()
+            && required
+                .iter()
+                .all(|scope| rmail_core::auth::satisfies(&granted, scope))
+    } else {
+        required
+            .iter()
+            .any(|scope| rmail_core::auth::satisfies(&granted, scope))
+    };
+    if satisfied {
         Ok(())
     } else {
         let wanted = required
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
-            .join(" or ");
+            .join(if every { " and " } else { " or " });
         Err(Status::from(RmailError::permission_denied(format!(
             "method {method} requires scope {wanted}, which this token does not grant"
         ))))

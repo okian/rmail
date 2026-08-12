@@ -33,7 +33,8 @@ pub use duration::{parse_human_duration, HumanDuration};
 
 /// Top-level table names accepted from the environment overlay.
 const KNOWN_TABLES: &[&str] = &[
-    "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc", "hooks",
+    "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc",
+    "hooks", "rules",
 ];
 
 /// Errors produced while loading or parsing configuration.
@@ -302,6 +303,8 @@ pub struct Config {
     pub grpc: GrpcConfig,
     /// Event-hook dispatcher settings.
     pub hooks: HooksConfig,
+    /// Rules-engine settings.
+    pub rules: RulesConfig,
 }
 
 impl Config {
@@ -1772,6 +1775,105 @@ pub enum HookEvent {
     /// A sync pass recorded an error (`events::EventKind::SyncState` whose
     /// payload's `error` field is non-null).
     OnSyncError,
+}
+
+// ---------------------------------------------------------------------------
+// Rules
+// ---------------------------------------------------------------------------
+
+/// Rules-engine settings (task 66, prd.md #45/#46/#50).
+///
+/// The rules themselves are **not** here. Unlike `[[hooks.hooks]]`, a rule is
+/// per account, created and backtested over gRPC, and stored in the database
+/// — see `rmail_core::rules`'s own module docs and migration V35 for why. This
+/// table holds only the knobs that govern how the engine runs them.
+///
+/// There is deliberately no model knob either: a `claude_is` classification is
+/// exactly the cheap, high-volume work `ai.models.triage` names, and synthesis
+/// is the one-off reasoning job `ai.models.deep` names. A second place to
+/// configure a model is a second place for it to drift out of step with the
+/// budget ladder that prices those two.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RulesConfig {
+    /// Whether the background evaluator runs at all.
+    ///
+    /// A disabled evaluator still registers `RuleService` — reflection and
+    /// the auth scope table see every RPC regardless of runtime config, the
+    /// convention `AiService`/`HookService` established — so creating,
+    /// listing, backtesting, and explicitly evaluating rules all still work.
+    /// What this gates is only the automatic "on each new message" path.
+    pub enabled: bool,
+    /// How often the evaluator re-reads the event log. This is the upper
+    /// bound on how long after a message arrives its rules fire.
+    pub tick_interval: HumanDuration,
+    /// How many messages one tick evaluates before deferring the rest.
+    pub max_batch: u32,
+    /// The mailbox an `archive = true` action moves to.
+    pub archive_mailbox: String,
+    /// Maximum length, in bytes, of one predicate's regex source.
+    ///
+    /// This and the two limits below bound *untrusted* patterns — a rule's
+    /// regexes come from a user, or from a model, and are then run unattended
+    /// against every new message. See `rmail_core::rules::model`'s own docs
+    /// for what each one stops and why a timeout is not among them.
+    pub max_pattern_len: u32,
+    /// Maximum size, in bytes, of one compiled regex program. A pattern that
+    /// would exceed it is refused when the rule is created, not when it is
+    /// first matched.
+    pub regex_size_limit_bytes: u32,
+    /// Maximum characters of any one field a regex is matched against.
+    pub max_match_chars: u32,
+    /// How many user corrections are replayed as few-shot examples on an
+    /// uncached `claude_is` call. Every example is tokens on every such call.
+    pub max_examples: u32,
+    /// How many messages a backtest or synthesis dry run examines. A backtest
+    /// is an interactive question; one over a whole mailbox's history is a
+    /// different (batch) feature.
+    pub max_window_messages: u32,
+    /// Default window, in days, for a synthesis dry run.
+    pub dry_run_days: u32,
+}
+
+impl Default for RulesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tick_interval: HumanDuration::new(crate::rules::DEFAULT_TICK_INTERVAL),
+            max_batch: 200,
+            archive_mailbox: "Archive".to_owned(),
+            max_pattern_len: 512,
+            regex_size_limit_bytes: 256 * 1024,
+            max_match_chars: 64 * 1024,
+            max_examples: 8,
+            max_window_messages: 500,
+            dry_run_days: 30,
+        }
+    }
+}
+
+impl RulesConfig {
+    /// The pattern bounds these settings describe.
+    #[must_use]
+    pub fn rule_limits(&self) -> crate::rules::RuleLimits {
+        crate::rules::RuleLimits {
+            // Floored like the two below, and for the same reason: a
+            // `max_pattern_len = 0` typo would refuse every pattern including
+            // `a`, with an error about byte counts that names nothing an
+            // operator would connect to the knob they set.
+            max_pattern_len: (self.max_pattern_len as usize).max(64),
+            // Floored, not passed through: a `regex_size_limit_bytes = 0`
+            // typo would refuse every pattern including `a`, turning a
+            // misconfiguration into "no rule in this daemon works" with an
+            // error message about program size that names nothing an operator
+            // would connect to the knob they set.
+            regex_size_limit_bytes: (self.regex_size_limit_bytes as usize).max(4 * 1024),
+            // Floored for the mirror-image reason: a zero here would truncate
+            // every haystack to nothing, so every regex silently stops
+            // matching rather than failing loudly.
+            max_match_chars: (self.max_match_chars as usize).max(1_024),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

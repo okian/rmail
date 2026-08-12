@@ -621,7 +621,7 @@ fn normalize_limit(requested: i64) -> i64 {
 /// backslash followed by ASCII alphanumerics/`-`/`_`/`.` closes that off while
 /// still admitting every predefined flag (`\Seen`, `\Flagged`, …) and any
 /// reasonable keyword.
-fn is_safe_flag(flag: &str) -> bool {
+pub(crate) fn is_safe_flag(flag: &str) -> bool {
     let body = flag.strip_prefix('\\').unwrap_or(flag);
     !body.is_empty()
         && body

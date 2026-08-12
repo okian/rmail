@@ -499,6 +499,8 @@ fn every_known_table_accepts_an_override() {
         jail.set_env("RMAIL_SEND__MAX_RETRIES", "9");
         jail.set_env("RMAIL_FINDER__ENABLED", "false");
         jail.set_env("RMAIL_GRPC__ENABLED", "false");
+        jail.set_env("RMAIL_HOOKS__MAX_CONCURRENCY", "9");
+        jail.set_env("RMAIL_RULES__ARCHIVE_MAILBOX", "Deep Storage");
 
         let cfg = Config::from_toml_str("").map_err(fe)?;
         assert!(!cfg.sync.idle);
@@ -510,6 +512,8 @@ fn every_known_table_accepts_an_override() {
         assert_eq!(cfg.send.max_retries, 9);
         assert!(!cfg.finder.enabled);
         assert!(!cfg.grpc.enabled);
+        assert_eq!(cfg.hooks.max_concurrency, 9);
+        assert_eq!(cfg.rules.archive_mailbox, "Deep Storage");
         Ok(())
     });
 }

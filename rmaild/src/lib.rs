@@ -5,7 +5,7 @@
 //! `AccountService`/`SyncService`/`AdminService`/`AuditService`/
 //! `MailService`/`NoteService`/`TagService`/`SearchService`/
 //! `SavedSearchService`/`ComposeService`/`SendSchedulerService`/`AiService`/
-//! `AiPolicyService`/`IndexService`/`HookService` handlers — all wrapped in a
+//! `AiPolicyService`/`IndexService`/`HookService`/`RuleService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -22,6 +22,7 @@ mod hook_service;
 mod index_service;
 mod mail_service;
 mod note_service;
+mod rule_service;
 mod saved_search_service;
 mod search_service;
 mod send_scheduler_service;
@@ -39,6 +40,7 @@ pub use hook_service::HookApi;
 pub use index_service::IndexApi;
 pub use mail_service::MailApi;
 pub use note_service::NoteApi;
+pub use rule_service::RuleApi;
 pub use saved_search_service::SavedSearchApi;
 pub use search_service::SearchApi;
 pub use send_scheduler_service::SendSchedulerApi;
@@ -75,6 +77,9 @@ use rmail_core::outbox::{
 };
 use rmail_core::rank::l1::Weights;
 use rmail_core::rank::l2::{ClaudeReranker, L2Stage, Reranker as CoreReranker};
+use rmail_core::rules::{
+    ActionRunner, Classifier, ClaudeClassifier, RuleEngine, RuleEvaluator, RuleSynthesizer,
+};
 use rmail_core::saved_search::SavedSearchStore;
 use rmail_core::smart_folder::{SmartFolderEvaluator, SmartFolderStore};
 use rmail_core::sync::{SyncEngine, SyncOptions};
@@ -90,6 +95,7 @@ use rmail_proto::v1::hook_service_server::HookServiceServer;
 use rmail_proto::v1::index_service_server::IndexServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::note_service_server::NoteServiceServer;
+use rmail_proto::v1::rule_service_server::RuleServiceServer;
 use rmail_proto::v1::saved_search_service_server::SavedSearchServiceServer;
 use rmail_proto::v1::search_service_server::SearchServiceServer;
 use rmail_proto::v1::send_scheduler_service_server::SendSchedulerServiceServer;
@@ -563,6 +569,12 @@ where
     let account_service = AccountServiceServer::new(AccountApi::new(db.clone()));
     let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
+    // Cloned before the store moves into its own service: the rules engine's
+    // action runner mutates mail and tags through the *same* stores the
+    // services do, so a rule-applied flag honours the same IMAP reflection and
+    // a rule-applied tag honours the same per-tag sync mode.
+    let rules_mail_store = mail_store.clone();
+    let rules_tag_store = tag_store.clone();
     let mail_service = MailServiceServer::new(MailApi::new(mail_store, stopping.clone()));
     let tag_service = TagServiceServer::new(TagApi::new(tag_store.clone()));
     // `ComposeService` needs nothing but the database: drafts are local, and
@@ -628,6 +640,10 @@ where
     // otherwise still pay a retention-window paging scan at boot and a
     // query every tick for nothing to match against.
     let hook_dispatcher = HookDispatcher::new(events.clone(), &config.hooks);
+    // Shared with the rules engine's `run_hook` action for the same reason
+    // `HookApi` shares it: three independent budgets would sum to three times
+    // the ceiling `hooks.max_concurrency` configures.
+    let hook_semaphore = hook_dispatcher.semaphore();
     let hook_service = HookServiceServer::new(HookApi::new(
         &config.hooks,
         stopping.clone(),
@@ -900,6 +916,13 @@ where
     // The pair built above, shared rather than a second one of this pool's
     // own — see its own comment and `AiWorkerPool::with_capacity`'s docs.
     .with_capacity(Arc::clone(&ai_semaphore), Arc::clone(&ai_rate_limiter));
+    // The rules engine draws from the same two, for the identical reason —
+    // see `rmail_core::rules::gate`. Cloned from the pair built above rather
+    // than read back off the pool: task 51 moved their construction ahead of
+    // `SearchApi` so the reranker could share them too, so the pool is no
+    // longer where they originate.
+    let rules_ai_semaphore = Arc::clone(&ai_semaphore);
+    let rules_ai_rate_limiter = Arc::clone(&ai_rate_limiter);
 
     // Always starts unpaused, regardless of `ai_active` — a disabled daemon
     // is reported via `GetUsage.enabled = false`, not by pretending it is
@@ -977,6 +1000,83 @@ where
         None
     };
 
+    // The rules engine (task 66). Registered unconditionally — the reflection
+    // set and the auth scope table must see every RPC regardless of runtime
+    // config — and `rules.enabled` gates only the background evaluator, so
+    // creating, listing, evaluating and backtesting deterministic rules keeps
+    // working on a daemon whose automatic path is off.
+    //
+    // The classifier shares `ai_semaphore`/`ai_rate_limiter` with the AI
+    // worker pool and `AiApi`: a rules engine evaluating every new message is
+    // exactly the workload `ai.limits` exists to bound, and a second
+    // independent budget would let the two paths together exceed it (see
+    // `rmail_core::rules::gate`). It also shares the hook dispatcher's
+    // semaphore for the same reason, so a `run_hook` action and a real event
+    // dispatch cannot together exceed `hooks.max_concurrency`.
+    //
+    // `ai.models.triage` classifies and `ai.models.deep` synthesizes rather
+    // than a `[rules]` model knob — a `claude_is` verdict is precisely the
+    // cheap, high-volume work the first names, and writing a rule from a
+    // sentence is the one-off reasoning job the second names.
+    let rule_engine = RuleEngine::new(
+        db.clone(),
+        config.rules.rule_limits(),
+        Arc::new(ClaudeClassifier::new(
+            db.clone(),
+            Arc::clone(&ai_provider),
+            Arc::clone(&ai_policy),
+            config.ai.privacy.clone(),
+            config.ai.limits.clone(),
+            config.ai.models.triage.clone(),
+            config.rules.max_examples as usize,
+            Arc::clone(&rules_ai_semaphore),
+            Arc::clone(&rules_ai_rate_limiter),
+        )) as Arc<dyn Classifier>,
+        ActionRunner::new(
+            db.clone(),
+            rules_mail_store,
+            rules_tag_store,
+            DraftStore::new(db.clone()),
+            events.clone(),
+            rmail_core::hooks::resolve(&config.hooks),
+            hook_semaphore,
+            usize::try_from(config.hooks.max_output_bytes).unwrap_or(usize::MAX),
+            config.rules.archive_mailbox.clone(),
+        ),
+        Arc::clone(&ai_policy),
+        config.rules.max_window_messages as usize,
+    );
+    let rule_service = RuleServiceServer::new(RuleApi::new(
+        rule_engine.clone(),
+        RuleSynthesizer::new(
+            rule_engine.clone(),
+            Arc::clone(&ai_provider),
+            Arc::clone(&ai_policy),
+            config.ai.privacy.clone(),
+            config.ai.limits.clone(),
+            config.ai.models.deep.clone(),
+            rules_ai_semaphore,
+            rules_ai_rate_limiter,
+        ),
+        config.rules.dry_run_days,
+        stopping.clone(),
+    ));
+    let rule_evaluator_handle = if config.rules.enabled {
+        Some(
+            RuleEvaluator::new(rule_engine, events.clone())
+                .with_tick_interval(config.rules.tick_interval.as_duration())
+                .with_max_batch(config.rules.max_batch as usize)
+                .spawn(stopping.clone())
+                .await,
+        )
+    } else {
+        tracing::info!(
+            "rules.enabled = false; rules are not evaluated automatically on new mail \
+             (RuleService still serves create/list/evaluate/backtest)"
+        );
+        None
+    };
+
     let incoming = UnixListenerStream::new(listener);
     let serve_result = Server::builder()
         // Every RPC runs inside a request-tracing span; the auth layer sits
@@ -1001,6 +1101,7 @@ where
         .add_service(ai_service)
         .add_service(ai_policy_service)
         .add_service(hook_service)
+        .add_service(rule_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
@@ -1011,6 +1112,9 @@ where
         let _ = handle.await;
     }
     if let Some(handle) = hook_dispatch_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = rule_evaluator_handle {
         let _ = handle.await;
     }
     let _ = index_handle.await;

@@ -50,6 +50,24 @@ pub enum Requirement {
     /// `CancelScheduled`, which can only ever *prevent* mail); a disjunction
     /// on an RPC with real authority is a way to accidentally grant it twice.
     AnyOf(&'static [Scope]),
+    /// The caller's granted scopes must satisfy **every** one of these.
+    ///
+    /// The mirror image of [`Requirement::AnyOf`], and the one this table
+    /// needed as soon as an RPC exercised two genuinely different authorities
+    /// at once. `RuleService/EvaluateRules` is the motivating case: firing a
+    /// rule runs an operator-configured hook (`automation`, exactly what
+    /// `HookService/TestHook` sits behind) *and* moves, flags, and drafts
+    /// replies to mail (`mail.write`, exactly what `MailService/Move` sits
+    /// behind). Either alone under-gates it — an `automation`-only token could
+    /// otherwise archive an inbox, and a `mail.write`-only token could
+    /// otherwise spawn a process — and picking the stronger of the two would
+    /// silently grant the other.
+    ///
+    /// `Scope::Admin` still satisfies this, since it satisfies each element
+    /// (see [`rmail_core::auth::satisfies`]). An empty slice would grant
+    /// everything, which is why no row here uses one and
+    /// `no_all_of_row_is_empty` asserts none ever does.
+    AllOf(&'static [Scope]),
 }
 
 /// method path -> requirement. See the module docs for the fail-closed
@@ -685,6 +703,84 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SavedSearchService/EvaluateSmartFolder",
         Requirement::Scope(Scope::MailWrite),
     ),
+    // -- RuleService (task 66) ------------------------------------------------
+    // These rows are the reason `Requirement::AllOf` exists; see its own doc
+    // comment. A rule is not one privilege — it is an unattended program that
+    // moves mail, spawns a configured hook, writes a reply draft, and spends
+    // money at a model provider — and the scopes below take that apart rather
+    // than collapsing it into whichever single scope happens to be strongest.
+    //
+    // `ListRules` is the deliberate low-water mark: reading the automation
+    // config is `automation` alone, exactly as `HookService/ListHooks` is.
+    // Everything that can *act* needs strictly more, which is the distinction
+    // "a rule that can draft a reply is not the same privilege as listing
+    // rules" names.
+    (
+        "/rmail.v1.RuleService/ListRules",
+        Requirement::Scope(Scope::Automation),
+    ),
+    // `CreateRule` persists a rule the background evaluator will then fire,
+    // unattended, against every new message — with no token involved at fire
+    // time. Creating one is therefore *granting* authority to the daemon, not
+    // merely writing config, and the grant is durable: `mail.write` because
+    // the rule moves, flags, and drafts replies to mail forever after, and
+    // `ai.invoke` because a `claude_is` predicate spends at the provider on
+    // every new message forever after. That is strictly more than the one-shot
+    // spend `SynthesizeRule`/`BacktestRule` need `ai.invoke` for below, so it
+    // cannot need less.
+    (
+        "/rmail.v1.RuleService/CreateRule",
+        Requirement::AllOf(&[Scope::Automation, Scope::MailWrite, Scope::AiInvoke]),
+    ),
+    // The only RPC here that fires actions: move/archive (`MailService/Move`
+    // is `mail.write`), add_labels/add_flags (`TagService/AddTag` and
+    // `MailService/SetFlags`, same), draft_reply (`ComposeService/CreateDraft`,
+    // same), and run_hook (`HookService/TestHook` is `automation`). Note it is
+    // *not* `mail.send`: a draft is not a transmission, and this service has no
+    // path to SMTP — `ComposeService/RenderDraft` draws that line and it is
+    // drawn the same way here.
+    //
+    // `ai.invoke` is on this row for exactly the reason it is on
+    // `BacktestRule`'s below: one call can classify hundreds of messages, and
+    // this table cannot see whether the rules in the request carry a
+    // `claude_is` at all. An RPC that may spend at a provider requires the
+    // scope named for spending at a provider, with no exception for the one
+    // that also mutates mail.
+    (
+        "/rmail.v1.RuleService/EvaluateRules",
+        Requirement::AllOf(&[Scope::Automation, Scope::MailWrite, Scope::AiInvoke]),
+    ),
+    // `SynthesizeRule` and `BacktestRule` mutate nothing — the engine's
+    // dry-run path never claims and never calls the action runner — so they do
+    // not need `mail.write`. They *do* both call the provider: synthesis
+    // always, and a backtest for every `claude_is` decision the cache does not
+    // already hold. `ai.invoke` is exactly the scope `AiService/AnalyzeMessage`
+    // sits behind for the same reason, and it is required even for a purely
+    // deterministic rule because this table cannot see whether the rule in the
+    // request has a `claude_is` at all.
+    //
+    // Both also disclose mail content (a backtest reports subjects and the
+    // model's explanation of a message), which `ai.invoke` already implies
+    // elsewhere: `AnalyzeMessage` returns a summary of a message with that
+    // scope alone.
+    (
+        "/rmail.v1.RuleService/SynthesizeRule",
+        Requirement::AllOf(&[Scope::Automation, Scope::AiInvoke]),
+    ),
+    (
+        "/rmail.v1.RuleService/BacktestRule",
+        Requirement::AllOf(&[Scope::Automation, Scope::AiInvoke]),
+    ),
+    // `RecordCorrection` calls no provider and mutates no mail, so it sits
+    // below everything that can act. It does, however, *copy message content*
+    // — it freezes the rendered subject and body of the corrected message into
+    // `rule_examples` — so it takes `mail.read` alongside `automation` rather
+    // than `automation` alone. A token that cannot read mail should not be
+    // able to cause mail to be read and stored somewhere new.
+    (
+        "/rmail.v1.RuleService/RecordCorrection",
+        Requirement::AllOf(&[Scope::Automation, Scope::MailRead]),
+    ),
 ];
 
 /// The requirement for `method` (a full gRPC path like
@@ -869,6 +965,107 @@ mod tests {
                 .any(|want| rmail_core::auth::satisfies(std::slice::from_ref(&read_only), want)),
             "mail.read alone must not be able to cancel"
         );
+    }
+
+    /// An `AllOf` row with no scopes would be vacuously satisfied — every
+    /// authenticated caller would pass. `authorize` guards against it too, but
+    /// the row should never exist in the first place.
+    #[test]
+    fn no_all_of_row_is_empty() {
+        for (method, requirement) in TABLE {
+            if let Requirement::AllOf(scopes) = requirement {
+                assert!(
+                    !scopes.is_empty(),
+                    "{method} has an empty AllOf, which grants it to everyone"
+                );
+            }
+        }
+    }
+
+    /// Firing a rule is two authorities at once, and neither alone buys it.
+    ///
+    /// A rule runs an operator-configured hook (`automation`) *and* moves,
+    /// flags, and drafts replies to mail (`mail.write`). Checked as a relation
+    /// rather than as literal rows: the property that matters is that each
+    /// scope on its own is insufficient, which a pair of `assert_eq!`s on the
+    /// row's contents would keep asserting even if `authorize` stopped
+    /// treating `AllOf` as a conjunction.
+    #[test]
+    fn evaluating_a_rule_needs_both_automation_and_mail_write() {
+        for method in [
+            "/rmail.v1.RuleService/EvaluateRules",
+            "/rmail.v1.RuleService/CreateRule",
+        ] {
+            let Some(Requirement::AllOf(required)) = lookup(method) else {
+                unreachable!("{method} should require every one of a scope set");
+            };
+            for granted in [Scope::Automation, Scope::MailWrite, Scope::MailRead] {
+                assert!(
+                    !required.iter().all(|want| rmail_core::auth::satisfies(
+                        std::slice::from_ref(&granted),
+                        want
+                    )),
+                    "{granted:?} alone must not be enough to fire {method}"
+                );
+            }
+            // ...and holding the whole set is.
+            let all: Vec<Scope> = required.to_vec();
+            assert!(
+                required
+                    .iter()
+                    .all(|want| rmail_core::auth::satisfies(&all, want)),
+                "the full scope set must be enough for {method}"
+            );
+            // A rule that can spend at a provider requires the scope named for
+            // it, whether or not it also mutates mail.
+            assert!(
+                required.contains(&Scope::AiInvoke),
+                "{method} can spend at a model provider and must require ai.invoke"
+            );
+        }
+    }
+
+    /// Listing rules is strictly less than firing one.
+    ///
+    /// This is the "a rule that can draft a reply is not the same privilege as
+    /// listing rules" distinction, asserted as a relation: whatever `ListRules`
+    /// needs must not be enough for `EvaluateRules`.
+    #[test]
+    fn listing_rules_is_not_enough_to_fire_one() {
+        let Some(Requirement::Scope(listing)) = lookup("/rmail.v1.RuleService/ListRules") else {
+            unreachable!("ListRules should require a single scope");
+        };
+        let Some(Requirement::AllOf(firing)) = lookup("/rmail.v1.RuleService/EvaluateRules") else {
+            unreachable!("EvaluateRules should require every one of a scope set");
+        };
+        assert!(
+            !firing
+                .iter()
+                .all(|want| rmail_core::auth::satisfies(std::slice::from_ref(listing), want)),
+            "{listing:?} buys a listing and must not also buy an unattended mail mutation"
+        );
+    }
+
+    /// The two model-calling rules RPCs require `ai.invoke`, the same scope
+    /// every other provider-calling RPC in this table sits behind.
+    #[test]
+    fn the_model_calling_rule_rpcs_require_ai_invoke() {
+        for method in [
+            "/rmail.v1.RuleService/SynthesizeRule",
+            "/rmail.v1.RuleService/BacktestRule",
+        ] {
+            let Some(Requirement::AllOf(required)) = lookup(method) else {
+                unreachable!("{method} should require every one of a scope set");
+            };
+            assert!(
+                required.contains(&Scope::AiInvoke),
+                "{method} can spend at a model provider and must require ai.invoke"
+            );
+            assert!(
+                !required.contains(&Scope::MailWrite),
+                "{method} is a dry run and must not demand a mutation scope it never uses"
+            );
+        }
     }
 
     #[test]

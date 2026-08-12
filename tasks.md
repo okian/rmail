@@ -629,7 +629,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core rank::train` (label generation, propensity weighting, guardrail blocks a regression, rollback)
 
 ## 66. Rules engine (+ NL synthesis + backtest)
-- [ ] status
+- [x] status
 - **depends-on:** 14, 43, 55
 - **parallel-safe:** yes
 - **acceptance:**
