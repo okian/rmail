@@ -1,6 +1,18 @@
-//! Stage 4 — L1 Ranker (prd.md, "Stage 4 — L1 Ranker (fast, learned)"):
+//! Ranking: Stage 4 (fast, over features) and Stage 5 (expensive, over
+//! text).
+//!
+//! [`Ranker`]/[`l1`] are prd.md's "Stage 4 — L1 Ranker (fast, learned)":
 //! turning task 30's per-candidate [`crate::features::FeatureVector`]s into
-//! one best-first, top-K list.
+//! one best-first, top-K list. [`l2`] is Stage 5, the optional reranker that
+//! re-orders that top-K by *reading the messages* — a local ONNX
+//! cross-encoder or a Claude listwise pass. The two are deliberately
+//! asymmetric: Stage 4 is a pure, synchronous, always-available function of
+//! the feature vectors (see below), while Stage 5 is asynchronous, does I/O,
+//! and is allowed to be absent — every one of its failure modes returns
+//! Stage 4's order unchanged. That is why Stage 4's contract is a complete
+//! ranking rather than a pre-filter.
+//!
+//! Everything below is about Stage 4; [`l2`]'s own module docs cover Stage 5.
 //!
 //! # One trait, two eras of implementation
 //!
@@ -59,6 +71,7 @@
 //! restated."
 
 pub mod l1;
+pub mod l2;
 
 use crate::features::CandidateFeatures;
 use crate::query::Intent;

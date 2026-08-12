@@ -55,6 +55,24 @@ fn defaults_match_prd() {
         assert!(cfg.search.retrievers.recency);
         assert!((cfg.search.retrievers.recency_half_life_days - 30.0).abs() < f64::EPSILON);
 
+        // search.reranker (task 51) — prd.md's `[search.reranker]` block,
+        // plus the operational knobs the L2 stage needs. Downloading the
+        // cross-encoder weights is off by default for the same reason the
+        // embedder's is: nothing about the local backend should reach the
+        // network without an explicit act.
+        assert_eq!(cfg.search.top_k_rerank, 50);
+        assert_eq!(cfg.search.reranker.cross_encoder_model, "bge-reranker-base");
+        assert!(cfg.search.reranker.cross_encoder_cache_dir.is_empty());
+        assert!(!cfg.search.reranker.cross_encoder_allow_download);
+        assert_eq!(cfg.search.reranker.claude_model, "claude-haiku-4-5");
+        assert_eq!(cfg.search.reranker.claude_max_candidates, 30);
+        assert_eq!(cfg.search.reranker.claude_max_tokens, 4096);
+        assert_eq!(cfg.search.reranker.claude_cache_entries, 256);
+        assert_eq!(
+            cfg.search.reranker.timeout.as_duration(),
+            Duration::from_secs(20)
+        );
+
         // index — privacy default is local embeddings
         assert_eq!(cfg.index.workers, 4);
         assert_eq!(cfg.index.semantic.provider, SemanticProvider::Local);
@@ -593,6 +611,69 @@ fn a_retriever_toggle_is_env_settable() {
             "an unrelated toggle is unaffected"
         );
         assert!((cfg.search.retrievers.recency_half_life_days - 14.0).abs() < f64::EPSILON);
+        Ok(())
+    });
+}
+
+/// Task 51's knobs are reachable the two ways every other knob is — a
+/// `[search.reranker]` table and `RMAIL_SEARCH__RERANKER__*` — and the
+/// rerank policy itself is a closed enum, so a typo is a startup error
+/// rather than a silently-off reranker.
+#[test]
+fn reranker_settings_parse_from_file_and_env() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let cfg = Config::from_toml_str(
+            r#"
+[search]
+rerank = "cross_encoder"
+
+[search.reranker]
+cross_encoder_model = "jina-reranker-v1-turbo-en"
+cross_encoder_allow_download = true
+claude_max_candidates = 12
+timeout = "2s"
+"#,
+        )
+        .map_err(fe)?;
+        assert_eq!(cfg.search.rerank, Rerank::CrossEncoder);
+        assert_eq!(
+            cfg.search.reranker.cross_encoder_model,
+            "jina-reranker-v1-turbo-en"
+        );
+        assert!(cfg.search.reranker.cross_encoder_allow_download);
+        assert_eq!(cfg.search.reranker.claude_max_candidates, 12);
+        assert_eq!(
+            cfg.search.reranker.timeout.as_duration(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            cfg.search.reranker.claude_model, "claude-haiku-4-5",
+            "an unset key in the table keeps its default"
+        );
+
+        jail.set_env("RMAIL_SEARCH__RERANK", "claude");
+        jail.set_env("RMAIL_SEARCH__RERANKER__CLAUDE_CACHE_ENTRIES", "4");
+        jail.set_env("RMAIL_SEARCH__RERANKER__CROSS_ENCODER_CACHE_DIR", "/models");
+        let cfg = Config::from_toml_str("").map_err(fe)?;
+        assert_eq!(cfg.search.rerank, Rerank::Claude);
+        assert_eq!(cfg.search.reranker.claude_cache_entries, 4);
+        assert_eq!(cfg.search.reranker.cross_encoder_cache_dir, "/models");
+        Ok(())
+    });
+}
+
+#[test]
+fn an_unknown_rerank_policy_is_rejected() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let err = Config::from_toml_str("[search]\nrerank = \"gpt\"\n")
+            .expect_err("an unknown rerank policy must not load");
+        let message = err.to_string();
+        assert!(
+            message.contains("rerank") || message.contains("gpt"),
+            "the error must name the offending key or value, got: {message}"
+        );
         Ok(())
     });
 }

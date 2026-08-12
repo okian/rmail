@@ -212,6 +212,27 @@ impl AiWorkerPool {
         Arc::clone(&self.rate_limiter)
     }
 
+    /// Adopt a caller-supplied concurrency/RPM pair instead of the fresh one
+    /// [`Self::new`] built.
+    ///
+    /// The accessors above let a caller constructed *after* this pool share
+    /// its budget. Search's L2 rerank (task 51) is constructed *before* it —
+    /// the daemon builds `SearchApi` first — so it needs the sharing to go
+    /// the other way: the caller creates the pair once, hands it to the
+    /// reranker, and hands the same pair here. Without this, that path would
+    /// enforce a second, independent `ai.limits.max_concurrency` /
+    /// `requests_per_minute` and the process as a whole could exceed both.
+    #[must_use]
+    pub fn with_capacity(
+        mut self,
+        semaphore: Arc<Semaphore>,
+        rate_limiter: Arc<RateLimiter>,
+    ) -> Self {
+        self.semaphore = semaphore;
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
     /// Reap expired leases, consult the cost gate, lease up to `limit`
     /// eligible jobs accordingly, and drive each through the full pipeline —
     /// bounded by `Semaphore(max_concurrency)` and paced by the RPM limiter.

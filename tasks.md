@@ -493,7 +493,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmaild ai_service` (cached get, force analyze stream, enrichment resume)
 
 ## 51. Semantic/hybrid retrieval + L2 rerank
-- [ ] status
+- [x] status
 - **depends-on:** 21, 29, 43, 49
 - **parallel-safe:** no
 - **acceptance:**

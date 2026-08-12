@@ -778,18 +778,56 @@ pub struct RankWeights(pub BTreeMap<String, f64>);
 pub struct RerankerConfig {
     /// Local ONNX cross-encoder model name.
     pub cross_encoder_model: String,
+    /// Where the cross-encoder's ONNX weights live.
+    ///
+    /// Empty means the same default the local embedder uses
+    /// (`$RMAIL_MODEL_CACHE`, else `$XDG_CACHE_HOME/rmail/models`, else
+    /// `~/.cache/rmail/models`) — one cache directory for every local model
+    /// rather than a second one an operator has to provision separately.
+    pub cross_encoder_cache_dir: String,
+    /// Whether the daemon may fetch missing cross-encoder weights itself.
+    ///
+    /// Off by default, for the identical reason
+    /// [`LocalEmbedConfig::allow_download`] is: the reranker's whole point is
+    /// that mail text stays on the host, and a search that silently pulls
+    /// several hundred megabytes from Hugging Face the first time somebody
+    /// types would not honor that. An unprovisioned cache degrades to the L1
+    /// order with a logged reason instead.
+    pub cross_encoder_allow_download: bool,
     /// Claude rerank model id.
     pub claude_model: String,
     /// Max candidates sent to Claude for listwise rerank.
     pub claude_max_candidates: u32,
+    /// Output-token ceiling for one listwise rerank turn. The answer is an
+    /// ordering plus a one-line reason per candidate, so this scales with
+    /// `claude_max_candidates` rather than with mailbox size.
+    pub claude_max_tokens: u32,
+    /// How many `(query, candidate_ids)` listwise verdicts stay cached in
+    /// memory. Bounded because the key is content-addressed: nothing evicts
+    /// an entry on its own, so an unbounded map would grow with distinct
+    /// queries for the life of the daemon.
+    pub claude_cache_entries: u32,
+    /// Wall-clock ceiling for the whole L2 stage, whichever backend runs.
+    /// Exceeding it degrades to the L1 order — prd.md's Stage 5 is an
+    /// optional precision improvement, never a latency cliff.
+    pub timeout: HumanDuration,
 }
 
 impl Default for RerankerConfig {
     fn default() -> Self {
         Self {
             cross_encoder_model: "bge-reranker-base".to_owned(),
+            cross_encoder_cache_dir: String::new(),
+            cross_encoder_allow_download: false,
             claude_model: "claude-haiku-4-5".to_owned(),
             claude_max_candidates: 30,
+            claude_max_tokens: 4096,
+            claude_cache_entries: 256,
+            // prd.md budgets the local cross-encoder at <80 ms for 50 pairs
+            // and the Claude path at "provider latency"; 20 s is a ceiling on
+            // the pathological case (a cold ONNX session load, a slow
+            // provider), not a target.
+            timeout: HumanDuration::new(secs(20)),
         }
     }
 }

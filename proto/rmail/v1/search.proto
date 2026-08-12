@@ -101,6 +101,25 @@ enum Mode {
   MODE_HYBRID = 3;
 }
 
+// Which L2 reranker (prd.md Stage 5) re-orders the top-K.
+// `RERANK_UNSPECIFIED` defers to the daemon's configured `search.rerank`;
+// the other values override it for this one request (`mail search --rerank
+// claude`). Reranking is always best-effort: whichever backend is asked for,
+// a failure, an unprovisioned model, or an exhausted AI budget degrades to
+// the L1 order rather than failing the search.
+enum Rerank {
+  RERANK_UNSPECIFIED = 0;
+  // No rerank; the L1 order stands.
+  RERANK_OFF = 1;
+  // The local ONNX cross-encoder — offline, no egress.
+  RERANK_CROSS_ENCODER = 2;
+  // Claude listwise over the top ~30, with a one-line "why" per result
+  // (SearchHit.why.claude_reason). Costs a provider call.
+  RERANK_CLAUDE = 3;
+  // The cross-encoder for interactive search, Claude for a deep one.
+  RERANK_AUTO = 4;
+}
+
 // Search intent, as prd.md's Stage 0 classifies it. `INTENT_UNSPECIFIED`
 // lets the query planner classify it from the query text; a client that sets
 // one of the other values overrides that classification (e.g. a `--explore`
@@ -137,6 +156,23 @@ message SearchRequest {
   bool thread_collapse = 7;
   // Restrict to one account; 0 = every configured account.
   int64 account_id = 8;
+  // Override `search.rerank` for this request. RERANK_UNSPECIFIED uses the
+  // daemon's configured policy.
+  //
+  // A request may only ask for *less* than the daemon is configured to do:
+  // RERANK_OFF and RERANK_CROSS_ENCODER are always honored, while
+  // RERANK_CLAUDE/RERANK_AUTO are honored only when `search.rerank` already
+  // selects Claude. `Search` is authorized by the ordinary mail-read scope,
+  // and a read token must not be able to turn a local-index query into a
+  // paid, egressing provider call the operator never sanctioned.
+  Rerank rerank = 9;
+  // Declare this an explicit "deep search" rather than interactive typing:
+  // slower and more expensive is acceptable. Only `rerank = RERANK_AUTO`
+  // (the configured default) reads it — that is the flag prd.md's "`auto`
+  // uses the cross-encoder for interactive typing and Claude for explicit
+  // 'deep search'" resolves against. An explicit RERANK_* value already says
+  // which backend to use and ignores this.
+  bool deep = 10;
 }
 
 // A byte range into a Snippet's `text` — never embedded markup, so every
@@ -154,15 +190,26 @@ message Snippet {
 
 message SearchHit {
   Message message = 1;
-  // Stage 4's relevance score. Comparable only within this one streamed
-  // response — never across two different queries, rerank passes, or
-  // intents (see rank::RankedCandidate's own doc comment).
+  // The ranking score, comparable only within this one streamed response —
+  // never across two different queries, rerank passes, or intents (see
+  // rank::RankedCandidate's own doc comment).
+  //
+  // With no L2 rerank this is the L1 ranker's score for this candidate. When
+  // a rerank ran it is still drawn from that response's L1 score
+  // distribution, but re-assigned to express the reranked order: sorting hits
+  // by this field always reproduces the order they were streamed in, which is
+  // the property clients need. `why.score` (with `explain`) is always this
+  // candidate's own L1 score, and is the one whose feature contributions sum
+  // back to it.
   double score = 2;
   Snippet snippet = 3;
   // Which retrievers surfaced this message ("lexical", "dense", "fuzzy",
   // "entity", "structured", "prefix", "recency").
   repeated string sources = 4;
-  // Present only when SearchRequest.explain was set.
+  // Present when SearchRequest.explain was set, and also — carrying only
+  // `claude_reason` and `score` — when an L2 Claude rerank produced a reason
+  // for this hit, so `mail search --rerank claude` gets the one-line "why"
+  // it paid for without also asking for the full feature breakdown.
   RankExplanation why = 5;
   optional int64 thread_id = 6;
   // Sibling messages collapsed into this one by thread_collapse.
@@ -192,15 +239,21 @@ message FeatureContribution {
 }
 
 message RankExplanation {
+  // Empty when this explanation exists only to carry `claude_reason` (see
+  // SearchHit.why).
   repeated FeatureContribution features = 1;
-  // Sum of every FeatureContribution.weighted_contribution — the same score
-  // the L1 ranker actually produced for this candidate under this query's
-  // intent.
+  // The score the L1 ranker actually produced for this candidate under this
+  // query's intent — always this candidate's own, even after an L2 rerank
+  // reordered the page (unlike SearchHit.score; see its comment). When
+  // `features` is non-empty, summing every
+  // FeatureContribution.weighted_contribution reproduces this exactly.
   double score = 2;
   repeated string sources = 3;
   // The matched span(s) prd.md's explainability section asks for.
   Snippet matched = 4;
-  // Set when an L2 Claude rerank ran; always empty until that stage exists.
+  // The L2 Claude reranker's one-line "why this matched". Empty when no
+  // rerank ran, when the cross-encoder ran (it produces a logit and no
+  // prose), or when the rerank degraded to the L1 order.
   string claude_reason = 5;
 }
 

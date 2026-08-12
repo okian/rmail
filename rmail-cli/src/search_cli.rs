@@ -143,8 +143,8 @@ use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::{
     ByteRange, EvalMetrics as WireEvalMetrics, EvalReport as WireEvalReport, EvaluateRequest,
     FeatureContribution, FullMessage, GetMessageRequest, GoldenQuery as WireGoldenQuery,
-    Intent as ProtoIntent, Judgment as WireJudgment, Mode as ProtoMode, RankExplanation, SearchHit,
-    SearchRequest, Snippet,
+    Intent as ProtoIntent, Judgment as WireJudgment, Mode as ProtoMode, RankExplanation,
+    Rerank as ProtoRerank, SearchHit, SearchRequest, Snippet,
 };
 use tokio_stream::StreamExt;
 
@@ -211,6 +211,18 @@ pub struct SearchArgs {
     /// Collapse each thread to its best-scoring message.
     #[arg(long = "thread-collapse")]
     thread_collapse: bool,
+    /// Override `search.rerank` for this query: `off`, `cross-encoder`,
+    /// `claude`, or `auto`. Reranking is always best-effort — a missing
+    /// local model, a provider failure, or an exhausted AI budget quietly
+    /// leaves the L1 ranking in place rather than failing the search.
+    #[arg(long, value_enum)]
+    rerank: Option<RerankArg>,
+    /// Treat this as an explicit deep search: slower and more expensive is
+    /// acceptable. Only `--rerank auto` (the usual default) reads it —
+    /// that is what makes `auto` pick Claude rather than the local
+    /// cross-encoder.
+    #[arg(long)]
+    deep: bool,
 }
 
 /// `mail similar <id>` flags. `similar` has no `--mode`/`--explore`/
@@ -303,6 +315,31 @@ impl SearchModeArg {
     }
 }
 
+/// `SearchRequest.rerank`, spelled the way a terminal user types it —
+/// prd.md's `mail search "invoice" --rerank claude`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum RerankArg {
+    Off,
+    /// `cross-encoder` is what clap derives from the variant name; the
+    /// `cross_encoder` alias is the spelling `search.rerank` and
+    /// `RMAIL_SEARCH__RERANK` use, so the same word works everywhere.
+    #[value(alias = "cross_encoder")]
+    CrossEncoder,
+    Claude,
+    Auto,
+}
+
+impl RerankArg {
+    const fn into_proto(self) -> ProtoRerank {
+        match self {
+            Self::Off => ProtoRerank::Off,
+            Self::CrossEncoder => ProtoRerank::CrossEncoder,
+            Self::Claude => ProtoRerank::Claude,
+            Self::Auto => ProtoRerank::Auto,
+        }
+    }
+}
+
 /// `mail search <query>` — `SearchService.Search`, streamed straight to
 /// stdout.
 ///
@@ -339,6 +376,10 @@ pub async fn search(socket: &Path, args: SearchArgs) -> Result<()> {
         explain: args.explain,
         thread_collapse: args.thread_collapse,
         account_id: args.account.unwrap_or(0),
+        rerank: args
+            .rerank
+            .map_or(ProtoRerank::Unspecified, RerankArg::into_proto) as i32,
+        deep: args.deep,
     };
 
     let mut stream = client

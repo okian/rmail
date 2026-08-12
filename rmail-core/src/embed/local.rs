@@ -35,7 +35,13 @@ use crate::embed::{truncate, Embedder, Embedding, MAX_BATCH};
 use crate::error::Error;
 
 /// Where the weights live, unless the environment says otherwise.
-const CACHE_ENV: &str = "RMAIL_MODEL_CACHE";
+///
+/// `pub(crate)` because the local cross-encoder reranker
+/// ([`crate::rank::l2::cross_encoder`]) provisions out of the same directory
+/// and names it in the same "how to fix this" error message. One env var for
+/// every local model is the point — an operator who populated the cache for
+/// the embedder should not have to discover a second one for the reranker.
+pub(crate) const CACHE_ENV: &str = "RMAIL_MODEL_CACHE";
 
 /// The local ONNX embedder.
 ///
@@ -247,7 +253,7 @@ impl Embedder for LocalEmbedder {
 /// Matched on the suffix rather than the full name because the organization
 /// that publishes a given ONNX export is `fastembed`'s business, not ours, and
 /// pinning it here would break on an upstream re-host.
-fn cached(cache: &Path, model: &str) -> bool {
+pub(crate) fn cached(cache: &Path, model: &str) -> bool {
     let suffix = format!("--{}", model.to_lowercase());
     let Ok(entries) = std::fs::read_dir(cache) else {
         return false;
@@ -265,7 +271,7 @@ fn cached(cache: &Path, model: &str) -> bool {
 }
 
 /// Where weights are cached.
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var(CACHE_ENV) {
         return PathBuf::from(dir);
     }

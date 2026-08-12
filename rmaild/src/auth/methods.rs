@@ -263,13 +263,23 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.ComposeService/RenderDraft",
         Requirement::Scope(Scope::MailSend),
     ),
-    // -- SearchService (tasks 33, 37) -----------------------------------------
+    // -- SearchService (tasks 33, 37, 51) -------------------------------------
     // Every RPC here is a read-only query over the local index (no IMAP round
     // trip, no mutation — see `search_service`'s own module docs), so
     // `mail.read` is the right ceiling for all four: `Search`/`Semantic`
     // rank and stream messages the caller could already `MailService::List`,
     // and `Explain` only re-derives a rationale for one, already-visible
     // message. None of them needs `mail.write`.
+    //
+    // Task 51's L2 rerank means `Search` *can* reach a provider — but only
+    // where the daemon's own `search.rerank` already selects Claude, because
+    // `SearchApi::rerank_for` lets `SearchRequest.rerank` reduce the
+    // configured backend and never escalate past it. That is what keeps this
+    // row at `mail.read`: a read-scoped token can still only ask for the
+    // reranking the operator already turned on, so it cannot spend or egress
+    // anything the configuration did not already sanction. If that clamp is
+    // ever loosened, `Search` needs `ai.invoke` the way
+    // `AnalyzeMessage`/`SuggestReply` do.
     (
         "/rmail.v1.SearchService/Search",
         Requirement::Scope(Scope::MailRead),

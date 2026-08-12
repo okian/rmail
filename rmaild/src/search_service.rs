@@ -1,8 +1,27 @@
 //! The `SearchService` gRPC implementation: the wiring that finally makes
-//! the search pipeline (tasks 26-32) reachable — `query::QueryPlanner` ->
+//! the search pipeline (tasks 26-32, 51) reachable — `query::QueryPlanner` ->
 //! `retrieve::Fanout` -> `fuse::Fuser` -> `features::FeatureExtractor` ->
-//! `rank::l1::L1Ranker` -> `present::Presenter`, streamed back as
-//! [`SearchHit`](rmail_proto::v1::SearchHit)s.
+//! `rank::l1::L1Ranker` -> `rank::l2::L2Stage` -> `present::Presenter`,
+//! streamed back as [`SearchHit`](rmail_proto::v1::SearchHit)s.
+//!
+//! # Stage 5 sits between ranking and presentation, and cannot fail
+//!
+//! `rank::l2::L2Stage::rerank` returns a ranking, never a `Result`: an
+//! unprovisioned cross-encoder, a provider outage, an exhausted AI budget or
+//! a blown deadline all return the L1 order unchanged (see that module's own
+//! docs). Nothing in this file therefore branches on whether a rerank
+//! succeeded — there is one code path through ranking whether or not this
+//! daemon can rerank at all.
+//!
+//! Two consequences are load-bearing here. First, `SearchRequest.rerank`
+//! overrides `search.rerank` per request and `SearchRequest.deep` is what
+//! `auto` resolves against, so both are decoded into a request-scoped
+//! `L2Stage` rather than read from config at the call site. Second, a
+//! reranked hit's `score` is a *permuted* L1 score (the mechanism `rank::l2`
+//! uses to make a new order survive `Presenter`'s own score sort), so
+//! `RankExplanation.score` is recomputed from the candidate's own feature
+//! vector — otherwise the wire invariant "summing every contribution
+//! reproduces `score`" would hold only when no rerank ran.
 //!
 //! # Streaming the first hit before the rest is computed
 //!
@@ -120,7 +139,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::Utc;
-use rmail_core::config::{IndexSemanticConfig, RetrieversConfig, SearchConfig, SearchMode};
+use rmail_core::config::{IndexSemanticConfig, Rerank, RetrieversConfig, SearchConfig, SearchMode};
 use rmail_core::embed::Embedder;
 use rmail_core::eval::{
     Evaluator, GoldenQuery as CoreGoldenQuery, GoldenSet, JudgedMessage, Metrics as CoreMetrics,
@@ -136,6 +155,7 @@ use rmail_core::index::semantic::SemanticIndex;
 use rmail_core::present::{PresentedResult, Presenter};
 use rmail_core::query::{Intent, QueryPlan, QueryPlanner};
 use rmail_core::rank::l1::{L1Ranker, Weights};
+use rmail_core::rank::l2::{L2Stage, SearchKind};
 use rmail_core::rank::Ranker;
 use rmail_core::retrieve::{Candidate, DenseRetriever, Fanout, Source};
 use rmail_core::{present, repo, Database, Error as RmailError};
@@ -145,8 +165,9 @@ use rmail_proto::v1::{
     EvaluateRequest, ExplainRequest, FeatureContribution as ProtoFeatureContribution,
     FeedbackAction as ProtoFeedbackAction, FeedbackRequest, Intent as ProtoIntent,
     Message as ProtoMessage, Mode as ProtoMode, QueryEval as ProtoQueryEval,
-    RankExplanation as ProtoRankExplanation, ResultAction as ProtoResultAction,
-    SearchHit as ProtoSearchHit, SearchRequest, Snippet as ProtoSnippet,
+    RankExplanation as ProtoRankExplanation, Rerank as ProtoRerank,
+    ResultAction as ProtoResultAction, SearchHit as ProtoSearchHit, SearchRequest,
+    Snippet as ProtoSnippet,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -301,6 +322,18 @@ fn resolve_mode(raw: i32, default_mode: SearchMode) -> WireMode {
     }
 }
 
+/// `None` means "let `search.rerank` stand" — [`ProtoRerank::Unspecified`]
+/// is the wire default, not a real override.
+fn decode_rerank(raw: i32) -> Option<Rerank> {
+    match ProtoRerank::try_from(raw).unwrap_or(ProtoRerank::Unspecified) {
+        ProtoRerank::Unspecified => None,
+        ProtoRerank::Off => Some(Rerank::Off),
+        ProtoRerank::CrossEncoder => Some(Rerank::CrossEncoder),
+        ProtoRerank::Claude => Some(Rerank::Claude),
+        ProtoRerank::Auto => Some(Rerank::Auto),
+    }
+}
+
 /// `None` means "let the query planner's own classification stand" —
 /// [`ProtoIntent::Unspecified`] is the wire default, not a real override.
 fn decode_intent(raw: i32) -> Option<Intent> {
@@ -388,6 +421,10 @@ pub struct SearchApi {
     fuser: Fuser,
     feature_extractor: FeatureExtractor,
     ranker: L1Ranker,
+    /// Stage 5. Always present — a stage with no usable backend is a
+    /// passthrough, not an absent one, so there is exactly one code path
+    /// through ranking whether or not this daemon can rerank.
+    rerank: L2Stage,
     presenter: Presenter,
     /// The implicit-feedback log (task 64). Always present; the
     /// `search.learning` opt-out lives inside it, so this file has one code
@@ -400,6 +437,26 @@ pub struct SearchApi {
     /// `MailApi`/`SyncApi`.
     shutdown: CancellationToken,
     generation: Generation,
+}
+
+/// The half of [`SearchApi::build_hits`]' inputs that does not change between
+/// the two calls one streamed page makes.
+///
+/// `build_hits` is called twice per page — once for the first-hit fast path,
+/// once for the remainder — and only `presented` differs. Grouping the rest
+/// keeps that fact visible at both call sites, and keeps the parameter list
+/// inside `clippy::too_many_arguments`' limit now that ranking (`reasons`) and
+/// feedback logging (`query_id`) each contribute one.
+#[derive(Clone, Copy)]
+struct HitContext<'a> {
+    fused: &'a [FusedCandidate],
+    features: &'a [CandidateFeatures],
+    plan: &'a QueryPlan,
+    explain: bool,
+    /// `Some` only when this page is being logged for the learning loop.
+    query_id: Option<i64>,
+    /// Per-message one-line rationale from an L2 reranker, when one ran.
+    reasons: &'a BTreeMap<i64, String>,
 }
 
 impl SearchApi {
@@ -416,6 +473,13 @@ impl SearchApi {
     /// this automatically before `SearchService` existed to call it. A
     /// fallible constructor here would just push that same `?` one frame
     /// later for no benefit.
+    ///
+    /// `rerank` is likewise built by the caller: the Claude backend needs the
+    /// daemon's single `ai::Provider` (one API-key resolution, one HTTP
+    /// client for the process), which is a thing `rmaild::serve_*` owns and
+    /// this constructor has no way to reach. Pass
+    /// [`L2Stage::disabled`](rmail_core::rank::l2::L2Stage::disabled) for a
+    /// daemon that should never rerank.
     #[must_use]
     pub fn new(
         db: Database,
@@ -423,6 +487,7 @@ impl SearchApi {
         weights: Weights,
         search: SearchConfig,
         semantic_config: &IndexSemanticConfig,
+        rerank: L2Stage,
         shutdown: CancellationToken,
     ) -> Self {
         let fts = FtsIndex::new(db.clone(), search.bm25_weights.clone());
@@ -451,6 +516,7 @@ impl SearchApi {
             fuser,
             feature_extractor,
             ranker,
+            rerank,
             presenter,
             feedback,
             search,
@@ -633,6 +699,23 @@ impl SearchApi {
             return None;
         }
 
+        // Stage 5, over the L1 top-K. Never fails: `L2Stage::rerank` returns
+        // the L1 order unchanged on every error, budget exhaustion, and
+        // timeout — see `rank::l2`'s own docs.
+        let reranked = self
+            .rerank_for(req.rerank)
+            .rerank(&plan.raw, &ranked, search_kind(req.deep), &cancel)
+            .await;
+        let ranked = reranked.ranked;
+        let reasons = reranked.reasons;
+        // `None`, not `finish_page`: this is still ahead of the first hit, so
+        // there are no impressions to log — the same answer the cancellation
+        // checks above give. (Task 51 wrote a bare `return` here against a
+        // `()`-returning `run_stream`; task 64 gave it a return value.)
+        if cancel.is_cancelled() {
+            return None;
+        }
+
         let limit = if req.limit == 0 {
             self.search.default_limit as usize
         } else {
@@ -676,16 +759,17 @@ impl SearchApi {
             .presenter
             .present(head, &fused, &plan, lambda, 1, &cancel)
             .await;
-        let first_hits = self
-            .build_hits(
-                &first_presented,
-                &fused,
-                &features,
-                &plan,
-                req.explain,
-                query_id,
-            )
-            .await;
+        // Built once and shared by both `build_hits` calls below — see
+        // `HitContext`.
+        let hit_ctx = HitContext {
+            fused: &fused,
+            features: &features,
+            plan: &plan,
+            explain: req.explain,
+            query_id,
+            reasons: &reasons,
+        };
+        let first_hits = self.build_hits(&first_presented, &hit_ctx).await;
         let mut sent: BTreeSet<i64> = BTreeSet::new();
         // The 1-based rank of the last hit put on the wire — the impression's
         // `position`. Counted here rather than inside `record_impression` so
@@ -714,9 +798,7 @@ impl SearchApi {
             .into_iter()
             .filter(|p| !sent.contains(&p.message_id))
             .collect();
-        let rest_hits = self
-            .build_hits(&rest, &fused, &features, &plan, req.explain, query_id)
-            .await;
+        let rest_hits = self.build_hits(&rest, &hit_ctx).await;
         for (id, hit) in rest_hits {
             let score = hit.score;
             if send(&tx, &cancel, Ok(hit)).await.is_break() {
@@ -782,6 +864,21 @@ impl SearchApi {
         if ranked.is_empty() {
             return Ok(Vec::new());
         }
+        // Stage 5 runs here too, as `SearchKind::Interactive`. An eval run
+        // must score the configuration this daemon actually ships (prd.md's
+        // "Relevance is measured, not asserted"), and skipping the rerank
+        // would report numbers for a pipeline nobody uses. Interactive rather
+        // than deep because an eval sweep is not a user asking one expensive
+        // question — under `search.rerank = "auto"` that keeps a golden-set
+        // run on the local backend instead of billing one Claude call per
+        // judged query.
+        let ranked = self
+            .rerank
+            .clone()
+            .with_policy(eval_rerank(self.search.rerank))
+            .rerank(&plan.raw, &ranked, SearchKind::Interactive, cancel)
+            .await
+            .ranked;
 
         let presented = self
             .presenter
@@ -843,6 +940,23 @@ impl SearchApi {
                 fanout.generate(plan, limit, cancel).await
             }
         }
+    }
+
+    /// This request's Stage 5, honoring `SearchRequest.rerank`'s override of
+    /// the daemon's `search.rerank`.
+    ///
+    /// Returns an owned stage rather than a borrow because an override has to
+    /// produce a *different* policy without mutating the shared one — and
+    /// cloning is what [`L2Stage`] is built for (two `Arc`s and a pooled
+    /// database handle; the Claude backend's verdict cache is shared, not
+    /// copied, so an override never costs a cache).
+    fn rerank_for(&self, raw: i32) -> L2Stage {
+        let Some(requested) = decode_rerank(raw) else {
+            return self.rerank.clone();
+        };
+        self.rerank
+            .clone()
+            .with_policy(clamp_rerank(requested, self.search.rerank))
     }
 
     /// Dense-vector-only candidate generation — `Semantic`'s whole job
@@ -927,6 +1041,10 @@ impl SearchApi {
 
     /// Turn presented results into wire [`ProtoSearchHit`]s, batch-fetching
     /// their `Message` rows in one round trip rather than one per hit.
+    ///
+    /// Everything except `presented` is identical between the two calls a
+    /// streamed page makes, which is why it travels as one [`HitContext`]
+    /// rather than six more parameters.
     /// Returns `(message_id, hit)` pairs, in `presented`'s own order, so a
     /// caller can both stream them and track which ids it already sent.
     ///
@@ -936,12 +1054,16 @@ impl SearchApi {
     async fn build_hits(
         &self,
         presented: &[PresentedResult],
-        fused: &[FusedCandidate],
-        features: &[CandidateFeatures],
-        plan: &QueryPlan,
-        explain: bool,
-        query_id: Option<i64>,
+        ctx: &HitContext<'_>,
     ) -> Vec<(i64, ProtoSearchHit)> {
+        let HitContext {
+            fused,
+            features,
+            plan,
+            explain,
+            query_id,
+            reasons,
+        } = *ctx;
         if presented.is_empty() {
             return Vec::new();
         }
@@ -967,18 +1089,43 @@ impl SearchApi {
                 })
                 .unwrap_or_default();
             let snippet = to_proto_snippet(&p.snippet);
+            let claude_reason = reasons.get(&p.message_id).cloned().unwrap_or_default();
+            let cf = features_by_id.get(&p.message_id);
+            // The L1 score for *this* candidate, recomputed from its own
+            // feature vector — not `p.score`. After a Stage 5 rerank the two
+            // differ by design (`rank::l2` permutes the window's scores to
+            // express the new order), and `RankExplanation`'s documented
+            // invariant is that its per-feature contributions sum to its
+            // `score`. Only the recomputed value satisfies that; `p.score`
+            // would make the breakdown fail to add up exactly when a rerank
+            // ran.
+            let l1_score = cf.map_or(p.score, |cf| self.ranker.score(&cf.features, plan.intent));
             let why = if explain {
-                features_by_id.get(&p.message_id).map(|cf| {
+                cf.map(|cf| {
                     self.explanation(
                         cf,
                         plan.intent,
-                        p.score,
+                        l1_score,
                         sources.clone(),
                         Some(snippet.clone()),
+                        claude_reason.clone(),
                     )
                 })
-            } else {
+            } else if claude_reason.is_empty() {
                 None
+            } else {
+                // prd.md's `mail search "invoice" --rerank claude` carries no
+                // `--explain`, and its whole point is the one-line "why this
+                // matched". A request that paid for a listwise call must get
+                // the reasons back; the feature breakdown stays behind
+                // `explain`, since that is the expensive, verbose part.
+                Some(ProtoRankExplanation {
+                    features: Vec::new(),
+                    score: l1_score,
+                    sources: sources.clone(),
+                    matched: None,
+                    claude_reason: claude_reason.clone(),
+                })
             };
             let hit = ProtoSearchHit {
                 message: Some(message),
@@ -1068,6 +1215,7 @@ impl SearchApi {
         score: f64,
         sources: Vec<String>,
         matched: Option<ProtoSnippet>,
+        claude_reason: String,
     ) -> ProtoRankExplanation {
         let contributions = self.ranker.contributions(&cf.features, intent);
         let features = contributions
@@ -1086,9 +1234,7 @@ impl SearchApi {
             score,
             sources,
             matched,
-            // No L2 rerank stage exists yet (prd.md Stage 5 — task 51); this
-            // stays empty rather than a placeholder string until it does.
-            claude_reason: String::new(),
+            claude_reason,
         }
     }
 
@@ -1157,6 +1303,61 @@ impl RankedSearch for EvalSearch<'_> {
             .map_err(|status| {
                 RmailError::Internal(format!("search pipeline: {}", status.message()))
             })
+    }
+}
+
+/// What a request's `SearchRequest.rerank` actually resolves to, given the
+/// daemon's configured `search.rerank`.
+///
+/// A request may only ever ask for *less* than the daemon is configured to
+/// do. `Search` is authorized by `Scope::MailRead` (see `auth::methods`), and
+/// a mail-reading token must not be able to turn a read of the local index
+/// into a paid, egressing provider call the operator's own `search.rerank`
+/// never sanctioned. `off` and `cross_encoder` only reduce cost and are
+/// always honored; Claude is honored only where the configured policy already
+/// reaches it.
+fn clamp_rerank(requested: Rerank, configured: Rerank) -> Rerank {
+    match requested {
+        Rerank::Off | Rerank::CrossEncoder => requested,
+        Rerank::Claude | Rerank::Auto => match configured {
+            Rerank::Claude | Rerank::Auto => requested,
+            configured => {
+                tracing::debug!(
+                    ?requested,
+                    ?configured,
+                    "SearchRequest.rerank asked for a backend search.rerank does not \
+                     sanction; using the configured one"
+                );
+                configured
+            }
+        },
+    }
+}
+
+/// The rerank policy an `Evaluate` run may use.
+///
+/// A golden-set sweep runs the whole pipeline once per judged query, so a
+/// configured `search.rerank = "claude"` would turn one `Evaluate` RPC into
+/// N provider calls — serialized behind the AI concurrency budget, at up to
+/// `search.reranker.timeout` each. Measuring the shipped configuration is the
+/// point (prd.md: "Relevance is measured, not asserted"), but not at the cost
+/// of an unbounded bill from a regression guard, so the hosted backend is
+/// substituted with the local one and everything else is measured as
+/// configured.
+const fn eval_rerank(configured: Rerank) -> Rerank {
+    match configured {
+        Rerank::Off => Rerank::Off,
+        Rerank::CrossEncoder | Rerank::Claude | Rerank::Auto => Rerank::CrossEncoder,
+    }
+}
+
+/// Which kind of search this is, for `search.rerank = "auto"` — prd.md's
+/// "cross-encoder for interactive typing, Claude for explicit deep search."
+const fn search_kind(deep: bool) -> SearchKind {
+    if deep {
+        SearchKind::Deep
+    } else {
+        SearchKind::Interactive
     }
 }
 
@@ -1259,12 +1460,20 @@ impl SearchService for SearchApi {
             .unwrap_or_default();
         let matched = self.matched_snippet(req.message_id, &plan, &cancel).await;
 
+        // No `claude_reason`: `Explain` re-derives one message's ranking
+        // rationale and deliberately does not run Stage 5 (see the module
+        // docs on why it re-derives rather than replays). A listwise reason
+        // is a property of one *page* of results — it says why this message
+        // beat the others it was ranked against — so synthesizing one here,
+        // for a message explained on its own, would be inventing a
+        // comparison that never happened.
         Ok(Response::new(self.explanation(
             cf,
             plan.intent,
             score,
             sources,
             matched,
+            String::new(),
         )))
     }
 
@@ -1461,7 +1670,9 @@ async fn send<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{should_log, Generation};
+    use super::{clamp_rerank, eval_rerank, search_kind, should_log, Generation};
+    use rmail_core::config::Rerank;
+    use rmail_core::rank::l2::SearchKind;
     use tokio_util::sync::CancellationToken;
 
     /// A superseded stream contributes nothing to the training corpus, even
@@ -1491,6 +1702,58 @@ mod tests {
     fn a_page_that_showed_nothing_is_not_logged() {
         assert!(!should_log(false, 0));
         assert!(!should_log(true, 0));
+    }
+
+    /// The escalation guard behind `auth::methods`' claim that `Search` is
+    /// safe at `mail.read`: a request can turn reranking *down* from any
+    /// configuration, and can never turn it up to a provider call the
+    /// operator did not already enable.
+    #[test]
+    fn a_request_can_only_reduce_the_configured_rerank() {
+        for configured in [
+            Rerank::Off,
+            Rerank::CrossEncoder,
+            Rerank::Claude,
+            Rerank::Auto,
+        ] {
+            assert_eq!(clamp_rerank(Rerank::Off, configured), Rerank::Off);
+            assert_eq!(
+                clamp_rerank(Rerank::CrossEncoder, configured),
+                Rerank::CrossEncoder
+            );
+        }
+
+        // Escalation is refused and falls back to the configured backend.
+        assert_eq!(clamp_rerank(Rerank::Claude, Rerank::Off), Rerank::Off);
+        assert_eq!(
+            clamp_rerank(Rerank::Claude, Rerank::CrossEncoder),
+            Rerank::CrossEncoder
+        );
+        assert_eq!(clamp_rerank(Rerank::Auto, Rerank::Off), Rerank::Off);
+        assert_eq!(
+            clamp_rerank(Rerank::Auto, Rerank::CrossEncoder),
+            Rerank::CrossEncoder
+        );
+
+        // ...and honored where the configuration already reaches Claude.
+        assert_eq!(clamp_rerank(Rerank::Claude, Rerank::Claude), Rerank::Claude);
+        assert_eq!(clamp_rerank(Rerank::Claude, Rerank::Auto), Rerank::Claude);
+        assert_eq!(clamp_rerank(Rerank::Auto, Rerank::Auto), Rerank::Auto);
+    }
+
+    /// A golden-set sweep must never bill one provider call per judged query.
+    #[test]
+    fn eval_never_resolves_to_the_hosted_backend() {
+        assert_eq!(eval_rerank(Rerank::Off), Rerank::Off);
+        assert_eq!(eval_rerank(Rerank::CrossEncoder), Rerank::CrossEncoder);
+        assert_eq!(eval_rerank(Rerank::Claude), Rerank::CrossEncoder);
+        assert_eq!(eval_rerank(Rerank::Auto), Rerank::CrossEncoder);
+    }
+
+    #[test]
+    fn deep_is_what_auto_resolves_against() {
+        assert_eq!(search_kind(true), SearchKind::Deep);
+        assert_eq!(search_kind(false), SearchKind::Interactive);
     }
 
     /// The mechanism the module docs' "Cancellation" section describes,

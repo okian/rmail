@@ -55,7 +55,7 @@ use std::time::Duration;
 use rmail_core::ai::{
     self, AiDispatchLoop, AiPauseFlag, AiQueue, AiWorkerPool, BatchClient, BatchCoordinator,
     DeepPassGate, DeepPassHandler, PassHandler, PolicyEngine, Provider as AiProvider,
-    QueueOptions as AiQueueOptions, TriagePassHandler,
+    QueueOptions as AiQueueOptions, RateLimiter, TriagePassHandler,
 };
 use rmail_core::compose::DraftStore;
 use rmail_core::embed::hash::HashEmbedder;
@@ -74,6 +74,7 @@ use rmail_core::outbox::{
     FollowupStore, ImapSentAppender, LettreSender, OutboxStore, SendPolicy, SendScheduler,
 };
 use rmail_core::rank::l1::Weights;
+use rmail_core::rank::l2::{ClaudeReranker, L2Stage, Reranker as CoreReranker};
 use rmail_core::saved_search::SavedSearchStore;
 use rmail_core::smart_folder::{SmartFolderEvaluator, SmartFolderStore};
 use rmail_core::sync::{SyncEngine, SyncOptions};
@@ -95,6 +96,7 @@ use rmail_proto::v1::send_scheduler_service_server::SendSchedulerServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
 use rmail_proto::v1::tag_service_server::TagServiceServer;
 use tokio::net::UnixListener;
+use tokio::sync::Semaphore;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
@@ -663,12 +665,87 @@ where
             // with `vec_chunks` unpopulated either way, it costs nothing real.
             Arc::new(HashEmbedder::new(VECTOR_DIM)) as Arc<dyn Embedder>
         });
+
+    // The AI provider and policy engine, built here rather than with the rest
+    // of the AI subsystem below because search's L2 rerank stage (task 51)
+    // needs the provider and is constructed first. One provider per process
+    // is the point — a second one would mean a second API-key resolution and
+    // a second HTTP client, and would make `ai.limits` accounting a fiction.
+    //
+    // `AiService` is always registered (reflection and the auth scope table
+    // must see every RPC regardless of runtime config); `ai_active` gates
+    // real *work*, not registration. A disabled or misconfigured AI
+    // subsystem falls back to `ai_service::NullProvider`, so every
+    // provider-calling RPC fails fast with `FAILED_PRECONDITION` instead of
+    // ever dialing out, and the dispatch loop is simply never spawned —
+    // prd.md's "AI down → AiService health NOT_SERVING, mail features
+    // unaffected" (health-service granularity is left for a later task; the
+    // effect on served behavior is already correct).
+    let ai_policy =
+        Arc::new(PolicyEngine::from_config(config).map_err(ServeError::InvalidAiPolicy)?);
+    let (ai_provider, ai_active): (Arc<dyn AiProvider>, bool) = if config.ai.enabled {
+        match ai::provider::build(&config.ai) {
+            Ok(provider) => (provider, true),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not build the configured AI provider; AI features are disabled \
+                     until this is fixed"
+                );
+                (Arc::new(ai_service::NullProvider), false)
+            }
+        }
+    } else {
+        tracing::info!("ai.enabled = false; AI features are disabled on this daemon");
+        (Arc::new(ai_service::NullProvider), false)
+    };
+
+    // The one `ai.limits` concurrency/pacing budget for this process. Created
+    // here rather than inside `AiWorkerPool` (which is built further down)
+    // because search's L2 rerank needs it *first* and must draw on the same
+    // budget the queue does — two independent pairs would let the daemon
+    // exceed `max_concurrency`/`requests_per_minute` in practice. The pool
+    // adopts this pair via `with_capacity` below; `AiApi` takes it from the
+    // pool's own accessors, as it always has.
+    let ai_semaphore = Arc::new(Semaphore::new(
+        config.ai.limits.max_concurrency.max(1) as usize
+    ));
+    let ai_rate_limiter = Arc::new(RateLimiter::new(config.ai.limits.requests_per_minute));
+
+    // Stage 5. The Claude backend is wired only when the AI subsystem is
+    // genuinely active: with `NullProvider` behind it, `search.rerank =
+    // "claude"` would spend a redaction pass and a budget check per query to
+    // reach a provider that always refuses. `None` degrades to the L1 order
+    // one step earlier and says so once, in the log, rather than per search.
+    // The local cross-encoder is always built — it is offline, and
+    // `L2Stage::new` loads no model until a search actually asks for one.
+    //
+    // `ai_policy` is threaded in because a rerank reads message *text*: it is
+    // the only stage of search that does, so it is the only one that has to
+    // honor `accounts.ai.enabled` and `ai.policy`'s per-folder rules.
+    let claude_reranker: Option<Arc<dyn CoreReranker>> = ai_active.then(|| {
+        Arc::new(ClaudeReranker::new(
+            Arc::clone(&ai_provider),
+            db.clone(),
+            &config.search.reranker,
+            config.ai.limits.clone(),
+            config.ai.privacy.clone(),
+            Arc::clone(&ai_semaphore),
+            Arc::clone(&ai_rate_limiter),
+        )) as Arc<dyn CoreReranker>
+    });
     let search_api = SearchApi::new(
         db.clone(),
         Arc::clone(&embedder),
         rank_weights,
         config.search.clone(),
         &config.index.semantic,
+        L2Stage::new(
+            db.clone(),
+            &config.search,
+            Arc::clone(&ai_policy),
+            claude_reranker,
+        ),
         stopping.clone(),
     );
     let search_service = SearchServiceServer::new(search_api.clone());
@@ -789,36 +866,9 @@ where
     // pool/batch coordinator that drive them, and the dispatch loop that
     // closes the loop between "a message synced" and "a triage job ran" —
     // see `rmail_core::ai::dispatch`'s own module docs for why task 50 owns
-    // that wiring and what gap it closes.
-    //
-    // `AiService` is always registered (reflection and the auth scope table
-    // must see every RPC regardless of runtime config); `ai_active` gates
-    // real *work*, not registration. A disabled or misconfigured AI
-    // subsystem falls back to `ai_service::NullProvider`, so every
-    // provider-calling RPC fails fast with `FAILED_PRECONDITION` instead of
-    // ever dialing out, and the dispatch loop is simply never spawned —
-    // prd.md's "AI down → AiService health NOT_SERVING, mail features
-    // unaffected" (health-service granularity is left for a later task; the
-    // effect on served behavior is already correct).
-    let ai_policy =
-        Arc::new(PolicyEngine::from_config(config).map_err(ServeError::InvalidAiPolicy)?);
-    let (ai_provider, ai_active): (Arc<dyn AiProvider>, bool) = if config.ai.enabled {
-        match ai::provider::build(&config.ai) {
-            Ok(provider) => (provider, true),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "could not build the configured AI provider; AI features are disabled \
-                     until this is fixed"
-                );
-                (Arc::new(ai_service::NullProvider), false)
-            }
-        }
-    } else {
-        tracing::info!("ai.enabled = false; AI features are disabled on this daemon");
-        (Arc::new(ai_service::NullProvider), false)
-    };
-
+    // that wiring and what gap it closes. The provider and the policy engine
+    // are built further up, before `SearchApi`, because the L2 rerank stage
+    // needs them.
     let ai_queue = AiQueue::new(db.clone(), AiQueueOptions::default());
     let index_queue = IndexQueue::new(db.clone(), IndexQueueOptions::default());
     let deep_handler = Arc::new(DeepPassHandler::new(
@@ -846,14 +896,10 @@ where
         ai_handlers.clone(),
         "rmaild-ai-worker",
         events.clone(),
-    );
-    // Shared with `AiApi` below — a forced `AnalyzeMessage`/`SuggestReply`
-    // call must draw from the *same* concurrency/RPM budget this pool
-    // enforces for its own queued dispatch, not a second, independent one
-    // that would let the two paths together exceed `ai.limits` in practice.
-    // See `AiWorkerPool::semaphore`/`AiApi::new`'s own docs.
-    let ai_semaphore = ai_worker_pool.semaphore();
-    let ai_rate_limiter = ai_worker_pool.rate_limiter();
+    )
+    // The pair built above, shared rather than a second one of this pool's
+    // own — see its own comment and `AiWorkerPool::with_capacity`'s docs.
+    .with_capacity(Arc::clone(&ai_semaphore), Arc::clone(&ai_rate_limiter));
 
     // Always starts unpaused, regardless of `ai_active` — a disabled daemon
     // is reported via `GetUsage.enabled = false`, not by pretending it is
