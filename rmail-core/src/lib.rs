@@ -17,6 +17,7 @@ pub mod error;
 pub mod eval;
 pub mod events;
 pub mod features;
+pub mod feedback;
 pub mod fuse;
 pub mod hooks;
 pub mod imap;

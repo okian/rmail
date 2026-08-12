@@ -39,6 +39,11 @@ fn json_hit_has_the_exact_documented_key_set() {
         thread_id: Some(88),
         thread_collapsed: vec![],
         near_duplicates: vec![],
+        // Task 64's feedback handle. Deliberately *not* part of the `--json`
+        // key set asserted below: it is a gRPC-session handle for
+        // `LogFeedback`, meaningless to a shell pipeline that has already
+        // exited by the time any feedback could be reported.
+        query_id: 0,
     };
 
     let value = serde_json::to_value(JsonHit::from_wire(&hit)).expect("hit serializes");
@@ -83,6 +88,7 @@ fn empty_collections_and_absent_why_still_serialize_as_present_keys() {
         thread_id: None,
         thread_collapsed: vec![],
         near_duplicates: vec![],
+        query_id: 0,
     };
     let value = serde_json::to_value(JsonHit::from_wire(&hit)).unwrap();
     assert_eq!(value["thread_id"], serde_json::Value::Null);

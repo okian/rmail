@@ -57,6 +57,43 @@
 //! cancel the previous one; the interruption itself is inherited for free
 //! from tasks 27-32's own plumbing.
 //!
+//! # Feedback: impressions are written here, actions arrive by RPC
+//!
+//! prd.md's learning loop (task 64) needs two things from a search, and only
+//! one of them is something a client can supply.
+//!
+//! The *impression* — which message was shown at which position, and the
+//! exact feature vector it was ranked by — is only knowable in this process,
+//! at this moment. `features::FeatureExtractor` reads the live corpus, so a
+//! vector re-derived later is a different vector: BM25 moves as the index
+//! grows, `recency_decay` moves by definition, and `is_unread` flips the
+//! instant the user opens the result, which is precisely the row a trainer
+//! cares most about. So [`SearchApi::run_stream`] carries the
+//! `CandidateFeatures` it *actually ranked with* into a
+//! [`rmail_core::feedback::Impression`] and writes it here.
+//!
+//! The *action* — opened, replied, archived, dwelled, scrolled past — is only
+//! knowable at the client, and arrives through `LogFeedback` keyed by the
+//! `query_id` stamped on every `SearchHit`.
+//!
+//! Two properties this file is responsible for, both structural:
+//!
+//! - **Logging never delays a search.** The `query_id` is minted in-process
+//!   (`feedback::new_query_id`), so nothing is written before the first hit
+//!   streams. `run_stream` *returns* what it wants logged rather than writing
+//!   it, and [`SearchApi::start_stream`]'s spawned task writes it only after
+//!   `run_stream` has returned — which is after the response channel has been
+//!   dropped and the client has already seen end-of-stream. A slow writer
+//!   connection therefore delays nothing a user can perceive.
+//! - **Logging never fails a search.** Every failure is a `warn`, never a
+//!   `Status`. The page was already served; a lost log line costs one
+//!   training example.
+//!
+//! A superseded stream logs nothing at all. That is a data-quality decision
+//! as much as a correctness one: the impressions of a query the user replaced
+//! mid-keystroke are results nobody looked at, and feeding them to a
+//! position-bias model as "shown but not clicked" is teaching it from noise.
+//!
 //! # `Explain` re-derives, it does not replay
 //!
 //! `Explain` re-runs query planning -> fan-out -> fuse -> feature
@@ -90,6 +127,9 @@ use rmail_core::eval::{
     RankedSearch, RECALL_K,
 };
 use rmail_core::features::{CandidateFeatures, FeatureExtractor};
+use rmail_core::feedback::{
+    Action as FeedbackActionRecord, ActionKind, FeedbackStore, Impression, QueryRecord,
+};
 use rmail_core::fuse::{FusedCandidate, Fuser};
 use rmail_core::index::fts::FtsIndex;
 use rmail_core::index::semantic::SemanticIndex;
@@ -103,9 +143,10 @@ use rmail_proto::v1::search_service_server::SearchService;
 use rmail_proto::v1::{
     ByteRange as ProtoByteRange, EvalMetrics as ProtoEvalMetrics, EvalReport as ProtoEvalReport,
     EvaluateRequest, ExplainRequest, FeatureContribution as ProtoFeatureContribution,
-    Intent as ProtoIntent, Message as ProtoMessage, Mode as ProtoMode, QueryEval as ProtoQueryEval,
-    RankExplanation as ProtoRankExplanation, SearchHit as ProtoSearchHit, SearchRequest,
-    Snippet as ProtoSnippet,
+    FeedbackAction as ProtoFeedbackAction, FeedbackRequest, Intent as ProtoIntent,
+    Message as ProtoMessage, Mode as ProtoMode, QueryEval as ProtoQueryEval,
+    RankExplanation as ProtoRankExplanation, ResultAction as ProtoResultAction,
+    SearchHit as ProtoSearchHit, SearchRequest, Snippet as ProtoSnippet,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -143,6 +184,96 @@ impl Generation {
         }
         token
     }
+}
+
+/// One served page's worth of feedback, handed from
+/// [`SearchApi::run_stream`] to [`SearchApi::log_page`] after the response
+/// stream has closed.
+///
+/// Built only when `search.learning` is on — the opt-out is the absence of
+/// this value, not a flag inside it, so a code path that forgets to check has
+/// nothing to write in the first place.
+struct LoggedPage {
+    record: QueryRecord,
+    impressions: Vec<Impression>,
+}
+
+/// Append one successfully-sent hit to the page's impressions.
+///
+/// The feature vector is looked up from the exact `CandidateFeatures` slice
+/// this request's ranker scored — never re-extracted — which is the whole
+/// point of logging here rather than deriving it later; see the module docs'
+/// "Feedback" section.
+///
+/// `position` is the caller's own count of hits put on the wire, **not**
+/// `page.impressions.len() + 1`. The two agree today, and would diverge the
+/// moment the vector lookup below misses: every impression after the miss
+/// would be logged one rank too high, silently corrupting exactly the
+/// position-bias signal this table exists to capture. Deriving the rank from
+/// what was *sent* rather than from what was *recorded* makes that class of
+/// drift impossible rather than merely unlikely.
+///
+/// A hit with no matching vector is skipped rather than logged with a
+/// placeholder: every presented result came from a ranked candidate, so this
+/// cannot happen, and a zero vector would be indistinguishable from a
+/// genuinely unremarkable one to whatever trains on it.
+fn record_impression(
+    page: Option<&mut LoggedPage>,
+    vectors: &BTreeMap<i64, &CandidateFeatures>,
+    message_id: i64,
+    position: u32,
+    score: f64,
+) {
+    let Some(page) = page else {
+        return;
+    };
+    let Some(cf) = vectors.get(&message_id) else {
+        tracing::warn!(
+            message_id,
+            position,
+            "a presented hit had no feature vector; impression not logged"
+        );
+        return;
+    };
+    page.impressions.push(Impression {
+        message_id,
+        position,
+        features: cf.features.clone(),
+        l1_score: score,
+        // Stage 5 (task 51) has not landed; `None` says "no reranker ran",
+        // which is not the same fact as a rerank score of zero.
+        l2_score: None,
+    });
+}
+
+/// Whether a stream that got this far should log what it collected.
+///
+/// Both terms matter, and the first is the one that would be easy to lose:
+///
+/// - **`!cancelled`** — a superseded stream logs nothing *even when hits were
+///   already sent*. The query was replaced by a fresher keystroke (or the
+///   daemon is stopping), so those results are ones nobody looked at, and
+///   feeding them to a position-bias model as "shown but not clicked" is
+///   training on noise. Less data beats wrong data.
+/// - **`impressions > 0`** — nothing was shown, so there is nothing to learn
+///   from, and a bare `search_log` row would be a record of what the user
+///   searched for and nothing else.
+///
+/// Split out from [`finish_page`] as a plain predicate so both terms are
+/// testable without constructing a whole 34-feature page: the end-to-end
+/// consequence is timing-dependent (a superseded stream may be cut before it
+/// sends anything at all, in which case the second term already covers it),
+/// which is exactly the shape of test that passes whether or not the rule
+/// survives.
+const fn should_log(cancelled: bool, impressions: usize) -> bool {
+    !cancelled && impressions > 0
+}
+
+/// The page to log, or `None` if there is nothing worth logging — see
+/// [`should_log`] for the rule and why it lives there.
+fn finish_page(page: Option<LoggedPage>, cancel: &CancellationToken) -> Option<LoggedPage> {
+    let cancelled = cancel.is_cancelled();
+    page.filter(|page| should_log(cancelled, page.impressions.len()))
 }
 
 /// Which candidate sources a request restricts itself to, resolved from
@@ -258,6 +389,11 @@ pub struct SearchApi {
     feature_extractor: FeatureExtractor,
     ranker: L1Ranker,
     presenter: Presenter,
+    /// The implicit-feedback log (task 64). Always present; the
+    /// `search.learning` opt-out lives inside it, so this file has one code
+    /// path rather than an `Option` every call site has to remember to check
+    /// — see `rmail_core::feedback`'s own module docs.
+    feedback: FeedbackStore,
     search: SearchConfig,
     /// Cancelled when the daemon shuts down, so every generation's token —
     /// and therefore every open stream — stops with it. Same pattern as
@@ -304,6 +440,7 @@ impl SearchApi {
         );
         let ranker = L1Ranker::new(weights);
         let presenter = Presenter::new(db.clone());
+        let feedback = FeedbackStore::new(db.clone(), search.learning, search.feedback);
 
         Self {
             db,
@@ -315,10 +452,21 @@ impl SearchApi {
             feature_extractor,
             ranker,
             presenter,
+            feedback,
             search,
             shutdown,
             generation: Generation::default(),
         }
+    }
+
+    /// The feedback log this handler writes through, so the daemon can drive
+    /// its retention sweep against the same store (and therefore the same
+    /// `search.learning`/`[search.feedback]` policy) the search path uses,
+    /// rather than constructing a second one that could be configured
+    /// differently.
+    #[must_use]
+    pub fn feedback(&self) -> &FeedbackStore {
+        &self.feedback
     }
 
     /// Kick off a `Search`/`Semantic` stream: register it as the current
@@ -362,16 +510,56 @@ impl SearchApi {
         let this = self.clone();
         tokio::spawn(
             async move {
-                this.run_stream(req, dense_only, cancel, tx).await;
+                // `tx` is moved into `run_stream` and dropped when it
+                // returns, so the client sees end-of-stream *before* the
+                // feedback write below even starts. That ordering is the
+                // whole reason the logging lives out here rather than at the
+                // bottom of `run_stream`: a page held open while the writer
+                // connection is busy would be a search this task made slower.
+                let logged = this.run_stream(req, dense_only, cancel, tx).await;
+                if let Some(page) = logged {
+                    this.log_page(page).await;
+                }
             }
             .instrument(tracing::Span::current()),
         );
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
+    /// Persist one served page's impressions, downgrading every failure to a
+    /// warning.
+    ///
+    /// Nothing upstream of here can fail a search by this point — the hits
+    /// are already on the wire — so an error is logged and dropped. The
+    /// alternative (propagating it) has nowhere to go: there is no response
+    /// left to attach it to.
+    async fn log_page(&self, page: LoggedPage) {
+        let query_id = page.record.query_id;
+        let shown = page.impressions.len();
+        match self.feedback.log_query(page.record, page.impressions).await {
+            Ok(written) => {
+                tracing::debug!(query_id, shown, written, "logged a search impression batch");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    query_id,
+                    shown,
+                    "logging search impressions failed; this page contributes no training data"
+                );
+            }
+        }
+    }
+
     /// Run the pipeline end to end and stream every hit it produces — the
     /// body of both `Search` and `Semantic`. See the module docs' "Streaming
     /// the first hit" section for the two-phase `present` call.
+    ///
+    /// Returns the impressions this page actually put on the wire, for the
+    /// caller to log *after* the response stream has closed — see the module
+    /// docs' "Feedback" section for why logging happens there rather than
+    /// here, and why a cancelled stream returns `None` rather than an empty
+    /// batch.
     #[tracing::instrument(skip(self, req, cancel, tx), fields(dense_only, explain = req.explain))]
     async fn run_stream(
         &self,
@@ -379,8 +567,12 @@ impl SearchApi {
         dense_only: bool,
         cancel: CancellationToken,
         tx: tokio::sync::mpsc::Sender<Result<ProtoSearchHit, Status>>,
-    ) {
+    ) -> Option<LoggedPage> {
         let now = Utc::now();
+        // Minted before anything is written, because it has to be on every
+        // hit as it streams; `None` when `search.learning` is off, and then
+        // nothing below builds an impression at all.
+        let query_id = self.feedback.new_query_id();
 
         let query = match self
             .effective_query(&req.query, &req.filter, req.account_id)
@@ -389,7 +581,7 @@ impl SearchApi {
             Ok(query) => query,
             Err(status) => {
                 let _ = send(&tx, &cancel, Err(status)).await;
-                return;
+                return None;
             }
         };
 
@@ -397,7 +589,7 @@ impl SearchApi {
             Ok(plan) => plan,
             Err(error) => {
                 let _ = send(&tx, &cancel, Err(Status::from(error))).await;
-                return;
+                return None;
             }
         };
         if let Some(intent) = decode_intent(req.intent) {
@@ -413,7 +605,7 @@ impl SearchApi {
                 .await
         };
         if cancel.is_cancelled() {
-            return;
+            return None;
         }
 
         let fused = self
@@ -427,7 +619,7 @@ impl SearchApi {
             )
             .await;
         if cancel.is_cancelled() {
-            return;
+            return None;
         }
 
         let features = self
@@ -438,7 +630,7 @@ impl SearchApi {
             .ranker
             .rank(&features, plan.intent, self.search.top_k_rerank as usize);
         if ranked.is_empty() || cancel.is_cancelled() {
-            return;
+            return None;
         }
 
         let limit = if req.limit == 0 {
@@ -447,6 +639,34 @@ impl SearchApi {
             req.limit as usize
         };
         let lambda = self.search.mmr_lambda;
+
+        // Impressions are accumulated as hits are *successfully handed to the
+        // response channel*, not as they are built. That is the strongest
+        // "was this shown?" signal this side of the wire has — it is not
+        // proof the client rendered it, but a hit that never left the daemon
+        // definitely was not shown, and logging one would teach a
+        // position-bias model that a result was displayed and ignored when it
+        // was in fact never displayed. (`scroll_past` is how a client reports
+        // the finer-grained truth about what it actually painted.)
+        //
+        // `None` when `search.learning` is off, so the opt-out costs not even
+        // the allocation — and, more to the point, so there is no populated
+        // batch sitting around for a later refactor to accidentally write.
+        let mut page = query_id.map(|query_id| LoggedPage {
+            record: QueryRecord {
+                query_id,
+                // `SearchRequest.account_id = 0` means "every configured
+                // account" (see `effective_query`), which is a NULL scope
+                // rather than account 0.
+                account_id: (req.account_id != 0).then_some(req.account_id),
+                raw_query: query.clone(),
+                intent: plan.intent,
+                issued_at: now.timestamp(),
+            },
+            impressions: Vec::new(),
+        });
+        let vectors: BTreeMap<i64, &CandidateFeatures> =
+            features.iter().map(|cf| (cf.message_id, cf)).collect();
 
         // Phase 1: the single best-scoring candidate, presented and flushed
         // alone — see the module docs for why this is provably the same
@@ -457,17 +677,32 @@ impl SearchApi {
             .present(head, &fused, &plan, lambda, 1, &cancel)
             .await;
         let first_hits = self
-            .build_hits(&first_presented, &fused, &features, &plan, req.explain)
+            .build_hits(
+                &first_presented,
+                &fused,
+                &features,
+                &plan,
+                req.explain,
+                query_id,
+            )
             .await;
         let mut sent: BTreeSet<i64> = BTreeSet::new();
+        // The 1-based rank of the last hit put on the wire — the impression's
+        // `position`. Counted here rather than inside `record_impression` so
+        // it stays the *wire* ordinal even if an impression is ever skipped;
+        // see that function's own docs.
+        let mut rank: u32 = 0;
         for (id, hit) in first_hits {
             sent.insert(id);
+            let score = hit.score;
             if send(&tx, &cancel, Ok(hit)).await.is_break() {
-                return;
+                return finish_page(page, &cancel);
             }
+            rank = rank.saturating_add(1);
+            record_impression(page.as_mut(), &vectors, id, rank, score);
         }
         if cancel.is_cancelled() {
-            return;
+            return None;
         }
 
         // Phase 2: the rest of the page.
@@ -480,13 +715,17 @@ impl SearchApi {
             .filter(|p| !sent.contains(&p.message_id))
             .collect();
         let rest_hits = self
-            .build_hits(&rest, &fused, &features, &plan, req.explain)
+            .build_hits(&rest, &fused, &features, &plan, req.explain, query_id)
             .await;
-        for (_, hit) in rest_hits {
+        for (id, hit) in rest_hits {
+            let score = hit.score;
             if send(&tx, &cancel, Ok(hit)).await.is_break() {
-                return;
+                return finish_page(page, &cancel);
             }
+            rank = rank.saturating_add(1);
+            record_impression(page.as_mut(), &vectors, id, rank, score);
         }
+        finish_page(page, &cancel)
     }
 
     /// Run the pipeline to completion and return the presented message ids,
@@ -701,6 +940,7 @@ impl SearchApi {
         features: &[CandidateFeatures],
         plan: &QueryPlan,
         explain: bool,
+        query_id: Option<i64>,
     ) -> Vec<(i64, ProtoSearchHit)> {
         if presented.is_empty() {
             return Vec::new();
@@ -749,6 +989,11 @@ impl SearchApi {
                 thread_id: p.thread_id,
                 thread_collapsed: p.thread_collapsed.clone(),
                 near_duplicates: p.near_duplicates.clone(),
+                // 0 is the wire sentinel for "this search was not logged, so
+                // there is nothing to attribute feedback to" — which is
+                // exactly what `None` means here (the `search.learning`
+                // opt-out).
+                query_id: query_id.unwrap_or(0),
             };
             out.push((p.message_id, hit));
         }
@@ -1116,6 +1361,80 @@ impl SearchService for SearchApi {
                 .collect(),
         }))
     }
+
+    #[tracing::instrument(skip(self, request), fields(query_id, actions))]
+    async fn log_feedback(
+        &self,
+        request: Request<FeedbackRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current()
+            .record("query_id", req.query_id)
+            .record("actions", req.actions.len());
+
+        // Decoded before the store is called, so a malformed enum or a
+        // missing `dwell_ms` is an INVALID_ARGUMENT naming the offending
+        // action rather than a generic failure from three layers down.
+        let actions = req
+            .actions
+            .iter()
+            .map(decode_action)
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        // Every domain error maps through the one `Error -> Status`
+        // conversion the whole daemon shares: INVALID_ARGUMENT for a
+        // malformed batch, NOT_FOUND for a `query_id` this daemon never
+        // logged (or that retention has since dropped). Opting out is
+        // neither — `log_actions` returns `Ok(0)` without writing, and the
+        // caller sees a plain success.
+        let written = self
+            .feedback
+            .log_actions(req.query_id, &actions)
+            .await
+            .map_err(Status::from)?;
+        tracing::debug!(written, "recorded search feedback");
+
+        Ok(Response::new(()))
+    }
+}
+
+/// Translate one wire action into the domain's own, rejecting anything
+/// outside prd.md's vocabulary.
+///
+/// `FEEDBACK_ACTION_UNSPECIFIED` and an unrecognized enum number are both
+/// refused rather than defaulted to `open`: a client that sent the wrong
+/// number is a client whose whole batch is suspect, and inventing a plausible
+/// action for it would write a training label nobody asked for.
+fn decode_action(action: &ProtoResultAction) -> Result<FeedbackActionRecord, Status> {
+    let kind = match ProtoFeedbackAction::try_from(action.action)
+        .unwrap_or(ProtoFeedbackAction::Unspecified)
+    {
+        ProtoFeedbackAction::Unspecified => {
+            return Err(Status::from(RmailError::invalid_argument(format!(
+                "action for message {} is unspecified; feedback with no action is not a signal",
+                action.message_id
+            ))));
+        }
+        ProtoFeedbackAction::Open => ActionKind::Open,
+        ProtoFeedbackAction::Reply => ActionKind::Reply,
+        ProtoFeedbackAction::Archive => ActionKind::Archive,
+        ProtoFeedbackAction::Dwell => ActionKind::Dwell,
+        ProtoFeedbackAction::ScrollPast => ActionKind::ScrollPast,
+    };
+    Ok(FeedbackActionRecord {
+        message_id: action.message_id,
+        kind,
+        dwell_ms: action.dwell_ms,
+        // proto3 cannot tell an absent scalar from a zero one, and a local
+        // client sharing this machine's clock has no reason to stamp its own:
+        // 0 means "use the daemon's". A unix timestamp of 0 is 1970, which is
+        // not a time any feedback was generated.
+        at: if action.at == 0 {
+            Utc::now().timestamp()
+        } else {
+            action.at
+        },
+    })
 }
 
 /// Send one stream item, giving up if the client went away, the daemon is
@@ -1142,8 +1461,37 @@ async fn send<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::Generation;
+    use super::{should_log, Generation};
     use tokio_util::sync::CancellationToken;
+
+    /// A superseded stream contributes nothing to the training corpus, even
+    /// when it had already put hits on the wire.
+    ///
+    /// Pinned here rather than only end-to-end because the integration path
+    /// cannot force the interesting case: cancellation usually cuts a stream
+    /// at one of `run_stream`'s checkpoints *before* the first hit is sent,
+    /// and a page with no impressions is dropped by the second term anyway —
+    /// so an end-to-end assertion passes whether or not the cancellation rule
+    /// exists. This one fails the moment the `!cancelled` term is dropped.
+    #[test]
+    fn a_cancelled_stream_logs_nothing_even_after_sending_hits() {
+        assert!(
+            !should_log(true, 25),
+            "a superseded stream must not log the page it had already sent"
+        );
+        assert!(
+            should_log(false, 25),
+            "an ordinary completed page is logged"
+        );
+    }
+
+    /// A query that showed nothing has nothing to learn from, cancelled or
+    /// not — a bare `search_log` row would only record what was searched for.
+    #[test]
+    fn a_page_that_showed_nothing_is_not_logged() {
+        assert!(!should_log(false, 0));
+        assert!(!should_log(true, 0));
+    }
 
     /// The mechanism the module docs' "Cancellation" section describes,
     /// proven in isolation (no database, no gRPC harness): a fresh
@@ -1173,6 +1521,62 @@ mod tests {
         let third = generation.begin(&shutdown);
         assert!(second.is_cancelled());
         assert!(!third.is_cancelled());
+    }
+
+    /// The feedback log has exactly one door, and it only opens inward.
+    ///
+    /// prd.md's learning loop is "local telemetry, never transmitted," and a
+    /// serialized feature vector is a behavioural fingerprint of the user's
+    /// mailbox — so the property worth defending is not "we do not currently
+    /// upload it" (nothing does) but "there is no RPC that hands it out."
+    /// That cannot be proven by inspecting this file, because the way it
+    /// would be lost is somebody adding an `ExportFeedback`/`GetImpressions`
+    /// RPC in a later task and nobody connecting it to this promise.
+    ///
+    /// So the check is against the compiled descriptor set: this is the
+    /// complete list of `SearchService` RPCs, and adding one fails here by
+    /// name. That makes this deliberately a changes-detector, which is the
+    /// point — a new RPC on this service is a decision about egress, and this
+    /// test is where that decision gets made rather than assumed. Extending
+    /// the list is the correct fix, once the new RPC has been checked against
+    /// the sentence above.
+    #[test]
+    fn no_search_rpc_reads_the_feedback_log_back_out() {
+        use prost::Message as _;
+
+        const EXPECTED: &[&str] = &[
+            // Read-only over the index; none of them touch the feedback
+            // tables at all.
+            "Search",
+            "Semantic",
+            "Explain",
+            "Evaluate",
+            // Write-only, into the log. Returns `google.protobuf.Empty` —
+            // it reports nothing back about what is stored.
+            "LogFeedback",
+        ];
+
+        let set = prost_types::FileDescriptorSet::decode(rmail_proto::FILE_DESCRIPTOR_SET)
+            .expect("the compiled descriptor set must decode");
+        let mut found: Vec<String> = Vec::new();
+        for file in &set.file {
+            for service in &file.service {
+                if file.package() == "rmail.v1" && service.name() == "SearchService" {
+                    found.extend(service.method.iter().map(|m| m.name().to_owned()));
+                }
+            }
+        }
+        found.sort();
+        let mut expected: Vec<String> = EXPECTED.iter().map(|m| (*m).to_owned()).collect();
+        expected.sort();
+
+        assert_eq!(
+            found, expected,
+            "SearchService's RPC list changed. If the new RPC can return \
+             anything from search_log/search_impression/search_action, it \
+             breaks prd.md's 'never transmitted' promise for the feedback \
+             log; if it cannot, add it to EXPECTED."
+        );
     }
 
     #[test]

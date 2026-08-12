@@ -612,7 +612,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core send::preflight followup::` · `cargo nextest run -p rmaild followup_service`
 
 ## 64. Feedback logging
-- [ ] status
+- [x] status
 - **depends-on:** 33
 - **parallel-safe:** yes
 - **acceptance:**

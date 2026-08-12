@@ -25,7 +25,10 @@ use rmail_core::index::{extract_message, IndexQueue, QueueOptions, PRIORITY_NORM
 use rmail_core::repo;
 use rmail_core::{Config, Database};
 use rmail_proto::v1::search_service_client::SearchServiceClient;
-use rmail_proto::v1::{ExplainRequest, Intent as ProtoIntent, SearchHit, SearchRequest};
+use rmail_proto::v1::{
+    ExplainRequest, FeedbackAction, FeedbackRequest, Intent as ProtoIntent, ResultAction,
+    SearchHit, SearchRequest,
+};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
@@ -725,6 +728,34 @@ async fn a_fresh_search_request_cancels_the_prior_stream() {
         control_hits.len()
     );
 
+    // Exactly two searches here ran to completion — request B and the control
+    // — so exactly two `search_log` rows should exist. A third would be the
+    // superseded stream A having logged the partial page it managed to send,
+    // which is the thing `search_service::should_log`'s `!cancelled` term
+    // exists to prevent.
+    //
+    // Honest about its own limits: whether A got far enough to send anything
+    // at all is timing-dependent, and when it does not, A logs nothing for
+    // the unrelated reason that it has no impressions. The deterministic
+    // guard on the cancellation rule itself is
+    // `search_service::tests::a_cancelled_stream_logs_nothing_even_after_sending_hits`;
+    // this is the end-to-end confirmation that the wiring around it agrees.
+    for query_id in [b_hits[0].query_id, control_hits[0].query_id] {
+        assert_ne!(query_id, 0, "a completed search must hand back a query id");
+        await_impressions(&server.db, query_id, 1).await;
+    }
+    let logged: i64 = server
+        .db
+        .with_read(|conn| conn.query_row("SELECT count(*) FROM search_log", [], |r| r.get(0)))
+        .unwrap();
+    assert_eq!(
+        logged,
+        2,
+        "only the two completed searches should have logged; a superseded stream must \
+         contribute nothing to the training corpus (A sent {} hits before it was cut)",
+        a_hits.len()
+    );
+
     server.stop().await;
 }
 
@@ -782,6 +813,381 @@ async fn semantic_search_returns_only_dense_sourced_hits() {
 
     let rest = drain(&mut stream).await;
     assert!(rest.is_empty());
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Feedback logging (task 64)
+// ---------------------------------------------------------------------------
+
+/// Raw `(search_log, search_impression, search_action)` row counts.
+///
+/// Read with SQL that never goes through `FeedbackStore`, because the opt-out
+/// assertions below have to distinguish "wrote nothing" from "wrote and
+/// filtered" — a return value cannot tell those apart.
+fn feedback_counts(db: &Database) -> (i64, i64, i64) {
+    db.with_read(|conn| {
+        Ok((
+            conn.query_row("SELECT count(*) FROM search_log", [], |r| r.get(0))?,
+            conn.query_row("SELECT count(*) FROM search_impression", [], |r| r.get(0))?,
+            conn.query_row("SELECT count(*) FROM search_action", [], |r| r.get(0))?,
+        ))
+    })
+    .unwrap()
+}
+
+/// Wait for a served page's impression batch to land.
+///
+/// Impressions are deliberately written *after* the response stream closes
+/// (see `rmaild::search_service`'s "Feedback" module docs: logging must not
+/// delay a search), so a test that read immediately would be racing the
+/// design rather than testing it.
+async fn await_impressions(db: &Database, query_id: i64, expected: usize) {
+    for _ in 0..300 {
+        let landed: i64 = db
+            .with_read(move |conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM search_impression WHERE query_id = ?1",
+                    [query_id],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        if landed as usize >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("impressions for query {query_id} never landed");
+}
+
+#[tokio::test]
+async fn a_search_logs_impressions_carrying_the_exact_vector_it_ranked_with() {
+    let server = TestServer::start().await;
+    server.seed_bulk(6, "budgetary", 2).await;
+
+    let mut client = server.client().await;
+    let mut stream = client
+        .search(search_request("budgetary"))
+        .await
+        .unwrap()
+        .into_inner();
+    let hits = drain(&mut stream).await;
+    assert!(
+        hits.len() >= 3,
+        "expected a multi-hit page, got {}",
+        hits.len()
+    );
+
+    // Every hit of one response carries the same, non-zero query id — the
+    // handle a client passes back to `LogFeedback`.
+    let query_id = hits[0].query_id;
+    assert_ne!(query_id, 0, "a logged search must hand back a query id");
+    assert!(hits.iter().all(|hit| hit.query_id == query_id));
+
+    await_impressions(&server.db, query_id, hits.len()).await;
+
+    let intent: String = server
+        .db
+        .with_read(move |conn| {
+            conn.query_row(
+                "SELECT intent FROM search_log WHERE query_id = ?1",
+                [query_id],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    let intent = rmail_core::feedback::parse_intent(&intent).expect("a stored intent name");
+
+    let rows: Vec<(i64, i64, Vec<u8>, f64)> = server
+        .db
+        .with_read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT message_id, position, features, l1_score FROM search_impression
+                 WHERE query_id = ?1 ORDER BY position",
+            )?;
+            let rows = stmt
+                .query_map([query_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            rows
+        })
+        .unwrap();
+
+    assert_eq!(rows.len(), hits.len());
+    let ranker = rmail_core::rank::l1::L1Ranker::default();
+    for (index, (message_id, position, blob, l1_score)) in rows.iter().enumerate() {
+        let hit = &hits[index];
+        assert_eq!(
+            *message_id,
+            hit.message.as_ref().unwrap().id,
+            "impressions are logged in the order the hits were streamed"
+        );
+        assert_eq!(*position, index as i64 + 1, "positions are 1-based ranks");
+        assert_eq!(
+            l1_score.to_bits(),
+            hit.score.to_bits(),
+            "the stored score is the one the client was shown"
+        );
+
+        // The property task 65 depends on, and the reason impressions are
+        // logged server-side at all: re-scoring the *stored* vector under the
+        // stored intent reproduces the score the user actually saw, bit for
+        // bit. A vector re-derived at training time would not — feature
+        // extraction reads the live corpus, and `is_unread` alone flips the
+        // moment a result is opened.
+        let features = rmail_core::feedback::decode_features(blob).expect("decode");
+        assert_eq!(
+            ranker.score(&features, intent).to_bits(),
+            hit.score.to_bits(),
+            "the logged vector must be the one the ranker scored, not an approximation"
+        );
+    }
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn log_feedback_records_every_action_in_the_vocabulary() {
+    let server = TestServer::start().await;
+    server.seed_bulk(5, "budgetary", 1).await;
+
+    let mut client = server.client().await;
+    let hits = drain(
+        &mut client
+            .search(search_request("budgetary"))
+            .await
+            .unwrap()
+            .into_inner(),
+    )
+    .await;
+    let query_id = hits[0].query_id;
+    await_impressions(&server.db, query_id, hits.len()).await;
+
+    let shown: Vec<i64> = hits
+        .iter()
+        .map(|h| h.message.as_ref().unwrap().id)
+        .collect();
+    let kinds = [
+        FeedbackAction::Open,
+        FeedbackAction::Reply,
+        FeedbackAction::Archive,
+        FeedbackAction::Dwell,
+        FeedbackAction::ScrollPast,
+    ];
+    let actions: Vec<ResultAction> = kinds
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| ResultAction {
+            message_id: shown[i % shown.len()],
+            action: *kind as i32,
+            dwell_ms: (*kind == FeedbackAction::Dwell).then_some(3_500),
+            at: 0,
+        })
+        .collect();
+
+    client
+        .log_feedback(FeedbackRequest { query_id, actions })
+        .await
+        .expect("LogFeedback should accept a well-formed batch");
+
+    let stored: Vec<(String, Option<i64>, i64)> = server
+        .db
+        .with_read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT action, dwell_ms, at FROM search_action WHERE query_id = ?1 ORDER BY rowid",
+            )?;
+            let rows = stmt
+                .query_map([query_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            rows
+        })
+        .unwrap();
+
+    assert_eq!(
+        stored
+            .iter()
+            .map(|(action, _, _)| action.as_str())
+            .collect::<Vec<_>>(),
+        vec!["open", "reply", "archive", "dwell", "scroll_past"],
+    );
+    assert_eq!(
+        stored
+            .iter()
+            .map(|(_, dwell, _)| *dwell)
+            .collect::<Vec<_>>(),
+        vec![None, None, None, Some(3_500), None],
+    );
+    assert!(
+        stored.iter().all(|(_, _, at)| *at > 1_600_000_000),
+        "an unset `at` must be stamped with the daemon's clock, not left at the 1970 epoch"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn log_feedback_maps_its_error_paths_to_the_right_status_codes() {
+    let server = TestServer::start().await;
+    server.seed_bulk(2, "budgetary", 1).await;
+
+    let mut client = server.client().await;
+    let hits = drain(
+        &mut client
+            .search(search_request("budgetary"))
+            .await
+            .unwrap()
+            .into_inner(),
+    )
+    .await;
+    let query_id = hits[0].query_id;
+    await_impressions(&server.db, query_id, hits.len()).await;
+    let message_id = hits[0].message.as_ref().unwrap().id;
+
+    let open = |message_id| ResultAction {
+        message_id,
+        action: FeedbackAction::Open as i32,
+        dwell_ms: None,
+        at: 0,
+    };
+
+    // A query id this daemon never minted — including one retention has
+    // since dropped — is NOT_FOUND, not a generic internal error.
+    let status = client
+        .log_feedback(FeedbackRequest {
+            query_id: 987_654_321,
+            actions: vec![open(message_id)],
+        })
+        .await
+        .expect_err("an unknown query id must not silently succeed");
+    assert_eq!(status.code(), Code::NotFound);
+
+    // 0 is the "not logged" sentinel, not an id.
+    let status = client
+        .log_feedback(FeedbackRequest {
+            query_id: 0,
+            actions: vec![open(message_id)],
+        })
+        .await
+        .expect_err("query_id 0 must be rejected");
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    // An unspecified action is refused rather than defaulted to `open`.
+    let status = client
+        .log_feedback(FeedbackRequest {
+            query_id,
+            actions: vec![ResultAction {
+                message_id,
+                action: FeedbackAction::Unspecified as i32,
+                dwell_ms: None,
+                at: 0,
+            }],
+        })
+        .await
+        .expect_err("an unspecified action must be rejected");
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    // A dwell with no duration carries no signal.
+    let status = client
+        .log_feedback(FeedbackRequest {
+            query_id,
+            actions: vec![ResultAction {
+                message_id,
+                action: FeedbackAction::Dwell as i32,
+                dwell_ms: None,
+                at: 0,
+            }],
+        })
+        .await
+        .expect_err("a dwell with no duration must be rejected");
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    // A message this query never showed. This is the check the `mail.read`
+    // scope on `LogFeedback` rests on (see `rmaild::auth::methods`): without
+    // it a read-scoped token could attach arbitrary training labels to
+    // arbitrary message ids under one of its own real query ids.
+    let status = client
+        .log_feedback(FeedbackRequest {
+            query_id,
+            actions: vec![open(9_999_999)],
+        })
+        .await
+        .expect_err("an action on an unshown message must be rejected");
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    let (_, _, actions) = feedback_counts(&server.db);
+    assert_eq!(actions, 0, "not one rejected batch wrote a partial row");
+
+    // An empty batch is a no-op, not an error: a client batching zero
+    // actions has nothing to report and no bug to be told about.
+    client
+        .log_feedback(FeedbackRequest {
+            query_id,
+            actions: Vec::new(),
+        })
+        .await
+        .expect("an empty batch is accepted");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn opting_out_of_learning_writes_no_feedback_rows_at_all() {
+    // The acceptance criterion at the gRPC surface, asserted on the absence
+    // of rows rather than on any response: with `search.learning = false` a
+    // real search through the real pipeline must leave every feedback table
+    // empty, and its hits must carry no query id for a client to report
+    // against.
+    let mut config = Config::default();
+    config.index.semantic.enabled = false;
+    config.search.learning = false;
+    let server = TestServer::with_config(config).await;
+    server.seed_bulk(4, "budgetary", 1).await;
+
+    let mut client = server.client().await;
+    let hits = drain(
+        &mut client
+            .search(search_request("budgetary"))
+            .await
+            .unwrap()
+            .into_inner(),
+    )
+    .await;
+    assert!(!hits.is_empty(), "search itself must still work");
+    assert!(
+        hits.iter().all(|hit| hit.query_id == 0),
+        "with learning off there is nothing to attribute feedback to"
+    );
+
+    // Give the (nonexistent) write every chance to land before asserting it
+    // did not happen — otherwise this test would pass on a slow machine even
+    // if the opt-out did nothing at all.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        feedback_counts(&server.db),
+        (0, 0, 0),
+        "search.learning = false must leave every feedback table empty"
+    );
+
+    // And the RPC itself is a silent no-op rather than an error: a client
+    // should not have to special-case a setting it does not own.
+    client
+        .log_feedback(FeedbackRequest {
+            query_id: 12_345,
+            actions: vec![ResultAction {
+                message_id: 1,
+                action: FeedbackAction::Open as i32,
+                dwell_ms: None,
+                at: 0,
+            }],
+        })
+        .await
+        .expect("LogFeedback is a no-op, not a failure, when learning is off");
+    assert_eq!(feedback_counts(&server.db), (0, 0, 0));
 
     server.stop().await;
 }

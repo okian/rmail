@@ -496,6 +496,11 @@ pub struct SearchConfig {
     /// Candidates kept for L2 rerank.
     pub top_k_rerank: u32,
     /// Whether implicit-feedback personalization is on.
+    ///
+    /// The master switch for task 64's local feedback log: `false` means
+    /// `search_log`/`search_impression`/`search_action` are never written to
+    /// at all (see [`crate::feedback`]), not that they are written and later
+    /// ignored.
     pub learning: bool,
     /// MMR lambda for exploratory diversification.
     pub mmr_lambda: f64,
@@ -514,6 +519,8 @@ pub struct SearchConfig {
     pub expansion: ExpansionConfig,
     /// Candidate-generation retriever toggles (task 28).
     pub retrievers: RetrieversConfig,
+    /// Implicit-feedback log retention (task 64).
+    pub feedback: FeedbackConfig,
 }
 
 impl Default for SearchConfig {
@@ -534,6 +541,51 @@ impl Default for SearchConfig {
             reranker: RerankerConfig::default(),
             expansion: ExpansionConfig::default(),
             retrievers: RetrieversConfig::default(),
+            feedback: FeedbackConfig::default(),
+        }
+    }
+}
+
+/// How much of the implicit-feedback log is kept (task 64).
+///
+/// Both bounds apply and whichever bites first wins — the same shape
+/// [`GrpcEvents`] uses, for the same reason: rows bound disk, age bounds how
+/// stale the training corpus is allowed to get.
+///
+/// # Why this needs a bound at all
+///
+/// A `search_impression` row carries a *serialized* 34-feature vector
+/// (`rmail_core::feedback::encode_features`), roughly 0.8 kB of JSON, and one
+/// search logs up to a full page of them. Left unbounded that is the single
+/// fastest-growing table in the database: at `search.default_limit = 25` and
+/// the [`FeedbackConfig::max_queries`] default below, the worst case is on
+/// the order of a hundred megabytes, and a real local corpus is a small
+/// fraction of that (most pages are shorter, and nobody runs ten thousand
+/// searches a quarter). The defaults are chosen so "leave learning on
+/// forever" is a decision an operator can make without watching the disk.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FeedbackConfig {
+    /// Age horizon, in days. `0` keeps nothing (a real answer, not a synonym
+    /// for unlimited — see [`FeedbackConfig::max_queries`]).
+    pub retention_days: u32,
+    /// Hard ceiling on retained queries; the oldest are dropped first, taking
+    /// their impressions and actions with them.
+    ///
+    /// There is deliberately no "unlimited" value for either bound. A config
+    /// typo that silently disabled retention would grow the log without
+    /// limit, which is the exact failure retention exists to prevent.
+    pub max_queries: u64,
+}
+
+impl Default for FeedbackConfig {
+    fn default() -> Self {
+        Self {
+            // A quarter: long enough that a seasonal query ("tax", "renewal")
+            // appears more than once in the corpus, short enough that the
+            // model is trained on what the mailbox looks like now.
+            retention_days: 90,
+            max_queries: 10_000,
         }
     }
 }

@@ -598,6 +598,72 @@ fn a_retriever_toggle_is_env_settable() {
 }
 
 #[test]
+fn the_feedback_log_retention_defaults_are_bounded() {
+    // Both bounds have to be *finite* by default. Task 64's log grows by a
+    // serialized 34-feature vector per shown result, so an unbounded default
+    // — or a default that a typo could read as unbounded — is the one
+    // configuration mistake that quietly eats the user's disk.
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let cfg = Config::from_toml_str("").map_err(fe)?;
+        assert!(cfg.search.learning, "personalization is on by default");
+        assert_eq!(cfg.search.feedback.retention_days, 90);
+        assert_eq!(cfg.search.feedback.max_queries, 10_000);
+        Ok(())
+    });
+}
+
+#[test]
+fn feedback_retention_is_settable_by_file_and_env() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let cfg = Config::from_toml_str("[search.feedback]\nretention_days = 7\n").map_err(fe)?;
+        assert_eq!(cfg.search.feedback.retention_days, 7);
+        assert_eq!(
+            cfg.search.feedback.max_queries, 10_000,
+            "the other bound still defaults"
+        );
+        Ok(())
+    });
+
+    // The env overlay is the path `.env.example` actually documents, and a
+    // typo'd key, a serde rename, or a nesting mistake would otherwise ship
+    // silently — the setting would simply never take.
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        jail.set_env("RMAIL_SEARCH__LEARNING", "false");
+        jail.set_env("RMAIL_SEARCH__FEEDBACK__RETENTION_DAYS", "30");
+        jail.set_env("RMAIL_SEARCH__FEEDBACK__MAX_QUERIES", "500");
+
+        let cfg = Config::from_toml_str("").map_err(fe)?;
+        assert!(!cfg.search.learning, "the opt-out must be env-settable");
+        assert_eq!(cfg.search.feedback.retention_days, 30);
+        assert_eq!(cfg.search.feedback.max_queries, 500);
+        assert_eq!(
+            cfg.search.rrf_k, 60,
+            "an unrelated search setting is unaffected"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn a_zero_feedback_bound_is_accepted_as_a_real_value() {
+    // Zero must survive parsing as zero — it means "keep nothing", and the
+    // pruner treats it that way. A validator that rejected or silently
+    // re-defaulted it would turn the strictest retention setting into the
+    // loosest one.
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let cfg = Config::from_toml_str("[search.feedback]\nretention_days = 0\nmax_queries = 0\n")
+            .map_err(fe)?;
+        assert_eq!(cfg.search.feedback.retention_days, 0);
+        assert_eq!(cfg.search.feedback.max_queries, 0);
+        Ok(())
+    });
+}
+
+#[test]
 fn missing_file_is_not_found() {
     // Reaches NotFound before any figment/env work, so no Jail is required.
     let err = Config::load("/nonexistent/rmail/definitely-absent.toml")

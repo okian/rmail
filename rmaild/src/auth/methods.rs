@@ -353,6 +353,35 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SearchService/Evaluate",
         Requirement::Scope(Scope::MailRead),
     ),
+    // `LogFeedback` (task 64) is the one `SearchService` RPC that writes, and
+    // it is still `mail.read` rather than `mail.write`.
+    //
+    // The reason is what "write" means in this table everywhere else: every
+    // `mail.write` row above mutates *mail* — a flag, a mailbox, a tag —
+    // and most of them reflect that mutation to the IMAP server. This one
+    // appends to a local, opt-outable telemetry log
+    // (`rmail_core::feedback`); it cannot change a message, cannot be seen
+    // by any other client, and cannot leave the machine. Requiring
+    // `mail.write` would mean a read-only token — the exact token prd.md
+    // describes handing to Claude to "read and summarize freely but not
+    // send" — could search but never contribute the click data that makes
+    // search better, which inverts the risk: the capability being granted
+    // here is "make my own future searches more relevant".
+    //
+    // What a caller can do with it is bounded to that, and the bound is
+    // enforced rather than assumed: the request names a `query_id` this
+    // daemon minted for a page it already served, and
+    // `feedback::repo::insert_actions` rejects — inside the same transaction
+    // as the write — any action naming a message that query did not show.
+    // Without that check a read-scoped token could attach arbitrary training
+    // labels to arbitrary message ids under one of its own real `query_id`s,
+    // and this row's reasoning would not hold. Nothing that survives the
+    // check reveals or alters anything a `mail.read` token could not already
+    // reach via `Search` itself.
+    (
+        "/rmail.v1.SearchService/LogFeedback",
+        Requirement::Scope(Scope::MailRead),
+    ),
     // -- SendSchedulerService (task 61) ----------------------------------------------
     // Replaces the provisional `OutboxService/Send` row this table carried
     // until task 61 landed the real `proto/rmail/v1/send_scheduler.proto` —

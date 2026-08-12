@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package rmail.v1;
 
+import "google/protobuf/empty.proto";
 import "rmail/v1/mail.proto";
 
 // SearchService is the ranked-retrieval surface described in prd.md Part I:
@@ -61,6 +62,34 @@ service SearchService {
   // Read-only, like every other RPC here: evaluating a golden set never
   // writes to the index or the feedback log.
   rpc Evaluate (EvaluateRequest) returns (EvalReport);
+
+  // Record what the user did with the results of a previous search — prd.md's
+  // implicit-feedback learning loop (task 64). `FeedbackRequest.query_id`
+  // comes from `SearchHit.query_id`; the actions are opens, replies,
+  // archives, dwells and scroll-pasts against message ids from that same
+  // page.
+  //
+  // This is the only RPC in this file that writes anything, and it is
+  // deliberately the only one that touches the feedback log *at all*: there
+  // is no companion RPC that reads impressions, actions or logged queries
+  // back out. That absence is the surface half of prd.md's "it is local
+  // telemetry, never transmitted" — a serialized feature vector is a
+  // behavioural fingerprint of a mailbox, and the way to keep it on the
+  // machine is not to build a way off it.
+  //
+  // The *impression* half of the log is not accepted here and cannot be. An
+  // impression carries the exact feature vector its result was ranked by, and
+  // only the daemon that ran the ranker has it — a client-supplied vector
+  // would be a re-derivation at best and a forgery at worst, and training on
+  // either is how a ranker silently gets worse. The daemon therefore writes
+  // impressions itself, from the vectors its own L1 ranker scored, once the
+  // page has been streamed.
+  //
+  // Never an error when `search.learning = false`: recording nothing is the
+  // correct response to "record this" when recording is off, and a client
+  // should not have to special-case a setting it does not own. Nothing is
+  // written either way.
+  rpc LogFeedback (FeedbackRequest) returns (google.protobuf.Empty);
 }
 
 // Execution mode: which candidate sources contribute. `MODE_UNSPECIFIED`
@@ -140,6 +169,15 @@ message SearchHit {
   repeated int64 thread_collapsed = 7;
   // Sibling messages collapsed as SimHash near-duplicates.
   repeated int64 near_duplicates = 8;
+  // The id of the search that produced this hit — pass it back to
+  // `LogFeedback` to attribute an action to this page. Identical on every hit
+  // of one response.
+  //
+  // 0 means this search was not logged, so there is nothing to attribute to:
+  // either `search.learning = false` (the opt-out; nothing at all was
+  // written) or the stream was superseded by a fresher query before it
+  // finished. A client should send no feedback for a 0.
+  int64 query_id = 9;
 }
 
 message FeatureContribution {
@@ -249,4 +287,63 @@ message EvalReport {
   // Macro-average across queries: every query weighted equally regardless of
   // how many relevant messages it has.
   EvalMetrics aggregate = 3;
+}
+
+// What a user did with a search result. prd.md's implicit-feedback vocabulary
+// exactly — "opened, replied to, archived-from-results, dwelled on (and how
+// long), scrolled past" — and nothing beyond it: each of the five is
+// something the trainer knows how to weight, and an action it cannot weight
+// is a row that costs disk and teaches nothing.
+enum FeedbackAction {
+  FEEDBACK_ACTION_UNSPECIFIED = 0;
+  // The result was opened. The baseline positive signal.
+  FEEDBACK_ACTION_OPEN = 1;
+  // The user replied to the message. The strongest positive.
+  FEEDBACK_ACTION_REPLY = 2;
+  // Archived straight from the result list — a mild *negative* for this
+  // query, not a neutral event.
+  FEEDBACK_ACTION_ARCHIVE = 3;
+  // Time spent on the message; `ResultAction.dwell_ms` carries how long and
+  // is required for this action.
+  FEEDBACK_ACTION_DWELL = 4;
+  // Skipped over on the way to something lower down the page. What makes a
+  // "clicked ≻ skipped-above" preference a pair rather than a lone positive.
+  FEEDBACK_ACTION_SCROLL_PAST = 5;
+}
+
+// One observation about one result of one search.
+message ResultAction {
+  // The message acted on (`Message.id`). Must be one this query actually
+  // showed: an action about a result that was never on the page has no
+  // position and no feature vector to attribute itself to, so it is rejected
+  // with INVALID_ARGUMENT rather than stored as a label out of thin air.
+  int64 message_id = 1;
+  FeedbackAction action = 2;
+  // Milliseconds spent on the message. Required for FEEDBACK_ACTION_DWELL —
+  // how long *is* the signal — and rejected on every other action, which
+  // would otherwise give the same measurement two competing definitions.
+  // Capped at 24h: a longer "dwell" is a bug or a forgery, and because
+  // long-dwell outranks a plain open, one absurd value would dominate every
+  // real signal in the corpus.
+  //
+  // `optional` rather than a bare int64 because 0 is a real dwell (the user
+  // opened and immediately left, which is a genuine negative) and proto3
+  // cannot otherwise distinguish it from "not measured".
+  optional int64 dwell_ms = 3;
+  // When it happened, unix seconds. 0 = the daemon stamps its own clock,
+  // which is the right default for a local client on the same machine.
+  // Negative is rejected.
+  int64 at = 4;
+}
+
+message FeedbackRequest {
+  // `SearchHit.query_id` from the page these actions are about. 0 is
+  // rejected: it is the wire sentinel for "that search was not logged", so
+  // there is nothing to attribute to.
+  int64 query_id = 1;
+  // The batch. Empty is accepted and does nothing; the batch is applied
+  // atomically, so a rejected action rejects the whole request rather than
+  // leaving a partial picture (a result recorded as skipped that was in fact
+  // opened is a wrong training label, not a missing one).
+  repeated ResultAction actions = 2;
 }

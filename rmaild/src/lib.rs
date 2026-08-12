@@ -673,6 +673,36 @@ where
     );
     let search_service = SearchServiceServer::new(search_api.clone());
 
+    // The implicit-feedback log's retention sweep (task 64). Separate from
+    // the event-log pruner above only because `SearchApi` — which owns the
+    // one `FeedbackStore` configured from `search.learning` and
+    // `[search.feedback]` — does not exist yet at that point; cloning its
+    // store rather than building a second one is what keeps "the policy the
+    // search path writes under" and "the policy retention enforces" the same
+    // object.
+    //
+    // Runs regardless of `search.learning`, and prunes once before its first
+    // sleep for the reason the event pruner does: a daemon restarted more
+    // often than the interval would otherwise never prune at all, which is
+    // exactly the machine that most needs it. Turning learning off should
+    // also *retire* what was already collected rather than freezing it on
+    // disk forever, which only happens if this loop keeps running.
+    let feedback_pruner = tokio::spawn({
+        let feedback = search_api.feedback().clone();
+        let stopping = stopping.clone();
+        async move {
+            loop {
+                if let Err(error) = feedback.prune().await {
+                    tracing::warn!(%error, "search feedback prune failed");
+                }
+                tokio::select! {
+                    () = stopping.cancelled() => return,
+                    () = tokio::time::sleep(PRUNE_INTERVAL) => {}
+                }
+            }
+        }
+    });
+
     // The indexing subsystem (task 24): the pipeline that runs the stages, the
     // loop that keeps it fed, and the operator surface over both.
     //
@@ -930,6 +960,7 @@ where
 
     stopping.cancel();
     let _ = pruner.await;
+    let _ = feedback_pruner.await;
     if let Some(handle) = ai_dispatch_handle {
         let _ = handle.await;
     }
