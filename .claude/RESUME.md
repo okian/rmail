@@ -6,9 +6,9 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**55 of 86 done, 31 remaining.** `tasks.md` is authoritative — count with
+**57 of 86 done, 29 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **2180/2180** on the full
+after merge, never on the agent's own report: currently **2292/2292** on the full
 workspace suite, with clippy, `buf lint`, gitleaks and typos clean.
 
 Defects in already-merged work keep being found by the post-merge full-suite
@@ -57,20 +57,13 @@ The rule now is: whatever number a branch used, rename it at merge to
 `max_merged + 1` and fix any `-- Vnn:` references inside the file. Never
 reference a migration version from Rust.
 
-Merged: V1–V14, V16, V18–V28, V32–V34. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V35.**
+Merged: V1–V14, V16, V18–V28, V32–V35. V15 and V17 are permanently unused, which
+costs nothing. **Next free: V36.** (V36/V37 are reserved by the in-flight wave: 52 and 77.)
 
-⚠️ The in-flight wave (51, 66) was dispatched with V29/V31 reserved, and then
-`moved_annotations` landed as V32 ahead of them. **Those branches must be
-renumbered to V35+ at merge, not left on the numbers they were given.** Task
-64 already hit this — its V30 became V34, and a doc comment naming the old
-number had to move with it.
-This is the exact trap the rule above describes, arrived at from the other
-direction: refinery only applies migrations *above* the last-applied version,
-so once V32 is in a database, a later-merged V29 is silently skipped and its
-table never exists. Assigning a number at dispatch is what created the hazard —
-the assignment is a hint for avoiding collisions between concurrent agents, never
-a promise the number survives.
+The wave of 51/64/66 all hit this and all were renumbered at merge: V30→V34,
+V31→V35, and task 23's V15→V33. The V15 case is the one the collision test
+does *not* catch — it was a genuine unused gap, not a duplicate — so the
+renumber-at-merge rule stays written down as well as gated.
 
 ## Orchestration notes worth not relearning
 
@@ -171,3 +164,22 @@ a promise the number survives.
   running agent's volume forces it into a cold rebuild mid-gate; deleting the
   main checkout's throws away the 26 GB cache every orchestrator run depends
   on. Compute the hashes, then remove only the spent ones.
+- **Two tasks adding one parameter each to the same function trips
+  `clippy::too_many_arguments`, and the fix is not `#[allow]`.** Tasks 51 and
+  64 both grew `search_service::build_hits` by one argument, taking it to 8.
+  Both call sites passed identical values for everything except `presented`,
+  so the honest resolution was a `HitContext` struct carrying the invariant
+  half — smaller call sites, and the "only `presented` differs" fact is now
+  stated in the code rather than implied.
+- **Union-merging two conflicting test modules eats a closing brace.** The
+  known hazard, hit again merging 51 into 64's `search_service.rs`: both sides
+  had appended `#[test]` functions, and concatenating the two halves dropped
+  the `}` that ended the last function on the ours side. `cargo check` caught
+  it immediately (`unclosed delimiter`), but only because the result did not
+  compile — a conflict in *data* rather than code would have merged silently.
+- **A cross-task merge can produce a type error that neither branch had.**
+  Task 51 wrote a bare `return;` in `run_stream`, correct against the
+  `()`-returning signature it branched from; task 64 had since given that
+  function a return value. Neither branch was wrong; the combination was.
+  This is the class of defect a per-task gate structurally cannot see, and
+  the reason the full suite runs on the *combined* tree after every merge.
