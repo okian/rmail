@@ -35,12 +35,18 @@ left it, because closing it belonged to no single task.
 
 ## Unfinished work preserved on branches
 
-**None.** Task 23 (OCR) was the last surviving WIP and is now merged and
-verified as V33 — its branch `worktree-agent-a92770680c94c9608` is spent.
-Tasks 24 and 61 were also previously listed here and are likewise merged.
-Do not re-merge any of them. Tasks 40, 51 and 84 were dispatched and
-died to a session limit before writing anything, so there is nothing to
-resume: start them fresh.
+| Task | Branch | State |
+|---|---|---|
+| 52 `ask_mailbox` | `worktree-agent-ae77e9f2c3ac21813` @ `369ea21` | New `ai/rag/`, proto, config, service wiring. Was mid-way through `rmaild/src/lib.rs`, including the stub-injection seam task 51 left for it. |
+| 77 injection shield | `worktree-agent-a0bd81b387f90c894` @ `16e5bd4` | Touched all three AI sinks (triage/deep, rules classify, l2 claude), plus `ai/injection/`, a V37 migration and an `ai_safety` service. **Was about to start the tests** — for a security task that is the part that matters, and it is entirely absent. |
+| 84 TUI keymap | `worktree-agent-a5042d9493ca36f50` @ `c091d4a` | `keymap/` engine plus a `mail keys` CLI in progress. |
+
+All three died to the **session limit**, not to a failure in the work, and
+none of it has ever been compiled, linted or tested as a whole. Finish and
+gate each before merging; do not merge on faith.
+
+Tasks 23, 24 and 61 were previously listed here and are all merged now —
+do not re-merge them.
 
 **Do not merge preserved WIP on the strength of an agent's own report.** Task
 61 reported its own gate green and still contained a duplicate-mail defect
