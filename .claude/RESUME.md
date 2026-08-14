@@ -6,9 +6,9 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**60 of 86 done, 26 remaining.** `tasks.md` is authoritative — count with
+**61 of 86 done, 25 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **2509/2509** on the full
+after merge, never on the agent's own report: currently **2529/2529** on the full
 workspace suite, with clippy, `buf lint`, gitleaks and typos clean.
 
 Defects in already-merged work keep being found by the post-merge full-suite
@@ -215,3 +215,34 @@ control is that all four run manually after each merge, and they earn it —
 language code, an upstream crate's misspelled enum variant, and a zero-width
 evasion fixture). If that discipline lapses the policy is simply not being
 followed, so keep running them, not just the container suite.
+
+## Verify lines: twelve done tasks were proving nothing
+
+Task 41 swept all 96 nextest invocations in `tasks.md` against a real
+`cargo nextest list` inside the container. A bare positional filter matches a
+test's **name**, not its binary id — and `docker-test.sh` always injects
+`--workspace`, so `-p` is ignored too. Twelve *completed* tasks had verify
+lines selecting zero tests. Measured directly: `-p rmaild mail_service`
+reports "no tests to run"; `--test mail_service` runs 22. `ai_service` 20,
+`compose_service` 16 — 58 tests three finished tasks cited as proof and had
+never once executed.
+
+Use `--test <binary>` or `-E 'binary(<name>)'`. A module filter alone
+(`search_service`) silently runs only the *lib* unit tests and none of the
+integration binary, which is the quiet version of the same bug.
+
+Also worth knowing: a verify line can go stale from an unrelated change.
+Task 84's `-p rmail-cli keymap::` matched nothing after the keymap moved to
+`rmail-core` to let `ConfigService` share the action registry.
+
+## Host disk is now the binding constraint, not quota
+
+The disk hit **100% (16 GiB of 1.8 TiB)** with two agents running. Almost none
+of it is this project: the worktrees are ~3 GB and the reclaimable Docker
+images a few hundred MB. Pruning volumes does not help — on this setup it
+frees space *inside* the VM and returns none of it to the host.
+
+Practical rule: with the host under ~20 GiB, **do not dispatch a third
+agent**. A fresh worktree needs 2–7 GB of host `target/` plus a new Docker
+volume, and running out mid-build fails every agent at once, not just the new
+one. Two concurrent agents is the safe ceiling until the host has room.
