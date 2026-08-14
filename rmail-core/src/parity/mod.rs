@@ -1,0 +1,1247 @@
+//! The feature-parity registry: one row per capability, reconciled against
+//! every surface that exposes it (prd.md's "Design invariant: *If the CLI can
+//! do it, gRPC can do it. If gRPC can't do it, it isn't a feature. If gRPC can
+//! do it, Claude can do it (via MCP auto-projection).*"; task 41).
+//!
+//! # Why this is keyed by RPC
+//!
+//! The invariant above has gRPC on both sides of it: the CLI and the TUI must
+//! not be able to do anything the API cannot, and MCP must be able to do
+//! everything the API can. One row per *RPC* is therefore the only key that
+//! can carry both halves — a row keyed by CLI verb could not say anything
+//! about an RPC no CLI verb reaches, and there are many (`MailService/List`,
+//! every `RuleService` and `SavedSearchService` method, `ComposeService`'s
+//! whole draft surface). Those are not gaps to close in this file; they are
+//! exactly the RPCs MCP will project that no human types.
+//!
+//! So [`Command`] has one variant per method in `proto/rmail/v1/*.proto`, and
+//! the CLI paths and TUI action ids that reach it hang off that variant as
+//! (possibly empty) lists. The empty list is the readable statement that a
+//! capability has no human surface yet; the *reverse* — a human surface with
+//! no capability — is what this module exists to make impossible.
+//!
+//! # The drift checks are tests, and they fail by name
+//!
+//! `tests.rs` reconciles this table against the **compiled** form of each
+//! surface, never against a second hand-written list:
+//!
+//! | reconciled against | what a mismatch means |
+//! |---|---|
+//! | `rmail_proto::FILE_DESCRIPTOR_SET` | an RPC exists that no row claims (or a row names a method that does not exist) |
+//! | [`crate::keymap::Action::ALL`] | a TUI action exists that is neither a capability nor declared UI-local |
+//! | `clap`'s own command tree (in `rmail-cli`, which owns the `Cli` type) | a `mail` verb exists that no capability backs |
+//!
+//! A check that compared two hand-written lists would prove only that
+//! somebody edited both. Each of these compares this table against something
+//! *generated* from the surface itself, so a new RPC, a new action, or a new
+//! subcommand fails the suite by name until a row is written for it — the
+//! same shape as `rmaild::auth::methods`'
+//! `every_rpc_in_the_descriptor_set_has_a_scope_row`, which is the check that
+//! caught `AuditService` shipping deny-everything.
+//!
+//! # What these checks do *not* catch
+//!
+//! They reconcile the *existence* of a verb, an action or an RPC — not the
+//! content of a claim. `every_cli_command_is_backed_by_a_capability` asks
+//! whether some row claims `mail sync`; it cannot tell whether the row names
+//! the RPCs that verb really calls. So adding a `--pause` flag to `mail sync`
+//! that called `SyncService/Pause` would pass every test here, because
+//! `mail sync` is already claimed. The same is true of the TUI: a new `Cmd`
+//! issued from an already-declared action is invisible to
+//! `every_tui_action_is_a_capability_or_declared_local`.
+//!
+//! Nothing generated exists to reconcile that against — the call sites are
+//! ordinary Rust, not a table — so the honest statement is that the `cli:` and
+//! `actions:` lists are maintained by hand and reviewed, while the *set* of
+//! verbs, actions and RPCs is enforced. `the_two_verbs_that_reach_two_rpcs_still_do`
+//! pins the two rows where this has already bitten rather than pretending to
+//! be a net.
+//!
+//! # Extending this table
+//!
+//! Add one variant per new RPC, in its service's block. The variant name is
+//! mechanically the service name without its `Service` suffix, followed by
+//! the method name (`MailService/Get` → `MailGet`), and
+//! `every_variant_is_named_after_its_rpc` enforces that — a row whose name
+//! and path disagree is a row someone will one day read as governing a
+//! different method than it does.
+//!
+//! # The seam this leaves for task 53 (gRPC → MCP auto-projection)
+//!
+//! Task 53 generates MCP tools "at runtime from the compiled descriptor set +
+//! per-RPC annotations (safe/mutating, tool name, arg mapping)". This table is
+//! those annotations, and [`Command::for_rpc`] is the join: walk the
+//! descriptor set, look each method up here, and you have the tool's name
+//! ([`Command::tool`]), its description ([`Command::summary`]) and whether it
+//! is safe or mutating ([`Command::effect`]). A method with no row cannot
+//! happen — `every_rpc_in_the_descriptor_set_has_a_command` fails first — so
+//! the projection has no "unknown RPC" case to invent a policy for.
+//!
+//! Two things are deliberately *not* here, because the descriptor set already
+//! has them and a second copy could only drift: whether an RPC streams
+//! (`MethodDescriptorProto::server_streaming`) and its argument shape (the
+//! request message's own fields, which is task 53's "arg mapping"). The scope
+//! an MCP tool is gated by is likewise not duplicated — that is
+//! `rmaild::auth::methods::lookup`, keyed by the same path string
+//! [`Command::rpc`] returns.
+
+#[cfg(test)]
+mod tests;
+
+use crate::keymap::Action;
+
+/// Whether calling a capability changes anything.
+///
+/// The "safe/mutating" annotation task 53 gates MCP tools with. The line is
+/// drawn at *authority*, not at whether a row is written to a table: a
+/// capability is [`Effect::Read`] only if a caller holding it could not, by
+/// calling it, cause any effect an observer outside this process could see.
+/// That is why `ComposeService/RenderDraft` is [`Effect::Mutate`] despite
+/// persisting nothing — it emits the exact octets of a transmissible message,
+/// which is why `rmaild::auth::methods` puts it behind `mail.send`.
+///
+/// Spend at a model provider is such an effect, which is what separates
+/// `AiService/AskMailbox` ([`Effect::Mutate`]) from `SearchService/Search`
+/// ([`Effect::Read`]) even though both can reach Claude: `SearchApi::rerank_for`
+/// clamps a search to the backend `search.rerank` already sanctioned, so a
+/// caller cannot spend anything the operator had not already turned on, while
+/// an ask with no model call is not a degraded answer but no answer at all.
+/// `rmaild::auth::methods` splits the same pair the same way and for the same
+/// reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Effect {
+    /// Observes state. Safe to project as a tool a read-only caller may use.
+    Read,
+    /// Changes state, or produces something carrying the authority to.
+    Mutate,
+}
+
+impl Effect {
+    /// Whether this capability changes anything.
+    #[must_use]
+    pub const fn is_mutating(self) -> bool {
+        matches!(self, Self::Mutate)
+    }
+}
+
+/// Declares the capability registry once, and derives the enum, the ordered
+/// list, and every accessor from it.
+///
+/// One list rather than six parallel ones, for the reason
+/// [`crate::keymap`]'s `actions!` macro gives: a capability added to the enum
+/// but forgotten in `ALL` would be invisible to every drift check in
+/// `tests.rs`, which is precisely the failure this file exists to prevent.
+macro_rules! commands {
+    ($(
+        $variant:ident {
+            rpc: $rpc:literal,
+            tool: $tool:literal,
+            effect: $effect:ident,
+            cli: [ $($cli:literal),* $(,)? ],
+            actions: [ $($action:ident),* $(,)? ],
+            summary: $summary:literal $(,)?
+        }
+    )*) => {
+        /// One capability of the rmail API, addressed by the RPC that is its
+        /// definition.
+        ///
+        /// See the module docs: the CLI, the TUI and (from task 53) MCP are
+        /// adapters over this list, and the tests reconcile each of them
+        /// against it.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum Command {
+            $( #[doc = $summary] $variant, )*
+        }
+
+        impl Command {
+            /// Every capability, in the order this table declares them
+            /// (grouped by service).
+            pub const ALL: &'static [Command] = &[ $( Command::$variant, )* ];
+
+            /// This variant's own name, for failure messages that have to
+            /// name the row a human must go and edit.
+            #[must_use]
+            pub const fn name(self) -> &'static str {
+                match self { $( Command::$variant => stringify!($variant), )* }
+            }
+
+            /// The fully-qualified gRPC method path that *is* this
+            /// capability, e.g. `/rmail.v1.MailService/Get` — the same string
+            /// `rmaild::auth::methods::lookup` is keyed by.
+            #[must_use]
+            pub const fn rpc(self) -> &'static str {
+                match self { $( Command::$variant => $rpc, )* }
+            }
+
+            /// The MCP tool name this capability projects to (task 53).
+            #[must_use]
+            pub const fn tool(self) -> &'static str {
+                match self { $( Command::$variant => $tool, )* }
+            }
+
+            /// Whether calling it changes anything.
+            #[must_use]
+            pub const fn effect(self) -> Effect {
+                match self { $( Command::$variant => Effect::$effect, )* }
+            }
+
+            /// The `mail` subcommand paths that reach this capability, space
+            /// separated and without the `mail` itself (`"ai budget set"`).
+            /// Empty when no CLI verb reaches it yet.
+            #[must_use]
+            pub const fn cli(self) -> &'static [&'static str] {
+                match self { $( Command::$variant => &[ $($cli,)* ], )* }
+            }
+
+            /// The TUI actions that reach this capability. Empty when none
+            /// does.
+            #[must_use]
+            pub const fn actions(self) -> &'static [Action] {
+                match self { $( Command::$variant => &[ $(Action::$action,)* ], )* }
+            }
+
+            /// One line describing the capability — what task 53 hands an
+            /// agent as the generated tool's description.
+            #[must_use]
+            pub const fn summary(self) -> &'static str {
+                match self { $( Command::$variant => $summary, )* }
+            }
+        }
+    };
+}
+
+commands! {
+    // -- AccountService (task 7) ---------------------------------------------
+    AccountCreate {
+        rpc: "/rmail.v1.AccountService/Create",
+        tool: "create_account",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Add a mail account, with its IMAP/SMTP hosts and credential source.",
+    }
+    AccountList {
+        rpc: "/rmail.v1.AccountService/List",
+        tool: "list_accounts",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "List the configured accounts (never their secrets).",
+    }
+    AccountGet {
+        rpc: "/rmail.v1.AccountService/Get",
+        tool: "get_account",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Read one account's settings by id.",
+    }
+    AccountDelete {
+        rpc: "/rmail.v1.AccountService/Delete",
+        tool: "delete_account",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Remove an account and the local mail belonging to it.",
+    }
+    // `TestConnection` stores nothing locally and still is not a `Read`: it
+    // performs a real login against someone else's IMAP server, which that
+    // server's rate limiter, audit log and lockout counter all observe. That
+    // is an effect outside this process, which is exactly where `Effect` draws
+    // its line — and the practical consequence of getting it wrong is a "safe"
+    // MCP tool an agent may hammer a remote server with until it locks the
+    // account out.
+    AccountTestConnection {
+        rpc: "/rmail.v1.AccountService/TestConnection",
+        tool: "test_account_connection",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Verify an account's IMAP login and report its server capabilities.",
+    }
+
+    // -- AdminService (task 38) ----------------------------------------------
+    AdminMintToken {
+        rpc: "/rmail.v1.AdminService/MintToken",
+        tool: "mint_token",
+        effect: Mutate,
+        cli: ["token create"],
+        actions: [],
+        summary: "Mint a capability token, returning its bearer secret exactly once.",
+    }
+    AdminRevokeToken {
+        rpc: "/rmail.v1.AdminService/RevokeToken",
+        tool: "revoke_token",
+        effect: Mutate,
+        cli: ["token revoke"],
+        actions: [],
+        summary: "Revoke a capability token by id.",
+    }
+    AdminListTokens {
+        rpc: "/rmail.v1.AdminService/ListTokens",
+        tool: "list_tokens",
+        effect: Read,
+        cli: ["token list"],
+        actions: [],
+        summary: "List capability tokens as metadata only — never the secret or its hash.",
+    }
+
+    // -- SyncService (task 15) -----------------------------------------------
+    SyncSyncFolder {
+        rpc: "/rmail.v1.SyncService/SyncFolder",
+        tool: "sync_folder",
+        effect: Mutate,
+        cli: ["sync"],
+        actions: [],
+        summary: "Run a sync pass over one mailbox, or every folder of an account.",
+    }
+    SyncStatus {
+        rpc: "/rmail.v1.SyncService/Status",
+        tool: "sync_status",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Report per-folder sync progress, strategy and last error.",
+    }
+    SyncPause {
+        rpc: "/rmail.v1.SyncService/Pause",
+        tool: "pause_sync",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Stop the background sync loop; local mail stays readable.",
+    }
+    SyncResume {
+        rpc: "/rmail.v1.SyncService/Resume",
+        tool: "resume_sync",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Restart the background sync loop after a pause.",
+    }
+    SyncWatchEvents {
+        rpc: "/rmail.v1.SyncService/WatchEvents",
+        tool: "watch_sync_events",
+        effect: Read,
+        // `mail sync --watch` keeps streaming from where the pass it just ran
+        // ended, so the one verb reaches two RPCs.
+        cli: ["sync"],
+        actions: [],
+        summary: "Stream sync events from a cursor, resuming without gaps.",
+    }
+
+    // -- MailService (task 39) -----------------------------------------------
+    MailList {
+        rpc: "/rmail.v1.MailService/List",
+        tool: "list_messages",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Stream a mailbox's messages, newest first.",
+    }
+    MailGet {
+        rpc: "/rmail.v1.MailService/Get",
+        tool: "get_message",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Fetch one message in full, with its body and attachment metadata.",
+    }
+    MailGetThread {
+        rpc: "/rmail.v1.MailService/GetThread",
+        tool: "get_thread",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Fetch a whole conversation in reply order.",
+    }
+    MailMove {
+        rpc: "/rmail.v1.MailService/Move",
+        tool: "move_message",
+        effect: Mutate,
+        cli: [],
+        // Archiving *is* a move, to the account's archive folder — one
+        // capability, two ways to ask for it.
+        actions: [Archive, MoveTo],
+        summary: "Move messages to another mailbox, reflecting the move to IMAP.",
+    }
+    MailCopy {
+        rpc: "/rmail.v1.MailService/Copy",
+        tool: "copy_message",
+        effect: Mutate,
+        cli: [],
+        actions: [CopyTo],
+        summary: "Copy messages into another mailbox, leaving the originals in place.",
+    }
+    MailSetFlags {
+        rpc: "/rmail.v1.MailService/SetFlags",
+        tool: "set_flags",
+        effect: Mutate,
+        cli: [],
+        actions: [ToggleRead, ToggleFlag],
+        summary: "Add or remove IMAP flags (\\Seen, \\Flagged, ...) on a message.",
+    }
+    MailDelete {
+        rpc: "/rmail.v1.MailService/Delete",
+        tool: "delete_message",
+        effect: Mutate,
+        cli: [],
+        actions: [Delete],
+        summary: "Delete a message — an expunge, not a move to trash.",
+    }
+    MailGetAttachment {
+        rpc: "/rmail.v1.MailService/GetAttachment",
+        tool: "get_attachment",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Stream one attachment's bytes in frame-sized chunks.",
+    }
+    MailWatchEvents {
+        rpc: "/rmail.v1.MailService/WatchEvents",
+        tool: "watch_mail_events",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Stream mail events (new message, flags changed, expunged) from a cursor.",
+    }
+
+    // -- SearchService (tasks 33, 37, 51, 64) ---------------------------------
+    SearchSearch {
+        rpc: "/rmail.v1.SearchService/Search",
+        tool: "search_mail",
+        effect: Read,
+        cli: ["search"],
+        actions: [],
+        summary: "Ranked hybrid search over the local index, streaming hits as they rank.",
+    }
+    SearchSemantic {
+        rpc: "/rmail.v1.SearchService/Semantic",
+        tool: "semantic_search",
+        effect: Read,
+        cli: ["similar"],
+        actions: [],
+        summary: "Embedding-kNN search: neighbors by meaning, with no keyword overlap needed.",
+    }
+    SearchExplain {
+        rpc: "/rmail.v1.SearchService/Explain",
+        tool: "explain_ranking",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Re-derive why one hit ranked where it did: feature contributions and matched spans.",
+    }
+    SearchEvaluate {
+        rpc: "/rmail.v1.SearchService/Evaluate",
+        tool: "evaluate_search",
+        effect: Read,
+        cli: ["search eval"],
+        actions: [],
+        summary: "Score a golden set against the corpus and report NDCG@10, MRR, Recall@50, P@3.",
+    }
+    SearchLogFeedback {
+        rpc: "/rmail.v1.SearchService/LogFeedback",
+        tool: "log_search_feedback",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Record which results a searcher opened, as training signal for ranking.",
+    }
+
+    // -- SavedSearchService (task 35) -----------------------------------------
+    SavedSearchCreateSavedSearch {
+        rpc: "/rmail.v1.SavedSearchService/CreateSavedSearch",
+        tool: "create_saved_search",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Store a named query that can be re-run later.",
+    }
+    SavedSearchUpdateSavedSearch {
+        rpc: "/rmail.v1.SavedSearchService/UpdateSavedSearch",
+        tool: "update_saved_search",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Change a saved search's name or query.",
+    }
+    SavedSearchListSavedSearches {
+        rpc: "/rmail.v1.SavedSearchService/ListSavedSearches",
+        tool: "list_saved_searches",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "List the stored saved searches.",
+    }
+    SavedSearchDeleteSavedSearch {
+        rpc: "/rmail.v1.SavedSearchService/DeleteSavedSearch",
+        tool: "delete_saved_search",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Delete a saved search by id.",
+    }
+    SavedSearchRunSavedSearch {
+        rpc: "/rmail.v1.SavedSearchService/RunSavedSearch",
+        tool: "run_saved_search",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Run a saved search now and stream its ranked hits.",
+    }
+    SavedSearchCreateSmartFolder {
+        rpc: "/rmail.v1.SavedSearchService/CreateSmartFolder",
+        tool: "create_smart_folder",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Define a virtual mailbox from a plain-English predicate compiled to a query.",
+    }
+    SavedSearchListSmartFolders {
+        rpc: "/rmail.v1.SavedSearchService/ListSmartFolders",
+        tool: "list_smart_folders",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "List the defined smart folders.",
+    }
+    SavedSearchDeleteSmartFolder {
+        rpc: "/rmail.v1.SavedSearchService/DeleteSmartFolder",
+        tool: "delete_smart_folder",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Delete a smart folder definition. The mail it matched is untouched.",
+    }
+    SavedSearchListSmartFolderMembers {
+        rpc: "/rmail.v1.SavedSearchService/ListSmartFolderMembers",
+        tool: "list_smart_folder_members",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Stream the messages a smart folder currently matches.",
+    }
+    SavedSearchEvaluateSmartFolder {
+        rpc: "/rmail.v1.SavedSearchService/EvaluateSmartFolder",
+        tool: "evaluate_smart_folder",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Re-evaluate a smart folder, auto-tagging and notifying on genuinely new members.",
+    }
+
+    // -- IndexService (task 24) -----------------------------------------------
+    IndexStatus {
+        rpc: "/rmail.v1.IndexService/Status",
+        tool: "index_status",
+        effect: Read,
+        cli: ["index status"],
+        actions: [],
+        summary: "Per-stage index coverage, queue depth, embedding model and lag.",
+    }
+    IndexReindex {
+        rpc: "/rmail.v1.IndexService/Reindex",
+        tool: "reindex",
+        effect: Mutate,
+        // Drain, selection and embedding-backfill are modes of the one RPC;
+        // the CLI spells each as its own verb.
+        cli: ["index run", "index reindex", "index embed"],
+        actions: [],
+        summary: "Enqueue and drain indexing work, streaming progress. Never deletes anything.",
+    }
+    IndexRebuild {
+        rpc: "/rmail.v1.IndexService/Rebuild",
+        tool: "rebuild_index",
+        effect: Mutate,
+        cli: ["index rebuild"],
+        actions: [],
+        summary: "DELETE a stage's derived index and recompute it; search is degraded until it catches up.",
+    }
+    IndexVerify {
+        rpc: "/rmail.v1.IndexService/Verify",
+        tool: "verify_index",
+        effect: Read,
+        cli: ["index verify"],
+        actions: [],
+        summary: "Report drift between what the index records and what it holds. Repairs nothing.",
+    }
+    IndexGc {
+        rpc: "/rmail.v1.IndexService/Gc",
+        tool: "gc_index",
+        effect: Mutate,
+        cli: ["index gc"],
+        actions: [],
+        summary: "Delete index rows whose parent message is gone.",
+    }
+    IndexSetPaused {
+        rpc: "/rmail.v1.IndexService/SetPaused",
+        tool: "set_index_paused",
+        effect: Mutate,
+        cli: ["index start", "index stop"],
+        actions: [],
+        summary: "Stop or start the background indexing worker. Queued work stays durable.",
+    }
+    IndexListEntities {
+        rpc: "/rmail.v1.IndexService/ListEntities",
+        tool: "list_entities",
+        effect: Read,
+        cli: ["entities"],
+        actions: [],
+        summary: "List entities extracted from mail (people, amounts, dates, tracking numbers) by kind.",
+    }
+
+    // -- TagService (task 55) -------------------------------------------------
+    TagAddTag {
+        rpc: "/rmail.v1.TagService/AddTag",
+        tool: "add_tag",
+        effect: Mutate,
+        cli: ["tag"],
+        actions: [],
+        summary: "Apply tags to a message or thread, creating them on demand.",
+    }
+    TagRemoveTag {
+        rpc: "/rmail.v1.TagService/RemoveTag",
+        tool: "remove_tag",
+        effect: Mutate,
+        cli: ["untag"],
+        actions: [],
+        summary: "Remove tags from a message or thread.",
+    }
+    TagListTags {
+        rpc: "/rmail.v1.TagService/ListTags",
+        tool: "list_tags",
+        effect: Read,
+        cli: ["tags"],
+        actions: [],
+        summary: "List an account's tags with their colors, hierarchy and message counts.",
+    }
+    TagCreateTag {
+        rpc: "/rmail.v1.TagService/CreateTag",
+        tool: "create_tag",
+        effect: Mutate,
+        cli: ["tags create"],
+        actions: [],
+        summary: "Create or update a tag definition: name, color, IMAP sync mode, parent.",
+    }
+    TagBulkTag {
+        rpc: "/rmail.v1.TagService/BulkTag",
+        tool: "bulk_tag",
+        effect: Mutate,
+        // Only `tag-bulk`. `mail tag search:<query>` looks like it would reach
+        // this RPC and deliberately does not — it refuses and points at
+        // `tag-bulk`, because the bulk form needs an account the per-message
+        // form does not (see `tag_cli`'s own `ParsedTarget::Bulk` arm).
+        cli: ["tag-bulk"],
+        actions: [],
+        summary: "Apply tags to every message a filter-only query selects, in one transaction.",
+    }
+    TagSuggestTags {
+        rpc: "/rmail.v1.TagService/SuggestTags",
+        tool: "suggest_tags",
+        effect: Read,
+        cli: ["suggest-tags"],
+        actions: [],
+        summary: "Stream a message's pending AI tag suggestions. Triggers no model call.",
+    }
+    TagResolveSuggestion {
+        rpc: "/rmail.v1.TagService/ResolveSuggestion",
+        tool: "resolve_tag_suggestion",
+        effect: Mutate,
+        cli: ["accept-tags", "reject-tags"],
+        actions: [],
+        summary: "Accept or reject a pending tag suggestion, which also trains the tagger.",
+    }
+
+    // -- NoteService (task 56) ------------------------------------------------
+    NoteAddNote {
+        rpc: "/rmail.v1.NoteService/AddNote",
+        tool: "add_note",
+        effect: Mutate,
+        cli: ["note add"],
+        actions: [],
+        summary: "Attach a freeform note to a message or a thread.",
+    }
+    NoteEditNote {
+        rpc: "/rmail.v1.NoteService/EditNote",
+        tool: "edit_note",
+        effect: Mutate,
+        cli: ["note edit"],
+        actions: [],
+        summary: "Replace a note's body.",
+    }
+    NoteDeleteNote {
+        rpc: "/rmail.v1.NoteService/DeleteNote",
+        tool: "delete_note",
+        effect: Mutate,
+        cli: ["note rm"],
+        actions: [],
+        summary: "Delete a note by id.",
+    }
+    NoteListNotes {
+        rpc: "/rmail.v1.NoteService/ListNotes",
+        tool: "list_notes",
+        effect: Read,
+        cli: ["notes"],
+        actions: [],
+        summary: "List the notes on a message or thread, newest first.",
+    }
+    NoteWatchNotes {
+        rpc: "/rmail.v1.NoteService/WatchNotes",
+        tool: "watch_notes",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Stream note additions, edits and deletions as they happen.",
+    }
+
+    // -- ComposeService (task 60) ---------------------------------------------
+    ComposeCreateDraft {
+        rpc: "/rmail.v1.ComposeService/CreateDraft",
+        tool: "create_draft",
+        effect: Mutate,
+        cli: [],
+        // Reply and forward are drafts with headers pre-filled from the
+        // message on screen; neither sends anything.
+        actions: [Reply, Forward],
+        summary: "Create a draft, optionally pre-filled as a reply or forward of a message.",
+    }
+    ComposeGetDraft {
+        rpc: "/rmail.v1.ComposeService/GetDraft",
+        tool: "get_draft",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Read one draft by id.",
+    }
+    ComposeListDrafts {
+        rpc: "/rmail.v1.ComposeService/ListDrafts",
+        tool: "list_drafts",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "List the drafts an account holds.",
+    }
+    ComposeUpdateDraft {
+        rpc: "/rmail.v1.ComposeService/UpdateDraft",
+        tool: "update_draft",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Edit a draft's recipients, subject, body or attachments.",
+    }
+    ComposeDeleteDraft {
+        rpc: "/rmail.v1.ComposeService/DeleteDraft",
+        tool: "delete_draft",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Delete a draft by id.",
+    }
+    ComposeRenderDraft {
+        rpc: "/rmail.v1.ComposeService/RenderDraft",
+        tool: "render_draft",
+        // Persists nothing, and is still not `Read`: it emits the complete
+        // octets of a transmissible message, Message-ID and all, which any
+        // SMTP client can put on the wire. See `Effect`'s own doc comment and
+        // `rmaild::auth::methods`, which puts this row behind `mail.send` for
+        // the same reason.
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Render a draft to final RFC 5322 octets without sending it.",
+    }
+
+    // -- SendSchedulerService (task 61) ----------------------------------------
+    SendSchedulerScheduleSend {
+        rpc: "/rmail.v1.SendSchedulerService/ScheduleSend",
+        tool: "schedule_send",
+        effect: Mutate,
+        cli: ["send"],
+        actions: [],
+        summary: "Queue a message for transmission now (inside an undo window) or at a stated time.",
+    }
+    SendSchedulerCancelScheduled {
+        rpc: "/rmail.v1.SendSchedulerService/CancelScheduled",
+        tool: "cancel_scheduled_send",
+        effect: Mutate,
+        cli: ["undo", "outbox cancel"],
+        actions: [],
+        summary: "Cancel a queued send — inside its undo window, or any time before it is due.",
+    }
+    SendSchedulerRescheduleSend {
+        rpc: "/rmail.v1.SendSchedulerService/RescheduleSend",
+        tool: "reschedule_send",
+        effect: Mutate,
+        cli: ["outbox reschedule"],
+        actions: [],
+        summary: "Move a queued send to a different time.",
+    }
+    SendSchedulerUpdateScheduledBody {
+        rpc: "/rmail.v1.SendSchedulerService/UpdateScheduledBody",
+        tool: "update_scheduled_body",
+        effect: Mutate,
+        cli: ["outbox edit"],
+        actions: [],
+        summary: "Replace the body of a message that has not gone out yet.",
+    }
+    SendSchedulerSendNow {
+        rpc: "/rmail.v1.SendSchedulerService/SendNow",
+        tool: "send_now",
+        effect: Mutate,
+        cli: ["outbox send-now"],
+        actions: [],
+        summary: "Make a scheduled message due immediately.",
+    }
+    SendSchedulerRetryFailed {
+        rpc: "/rmail.v1.SendSchedulerService/RetryFailed",
+        tool: "retry_failed_send",
+        effect: Mutate,
+        cli: ["outbox retry"],
+        actions: [],
+        summary: "Return a message the server refused to the send queue.",
+    }
+    SendSchedulerListOutbox {
+        rpc: "/rmail.v1.SendSchedulerService/ListOutbox",
+        tool: "list_outbox",
+        effect: Read,
+        // `outbox show` is the same listing narrowed to one id.
+        cli: ["outbox", "outbox show"],
+        actions: [],
+        summary: "List queued, sent and failed outbound mail with its state.",
+    }
+    SendSchedulerWatchOutbox {
+        rpc: "/rmail.v1.SendSchedulerService/WatchOutbox",
+        tool: "watch_outbox",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Stream outbox state changes — the undo countdown, a send, a failure.",
+    }
+    SendSchedulerSuggestSendTime {
+        rpc: "/rmail.v1.SendSchedulerService/SuggestSendTime",
+        tool: "suggest_send_time",
+        effect: Read,
+        cli: ["outbox suggest"],
+        actions: [],
+        summary: "Propose a send time inside the configured guardrails. Schedules nothing.",
+    }
+    SendSchedulerCreateFollowup {
+        rpc: "/rmail.v1.SendSchedulerService/CreateFollowup",
+        tool: "create_followup",
+        effect: Mutate,
+        cli: ["followup add"],
+        actions: [],
+        summary: "Arm a reminder to chase a sent message that has had no reply.",
+    }
+    SendSchedulerListFollowups {
+        rpc: "/rmail.v1.SendSchedulerService/ListFollowups",
+        tool: "list_followups",
+        effect: Read,
+        cli: ["followup list"],
+        actions: [],
+        summary: "List follow-up reminders and whether each is due.",
+    }
+    SendSchedulerDismissFollowup {
+        rpc: "/rmail.v1.SendSchedulerService/DismissFollowup",
+        tool: "dismiss_followup",
+        effect: Mutate,
+        cli: ["followup dismiss"],
+        actions: [],
+        summary: "Dismiss a follow-up reminder.",
+    }
+
+    // -- AiService (tasks 50, 52) ----------------------------------------------
+    AiGetSummary {
+        rpc: "/rmail.v1.AiService/GetSummary",
+        tool: "get_summary",
+        effect: Read,
+        cli: ["ai summary"],
+        actions: [],
+        summary: "Read a message's cached AI summary. Never calls the model.",
+    }
+    AiAnalyzeMessage {
+        rpc: "/rmail.v1.AiService/AnalyzeMessage",
+        tool: "analyze_message",
+        effect: Mutate,
+        cli: ["ai process"],
+        actions: [],
+        summary: "Force a fresh deep-pass analysis of one message, streaming tokens as they arrive.",
+    }
+    AiStreamEnrichments {
+        rpc: "/rmail.v1.AiService/StreamEnrichments",
+        tool: "stream_enrichments",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Stream AI enrichments as the pipeline produces them, resumable from a cursor.",
+    }
+    AiSuggestReply {
+        rpc: "/rmail.v1.AiService/SuggestReply",
+        tool: "suggest_reply",
+        effect: Mutate,
+        cli: ["ai reply"],
+        actions: [],
+        summary: "Return a suggested reply, generating and caching one if none exists yet.",
+    }
+    AiGetUsage {
+        rpc: "/rmail.v1.AiService/GetUsage",
+        tool: "get_ai_usage",
+        effect: Read,
+        cli: ["ai status", "ai cost"],
+        actions: [],
+        summary: "Queue depth, today's and this month's tokens and cost, headroom, pause state.",
+    }
+    AiSetPaused {
+        rpc: "/rmail.v1.AiService/SetPaused",
+        tool: "set_ai_paused",
+        effect: Mutate,
+        cli: ["ai pause", "ai resume"],
+        actions: [],
+        summary: "Pause or resume the daemon's AI dispatch loop for every account it serves.",
+    }
+    AiRetryFailed {
+        rpc: "/rmail.v1.AiService/RetryFailed",
+        tool: "retry_failed_ai_jobs",
+        effect: Mutate,
+        cli: ["ai retry"],
+        actions: [],
+        summary: "Requeue every quarantined AI job across the whole daemon.",
+    }
+    // `Mutate` where `SearchService/Search` is `Read`, although both can reach
+    // the provider — see `Effect`'s own doc comment for why the two differ.
+    AiAskMailbox {
+        rpc: "/rmail.v1.AiService/AskMailbox",
+        tool: "ask_mailbox",
+        effect: Mutate,
+        cli: ["ask"],
+        actions: [],
+        summary: "Answer a plain-English question over the mailbox, streaming a cited answer.",
+    }
+
+    // -- AiPolicyService (task 76) ---------------------------------------------
+    AiPolicySetBudget {
+        rpc: "/rmail.v1.AiPolicyService/SetBudget",
+        tool: "set_ai_budget",
+        effect: Mutate,
+        cli: ["ai budget set"],
+        actions: [],
+        summary: "Set the daily/monthly token and dollar caps for one account or globally.",
+    }
+    AiPolicyGetSpend {
+        rpc: "/rmail.v1.AiPolicyService/GetSpend",
+        tool: "get_ai_budget",
+        effect: Read,
+        cli: ["ai budget status"],
+        actions: [],
+        summary: "Report spend so far today and this month against the caps in force.",
+    }
+
+    // -- AiSafetyService (task 77) ---------------------------------------------
+    AiSafetyScanInjection {
+        rpc: "/rmail.v1.AiSafetyService/ScanInjection",
+        tool: "scan_prompt_injection",
+        effect: Read,
+        cli: ["ai scan-injection"],
+        actions: [],
+        summary: "Scan one message for prompt-injection signals, quoting what it tried. Costs nothing.",
+    }
+    AiSafetyConfirmInjection {
+        rpc: "/rmail.v1.AiSafetyService/ConfirmInjection",
+        tool: "confirm_prompt_injection",
+        effect: Mutate,
+        // Reached by `mail ai scan-injection --confirm`/`--revoke`, which
+        // always rescans first so a confirmation names findings just seen.
+        cli: ["ai scan-injection"],
+        actions: [],
+        summary: "Release (or re-withhold) rule actions on a message flagged for prompt injection.",
+    }
+
+    // -- AuditService (task 45) ------------------------------------------------
+    AuditQueryAiCalls {
+        rpc: "/rmail.v1.AuditService/QueryAiCalls",
+        tool: "query_ai_audit",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Query the append-only ledger of every model call: model, tokens, cost, payload hash.",
+    }
+    AuditExportLedger {
+        rpc: "/rmail.v1.AuditService/ExportLedger",
+        tool: "export_ai_audit",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Stream the whole AI audit ledger for export.",
+    }
+
+    // -- RuleService (task 66) -------------------------------------------------
+    RuleCreateRule {
+        rpc: "/rmail.v1.RuleService/CreateRule",
+        tool: "create_rule",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Persist a classification rule the background evaluator then fires unattended.",
+    }
+    RuleListRules {
+        rpc: "/rmail.v1.RuleService/ListRules",
+        tool: "list_rules",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "List the configured rules and their predicates and actions.",
+    }
+    RuleEvaluateRules {
+        rpc: "/rmail.v1.RuleService/EvaluateRules",
+        tool: "run_rules_on_query",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Run rules over the messages a query selects and fire their actions.",
+    }
+    // Both are `Mutate` despite acting on no mail, because `Effect`'s line is
+    // drawn at what a caller can cause outside this process and both spend at
+    // the provider — synthesis always, a backtest for every `claude_is`
+    // verdict the cache does not already hold — and both write that cache and
+    // an audit-ledger row. `rule.proto`'s own header says so in as many words
+    // ("not side-effect free in the absolute sense ... spends real money at
+    // the provider. What it never does is act on mail"), which is why the
+    // scope table asks for `ai.invoke` here. Calling them `Read` would let
+    // task 53 project them as safe tools an agent may call freely, and each
+    // call costs money.
+    RuleSynthesizeRule {
+        rpc: "/rmail.v1.RuleService/SynthesizeRule",
+        tool: "synthesize_rule",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Turn a plain-English instruction into a concrete rule. Stores no rule, \
+                  but calls the model.",
+    }
+    RuleBacktestRule {
+        rpc: "/rmail.v1.RuleService/BacktestRule",
+        tool: "backtest_rule",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Dry-run a rule over history: what it would have hit, why, and at what cost.",
+    }
+    RuleRecordCorrection {
+        rpc: "/rmail.v1.RuleService/RecordCorrection",
+        tool: "record_rule_correction",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Record that a rule got a message wrong, as a few-shot example for next time.",
+    }
+
+    // -- HookService (task 67) -------------------------------------------------
+    HookListHooks {
+        rpc: "/rmail.v1.HookService/ListHooks",
+        tool: "list_hooks",
+        effect: Read,
+        cli: ["hook list"],
+        actions: [],
+        summary: "List the configured event hooks, enabled or not.",
+    }
+    HookTestHook {
+        rpc: "/rmail.v1.HookService/TestHook",
+        tool: "test_hook",
+        effect: Mutate,
+        cli: ["hook test"],
+        actions: [],
+        summary: "Run one configured hook now against a sample or supplied event.",
+    }
+
+    // -- ConfigService (task 84) -----------------------------------------------
+    ConfigGetKeymap {
+        rpc: "/rmail.v1.ConfigService/GetKeymap",
+        tool: "get_keymap",
+        effect: Read,
+        // Deliberately not `mail keys list`: that reads `keys.toml` directly,
+        // because bindings belong to the terminal in front of the user rather
+        // than to the daemon (see `rmail-cli`'s `keys_cli` module docs).
+        cli: [],
+        actions: [],
+        summary: "Read the effective key bindings and the action id each chord runs.",
+    }
+    ConfigSetBinding {
+        rpc: "/rmail.v1.ConfigService/SetBinding",
+        tool: "set_key_binding",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Bind or unbind a chord in one mode.",
+    }
+}
+
+impl Command {
+    /// The capability an RPC path names, or `None` if it names none.
+    ///
+    /// The join task 53's projection walks: descriptor set → path → row.
+    /// `None` cannot happen for a method this workspace actually serves —
+    /// `every_rpc_in_the_descriptor_set_has_a_command` fails the suite first —
+    /// so a caller may treat it as "not one of ours" rather than as a case to
+    /// invent a policy for.
+    #[must_use]
+    pub fn for_rpc(rpc: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.rpc() == rpc)
+    }
+
+    /// The capability an MCP tool name refers to, or `None`. The reverse of
+    /// [`Command::tool`], for dispatching a tool call back onto an RPC.
+    #[must_use]
+    pub fn for_tool(tool: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.tool() == tool)
+    }
+
+    /// Every capability a TUI action reaches. Empty for a UI-local action
+    /// (see [`LOCAL_ACTIONS`]).
+    pub fn for_action(action: Action) -> impl Iterator<Item = Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(move |c| c.actions().contains(&action))
+    }
+
+    /// Every capability a `mail` subcommand path reaches, e.g. `"ai pause"`.
+    /// Empty for a deliberately client-side verb (see [`LOCAL_CLI`]).
+    pub fn for_cli(path: &str) -> impl Iterator<Item = Self> + '_ {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(move |c| c.cli().contains(&path))
+    }
+
+    /// The service part of [`Command::rpc`], e.g. `rmail.v1.MailService`.
+    #[must_use]
+    pub fn service(self) -> &'static str {
+        split_rpc(self.rpc()).0
+    }
+
+    /// The method part of [`Command::rpc`], e.g. `Get`.
+    #[must_use]
+    pub fn method(self) -> &'static str {
+        split_rpc(self.rpc()).1
+    }
+}
+
+/// `/pkg.Service/Method` → `("pkg.Service", "Method")`.
+///
+/// Total rather than fallible: `every_rpc_path_is_well_formed` asserts every
+/// row has both halves, so there is no malformed-path case for callers to
+/// handle, and returning `("", "")` for one keeps [`Command::service`]
+/// infallible instead of forcing an `unwrap` at every call site.
+fn split_rpc(rpc: &'static str) -> (&'static str, &'static str) {
+    match rpc.strip_prefix('/').and_then(|r| r.split_once('/')) {
+        Some((service, method)) => (service, method),
+        None => ("", ""),
+    }
+}
+
+/// `mail` verbs that deliberately have no RPC, and why.
+///
+/// This is the escape hatch on "if the CLI can do it, gRPC can do it", and it
+/// is written by hand on purpose: adding a `mail` subcommand fails
+/// `every_cli_command_is_backed_by_a_capability` by name, and the author then
+/// has to decide — in a diff a reviewer reads — whether the verb belongs in
+/// [`Command`] or here. What must never happen is a verb quietly landing in
+/// neither, which is the state every surface was in before this table existed.
+///
+/// The entries below are three arguments between them:
+///
+/// - `ping` is the standard `grpc.health.v1.Health/Check` probe, served by
+///   `tonic-health`. It is an RPC — just not a `rmail.v1` one, so it is not in
+///   this workspace's descriptor set and cannot be a [`Command`] row.
+/// - `tui` *is* a client. The terminal UI is an adapter over this table, not a
+///   capability in it.
+/// - `keys …` and `hook add` edit the user's own files (`keys.toml`, the
+///   master TOML). Both have module docs in `rmail-cli` explaining why a
+///   daemon round-trip would end up editing the same file anyway, with a
+///   second writer to keep in sync. Note `ConfigService/GetKeymap` and
+///   `SetBinding` still exist as capabilities — for the palette and for MCP —
+///   they are simply not what `mail keys` uses.
+pub const LOCAL_CLI: &[(&str, &str)] = &[
+    (
+        "ping",
+        "the standard grpc.health.v1.Health/Check probe, served by tonic-health rather than \
+         declared in proto/rmail/v1",
+    ),
+    (
+        "tui",
+        "the terminal UI itself — a client of this table, not an entry in it",
+    ),
+    (
+        "keys list",
+        "reads keys.toml directly; bindings belong to the terminal, not the daemon",
+    ),
+    (
+        "keys set",
+        "rewrites keys.toml directly; see keys_cli's module docs",
+    ),
+    (
+        "keys unset",
+        "rewrites keys.toml directly; see keys_cli's module docs",
+    ),
+    (
+        "keys actions",
+        "prints the compiled-in action registry; nothing to ask a daemon",
+    ),
+    (
+        "hook add",
+        "appends a [[hooks.hooks]] block to the operator's own config file; there is no \
+         CreateHook RPC by design",
+    ),
+];
+
+/// TUI actions that are not capabilities, and why.
+///
+/// The mirror of [`LOCAL_CLI`] for `keys.toml`'s action-id vocabulary
+/// (task 84's `actions!` registry). Two different arguments live here, and
+/// only the first is the obvious one.
+///
+/// **Movement and rendering.** `cursor.*`, `focus.*`, `open`, `back`,
+/// `cancel`, `quit`, `help`, `visual.*` change where the cursor is or what is
+/// on screen. Several *cause* a read — opening a folder lists its messages —
+/// but the action is "show me this", not a capability of the API, and treating
+/// it as one would put `cursor.down` in an MCP tool list.
+/// `message.open-html` belongs here too, though for its own reason: it writes
+/// the HTML part to a temp file and hands it to the user's browser, a local
+/// effect on the machine running the TUI with no RPC because there is nothing
+/// for the daemon to do.
+///
+/// **Overlay completions.** `pick.accept`, `confirm.accept` and
+/// `input.submit` are the second argument, and it is worth stating precisely
+/// because these three are the keystrokes that actually *dispatch* a
+/// mutation: `pick.accept` emits the Move or Copy, `confirm.accept` emits the
+/// expunge, and `input.submit` completes a forward into a draft. They are
+/// still not capabilities, because **what they complete depends on which
+/// overlay is up** — `confirm.accept` means "yes" and today the only thing it
+/// confirms is a delete. Naming a capability requires knowing the question.
+/// The capability is declared on the action that *asked* it —
+/// `message.delete` on [`Command::actions`] of `MailDelete`, `message.move`/
+/// `message.copy` on `MailMove`/`MailCopy`, `message.forward` on
+/// `ComposeCreateDraft` — so nothing the TUI can reach is undeclared; a
+/// two-keystroke interaction is declared once, on the keystroke that says
+/// what it is for.
+pub const LOCAL_ACTIONS: &[Action] = &[
+    Action::CursorDown,
+    Action::CursorUp,
+    Action::CursorTop,
+    Action::CursorBottom,
+    Action::FocusToggle,
+    Action::FocusFolders,
+    Action::FocusMessages,
+    Action::Open,
+    Action::Back,
+    Action::Cancel,
+    Action::Quit,
+    Action::Help,
+    Action::VisualToggle,
+    Action::VisualSwapEnds,
+    Action::OpenHtml,
+    Action::PickAccept,
+    Action::ConfirmAccept,
+    Action::InputSubmit,
+    Action::InputBackspace,
+];

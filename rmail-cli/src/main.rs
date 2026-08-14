@@ -6,6 +6,10 @@ mod keymap;
 mod keys_cli;
 mod note_cli;
 mod outbox_cli;
+/// The CLI half of the feature-parity drift check (task 41). Test-only: it
+/// asserts about `Cli`'s own `clap` tree rather than contributing to it.
+#[cfg(test)]
+mod parity;
 mod search_cli;
 mod tag_cli;
 mod tui;

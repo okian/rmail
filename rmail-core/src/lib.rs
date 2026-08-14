@@ -27,6 +27,7 @@ pub mod mail;
 pub mod message;
 pub mod notes;
 pub mod outbox;
+pub mod parity;
 pub mod present;
 pub mod query;
 pub mod rank;

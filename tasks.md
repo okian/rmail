@@ -19,6 +19,21 @@ as `cargo nextest run …` for readability; run them as
 `scripts/docker-test.sh <same args>` — the wrapper passes cargo arguments straight
 through. Do not run `cargo test`/`cargo nextest` on the host.
 
+**A bare filter matches a test's *name*, never its binary.** `cargo nextest run -p
+rmaild mail_service` selected **zero** tests for the whole life of this file: it looks
+like it names the `rmaild/tests/mail_service.rs` binary, but nextest matches the string
+against test names, and none of that binary's 22 tests has `mail_service` in its name.
+A whole integration suite can be "verified" by a command that runs nothing. To select a
+test *binary*, use `--test <name>` (or `-E 'binary(<name>)'`); a bare word is only for
+matching a module path or a name prefix, as in `-p rmail-core config::`. Every line
+below was swept against `cargo nextest list` and now selects what it claims to.
+
+**`-p` does not narrow anything either.** `scripts/docker-test.sh` always injects
+`--workspace`, and cargo ignores `--package` when `--workspace` is present — so
+`scripts/docker-test.sh -p rmail-core parity::` applies `parity::` to the whole
+workspace, not to `rmail-core`. The `-p` in the lines below documents where a task's
+tests live; it is the filter (or `--test`) that does the selecting.
+
 ---
 
 ## 1. Workspace & toolchain scaffold
@@ -33,7 +48,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
   - `mail` binary exists with a `ping` subcommand that round-trips gRPC `Health.Check` over the socket.
   - `nextest` configured; a placeholder integration test starts the in-process server and asserts health `SERVING`.
   - GitHub Actions CI workflow runs fmt-check, clippy, nextest, `buf lint`, and `cargo build --release`; `.env.example` committed.
-- **verify:** `cargo build --release` · `buf lint` · `cargo nextest run -p rmaild health` · `cargo fmt --all -- --check` · `cargo clippy --all-targets --all-features -- -D warnings`
+- **verify:** `cargo build --release` · `buf lint` · `cargo nextest run -p rmaild --test health` · `cargo fmt --all -- --check` · `cargo clippy --all-targets --all-features -- -D warnings`
 
 ## 2. Configuration system
 - [x] status
@@ -176,7 +191,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
   - **Deferred to task 13's follow-up / the background scheduler:** the IDLE watcher is not spawned by the daemon, so events are produced only by an explicit `SyncFolder` RPC. `SyncEngine::sync` has no injection seam for a mock IMAP server, so its success path (connect → pass → drain → report) is covered by the engines beneath it rather than end to end. `SyncFolder` carries no server-side deadline.
   - Sync emits `events` (NewMessage/FlagsChanged/SyncProgress) that downstream indexing/AI/rules consume.
   - Client cancellation stops the upstream stream promptly.
-- **verify:** `cargo nextest run -p rmaild sync_service` (in-process server: trigger sync, observe streamed events, resume)
+- **verify:** `cargo nextest run -p rmaild --test sync_service` (in-process server: trigger sync, observe streamed events, resume)
 
 ## 16. Index job queue & state
 - [x] status
@@ -257,7 +272,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - `IndexService.Status/Reindex(stream)` plus `mail index status|run|start|stop|reindex|rebuild|verify|gc|embed --backfill` and `mail entities <kind>`.
   - `status` reports per-kind coverage %, queue depth, model/dim, and lag; `verify` detects state/content-hash drift; `gc` vacuums orphans.
-- **verify:** `cargo nextest run -p rmaild index_service` (status coverage, reindex stream, verify drift)
+- **verify:** `cargo nextest run -p rmaild --test index_service` (status coverage, reindex stream, verify drift)
 
 ## 25. Query understanding — operator parser & grammar
 - [x] status
@@ -337,7 +352,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - `SearchService.Search(stream SearchHit)`, `Semantic`, and `Explain` wired end-to-end through the pipeline; first hit reaches the client fast; a fresh request cancels the prior stream (generation token).
   - `SearchHit` carries score, highlighted snippet, `sources`, and (when `explain`) a `RankExplanation` of top feature contributions + matched spans.
-- **verify:** `cargo nextest run -p rmaild search_service` (streamed hits, cancellation, explain block)
+- **verify:** `cargo nextest run -p rmaild --test search_service` · `cargo nextest run -p rmaild search_service::` (streamed hits, cancellation, explain block)
 
 ## 34. Search CLI verbs
 - [x] status
@@ -345,7 +360,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **parallel-safe:** yes
 - **acceptance:**
   - `mail search "<q>"`, `--explore`, `--explain`, `--json`, `~`/`=` prefixes, and `mail similar <id>` implemented as gRPC-client verbs; `--json` emits the PRD item schema (uid, subject, score, snippet, sources, why).
-- **verify:** `cargo nextest run -p rmail-cli search_cli` (json schema, flags map to request fields)
+- **verify:** `cargo nextest run -p rmail-cli --test search_cli` · `cargo nextest run -p rmail-cli search_cli::` (json schema, flags map to request fields)
 
 ## 35. Saved searches & deterministic smart folders
 - [x] status
@@ -353,7 +368,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **parallel-safe:** yes
 - **acceptance:**
   - Named saved searches persisted and re-runnable through the full pipeline; deterministic smart folders (operator-DSL predicate) re-evaluated on each sync so membership stays live without moving server mail; can trigger auto-tag/notify on new matches. (NL-compiled smart folders land in task 58.)
-- **verify:** `cargo nextest run -p rmail-core saved_search:: smart_folder::`
+- **verify:** `cargo nextest run -p rmail-core saved_search:: smart_folder::` · `cargo nextest run -p rmaild --test saved_search_service`
 
 ## 36. Query/embedding/result caching & incrementality
 - [ ] status
@@ -370,7 +385,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - Versioned golden set `(query, judged-relevant ids)`; `mail search eval` reports NDCG@10, MRR, Recall@50, P@3; offline replay/shadow scoring over logged impressions.
   - CI job runs the golden set on a fixture corpus and fails the build on an NDCG@10 drop below threshold.
-- **verify:** `cargo nextest run -p rmail-core eval::` · `mail search eval` on the fixture corpus meets threshold
+- **verify:** `cargo nextest run -p rmail-core eval::` · `cargo nextest run -p rmaild --test eval_service` · `mail search eval` on the fixture corpus meets threshold
 
 ## 38. Capability tokens & auth interceptor
 - [x] status
@@ -380,7 +395,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
   - `api_tokens` (argon2id hashes, scopes, expiry, revoked); `AdminService.MintToken/RevokeToken/ListTokens`; `mail token create/list/revoke`.
   - tonic interceptor enforces per-method scope (`mail.read`,`mail.write`,`mail.send`,`ai.invoke`,`ai.spend:<usd>`,`mailbox:<name>`,`automation`,`admin`); Unix-socket peer-uid (`SO_PEERCRED`) grants implicit admin; TCP requires Bearer token (constant-time verify) or mTLS.
   - A read-only token is physically denied `Send`/`Delete`.
-- **verify:** `cargo nextest run -p rmaild auth::` (scope allow/deny matrix, peer-uid path, revoked token rejected)
+- **verify:** `cargo nextest run -p rmaild auth::` · `cargo nextest run -p rmaild --test admin_service` (scope allow/deny matrix, peer-uid path, revoked token rejected)
 
 ## 39. MailService
 - [x] status
@@ -389,7 +404,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - `List(stream)`, `Get`, `GetThread`, `Move`, `Copy`, `SetFlags`, `Delete`, `GetAttachment(stream)`, `WatchEvents(stream)` implemented over core services with correct scopes; attachments chunk-streamed within the 16 MiB frame cap.
   - Mutations reflect to IMAP (flags/move) and emit `events`.
-- **verify:** `cargo nextest run -p rmaild mail_service` (CRUD, threaded get, watch stream, attachment chunking)
+- **verify:** `cargo nextest run -p rmaild --test mail_service` (CRUD, threaded get, watch stream, attachment chunking)
 
 ## 40. Idempotency, pagination & error-model hardening
 - [ ] status
@@ -402,13 +417,13 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmaild idempotency:: pagination::`
 
 ## 41. Feature-parity command enum + CI drift check
-- [ ] status
+- [x] status
 - **depends-on:** 39, 33
 - **parallel-safe:** no
 - **acceptance:**
   - A single internal command enum backs CLI/TUI/gRPC; a test enumerates every core command and asserts a corresponding RPC exists.
   - CI job fails if any core command lacks an RPC (no CLI/gRPC/MCP feature drift).
-- **verify:** `cargo nextest run -p rmail-core parity::` (every command → RPC; missing mapping fails)
+- **verify:** `cargo nextest run -p rmail-core parity::` · `cargo nextest run -p rmaild auth::methods::` (every command → RPC; missing mapping fails; effect/scope agree)
 
 ## 42. CLI as gRPC client: structured output & generic call
 - [ ] status
@@ -445,7 +460,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - Append-only ledger recording every Claude request (timestamp, ids, model, tokens, cost, redaction level, latency, SHA-256 of the exact payload sent); `ai_usage` day rollups; every AI artifact links to its ledger entry.
   - `AuditService.QueryAiCalls/ExportLedger`.
-- **verify:** `cargo nextest run -p rmail-core ai::audit` (append-only invariant, payload hash, cost rollup)
+- **verify:** `cargo nextest run -p rmail-core ai::audit` · `cargo nextest run -p rmaild --test audit_service` (append-only invariant, payload hash, cost rollup)
 
 ## 46. AI policy & data-residency engine
 - [x] status
@@ -490,7 +505,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
   - `mail ai status|process|summary|reply|retry|pause|resume|cost` verbs.
   - **Per-thread deep-pass serialization — carried over from task 49.** `build_request` reads a thread's prior rollup *before* the concurrency semaphore and before the provider call, so two messages of the same thread leased in one dispatch cycle both read the same prior state and the last writer overwrites the other's contribution to `ai_summaries.thread_summary`. No content is lost from the mailbox (each row keeps its own `summary`), only from the rollup. It cannot be fixed inside the handler — a process-local lock would not bind a second daemon or worker pool — so the queue must serialize dispatch per thread, e.g. capping concurrent `"deep"` leases to one per thread per cycle. This bites hardest on the batch path, which is exactly where a thread most often has several messages queued at once (backlog, initial sync).
   - **Daemon dispatch loop — carried over from task 48.** Task 48 built the triage `PassHandler` and task 47 the queue, but *nothing enqueues a triage job when a message syncs*: the PRD's "every newly synced message runs one Haiku call" has no wiring. This task owns it — subscribe the daemon to the sync event bus (`rmail-core/src/events/`), enqueue via `AiQueue::enqueue`, and run `AiWorkerPool::dispatch_pending` / `BatchCoordinator::maybe_submit`+`poll` on a schedule. Without this the whole AI pipeline is inert in production however green its unit tests are, so cover it with a test that syncs a message and asserts a job appears.
-- **verify:** `cargo nextest run -p rmaild ai_service` (cached get, force analyze stream, enrichment resume)
+- **verify:** `cargo nextest run -p rmaild --test ai_service` (cached get, force analyze stream, enrichment resume)
 
 ## 51. Semantic/hybrid retrieval + L2 rerank
 - [x] status
@@ -536,7 +551,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
   - `tags`/`message_tags` + effective-tags view; `TagService` (Add/Remove/List/Create/BulkTag/SuggestTags/ResolveSuggestion); hierarchy (`/`), colors, per-tag `sync_mode`.
   - `sync_mode=imap` round-trips tag ⇄ IMAP keyword / Gmail `X-GM-LABELS`; `auto` downgrades to local on `NO`; inbound server keywords import as `source='imap'`; `tag:`/`-tag:` operators; bulk tag = single txn + coalesced STORE.
   - `mail tag/untag/tags ...` verbs.
-- **verify:** `cargo nextest run -p rmail-core tags::` · `cargo nextest run -p rmaild tag_service`
+- **verify:** `cargo nextest run -p rmail-core tags::` · `cargo nextest run -p rmaild --test tag_service`
 
 ## 56. Notes subsystem
 - [x] status
@@ -545,7 +560,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - `notes` + `notes_fts` (trigger-synced); `NoteService` (Add/Edit/Delete/List/WatchNotes); markdown, message/thread target (XOR check), `$EDITOR` flow; `note:`/`has:note` operators feed the lexical retriever.
   - `mail note/notes ...` verbs; last-write-wins on `updated_at`.
-- **verify:** `cargo nextest run -p rmail-core notes::` · `cargo nextest run -p rmaild note_service`
+- **verify:** `cargo nextest run -p rmail-core notes::` · `cargo nextest run -p rmaild --test note_service`
 
 ## 57. AI auto-tagging + suggestions
 - [ ] status
@@ -573,7 +588,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
   - `finder_index`/`finder_dirty`/`finder_commands`; triggers write the dirty feed, a ~250ms drain maintains an in-memory `Arc<RwLock<FinderStore>>` (pre-folded `match_blob`, <25 MB for 100k msgs).
   - Skim/fzf subsequence DP scorer with the PRD bonuses/penalties, smart-case, NFKC+ASCII-fold, exact-substring short-circuit, returns `(score,positions)`; blended ranking with recency/unread/importance/frequency/kind weights; scopes + sigils (`>#@/:`).
   - `Finder.Find(stream)` bounded top-K heap flushing descending batches, keystroke cancellation; `mail find` verbs (+`--json`,`--select --action`); MCP `fuzzy_find`.
-- **verify:** `cargo nextest run -p rmail-core finder::score finder::rank` · `cargo nextest run -p rmaild finder_service` (streamed batches, cancellation)
+- **verify:** `cargo nextest run -p rmail-core finder::score finder::rank` · `cargo nextest run -p rmaild --test finder_service` (streamed batches, cancellation)
 
 ## 60. Compose & drafts
 - [x] status
@@ -581,7 +596,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **parallel-safe:** no
 - **acceptance:**
   - `ComposeService` draft CRUD; build full RFC 5322 MIME (headers, multipart, correct In-Reply-To/References) from a draft; drafts persist locally.
-- **verify:** `cargo nextest run -p rmail-core compose::mime` · `cargo nextest run -p rmaild compose_service`
+- **verify:** `cargo nextest run -p rmail-core compose::mime` · `cargo nextest run -p rmaild --test compose_service`
 
 ## 61. Scheduled send & durable outbox (III-5)
 - [x] status
@@ -591,7 +606,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
   - `outbox` + `followups`; scheduler sleeps until `min(next_due, poll_interval)`, woken by `Notify`/wake-from-sleep/network-up; SMTP via `lettre` (bounded worker pool), appends to IMAP Sent (Bcc stripped).
   - Undo-send = schedule at `now+undo_window`; idempotency via `smtp_message_id` persisted before DATA (at-most-once); transient 4xx→backoff stay `scheduled`, permanent 5xx→`failed`; missed window within `late_tolerance` still sends, else "sent late"; NL time via `chrono` first.
   - `SendScheduler` RPCs + `mail send --at`, `mail undo`, `mail outbox ...`, `mail followup ...`; MCP-originated sends store `origin="ai"` and always get an undo window.
-- **verify:** `cargo nextest run -p rmail-core outbox::` (lifecycle, idempotent retry, offline/late tolerance) · `cargo nextest run -p rmaild send_scheduler`
+- **verify:** `cargo nextest run -p rmail-core outbox::` (lifecycle, idempotent retry, offline/late tolerance) · `cargo nextest run -p rmaild --test send_scheduler`
 
 ## 62. AI reply drafting
 - [ ] status
@@ -600,7 +615,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - `DraftService.DraftReply(stream)` reads the full local thread + samples of the user's own past replies to that correspondent + a short intent → on-voice reply with correct headers, staged as an editable draft that never auto-sends; `mail reply <id> --ai`.
   - Tone/length rewrite (`RewriteDraft`) producing cyclable, revertible revisions.
-- **verify:** `cargo nextest run -p rmaild draft_reply` (streamed draft, headers correct, never auto-sends)
+- **verify:** `cargo nextest run -p rmaild --test draft_reply` (streamed draft, headers correct, never auto-sends)
 
 ## 63. Pre-send guardian + follow-up/waiting-on tracker
 - [ ] status
@@ -609,7 +624,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - `OutboxService.PreflightCheck` flags "see attached" w/o attachment, wrong/extra recipients, unfilled placeholders, apparent secrets, tone clashes — blocks or warns by severity (auto on send).
   - Follow-up/waiting-on tracker: judge whether a sent message expects a reply, extract the ask, record a deadline, surface an aging waiting-on list, draft a nudge; auto-dismiss on detected reply.
-- **verify:** `cargo nextest run -p rmail-core send::preflight followup::` · `cargo nextest run -p rmaild followup_service`
+- **verify:** `cargo nextest run -p rmail-core send::preflight followup::` · `cargo nextest run -p rmaild --test followup_service`
 
 ## 64. Feedback logging
 - [x] status
@@ -635,7 +650,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - TOML rules mix deterministic predicates (from/subject/header/flags/size regex) with a `claude_is` NL predicate and an actions block (move/label/flag/archive/notify/run-hook/draft-reply); classification cached by `message-id + prompt-hash`; evaluated on each new message.
   - `RuleService.Create/List/Evaluate/Synthesize/Backtest`; NL synthesis prefers cheap deterministic predicates and returns a dry-run over last N days; backtest reports per-message outcomes + Claude explanation per `claude_is`; corrections become few-shot examples.
-- **verify:** `cargo nextest run -p rmail-core rules::` · `cargo nextest run -p rmaild rule_service` (eval, dry-run, cache reuse)
+- **verify:** `cargo nextest run -p rmail-core rules::` · `cargo nextest run -p rmaild --test rule_service` (eval, dry-run, cache reuse)
 
 ## 67. Hooks dispatcher
 - [x] status
@@ -643,7 +658,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **parallel-safe:** yes
 - **acceptance:**
   - Config-driven shell commands fire on `on_new_message`/`on_label`/`on_move`/`on_rule_match`/`on_sync_error` with the event JSON on stdin, run in a bounded worker pool with timeouts; `HookService.ListHooks/TestHook`; `mail hook add`.
-- **verify:** `cargo nextest run -p rmail-core hooks::` (event→stdin JSON, timeout kill, bounded concurrency)
+- **verify:** `cargo nextest run -p rmail-core hooks::` · `cargo nextest run -p rmaild --test hook_service` (event→stdin JSON, timeout kill, bounded concurrency)
 
 ## 68. Outbound webhooks + Slack forward
 - [ ] status
@@ -661,7 +676,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - Scheduled/event-driven bounded agentic loop where Claude calls a constrained, allowlisted toolset (archive/label/snooze/draft-reply/escalate) toward a user policy; dry-run by default; every action logged with its reason; requires an allowlist scope to mutate.
   - `AgentService.RunInboxAgent/GetAgentRunLog`; `mail agent run [--dry-run]`.
-- **verify:** `cargo nextest run -p rmaild agent_service` (dry-run makes no mutations, allowlist enforcement, action log)
+- **verify:** `cargo nextest run -p rmaild --test agent_service` (dry-run makes no mutations, allowlist enforcement, action log)
 
 ## 70. AI periodic digest
 - [ ] status
@@ -669,7 +684,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **parallel-safe:** yes
 - **acceptance:**
   - Scheduled job clusters a window's mail by topic/sender and has Claude produce a ranked markdown briefing (needs-reply/FYI/waiting-on/auto-handled/skipped) with every line linked to source message-ids; `AnalyticsService.GenerateDigest`; `mail digest --since 7d`.
-- **verify:** `cargo nextest run -p rmaild digest` (sectioned briefing, every line cites a message-id)
+- **verify:** `cargo nextest run -p rmaild --test digest` (sectioned briefing, every line cites a message-id)
 
 ## 71. Response-time & SLA analytics
 - [ ] status
@@ -703,7 +718,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **parallel-safe:** yes
 - **acceptance:**
   - Extracted attachment text chunked+embedded and fused via RRF so "the termination-for-convenience clause" returns the exact attachment + page (`SearchService.SearchAttachments`); `AttachmentService.AskAttachment(stream)` answers a question scoped to one attachment/result-set with page/section citations, refusing unsupported answers.
-- **verify:** `cargo nextest run -p rmaild attach_search ask_attachment` (page-cited answer, unsupported refusal)
+- **verify:** `cargo nextest run -p rmaild --test attach_search --test ask_attachment` (page-cited answer, unsupported refusal)
 
 ## 75. Table, calendar/task & link extraction
 - [ ] status
@@ -720,7 +735,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **parallel-safe:** yes
 - **acceptance:**
   - Per-account + global daily/monthly token & dollar caps checked before dispatch; soft cap auto-downgrades the model (opus→sonnet→haiku), hard cap blocks; bulk jobs get a separate sub-budget; `AiPolicyService.SetBudget/GetSpend`; `mail ai budget set/status`.
-- **verify:** `cargo nextest run -p rmail-core ai::budget` (soft-cap downgrade, hard-cap block, bulk sub-budget)
+- **verify:** `cargo nextest run -p rmail-core ai::budget` · `cargo nextest run -p rmaild --test ai_policy_service` (soft-cap downgrade, hard-cap block, bulk sub-budget)
 
 ## 77. Prompt-injection shield
 - [x] status
@@ -728,7 +743,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **parallel-safe:** yes
 - **acceptance:**
   - Every body wrapped in untrusted-content delimiters and scanned for injection patterns (hidden text, zero-width chars, "ignore previous instructions"); detected messages flagged and any AI action on them requires confirmation, logged; `AiSafetyService.ScanInjection`; `mail ai scan-injection <id>`.
-- **verify:** `cargo nextest run -p rmail-core ai::injection` (pattern/zero-width detection, action-gating on flagged mail)
+- **verify:** `cargo nextest run -p rmail-core ai::injection` · `cargo nextest run -p rmaild --test ai_safety_service` (pattern/zero-width detection, action-gating on flagged mail)
 
 ## 78. Local-only model path
 - [ ] status
@@ -753,7 +768,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **acceptance:**
   - Synthetic unified mailbox merging every account's Inbox into one time-ordered, Message-ID-deduplicated view with actions routed back to the correct account/folder (`MailService.ListUnified`, `mail list --all`).
   - Autoconfig probes ISPDB/SRV/autodiscover and, on a miss, hands domain+MX+probe responses to Claude to infer IMAP/SMTP settings, validates by login, writes a ready TOML block (`mail account add <email>`).
-- **verify:** `cargo nextest run -p rmaild unified_inbox` · `cargo nextest run -p rmail-core autoconfig::` (dedup/order, probe→settings, login validation)
+- **verify:** `cargo nextest run -p rmaild --test unified_inbox` · `cargo nextest run -p rmail-core autoconfig::` (dedup/order, probe→settings, login validation)
 
 ## 81. Priority notification engine
 - [ ] status
@@ -786,7 +801,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **parallel-safe:** no
 - **acceptance:**
   - Layered keymap engine (normal/insert/visual, chord sequences), fully rebindable and hot-reloadable via `keys.toml`, mapping to named action ids shared by palette/gRPC/MCP; `ConfigService.GetKeymap/SetBinding`; `mail keys set <chord> <action>`.
-- **verify:** `cargo nextest run -p rmail-cli keymap::` (chord resolution, rebind, hot-reload, action-id shared registry)
+- **verify:** `cargo nextest run -p rmail-core keymap::` · `cargo nextest run -p rmail-cli keys_cli::` · `cargo nextest run -p rmaild config_service::` (chord resolution, rebind, hot-reload, action-id shared registry)
 
 ## 85. TUI overlays (search / finder / AI panel / ask pane / palette / outbox)
 - [ ] status

@@ -83,6 +83,15 @@ libc.workspace = true
 [dev-dependencies]
 # Enable figment's `Jail` sandbox for isolated env/file config tests.
 figment = { workspace = true, features = ["test"] }
+# `parity::tests` only. The feature-parity registry (task 41) reconciles itself
+# against the *compiled* descriptor set rather than against a second list a
+# human maintains, which is the whole reason the check is worth anything — so
+# the tests need the generated protos and prost's decoder. Deliberately a
+# dev-dependency: `parity` itself is plain data (method paths as strings) and
+# this crate's shipped code still depends on no generated transport type.
+rmail-proto.workspace = true
+prost.workspace = true
+prost-types.workspace = true
 # `benches/search_budgets.rs`. `async_tokio` lets a `Bencher` run an `async`
 # closure directly against a `&tokio::runtime::Runtime` instead of hand-rolled
 # `block_on` boilerplate at every `bench_function` call site.

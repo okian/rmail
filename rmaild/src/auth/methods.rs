@@ -947,6 +947,88 @@ mod tests {
         }
     }
 
+    /// Every capability in the feature-parity registry has a scope row.
+    ///
+    /// The two tables are keyed by the same string and maintained for
+    /// different reasons — this one says what a caller must hold,
+    /// `rmail_core::parity` says what the capability *is* and what each
+    /// surface calls it — so they can drift apart in either direction. The
+    /// descriptor-set check above already covers "an RPC with no scope row",
+    /// but it does not cover the case where a row is written here against a
+    /// path the registry spells differently: both would look internally
+    /// consistent while `Command::rpc` and `lookup` disagreed about the same
+    /// method, which is exactly what task 53's projection joins on.
+    #[test]
+    fn every_parity_capability_has_a_scope_row() {
+        for command in rmail_core::parity::Command::ALL {
+            assert!(
+                lookup(command.rpc()).is_some(),
+                "{} ({}) is a declared capability with no row in this table, so the \
+                 fail-closed default denies every call to it",
+                command.name(),
+                command.rpc()
+            );
+        }
+    }
+
+    /// The two tables' independent judgments about the same RPC agree.
+    ///
+    /// `rmail_core::parity::Effect` and this table's `Requirement` are decided
+    /// separately: one is "does calling it change anything", the other is
+    /// "what must the caller hold". They are not the same question — a write
+    /// can legitimately sit at `mail.read` (`SearchService/LogFeedback`, whose
+    /// row above argues the case at length) — but two combinations are always
+    /// a mistake in one table or the other, and task 53 gates generated MCP
+    /// tools on exactly this pair:
+    ///
+    /// - a capability that mutates and is `Public` would be an unauthenticated
+    ///   write;
+    /// - a capability marked `Read` whose row demands `mail.write`/`mail.send`
+    ///   /`ai.invoke` means one of the two files has the wrong idea about what
+    ///   it does, and if it is this one that is right, MCP would project a
+    ///   mutation as a safe tool.
+    ///
+    /// `ai.invoke` is in that set for a reason found the hard way:
+    /// `SynthesizeRule`/`BacktestRule` were first written here as `Read`
+    /// because they act on no mail, while this table already required
+    /// `ai.invoke` for them because they spend at the provider — which is one
+    /// of the effects `parity::Effect` explicitly counts. Two files disagreed
+    /// in exactly the way this test exists to notice, and without `ai.invoke`
+    /// in the set it did not notice.
+    #[test]
+    fn effect_and_scope_agree_about_what_each_capability_does() {
+        for command in rmail_core::parity::Command::ALL {
+            let Some(requirement) = lookup(command.rpc()) else {
+                // `every_parity_capability_has_a_scope_row` reports this
+                // properly; skipping keeps the two failures from overlapping.
+                continue;
+            };
+            let required: Vec<&Scope> = match requirement {
+                Requirement::Public => Vec::new(),
+                Requirement::Scope(scope) => vec![scope],
+                Requirement::AnyOf(scopes) | Requirement::AllOf(scopes) => scopes.iter().collect(),
+            };
+
+            if command.effect().is_mutating() {
+                assert!(
+                    !required.is_empty(),
+                    "{} mutates and requires no scope at all",
+                    command.rpc()
+                );
+            } else {
+                for scope in required {
+                    assert!(
+                        !matches!(scope, Scope::MailWrite | Scope::MailSend | Scope::AiInvoke),
+                        "{} is declared read-only in rmail_core::parity but this table puts it \
+                         behind {scope:?} — one of the two is wrong, and if this one is right \
+                         then MCP would project a mutation as a safe tool",
+                        command.rpc()
+                    );
+                }
+            }
+        }
+    }
+
     /// Every `(fully.qualified.Service, Method)` pair in the compiled protos.
     fn descriptor_methods() -> Vec<(String, String)> {
         use prost::Message as _;
