@@ -2235,6 +2235,8 @@ pub struct GrpcConfig {
     pub limits: GrpcLimits,
     /// Event-log retention.
     pub events: GrpcEvents,
+    /// Mutating-RPC replay fence.
+    pub idempotency: GrpcIdempotency,
 }
 
 impl Default for GrpcConfig {
@@ -2249,6 +2251,7 @@ impl Default for GrpcConfig {
             web: GrpcWeb::default(),
             limits: GrpcLimits::default(),
             events: GrpcEvents::default(),
+            idempotency: GrpcIdempotency::default(),
         }
     }
 }
@@ -2332,6 +2335,43 @@ impl Default for GrpcEvents {
         Self {
             retention_days: 7,
             retention_rows: 1_000_000,
+        }
+    }
+}
+
+/// The mutating-RPC replay fence (`rmail_core::idempotency`).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GrpcIdempotency {
+    /// How long a **recorded** response stays replayable.
+    ///
+    /// This is the window in which a retry of `Move`/`Delete`/`ScheduleSend`
+    /// replays instead of re-applying. A day covers every realistic retry loop
+    /// — an offline agent coming back, a scheduled job re-running — without
+    /// keeping a table of dead keys around for a week.
+    pub retention: HumanDuration,
+
+    /// How long a claim that has **not** reported an outcome stays fenced.
+    ///
+    /// Deliberately much shorter than [`GrpcIdempotency::retention`]: an
+    /// unfinished claim usually means the client's deadline elapsed or its
+    /// connection dropped (tonic then drops the handler before it can record
+    /// or release), and that client's next act is to retry the same key.
+    /// Fencing it for a day would break the workflow the key exists for.
+    ///
+    /// Five minutes is well past what any fenced mutation can take — each is
+    /// bounded by a small multiple of `imap::IMAP_DEADLINE` — so "unfinished
+    /// and older than this" genuinely means abandoned rather than slow.
+    /// Shortening it below that trades the at-most-once guarantee for
+    /// availability; lengthening it does the reverse.
+    pub in_flight: HumanDuration,
+}
+
+impl Default for GrpcIdempotency {
+    fn default() -> Self {
+        Self {
+            retention: HumanDuration::new(days(1)),
+            in_flight: HumanDuration::new(mins(5)),
         }
     }
 }

@@ -233,7 +233,10 @@ impl IndexService for IndexApi {
                 // and what stops a graceful shutdown waiting on a selection
                 // scan nobody is listening for.
                 let enqueued = tokio::select! {
-                    () = cancel.cancelled() => return,
+                    () = cancel.cancelled() => {
+                        crate::stream::terminate_cancelled(&tx).await;
+                        return;
+                    }
                     enqueued = async {
                         match mode {
                             ReindexMode::Unspecified | ReindexMode::Drain => Ok(0),
@@ -483,7 +486,11 @@ async fn send(
     item: Result<IndexProgress, Status>,
 ) -> std::ops::ControlFlow<()> {
     tokio::select! {
-        () = cancel.cancelled() => std::ops::ControlFlow::Break(()),
+        () = cancel.cancelled() => {
+            // Never end a cancelled stream silently — see `crate::stream`.
+            crate::stream::terminate_cancelled(tx).await;
+            std::ops::ControlFlow::Break(())
+        }
         sent = tx.send(item) => {
             if sent.is_ok() {
                 std::ops::ControlFlow::Continue(())

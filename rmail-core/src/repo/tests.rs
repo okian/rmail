@@ -208,7 +208,7 @@ fn message_roundtrip_preserves_raw_and_orders_by_date() {
 
     let listed = tmp
         .db
-        .with_read(|c| list_messages(c, mailbox_id, 10))
+        .with_read(|c| list_messages(c, mailbox_id, None, 10))
         .unwrap();
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].id, newer, "newest by date is first");
@@ -849,7 +849,7 @@ fn listing_falls_back_to_internaldate_when_date_missing() {
 
     let listed = tmp
         .db
-        .with_read(|c| list_messages(c, mailbox_id, 10))
+        .with_read(|c| list_messages(c, mailbox_id, None, 10))
         .unwrap();
     assert_eq!(listed.len(), 2);
     assert_eq!(

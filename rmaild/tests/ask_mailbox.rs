@@ -836,3 +836,39 @@ async fn ask_mailbox_rejects_an_empty_question() {
     assert_eq!(server.provider.stream_calls(), 0);
     server.stop().await;
 }
+
+/// A retrieval failure must keep its reason across the `Status`→`Error` seam
+/// between `SearchApi` and the RAG engine.
+///
+/// Before task 40 that seam wrapped every failure in `Error::Internal`, which
+/// cost the caller twice: the code became `INTERNAL`, and the boundary then
+/// scrubbed the message — so naming an account that does not exist reported
+/// "internal error" and was indistinguishable from a daemon bug. A client
+/// branches on the reason, and `INTERNAL` tells it to give up on a mistake it
+/// could have fixed.
+#[tokio::test]
+async fn ask_mailbox_reports_an_unknown_account_as_not_found() {
+    let server = TestServer::start().await;
+    let status = server
+        .client()
+        .await
+        .ask_mailbox(AskRequest {
+            question: "how much did AWS bill me?".to_owned(),
+            account_id: 999_999,
+            ..Default::default()
+        })
+        .await
+        .expect_err("an unknown account cannot be retrieved from");
+
+    assert_eq!(status.code(), Code::NotFound, "{status:?}");
+    assert!(
+        status.message().contains("999999") || status.message().contains("account"),
+        "the client-safe detail must survive the round trip: {status:?}"
+    );
+    assert_eq!(
+        server.provider.stream_calls(),
+        0,
+        "a retrieval failure must not reach the provider"
+    );
+    server.stop().await;
+}

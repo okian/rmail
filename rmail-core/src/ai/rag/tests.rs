@@ -44,6 +44,10 @@ struct MockProvider {
     seen: Mutex<Vec<ChatRequest>>,
     calls: AtomicUsize,
     fail: Mutex<Option<String>>,
+    /// When set, the stream emits its queued frames and then parks forever
+    /// without a `Done` — a model that is still thinking, which is the only
+    /// state in which cancelling can truncate an answer.
+    stall: std::sync::atomic::AtomicBool,
 }
 
 impl MockProvider {
@@ -53,6 +57,11 @@ impl MockProvider {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push_back(frames.iter().map(|s| (*s).to_owned()).collect());
+    }
+
+    /// Leave the next stream unfinished after its queued frames.
+    fn stall(&self) {
+        self.stall.store(true, Ordering::SeqCst);
     }
 
     fn calls(&self) -> usize {
@@ -109,11 +118,17 @@ impl Provider for MockProvider {
             .pop_front()
             .unwrap_or_default();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let stall = self.stall.load(Ordering::SeqCst);
         tokio::spawn(async move {
             for frame in frames {
                 if tx.send(Ok(StreamFrame::Token(frame))).await.is_err() {
                     return;
                 }
+            }
+            if stall {
+                // Holds `tx`, so the relay sees an *open* stream with nothing
+                // on it — not a closed one, which is a different code path.
+                std::future::pending::<()>().await;
             }
             let _ = tx.send(Ok(StreamFrame::Usage(Usage::default()))).await;
             let _ = tx
@@ -1209,4 +1224,78 @@ fn neutralizing_markers_preserves_everything_that_is_not_a_marker() {
     // Multi-byte text either side of a marker must survive intact.
     assert_eq!(neutralize_markers("café [7] naïve"), "café (7) naïve");
     assert_eq!(neutralize_markers("[unclosed"), "[unclosed");
+}
+
+// ---------------------------------------------------------------------------
+// A cancelled answer must say so
+// ---------------------------------------------------------------------------
+
+/// The reported defect: a cancelled `AskMailbox` stream simply stopped
+/// yielding, which tonic turns into `OK` with no terminal `Done`. A client
+/// kept half an answer, saw success, and exited 0 — indistinguishable from a
+/// model that had finished.
+#[tokio::test]
+async fn a_cancelled_answer_ends_with_an_error_not_a_clean_stream() {
+    let fx = Fixture::open().await;
+    let invoice = fx
+        .message(
+            fx.inbox_id,
+            "Your AWS invoice",
+            "Your AWS bill for Q2 was 4200 dollars, due on the fifteenth.",
+        )
+        .await;
+
+    let provider = Arc::new(MockProvider::default());
+    provider.queue(&["AWS billed "]);
+    provider.stall();
+    let engine = fx.engine(
+        &provider,
+        StubRetriever::new(vec![invoice]),
+        &Config::default(),
+    );
+
+    let cancel = CancellationToken::new();
+    let mut stream = engine
+        .ask(&ask("how much did AWS bill me in Q2?"), &cancel)
+        .await
+        .expect("an answer");
+
+    // Read as far as the first token, so the answer is genuinely half
+    // delivered when the cancellation lands.
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("a frame should arrive")
+            .expect("the stream should still be open");
+        if matches!(event, Ok(AskEvent::Token(_))) {
+            break;
+        }
+    }
+
+    cancel.cancel();
+
+    let mut rest: Vec<Result<AskEvent, Error>> = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await
+    {
+        rest.push(event);
+    }
+
+    let last = rest
+        .pop()
+        .expect("a cancelled stream must not simply end; it must carry a terminal error");
+    let reason = last
+        .as_ref()
+        .err()
+        .map(Error::reason)
+        .unwrap_or_else(|| unreachable!("expected a terminal error, got {last:?}"));
+    assert_eq!(
+        reason,
+        crate::ErrorReason::Cancelled,
+        "a cancelled answer must be branchable as CANCELLED, not guessed at"
+    );
+    assert!(
+        !rest.iter().any(|e| matches!(e, Ok(AskEvent::Done(_)))),
+        "a cancelled answer must not claim it finished"
+    );
 }

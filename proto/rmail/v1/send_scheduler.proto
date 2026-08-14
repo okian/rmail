@@ -74,6 +74,11 @@ service SendSchedulerService {
   // which a reconnecting client re-reads with ListOutbox). Durable send
   // outcomes are also appended to the event log as SEND_RESULT, which
   // MailService.WatchEvents replays.
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc WatchOutbox(WatchOutboxRequest) returns (stream OutboxEvent);
 
   // Propose a send time inside the configured business-hours guardrails.
@@ -229,6 +234,13 @@ message ScheduleSendRequest {
   // Who is asking. Defaults to the user. MCP passes SEND_ORIGIN_AI, which is
   // what earns the mandatory interception window.
   SendOrigin origin = 14;
+  // Optional replay fence, as MailService's DeleteRequest.idempotency_key —
+  // and the one this matters most for: without it, a client that retries
+  // after a lost response has queued the message twice, and the outbox's own
+  // `smtp_message_id` fence cannot help, because two rows are two genuinely
+  // different messages. With it, the retry replays the first call's
+  // OutboxEntry and enqueues nothing.
+  string idempotency_key = 15;
 }
 
 message CancelRequest {
@@ -264,10 +276,16 @@ message ListOutboxRequest {
   // 0 uses the server default (50); the server caps this at 500 rather than
   // rejecting a larger value, matching prd.md's pagination rule.
   int32 page_size = 3;
+  // `next_page_token` from the previous page; empty starts at the beginning.
+  // Opaque, and bound to *both* filters — a token minted while listing one
+  // account, or one state, is INVALID_ARGUMENT against any other.
+  string page_token = 4;
 }
 
 message ListOutboxResponse {
   repeated OutboxEntry entries = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
 }
 
 message WatchOutboxRequest {
@@ -342,8 +360,13 @@ message ListFollowupsRequest {
   // Filter by state. UNSPECIFIED means every state.
   FollowupState state = 2;
   int32 page_size = 3;
+  // `next_page_token` from the previous page; empty starts at the beginning.
+  // Opaque, and bound to both filters, as ListOutboxRequest.page_token is.
+  string page_token = 4;
 }
 
 message ListFollowupsResponse {
   repeated Followup followups = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
 }

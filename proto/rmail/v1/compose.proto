@@ -27,10 +27,9 @@ service ComposeService {
   // are omitted (`DraftAttachment.size` is still authoritative); use
   // GetDraft to fetch them.
   //
-  // Single-page today: `page_size` caps at 500 and there is no page token, so
-  // an account with more than 500 drafts cannot page past the first. Adding
-  // `page_token`/`next_page_token` is additive and therefore non-breaking, so
-  // it is left to the pagination-hardening task rather than guessed at here.
+  // Paginated by opaque token: `page_size` caps at 500, and a full page comes
+  // back with a `next_page_token` to pass into the following call. An absent
+  // token means this was the last page.
   rpc ListDrafts(ListDraftsRequest) returns (ListDraftsResponse);
 
   // Apply a partial edit. Fields left unset are untouched; a recipient list
@@ -139,10 +138,17 @@ message ListDraftsRequest {
   // 0 uses the server default (50); the server caps this at 500 rather than
   // rejecting a larger value, matching prd.md's pagination rule.
   int32 page_size = 2;
+  // `next_page_token` from the previous page; empty starts at the beginning.
+  // Opaque, and bound to the query that produced it — replaying one against a
+  // different `account_id` is INVALID_ARGUMENT, not a read into that
+  // account's drafts.
+  string page_token = 3;
 }
 
 message ListDraftsResponse {
   repeated Draft drafts = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
 }
 
 // A recipient list in an UpdateDraftRequest.

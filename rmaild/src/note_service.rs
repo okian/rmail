@@ -127,7 +127,10 @@ impl NoteService for NoteApi {
             async move {
                 loop {
                     let received = tokio::select! {
-                        () = cancel.cancelled() => return,
+                        () = cancel.cancelled() => {
+                            crate::stream::terminate_cancelled(&tx).await;
+                            return;
+                        }
                         received = changes.recv() => received,
                     };
                     match received {
@@ -171,7 +174,11 @@ async fn send(
     item: Result<NoteEvent, Status>,
 ) -> std::ops::ControlFlow<()> {
     tokio::select! {
-        () = cancel.cancelled() => std::ops::ControlFlow::Break(()),
+        () = cancel.cancelled() => {
+            // Never end a cancelled stream silently — see `crate::stream`.
+            crate::stream::terminate_cancelled(tx).await;
+            std::ops::ControlFlow::Break(())
+        }
         sent = tx.send(item) => {
             if sent.is_ok() {
                 std::ops::ControlFlow::Continue(())

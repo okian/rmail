@@ -90,6 +90,11 @@ impl TestServer {
             FollowupStore::new(db.clone()),
             db.clone(),
             config,
+            rmail_core::idempotency::IdempotencyStore::new(
+                db.clone(),
+                std::time::Duration::from_secs(3600),
+                std::time::Duration::from_secs(300),
+            ),
             cancel.clone(),
         );
 
@@ -151,6 +156,7 @@ impl TestServer {
             tz: String::new(),
             undo_window_secs: None,
             origin: SendOrigin::User as i32,
+            idempotency_key: String::new(),
         }
     }
 
@@ -248,6 +254,7 @@ async fn an_inline_send_is_rendered_scheduled_and_readable() {
             account_id: Some(server.account_id),
             state: OutboxState::Unspecified as i32,
             page_size: 0,
+            page_token: String::new(),
         })
         .await
         .unwrap()
@@ -656,6 +663,7 @@ async fn bad_requests_report_the_status_their_contract_promises() {
             account_id: None,
             state: OutboxState::Unspecified as i32,
             page_size: -1,
+            page_token: String::new(),
         })
         .await
         .unwrap_err();
@@ -866,6 +874,7 @@ async fn follow_ups_are_armed_listed_and_dismissed() {
             account_id: Some(server.account_id),
             state: FollowupState::Armed as i32,
             page_size: 0,
+            page_token: String::new(),
         })
         .await
         .unwrap()
@@ -934,6 +943,162 @@ async fn a_followup_on_an_unknown_account_or_with_no_message_id_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency (task 40)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_retried_schedule_send_under_one_key_queues_one_message() {
+    // The case the outbox's own `smtp_message_id` fence cannot cover: two
+    // enqueues are two genuinely different messages, each with its own
+    // Message-ID, so nothing downstream can tell they were meant to be one.
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let request = ScheduleSendRequest {
+        idempotency_key: "send-key-1".to_owned(),
+        ..server.request()
+    };
+    let first = client
+        .schedule_send(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let replayed = client
+        .schedule_send(request)
+        .await
+        .expect("a retry under the same key must replay")
+        .into_inner();
+
+    assert_eq!(
+        replayed.id, first.id,
+        "the retry must replay the first entry, not create a second"
+    );
+    assert_eq!(replayed.subject, first.subject);
+
+    let queued: i64 = server
+        .db
+        .with_read(|conn| conn.query_row("SELECT count(*) FROM outbox", [], |row| row.get(0)))
+        .unwrap();
+    assert_eq!(queued, 1, "the message was queued twice");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn list_outbox_pages_through_the_queue_exactly_once() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let mut expected = Vec::new();
+    for n in 0..5 {
+        expected.push(
+            client
+                .schedule_send(ScheduleSendRequest {
+                    subject: Some(format!("Note {n}")),
+                    ..server.request()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .id,
+        );
+    }
+    expected.sort_unstable();
+
+    let mut seen = Vec::new();
+    let mut token = String::new();
+    for _ in 0..10 {
+        let page = client
+            .list_outbox(ListOutboxRequest {
+                account_id: Some(server.account_id),
+                state: OutboxState::Unspecified as i32,
+                page_size: 2,
+                page_token: token.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(page.entries.len() <= 2);
+        seen.extend(page.entries.iter().map(|e| e.id));
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        token = page.next_page_token;
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, expected, "paging repeated or skipped an entry");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_outbox_page_token_cannot_be_re_aimed_at_another_state() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    for n in 0..3 {
+        client
+            .schedule_send(ScheduleSendRequest {
+                subject: Some(format!("Note {n}")),
+                ..server.request()
+            })
+            .await
+            .unwrap();
+    }
+
+    let token = client
+        .list_outbox(ListOutboxRequest {
+            account_id: Some(server.account_id),
+            state: OutboxState::Unspecified as i32,
+            page_size: 1,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .next_page_token;
+    assert!(!token.is_empty(), "a full page should carry a token");
+
+    let status = client
+        .list_outbox(ListOutboxRequest {
+            account_id: Some(server.account_id),
+            state: OutboxState::Scheduled as i32,
+            page_size: 1,
+            page_token: token,
+        })
+        .await
+        .expect_err("a token from an unfiltered listing must not resume a filtered one");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn reusing_a_send_key_with_a_different_message_is_already_exists() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client
+        .schedule_send(ScheduleSendRequest {
+            idempotency_key: "send-key-2".to_owned(),
+            ..server.request()
+        })
+        .await
+        .unwrap();
+
+    let status = client
+        .schedule_send(ScheduleSendRequest {
+            idempotency_key: "send-key-2".to_owned(),
+            subject: Some("Dinner, actually".to_owned()),
+            ..server.request()
+        })
+        .await
+        .expect_err("a key names one message; a changed one must not replay it");
+    assert_eq!(status.code(), Code::AlreadyExists, "{status:?}");
 
     server.stop().await;
 }

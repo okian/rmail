@@ -300,7 +300,7 @@ async fn list_and_get_read_local_state_without_touching_imap() {
     let fx = Fixture::new();
     let (_account_id, inbox_id, _archive_id, message_id) = fx.seed(&["\\Seen"]);
 
-    let listed = fx.store.list(inbox_id, 0).await.unwrap();
+    let listed = fx.store.list(inbox_id, 0, "").await.unwrap().messages;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].message.id, message_id);
     assert_eq!(listed[0].flags, vec!["\\Seen".to_owned()]);
@@ -1074,8 +1074,163 @@ async fn list_applies_the_requested_limit_not_the_full_mailbox() {
 
     // 6 messages exist (the one from `seed` plus 5 more); asking for a limit
     // of 2 must return exactly 2, not the whole mailbox.
-    let capped = fx.store.list(inbox_id, 2).await.unwrap();
+    let capped = fx.store.list(inbox_id, 2, "").await.unwrap().messages;
     assert_eq!(capped.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Keyset pagination
+// ---------------------------------------------------------------------------
+
+/// Seed `count` messages into `mailbox_id`, all sharing one timestamp.
+///
+/// The tie is the point: every message has the same `COALESCE(date,
+/// internaldate)` value, so the only thing that can produce a total order — and
+/// therefore a page boundary that neither repeats nor drops a row — is the
+/// `id` tiebreak in both the `ORDER BY` and the cursor.
+fn seed_tied(fx: &Fixture, account_id: i64, mailbox_id: i64, count: i64) -> Vec<i64> {
+    (0..count)
+        .map(|n| {
+            fx.tmp
+                .db
+                .with_write(move |c| {
+                    repo::insert_message(
+                        c,
+                        &NewMessage {
+                            account_id,
+                            mailbox_id,
+                            uid: 5_000 + n,
+                            uidvalidity: 1,
+                            date: Some(1_700_000_000),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn paging_visits_every_message_exactly_once() {
+    let fx = Fixture::new();
+    let (account_id, inbox_id, _archive_id, seeded) = fx.seed(&[]);
+    let mut expected = vec![seeded];
+    expected.extend(seed_tied(&fx, account_id, inbox_id, 6));
+    expected.sort_unstable();
+
+    let mut seen = Vec::new();
+    let mut token = String::new();
+    for _ in 0..10 {
+        let page = fx.store.list(inbox_id, 2, &token).await.unwrap();
+        assert!(page.messages.len() <= 2, "page over the requested size");
+        seen.extend(page.messages.iter().map(|m| m.message.id));
+        match page.next_page_token {
+            Some(next) => token = next,
+            None => break,
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen, expected,
+        "paging must visit every message exactly once, with no repeats or gaps"
+    );
+}
+
+#[tokio::test]
+async fn the_last_page_carries_no_token() {
+    // Definitive, not "call again to find out": a token on an exhausted list
+    // costs every client one extra empty round trip, every time.
+    let fx = Fixture::new();
+    let (account_id, inbox_id, _archive_id, _seeded) = fx.seed(&[]);
+    seed_tied(&fx, account_id, inbox_id, 3);
+
+    // Exactly four messages, asked for four at a time.
+    let page = fx.store.list(inbox_id, 4, "").await.unwrap();
+    assert_eq!(page.messages.len(), 4);
+    assert_eq!(page.next_page_token, None);
+}
+
+#[tokio::test]
+async fn a_page_token_cannot_be_re_aimed_at_another_mailbox() {
+    // The security property: a token is caller-supplied input, so resuming
+    // one against a mailbox it was not minted for must be refused rather than
+    // read at whatever offset it happens to name.
+    let fx = Fixture::new();
+    let (account_id, inbox_id, archive_id, _seeded) = fx.seed(&[]);
+    seed_tied(&fx, account_id, inbox_id, 4);
+    seed_tied(&fx, account_id, archive_id, 4);
+
+    let token = fx
+        .store
+        .list(inbox_id, 2, "")
+        .await
+        .unwrap()
+        .next_page_token
+        .expect("a full page should carry a token");
+
+    let error = fx
+        .store
+        .list(archive_id, 2, &token)
+        .await
+        .expect_err("a token from another mailbox must be refused");
+    assert_eq!(error.reason(), crate::ErrorReason::InvalidArgument);
+}
+
+#[tokio::test]
+async fn a_garbage_page_token_is_invalid_argument() {
+    let fx = Fixture::new();
+    let (_account_id, inbox_id, _archive_id, _seeded) = fx.seed(&[]);
+    let error = fx
+        .store
+        .list(inbox_id, 2, "not-a-real-token")
+        .await
+        .expect_err("a malformed token must be refused");
+    assert_eq!(error.reason(), crate::ErrorReason::InvalidArgument);
+}
+
+#[tokio::test]
+async fn a_message_with_no_date_at_all_is_still_reachable_by_paging() {
+    // `COALESCE(date, internaldate)` is NULL for such a message, and NULL
+    // compares as neither less nor greater than a cursor — so with the
+    // two-argument form these rows fall off the end of the second page and
+    // become unreachable. The three-argument form pins them at 0.
+    let fx = Fixture::new();
+    let (account_id, inbox_id, _archive_id, _seeded) = fx.seed(&[]);
+    seed_tied(&fx, account_id, inbox_id, 2);
+    let undated = fx
+        .tmp
+        .db
+        .with_write(move |c| {
+            repo::insert_message(
+                c,
+                &NewMessage {
+                    account_id,
+                    mailbox_id: inbox_id,
+                    uid: 9_999,
+                    uidvalidity: 1,
+                    date: None,
+                    internaldate: None,
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+    let mut seen = Vec::new();
+    let mut token = String::new();
+    for _ in 0..10 {
+        let page = fx.store.list(inbox_id, 1, &token).await.unwrap();
+        seen.extend(page.messages.iter().map(|m| m.message.id));
+        match page.next_page_token {
+            Some(next) => token = next,
+            None => break,
+        }
+    }
+    assert!(
+        seen.contains(&undated),
+        "a message with neither Date nor INTERNALDATE was never paged to: {seen:?}"
+    );
 }
 
 /// A span field declared by `#[tracing::instrument]` actually carries a value.

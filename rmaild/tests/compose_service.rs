@@ -302,6 +302,7 @@ async fn list_omits_attachment_bytes_but_keeps_the_size() {
         .list_drafts(ListDraftsRequest {
             account_id: server.account_id,
             page_size: 0,
+            page_token: String::new(),
         })
         .await
         .unwrap()
@@ -668,10 +669,96 @@ async fn a_negative_page_size_is_invalid_argument() {
         .list_drafts(ListDraftsRequest {
             account_id: server.account_id,
             page_size: -1,
+            page_token: String::new(),
         })
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn list_drafts_pages_through_an_account_exactly_once() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let mut expected = Vec::new();
+    for n in 0..5 {
+        expected.push(
+            client
+                .create_draft(CreateDraftRequest {
+                    subject: format!("draft {n}"),
+                    ..server.create_request()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .id,
+        );
+    }
+    expected.sort_unstable();
+
+    let mut seen = Vec::new();
+    let mut token = String::new();
+    for _ in 0..10 {
+        let page = client
+            .list_drafts(ListDraftsRequest {
+                account_id: server.account_id,
+                page_size: 2,
+                page_token: token.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(page.drafts.len() <= 2);
+        seen.extend(page.drafts.iter().map(|d| d.id));
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        token = page.next_page_token;
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, expected, "paging repeated or skipped a draft");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_draft_page_token_cannot_be_re_aimed_at_another_account() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    for n in 0..3 {
+        client
+            .create_draft(CreateDraftRequest {
+                subject: format!("draft {n}"),
+                ..server.create_request()
+            })
+            .await
+            .unwrap();
+    }
+
+    let token = client
+        .list_drafts(ListDraftsRequest {
+            account_id: server.account_id,
+            page_size: 1,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .next_page_token;
+    assert!(!token.is_empty(), "a full page should carry a token");
+
+    let status = client
+        .list_drafts(ListDraftsRequest {
+            account_id: server.account_id + 1,
+            page_size: 1,
+            page_token: token,
+        })
+        .await
+        .expect_err("a token from another account must be refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+
     server.stop().await;
 }
 

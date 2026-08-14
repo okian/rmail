@@ -238,7 +238,7 @@ async fn list_is_newest_edited_first_and_omits_attachment_bytes() {
         })
         .unwrap();
 
-    let listed = store.list(fx.account_id, 0).await.unwrap();
+    let listed = store.list(fx.account_id, 0, "").await.unwrap().drafts;
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].id, second_id, "most recently edited first");
     assert_eq!(listed[1].id, first_id);
@@ -257,7 +257,7 @@ async fn list_is_newest_edited_first_and_omits_attachment_bytes() {
         .unwrap();
     assert!(first.updated_at > 2000, "an edit advances updated_at");
 
-    let listed = store.list(fx.account_id, 0).await.unwrap();
+    let listed = store.list(fx.account_id, 0, "").await.unwrap().drafts;
     assert_eq!(listed[0].id, first_id, "an edit moves a draft to the front");
     assert_eq!(listed[1].id, second_id);
 
@@ -304,15 +304,25 @@ async fn list_is_scoped_to_one_account_and_capped() {
         .await
         .unwrap();
 
-    assert_eq!(store.list(fx.account_id, 0).await.unwrap().len(), 3);
-    assert_eq!(store.list(other_account, 0).await.unwrap().len(), 1);
-    assert_eq!(store.list(fx.account_id, 2).await.unwrap().len(), 2);
+    assert_eq!(
+        store.list(fx.account_id, 0, "").await.unwrap().drafts.len(),
+        3
+    );
+    assert_eq!(
+        store.list(other_account, 0, "").await.unwrap().drafts.len(),
+        1
+    );
+    assert_eq!(
+        store.list(fx.account_id, 2, "").await.unwrap().drafts.len(),
+        2
+    );
     // Over the cap clamps rather than erroring.
     assert_eq!(
         store
-            .list(fx.account_id, MAX_LIST_LIMIT + 1000)
+            .list(fx.account_id, MAX_LIST_LIMIT + 1000, "")
             .await
             .unwrap()
+            .drafts
             .len(),
         3
     );

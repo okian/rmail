@@ -465,6 +465,7 @@ async fn list_streams_a_mailboxs_messages_with_flags() {
         .list(ListMessagesRequest {
             mailbox_id: inbox_id,
             page_size: 0,
+            page_token: String::new(),
         })
         .await
         .unwrap()
@@ -627,6 +628,7 @@ async fn set_flags_reflects_to_imap_updates_locally_and_emits_an_event() {
         .set_flags(SetFlagsRequest {
             message_id,
             flags: vec!["\\Seen".to_owned(), "\\Flagged".to_owned()],
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -664,6 +666,7 @@ async fn set_flags_with_an_unsafe_flag_is_invalid_argument() {
         .set_flags(SetFlagsRequest {
             message_id,
             flags: vec!["not a flag".to_owned()],
+            idempotency_key: String::new(),
         })
         .await
         .unwrap_err();
@@ -690,6 +693,7 @@ async fn a_refused_imap_call_leaves_local_state_untouched() {
         .set_flags(SetFlagsRequest {
             message_id,
             flags: vec!["\\Flagged".to_owned()],
+            idempotency_key: String::new(),
         })
         .await
         .unwrap_err();
@@ -716,6 +720,7 @@ async fn move_reflects_to_imap_drops_the_local_row_and_emits_a_moved_event() {
         .r#move(MoveRequest {
             message_id,
             dest_mailbox_id: archive_id,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -781,6 +786,7 @@ async fn move_across_accounts_is_rejected_without_calling_imap() {
         .r#move(MoveRequest {
             message_id,
             dest_mailbox_id: other_mailbox,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap_err();
@@ -800,6 +806,7 @@ async fn copy_reflects_to_imap_and_leaves_local_state_and_events_untouched() {
         .copy(CopyRequest {
             message_id,
             dest_mailbox_id: archive_id,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -831,7 +838,13 @@ async fn delete_reflects_to_imap_drops_the_local_row_and_emits_a_deleted_event()
     let (account_id, inbox_id, _archive_id, message_id) = server.seed(&[], None);
     let mut client = server.client().await;
 
-    client.delete(DeleteRequest { message_id }).await.unwrap();
+    client
+        .delete(DeleteRequest {
+            message_id,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap();
 
     assert!(server
         .db
@@ -863,6 +876,7 @@ async fn deleting_an_unknown_message_is_not_found() {
     let status = client
         .delete(DeleteRequest {
             message_id: 999_999,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap_err();
@@ -1299,4 +1313,364 @@ async fn a_shutdown_closes_an_open_attachment_stream_rather_than_holding_it() {
         shutdown.await.is_ok(),
         "shutdown must not wait on an open (unread) attachment stream"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Pagination (task 40)
+// ---------------------------------------------------------------------------
+
+/// Seed `count` extra messages into `mailbox_id`, all on one timestamp — the
+/// tie a page boundary has to survive. See `rmail_core::mail::tests`'
+/// `seed_tied` for the same reasoning.
+fn seed_tied(server: &TestServer, account_id: i64, mailbox_id: i64, count: i64) -> Vec<i64> {
+    (0..count)
+        .map(|n| {
+            server
+                .db
+                .with_write(move |c| {
+                    repo::insert_message(
+                        c,
+                        &NewMessage {
+                            account_id,
+                            mailbox_id,
+                            uid: 5_000 + n,
+                            uidvalidity: 1,
+                            date: Some(1_700_000_000),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .unwrap()
+        })
+        .collect()
+}
+
+/// One page of `List`, plus the `x-rmail-next-page-token` header if there was
+/// one. The header is where a *streamed* list has to carry its token — see
+/// `rmaild::mail_service`'s module docs.
+async fn list_page(
+    client: &mut MailServiceClient<Channel>,
+    mailbox_id: i64,
+    page_size: i32,
+    page_token: &str,
+) -> (Vec<i64>, Option<String>) {
+    let response = client
+        .list(ListMessagesRequest {
+            mailbox_id,
+            page_size,
+            page_token: page_token.to_owned(),
+        })
+        .await
+        .unwrap();
+    let next = response
+        .metadata()
+        .get(rmail_core::page::NEXT_PAGE_TOKEN_METADATA_KEY)
+        .map(|value| value.to_str().unwrap().to_owned());
+    let mut stream = response.into_inner();
+    let mut ids = Vec::new();
+    while let Some(message) = stream.next().await {
+        ids.push(message.unwrap().id);
+    }
+    (ids, next)
+}
+
+#[tokio::test]
+async fn a_shutdown_ends_an_open_watch_stream_with_cancelled_not_ok() {
+    // The contract every streaming RPC now shares. `WatchEvents` is the
+    // clearest case: it never completes on its own, so before this change a
+    // shutdown produced a clean `OK` — indistinguishable, from the client's
+    // side, from a feed that had simply run out of events. A watcher would
+    // have concluded there was nothing more to see and stopped reconnecting.
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let mut stream = client
+        .watch_events(WatchEventsRequest {
+            since_seq: 0,
+            account_id: 0,
+            kinds: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // The producer is parked on the live tail with an empty backlog by the
+    // time shutdown lands — the state the terminal frame has to survive.
+    let db_path = server.db_path.clone();
+    let socket = server.socket.clone();
+    let _ = server.shutdown.send(());
+
+    let mut terminal = None;
+    while let Ok(Some(item)) = tokio::time::timeout(STREAM_TIMEOUT, stream.next()).await {
+        if let Err(status) = item {
+            terminal = Some(status);
+            break;
+        }
+    }
+    let status = terminal.expect("a cancelled watch stream must not simply end");
+    assert_eq!(status.code(), Code::Cancelled, "{status:?}");
+
+    let _ = tokio::time::timeout(Duration::from_secs(10), server.handle).await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", db_path.display())));
+    }
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
+async fn list_pages_through_a_mailbox_exactly_once() {
+    let server = TestServer::start().await;
+    let (account_id, inbox_id, _archive_id, seeded) = server.seed(&[], None);
+    let mut expected = vec![seeded];
+    expected.extend(seed_tied(&server, account_id, inbox_id, 6));
+    expected.sort_unstable();
+
+    let mut client = server.client().await;
+    let mut seen = Vec::new();
+    let mut token = String::new();
+    for _ in 0..10 {
+        let (ids, next) = list_page(&mut client, inbox_id, 2, &token).await;
+        assert!(ids.len() <= 2, "page over the requested size: {ids:?}");
+        seen.extend(ids);
+        match next {
+            Some(next) => token = next,
+            None => break,
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, expected, "paging repeated or skipped a message");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn the_final_list_page_carries_no_token_header() {
+    let server = TestServer::start().await;
+    let (account_id, inbox_id, _archive_id, _seeded) = server.seed(&[], None);
+    seed_tied(&server, account_id, inbox_id, 3);
+    let mut client = server.client().await;
+
+    let (ids, next) = list_page(&mut client, inbox_id, 4, "").await;
+    assert_eq!(ids.len(), 4);
+    assert_eq!(
+        next, None,
+        "an exhausted list must say so; a token here costs every client an \
+         extra empty round trip"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_negative_list_page_size_is_invalid_argument() {
+    // The same answer ListDrafts/ListOutbox/ListFollowups give. A negative
+    // page size is nonsense rather than a request for the default, and one
+    // list RPC quietly disagreeing is the kind of inconsistency a client
+    // only discovers in production.
+    let server = TestServer::start().await;
+    let (_account_id, inbox_id, _archive_id, _seeded) = server.seed(&[], None);
+    let status = server
+        .client()
+        .await
+        .list(ListMessagesRequest {
+            mailbox_id: inbox_id,
+            page_size: -1,
+            page_token: String::new(),
+        })
+        .await
+        .expect_err("a negative page size must be rejected");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_list_page_token_cannot_be_re_aimed_at_another_mailbox() {
+    // The token is caller-supplied input. Replayed against a mailbox it was
+    // not minted for it must be refused, not honoured as a bare offset.
+    let server = TestServer::start().await;
+    let (account_id, inbox_id, archive_id, _seeded) = server.seed(&[], None);
+    seed_tied(&server, account_id, inbox_id, 4);
+    seed_tied(&server, account_id, archive_id, 4);
+    let mut client = server.client().await;
+
+    let (_ids, token) = list_page(&mut client, inbox_id, 2, "").await;
+    let token = token.expect("a full page should carry a token");
+
+    let status = client
+        .list(ListMessagesRequest {
+            mailbox_id: archive_id,
+            page_size: 2,
+            page_token: token,
+        })
+        .await
+        .expect_err("a token from another mailbox must be refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency (task 40)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_retried_move_under_one_idempotency_key_reaches_imap_once() {
+    let server = TestServer::start().await;
+    let (_account_id, _inbox_id, archive_id, message_id) = server.seed(&[], None);
+    let mut client = server.client().await;
+
+    let request = MoveRequest {
+        message_id,
+        dest_mailbox_id: archive_id,
+        idempotency_key: "move-key-1".to_owned(),
+    };
+    client.r#move(request.clone()).await.unwrap();
+    // The retry a client makes when it never saw the first response. Without
+    // the fence this reaches IMAP a second time — against a message the local
+    // mirror has already dropped, so it is also a NOT_FOUND the caller cannot
+    // interpret.
+    client
+        .r#move(request)
+        .await
+        .expect("a retry under the same key must replay, not fail");
+
+    assert_eq!(
+        server
+            .imap_calls()
+            .iter()
+            .filter(|call| matches!(call, Call::Move { .. }))
+            .count(),
+        1,
+        "the mailbox was mutated twice: {:?}",
+        server.imap_calls()
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn reusing_an_idempotency_key_with_a_different_payload_is_already_exists() {
+    let server = TestServer::start().await;
+    let (_account_id, inbox_id, archive_id, message_id) = server.seed(&[], None);
+    let mut client = server.client().await;
+
+    client
+        .r#move(MoveRequest {
+            message_id,
+            dest_mailbox_id: archive_id,
+            idempotency_key: "shared-key".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    let status = client
+        .r#move(MoveRequest {
+            message_id,
+            dest_mailbox_id: inbox_id,
+            idempotency_key: "shared-key".to_owned(),
+        })
+        .await
+        .expect_err("a key names one call; a changed payload must not replay it");
+    assert_eq!(status.code(), Code::AlreadyExists, "{status:?}");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_failed_mutation_releases_its_idempotency_key() {
+    // A transient IMAP outage must not poison the key: the mutation did not
+    // apply (IMAP is called before any local write), so the retry is the
+    // first attempt again.
+    let server = TestServer::with_imap(FakeImap {
+        fail_set_flags: true,
+        ..Default::default()
+    })
+    .await;
+    let (_account_id, _inbox_id, _archive_id, message_id) = server.seed(&[], None);
+    let mut client = server.client().await;
+
+    let request = SetFlagsRequest {
+        message_id,
+        flags: vec!["\\Flagged".to_owned()],
+        idempotency_key: "flag-key".to_owned(),
+    };
+    let status = client
+        .set_flags(request.clone())
+        .await
+        .expect_err("the fake IMAP refuses");
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+
+    // The same key again: a released claim, so the call runs rather than
+    // replaying — and fails the same way, which is only observable because it
+    // reached IMAP a second time.
+    let status = client
+        .set_flags(request)
+        .await
+        .expect_err("the fake IMAP still refuses");
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert_eq!(
+        server
+            .imap_calls()
+            .iter()
+            .filter(|call| matches!(call, Call::SetFlags { .. }))
+            .count(),
+        2,
+        "a failed mutation must leave its key retryable"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_unusable_idempotency_key_is_invalid_argument() {
+    let server = TestServer::start().await;
+    let (_account_id, _inbox_id, _archive_id, message_id) = server.seed(&[], None);
+    let mut client = server.client().await;
+
+    let status = client
+        .delete(DeleteRequest {
+            message_id,
+            idempotency_key: "has\nnewline".to_owned(),
+        })
+        .await
+        .expect_err("a key is echoed into logs; control characters are refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(
+        server.imap_calls().is_empty(),
+        "a rejected key must be rejected before the mutation runs"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn mutations_without_a_key_are_unfenced_and_unchanged() {
+    // The field is opt-in: a client that does not know about it must behave
+    // exactly as it did before, including being able to repeat a call.
+    let server = TestServer::start().await;
+    let (_account_id, _inbox_id, _archive_id, message_id) = server.seed(&[], None);
+    let mut client = server.client().await;
+
+    for _ in 0..2 {
+        client
+            .set_flags(SetFlagsRequest {
+                message_id,
+                flags: vec!["\\Seen".to_owned()],
+                idempotency_key: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        server
+            .imap_calls()
+            .iter()
+            .filter(|call| matches!(call, Call::SetFlags { .. }))
+            .count(),
+        2,
+        "an empty key must not fence anything"
+    );
+
+    server.stop().await;
 }

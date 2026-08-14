@@ -26,8 +26,11 @@ service SearchService {
   //
   // A fresh `Search`/`Semantic` call cancels whichever `Search`/`Semantic`
   // stream is still running (a single shared "current query" slot, the same
-  // shape a TUI's debounced keystroke-driven search box needs) — the older
-  // call's stream simply ends, yielding whatever it had already produced.
+  // shape a TUI's debounced keystroke-driven search box needs). The older
+  // call keeps whatever it had already produced and then terminates with
+  // CANCELLED — never a clean OK, because the slot is daemon-wide and the
+  // client that lost it is not necessarily the client that took it: an `OK`
+  // would hand an unrelated caller a silently truncated page.
   rpc Search (SearchRequest) returns (stream SearchHit);
 
   // As `Search`, but candidate generation is restricted to the dense-vector

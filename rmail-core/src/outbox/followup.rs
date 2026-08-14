@@ -27,7 +27,24 @@ use crate::storage::Database;
 pub const DEFAULT_LIST_LIMIT: usize = 50;
 
 /// Hard cap on [`FollowupStore::list`]'s page size.
-pub const MAX_LIST_LIMIT: usize = 500;
+pub const MAX_LIST_LIMIT: usize = crate::page::MAX_PAGE_SIZE as usize;
+
+/// One page of [`FollowupStore::list`], plus the token for the next one.
+#[derive(Debug, Clone)]
+pub struct FollowupPage {
+    /// This page's reminders, soonest-due first.
+    pub followups: Vec<Followup>,
+    /// The token for the following page; `None` means this was the last.
+    pub next_page_token: Option<String>,
+}
+
+/// The page-token scope for a reminder listing — see [`crate::page`].
+#[must_use]
+pub fn list_scope(account_id: Option<i64>, state: Option<FollowupState>) -> crate::page::PageScope {
+    crate::page::PageScope::new("rmail.v1.SendSchedulerService/ListFollowups")
+        .opt_field("account_id", account_id)
+        .opt_field("state", state.map(FollowupState::as_str))
+}
 
 /// Longest note retained, in octets. A reminder note is a line, not a
 /// document, and this column is read into a listing.
@@ -217,42 +234,75 @@ impl FollowupStore {
         }
     }
 
-    /// List reminders, newest first, optionally filtered by account and
-    /// state.
+    /// List one page of reminders, soonest-due first, optionally filtered by
+    /// account and state.
+    ///
+    /// `page_token` resumes a previous page and is bound to both filters — see
+    /// [`crate::page`].
     ///
     /// # Errors
     ///
-    /// A mapped storage error.
+    /// [`Error::InvalidArgument`] if `page_token` is malformed or belongs to a
+    /// different query; otherwise a mapped storage error.
     pub async fn list(
         &self,
         account_id: Option<i64>,
         state: Option<FollowupState>,
         limit: usize,
-    ) -> Result<Vec<Followup>, Error> {
+        page_token: &str,
+    ) -> Result<FollowupPage, Error> {
+        let scope = list_scope(account_id, state);
+        let after = crate::page::decode(page_token, &scope)?;
         let limit = i64::try_from(match limit {
             0 => DEFAULT_LIST_LIMIT,
             n => n.min(MAX_LIST_LIMIT),
         })
         .unwrap_or(i64::MAX);
+        // The overflow probe — see `MailStore::list`.
+        let probe = limit.saturating_add(1);
         let state = state.map(FollowupState::as_str);
 
-        self.db
+        let mut followups: Vec<Followup> = self
+            .db
             .read(move |conn| {
+                // Ascending here, unlike every other list: a reminder queue is
+                // read soonest-first. The cursor comparison flips with it.
+                let cursor_sql = match after {
+                    Some(_) => "AND remind_at >= ?4 AND (remind_at > ?4 OR id > ?5)",
+                    None => "",
+                };
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {COLUMNS} FROM followups
                      WHERE (?1 IS NULL OR account_id = ?1)
                        AND (?2 IS NULL OR state = ?2)
+                       {cursor_sql}
                      ORDER BY remind_at, id LIMIT ?3"
                 ))?;
-                let rows = stmt
-                    .query_map(rusqlite::params![account_id, state, limit], row_to_raw)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                let rows = match after {
+                    Some(cursor) => stmt.query_map(
+                        rusqlite::params![account_id, state, probe, cursor.sort, cursor.id],
+                        row_to_raw,
+                    )?,
+                    None => {
+                        stmt.query_map(rusqlite::params![account_id, state, probe], row_to_raw)?
+                    }
+                };
+                rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .await?
             .into_iter()
             .map(TryInto::try_into)
-            .collect()
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let overflow = i64::try_from(followups.len()).unwrap_or(i64::MAX) > limit;
+        followups.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        let last = followups
+            .last()
+            .map(|f| crate::page::Cursor::new(f.remind_at, f.id));
+        Ok(FollowupPage {
+            next_page_token: crate::page::next_token(&scope, last, overflow),
+            followups,
+        })
     }
 
     /// Dismiss a reminder.

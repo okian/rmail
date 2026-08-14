@@ -117,7 +117,23 @@ pub const DEFAULT_LIST_LIMIT: usize = 50;
 
 /// Hard cap on [`DraftStore::list`]'s page size, matching prd.md's
 /// "server caps 500" pagination rule.
-pub const MAX_LIST_LIMIT: usize = 500;
+pub const MAX_LIST_LIMIT: usize = crate::page::MAX_PAGE_SIZE as usize;
+
+/// One page of [`DraftStore::list`], plus the token for the next one.
+#[derive(Debug, Clone)]
+pub struct DraftPage {
+    /// This page's drafts, most recently edited first.
+    pub drafts: Vec<Draft>,
+    /// The token for the following page; `None` means this was the last.
+    pub next_page_token: Option<String>,
+}
+
+/// The page-token scope for a draft listing — see [`crate::page`].
+#[must_use]
+pub fn list_scope(account_id: i64) -> crate::page::PageScope {
+    crate::page::PageScope::new("rmail.v1.ComposeService/ListDrafts")
+        .field("account_id", account_id)
+}
 
 /// Which recipient header an address belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -436,37 +452,69 @@ impl DraftStore {
             .ok_or_else(|| Error::not_found(format!("draft {draft_id} not found")))
     }
 
-    /// List an account's drafts, most recently edited first, **without**
-    /// attachment bytes (see [`DraftAttachment`]).
+    /// List one page of an account's drafts, most recently edited first,
+    /// **without** attachment bytes (see [`DraftAttachment`]).
     ///
     /// `limit` of zero means [`DEFAULT_LIST_LIMIT`]; anything above
     /// [`MAX_LIST_LIMIT`] is clamped to it rather than rejected, matching
-    /// prd.md's "server caps 500" rule.
+    /// prd.md's "server caps 500" rule. `page_token` resumes a previous page
+    /// and is bound to the account it was minted for — see [`crate::page`].
     ///
     /// # Errors
     ///
-    /// A mapped storage error.
-    #[tracing::instrument(skip(self))]
-    pub async fn list(&self, account_id: i64, limit: usize) -> Result<Vec<Draft>, Error> {
+    /// [`Error::InvalidArgument`] if `page_token` is malformed or belongs to a
+    /// different query; otherwise a mapped storage error.
+    #[tracing::instrument(skip(self, page_token))]
+    pub async fn list(
+        &self,
+        account_id: i64,
+        limit: usize,
+        page_token: &str,
+    ) -> Result<DraftPage, Error> {
+        let scope = list_scope(account_id);
+        let after = crate::page::decode(page_token, &scope)?;
         let limit = match limit {
             0 => DEFAULT_LIST_LIMIT,
             n => n.min(MAX_LIST_LIMIT),
         };
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // The overflow probe — see `MailStore::list` for why a page reads one
+        // more row than it returns.
+        let probe = limit.saturating_add(1);
 
-        Ok(self
+        let (drafts, overflow) = self
             .db
             .read(move |conn| {
-                let ids: Vec<i64> = {
-                    let mut stmt = conn.prepare(
-                        "SELECT id FROM drafts WHERE account_id = ?1
-                         ORDER BY updated_at DESC, id DESC LIMIT ?2",
-                    )?;
+                let mut ids: Vec<i64> = {
+                    let (cursor_sql, mut params) = match after {
+                        Some(cursor) => (
+                            "AND updated_at <= ?3 AND (updated_at < ?3 OR id < ?4)",
+                            vec![account_id, probe, cursor.sort, cursor.id],
+                        ),
+                        None => ("", vec![account_id, probe]),
+                    };
+                    let mut stmt = conn.prepare(&format!(
+                        "SELECT id FROM drafts WHERE account_id = ?1 {cursor_sql}
+                         ORDER BY updated_at DESC, id DESC LIMIT ?2"
+                    ))?;
                     let rows = stmt
-                        .query_map(rusqlite::params![account_id, limit], |row| row.get(0))?
+                        .query_map(
+                            rusqlite::params_from_iter(std::mem::take(&mut params)),
+                            |row| row.get(0),
+                        )?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     rows
                 };
+                // Decided here, from the *id* query, and not from how many
+                // drafts came back below. `Database::read` hands out a bare
+                // pooled connection with no enclosing transaction, so in WAL
+                // mode each `load_draft` sees its own snapshot: one concurrent
+                // `delete` between the two makes a probe row vanish, and a
+                // count taken after loading would then read as "no more
+                // pages" and strand the rest of the account's drafts.
+                let overflow = i64::try_from(ids.len()).unwrap_or(i64::MAX) > limit;
+                ids.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+
                 // Three indexed lookups per draft rather than one join with
                 // a fan-out to un-pivot afterwards. Bounded by
                 // `MAX_LIST_LIMIT`, all on one already-open connection, all
@@ -482,9 +530,17 @@ impl DraftStore {
                         drafts.push(draft);
                     }
                 }
-                Ok(drafts)
+                Ok((drafts, overflow))
             })
-            .await?)
+            .await?;
+
+        let last = drafts
+            .last()
+            .map(|d| crate::page::Cursor::new(d.updated_at, d.id));
+        Ok(DraftPage {
+            next_page_token: crate::page::next_token(&scope, last, overflow),
+            drafts,
+        })
     }
 
     /// Apply a partial edit.

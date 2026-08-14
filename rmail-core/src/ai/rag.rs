@@ -429,7 +429,10 @@ impl RagEngine {
             let semaphore = Arc::clone(&self.semaphore);
             tokio::select! {
                 () = cancel.cancelled() => {
-                    let _ = tx.send(Err(Error::deadline_exceeded(
+                    // `CANCELLED`, not `DEADLINE_EXCEEDED`: no deadline
+                    // elapsed — the daemon (or the client dropping the
+                    // stream) stopped the work.
+                    let _ = tx.send(Err(Error::cancelled(
                         "cancelled while waiting for AI concurrency capacity".to_owned(),
                     ))).await;
                     return;
@@ -447,7 +450,7 @@ impl RagEngine {
         };
         tokio::select! {
             () = cancel.cancelled() => {
-                let _ = tx.send(Err(Error::deadline_exceeded(
+                let _ = tx.send(Err(Error::cancelled(
                     "cancelled while waiting for AI rate-limit capacity".to_owned(),
                 ))).await;
                 return;
@@ -547,6 +550,16 @@ impl RagEngine {
         loop {
             let next = tokio::select! {
                 () = cancel.cancelled() => {
+                    // A terminal frame, not a clean end. Returning silently
+                    // here closes the channel, which tonic turns into an `OK`
+                    // with no `AskDone` — so a client keeps half an answer,
+                    // sees success, and exits 0. `try_send` rather than
+                    // `send`: if the consumer is gone (the other way this
+                    // token fires) there is nobody to tell, and waiting for
+                    // capacity would hold shutdown open.
+                    let _ = tx.try_send(Err(Error::cancelled(
+                        "the answer was cancelled before it finished".to_owned(),
+                    )));
                     self.audit_incomplete(&ctx, "cancelled").await;
                     return;
                 }
@@ -832,21 +845,38 @@ fn refusal_stream(trace: RetrievalTrace, refusal: Refusal) -> AskStream {
 /// answer has been superseded, and in both cases nothing further should be
 /// produced. Shaped like `rmaild`'s own stream `send` helpers so the call
 /// sites read the same way.
+///
+/// A break *caused by cancellation* leaves a terminal error behind, so a
+/// caller that stops here has still told the client the answer is incomplete
+/// — without it, a cancelled `AskMailbox` ends `OK` with no `Done` frame and
+/// a partial answer reads as a whole one. Best-effort (`try_send`) for the
+/// reason the `relay` loop's own cancel branch documents.
 async fn send(
     tx: &mpsc::Sender<Result<AskEvent, Error>>,
     cancel: &CancellationToken,
     event: Result<AskEvent, Error>,
 ) -> ControlFlow<()> {
     if cancel.is_cancelled() {
+        terminate_cancelled(tx);
         return ControlFlow::Break(());
     }
     tokio::select! {
-        () = cancel.cancelled() => ControlFlow::Break(()),
+        () = cancel.cancelled() => {
+            terminate_cancelled(tx);
+            ControlFlow::Break(())
+        }
         sent = tx.send(event) => match sent {
             Ok(()) => ControlFlow::Continue(()),
             Err(_) => ControlFlow::Break(()),
         },
     }
+}
+
+/// Best-effort terminal frame for an answer the daemon cut short.
+fn terminate_cancelled(tx: &mpsc::Sender<Result<AskEvent, Error>>) {
+    let _ = tx.try_send(Err(Error::cancelled(
+        "the answer was cancelled before it finished".to_owned(),
+    )));
 }
 
 /// The user turn: the question, then one labelled block per source.

@@ -199,12 +199,20 @@ impl CmdExec for GrpcExec {
                 let mut client = self.mail.clone();
                 let applied = flags.clone();
                 self.spawn(out, async move {
-                    let result = call(client.set_flags(SetFlagsRequest { message_id, flags }))
-                        .await
-                        .map(|_| Effect::Flags {
-                            message_id,
-                            flags: applied,
-                        });
+                    let result = call(client.set_flags(SetFlagsRequest {
+                        message_id,
+                        flags,
+                        // Empty: a keystroke in the TUI is issued once and
+                        // never auto-retried, so there is nothing for a replay
+                        // fence to protect against. Minting keys is a client
+                        // policy the CLI's gRPC layer owns (task 42).
+                        idempotency_key: String::new(),
+                    }))
+                    .await
+                    .map(|_| Effect::Flags {
+                        message_id,
+                        flags: applied,
+                    });
                     Msg::Done { label, result }
                 });
             }
@@ -218,6 +226,7 @@ impl CmdExec for GrpcExec {
                     let result = call(client.r#move(MoveRequest {
                         message_id,
                         dest_mailbox_id,
+                        idempotency_key: String::new(),
                     }))
                     .await
                     .map(|_| Effect::Removed(message_id));
@@ -236,6 +245,7 @@ impl CmdExec for GrpcExec {
                     let result = call(client.copy(CopyRequest {
                         message_id,
                         dest_mailbox_id,
+                        idempotency_key: String::new(),
                     }))
                     .await
                     .map(|_| Effect::None);
@@ -248,9 +258,12 @@ impl CmdExec for GrpcExec {
             Cmd::Delete { message_id } => {
                 let mut client = self.mail.clone();
                 self.spawn(out, async move {
-                    let result = call(client.delete(DeleteRequest { message_id }))
-                        .await
-                        .map(|_| Effect::Removed(message_id));
+                    let result = call(client.delete(DeleteRequest {
+                        message_id,
+                        idempotency_key: String::new(),
+                    }))
+                    .await
+                    .map(|_| Effect::Removed(message_id));
                     Msg::Done {
                         label: "deleted".to_owned(),
                         result,
@@ -391,6 +404,8 @@ async fn load_messages(
     let response = call(client.list(ListMessagesRequest {
         mailbox_id,
         page_size: PAGE_SIZE,
+        // The TUI shows one page; paging through it is task 42's surface.
+        page_token: String::new(),
     }))
     .await?;
     let mut stream = response.into_inner();

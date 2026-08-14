@@ -177,25 +177,108 @@ async fn listing_filters_by_state_and_account() {
         .unwrap();
     store.dismiss(dismissed.id).await.unwrap();
 
-    assert_eq!(store.list(None, None, 0).await.unwrap().len(), 2);
+    assert_eq!(
+        store.list(None, None, 0, "").await.unwrap().followups.len(),
+        2
+    );
     let only_armed = store
-        .list(Some(fixture.account_id), Some(FollowupState::Armed), 0)
+        .list(Some(fixture.account_id), Some(FollowupState::Armed), 0, "")
         .await
-        .unwrap();
+        .unwrap()
+        .followups;
     assert_eq!(only_armed.len(), 1);
     assert_eq!(only_armed[0].id, armed.id);
     assert!(store
-        .list(Some(fixture.account_id + 1), None, 0)
+        .list(Some(fixture.account_id + 1), None, 0, "")
         .await
         .unwrap()
+        .followups
         .is_empty());
     assert_eq!(
         store
-            .list(None, None, MAX_LIST_LIMIT + 100)
+            .list(None, None, MAX_LIST_LIMIT + 100, "")
             .await
             .unwrap()
+            .followups
             .len(),
         2
+    );
+}
+
+#[tokio::test]
+async fn paging_reminders_visits_every_one_exactly_once_soonest_first() {
+    // The only ASC-ordered cursor in the tree: a reminder queue reads
+    // soonest-due first, so its comparison is the mirror of every other
+    // list's. Every reminder here shares one `remind_at`, which is exactly
+    // where a DESC predicate copy-pasted into an ASC order would loop or skip.
+    let fixture = Fixture::open_named("followup-paging");
+    let store = FollowupStore::new(fixture.db.clone());
+    let due = now() + 3_600;
+    let mut expected = Vec::new();
+    for n in 0..7 {
+        expected.push(
+            store
+                .create(new(&fixture, &format!("m{n}@example.com"), due))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    expected.sort_unstable();
+
+    let mut seen = Vec::new();
+    let mut token = String::new();
+    for _ in 0..10 {
+        let page = store.list(None, None, 2, &token).await.unwrap();
+        assert!(page.followups.len() <= 2, "page over the requested size");
+        seen.extend(page.followups.iter().map(|f| f.id));
+        match page.next_page_token {
+            Some(next) => token = next,
+            None => break,
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, expected, "paging repeated or skipped a reminder");
+}
+
+#[tokio::test]
+async fn a_reminder_page_token_is_bound_to_both_of_its_filters() {
+    let fixture = Fixture::open_named("followup-token");
+    let store = FollowupStore::new(fixture.db.clone());
+    for n in 0..4 {
+        store
+            .create(new(&fixture, &format!("m{n}@example.com"), now() + 3_600))
+            .await
+            .unwrap();
+    }
+
+    let token = store
+        .list(Some(fixture.account_id), None, 2, "")
+        .await
+        .unwrap()
+        .next_page_token
+        .expect("a full page should carry a token");
+
+    assert_eq!(
+        store
+            .list(Some(fixture.account_id + 1), None, 2, &token)
+            .await
+            .expect_err("another account's listing must refuse it")
+            .reason(),
+        ErrorReason::InvalidArgument
+    );
+    assert_eq!(
+        store
+            .list(
+                Some(fixture.account_id),
+                Some(FollowupState::Armed),
+                2,
+                &token
+            )
+            .await
+            .expect_err("another state filter must refuse it")
+            .reason(),
+        ErrorReason::InvalidArgument
     );
 }
 

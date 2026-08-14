@@ -15,6 +15,11 @@ service AuditService {
   // compliance archive or `mail ai audit export`). Unlike QueryAiCalls this
   // is not paginated by the caller — the server streams until the filter is
   // exhausted.
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc ExportLedger(ExportLedgerRequest) returns (stream AuditEntry);
 }
 

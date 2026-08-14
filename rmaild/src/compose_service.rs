@@ -101,9 +101,13 @@ impl ComposeService for ComposeApi {
         // it is rejected instead of silently becoming the default.
         let page_size = usize::try_from(req.page_size)
             .map_err(|_| Status::from(Error::invalid_argument("page_size must not be negative")))?;
-        let drafts = self.store.list(req.account_id, page_size).await?;
+        let page = self
+            .store
+            .list(req.account_id, page_size, &req.page_token)
+            .await?;
         Ok(Response::new(ListDraftsResponse {
-            drafts: drafts.iter().map(draft_to_proto).collect(),
+            drafts: page.drafts.iter().map(draft_to_proto).collect(),
+            next_page_token: page.next_page_token.unwrap_or_default(),
         }))
     }
 

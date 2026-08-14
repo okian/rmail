@@ -677,7 +677,30 @@ impl Message {
             updated_at: row.get("updated_at")?,
         })
     }
+
+    /// The listing sort key: `Date` if the message carries one, otherwise the
+    /// server's `INTERNALDATE`, otherwise `0`.
+    ///
+    /// The Rust mirror of [`LIST_SORT_KEY`]'s SQL, and it must stay one: a
+    /// page token is built from this value and compared against that
+    /// expression, so a divergence between the two would make a page boundary
+    /// land somewhere the query never looks.
+    #[must_use]
+    pub fn sort_key(&self) -> i64 {
+        self.date.or(self.internaldate).unwrap_or(0)
+    }
 }
+
+/// The mailbox-listing sort expression, in SQL.
+///
+/// Three-argument `COALESCE` on purpose: a message with neither a `Date`
+/// header nor an `INTERNALDATE` has a NULL key, and NULL compares as neither
+/// less nor greater than a cursor — every such message would become
+/// unreachable the moment pagination started. Pinning them at `0` puts them
+/// exactly where SQLite's "NULLs last under DESC" already had them, so the
+/// visible order does not change. `idx_messages_mailbox_page` (V37) indexes
+/// this exact expression.
+const LIST_SORT_KEY: &str = "COALESCE(date, internaldate, 0)";
 
 const MESSAGE_COLS: &str = "id, account_id, mailbox_id, uid, uidvalidity, message_id, thread_id, \
      in_reply_to, references_hdr, subject, from_addr, from_name, to_addrs, cc_addrs, date, \
@@ -861,9 +884,21 @@ pub struct MessageText {
     pub body_html: Option<String>,
 }
 
-/// List a mailbox's messages, newest first by `COALESCE(date, internaldate)`
-/// (so mail with a missing/backdated Date header still sorts by arrival), with
-/// a limit. The ordering matches `idx_messages_mailbox_date`.
+/// List a mailbox's messages, newest first by [`LIST_SORT_KEY`] (so mail with
+/// a missing/backdated Date header still sorts by arrival), starting strictly
+/// after `after`.
+///
+/// `id DESC` is the tiebreak, in the `ORDER BY` **and** in the cursor, because
+/// timestamps tie: a bulk import gives a hundred messages one `INTERNALDATE`,
+/// and a page boundary landing inside that group would repeat or drop the rest
+/// of it depending on how SQLite happened to break the tie that time. Both
+/// halves are in `idx_messages_mailbox_page` (V37), so a page is a range scan
+/// with no sort.
+///
+/// The cursor predicate is written as a range (`key <= ?`) plus a filter
+/// rather than the equivalent `(key < ?) OR (key = ? AND id < ?)`, so the
+/// planner gets a single bound on the index prefix instead of a disjunction it
+/// has to turn into two scans.
 ///
 /// A negative `limit` is clamped to 0 — in SQLite a negative LIMIT means "no
 /// limit", which would turn a bad page size into a full-table read.
@@ -873,16 +908,28 @@ pub struct MessageText {
 pub fn list_messages(
     conn: &Connection,
     mailbox_id: i64,
+    after: Option<crate::page::Cursor>,
     limit: i64,
 ) -> rusqlite::Result<Vec<Message>> {
+    // The cursor's two parameters are appended rather than bound to NULL on
+    // the first page: `?3 IS NULL OR key <= ?3` would be uniform, but it also
+    // stops the planner from turning the comparison into a bound on the
+    // index prefix, which is the entire performance argument for keyset
+    // pagination.
+    let mut params: Vec<i64> = vec![mailbox_id, limit.max(0)];
+    let cursor_sql = match after {
+        Some(cursor) => {
+            params.push(cursor.sort);
+            params.push(cursor.id);
+            format!("AND {LIST_SORT_KEY} <= ?3 AND ({LIST_SORT_KEY} < ?3 OR id < ?4)")
+        }
+        None => String::new(),
+    };
     let mut stmt = conn.prepare(&format!(
-        "SELECT {MESSAGE_COLS} FROM messages WHERE mailbox_id = ?1
-         ORDER BY COALESCE(date, internaldate) DESC LIMIT ?2"
+        "SELECT {MESSAGE_COLS} FROM messages WHERE mailbox_id = ?1 {cursor_sql}
+         ORDER BY {LIST_SORT_KEY} DESC, id DESC LIMIT ?2"
     ))?;
-    let rows = stmt.query_map(
-        rusqlite::params![mailbox_id, limit.max(0)],
-        Message::from_row,
-    )?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), Message::from_row)?;
     rows.collect()
 }
 

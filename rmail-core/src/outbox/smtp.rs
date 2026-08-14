@@ -367,13 +367,17 @@ fn parse_address(addr: &str) -> Result<Address, SendFailure> {
 #[must_use]
 fn classify_core_error(error: &Error) -> SendFailure {
     use crate::ErrorReason::{
-        AlreadyExists, DeadlineExceeded, FailedPrecondition, Internal, InvalidArgument, NotFound,
-        OutOfRange, PermissionDenied, ResourceExhausted, Unauthenticated, Unavailable,
+        Aborted, AlreadyExists, Cancelled, DeadlineExceeded, FailedPrecondition, Internal,
+        InvalidArgument, NotFound, OutOfRange, PermissionDenied, ResourceExhausted,
+        Unauthenticated, Unavailable,
     };
     match error.reason() {
         NotFound | FailedPrecondition | InvalidArgument | PermissionDenied | Unauthenticated
         | AlreadyExists | OutOfRange => SendFailure::Permanent(error.to_string()),
-        Unavailable | DeadlineExceeded | ResourceExhausted => {
+        // `Cancelled` is a shutting-down daemon and `Aborted` a concurrent
+        // claim; both are true *now* and false on the next attempt, which is
+        // this function's whole test for transience.
+        Unavailable | DeadlineExceeded | ResourceExhausted | Cancelled | Aborted => {
             SendFailure::Transient(error.to_string())
         }
         Internal => {

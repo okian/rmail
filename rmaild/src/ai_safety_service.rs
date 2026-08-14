@@ -42,6 +42,7 @@
 use rmail_core::ai::injection::store::{self, Flag};
 use rmail_core::config::{AiInjection, AiPrivacy};
 use rmail_core::storage::Database;
+use rmail_core::Error;
 use rmail_proto::v1::ai_safety_service_server::AiSafetyService;
 use rmail_proto::v1::{
     ConfirmInjectionRequest, ConfirmInjectionResponse, InjectionDetection, InjectionSeverity,
@@ -163,9 +164,12 @@ impl AiSafetyApi {
 /// message was deleted".
 fn validate_id(message_id: i64) -> Result<i64, Status> {
     if message_id <= 0 {
-        return Err(Status::invalid_argument(
+        // Through the domain error so the status carries the stable
+        // `ErrorInfo.reason` every other error path here does — a client
+        // branches on `reason`, and a bare `Status` gives it nothing.
+        return Err(Status::from(Error::invalid_argument(
             "message_id must be a positive message id",
-        ));
+        )));
     }
     Ok(message_id)
 }

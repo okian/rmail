@@ -29,6 +29,11 @@ service AiService {
   // deadline passing aborts the upstream Claude call, not merely the stream
   // to the client — see rmaild's own docs on how the cancellation reaches
   // the SSE reader.
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc AnalyzeMessage(AnalyzeMessageRequest) returns (stream AnalyzeEvent);
 
   // A live subscription to every enrichment (triage or deep) as it is
@@ -36,6 +41,11 @@ service AiService {
   // becoming smarter in real time. Resumable by the last message_id already
   // seen; see StreamEnrichmentsRequest's own docs for why that cursor is
   // coarser than SyncService.WatchEvents' seq-based one, and what that costs.
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc StreamEnrichments(StreamEnrichmentsRequest) returns (stream Enrichment);
 
   // The deep pass's suggested reply for a message. Returns the cached one if
@@ -83,6 +93,11 @@ service AiService {
   // Messages in folders `ai.policy` marks `local_only` or `forbidden` are
   // never packed and never reach the provider; a question whose every match
   // is withheld refuses without a model call at all.
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc AskMailbox(AskRequest) returns (stream AskChunk);
 }
 

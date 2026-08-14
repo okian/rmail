@@ -65,12 +65,15 @@ async-trait.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The idempotency fence hashes the *encoded* request and caches the encoded
+# response, so `idempotency.rs` needs prost's `Message` at runtime and not only
+# in the descriptor-set test below.
+prost.workspace = true
 
 [dev-dependencies]
 tonic-types.workspace = true
 # Decoding the compiled descriptor set so the auth scope table can be checked
 # against the RPCs actually served (see `auth::methods` tests).
-prost.workspace = true
 prost-types.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 # Only used by the AuditService integration test, to verify a ledger entry's

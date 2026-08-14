@@ -7,7 +7,8 @@
 //! second" contract and why `Move` drops the local row rather than
 //! re-pointing it). This file's own design lives in its two streaming RPCs:
 //!
-//! # `List` is bounded, not (yet) truly streamed
+//! # `List` is bounded, not (yet) truly streamed — and that is what lets it
+//! paginate
 //!
 //! `List` fetches its whole (capped — see
 //! [`rmail_core::mail::MAX_LIST_LIMIT`]) page from [`MailStore::list`] before
@@ -17,6 +18,17 @@
 //! Bounded at 500 rows, this is not a leak; it is a real difference from
 //! `GetAttachment`/`WatchEvents`, which genuinely produce their frames
 //! incrementally.
+//!
+//! It is also what makes the opaque page token deliverable. A server-streamed
+//! response has no envelope to carry a `next_page_token` field, and gRPC has
+//! no supported way to add a trailer on a successful stream — but the *initial
+//! metadata* is written when the handler returns, and by then this handler
+//! already knows its whole page and therefore its next token. So the token
+//! rides in the response headers under
+//! [`rmail_core::page::NEXT_PAGE_TOKEN_METADATA_KEY`]. A handler that
+//! genuinely streamed its read could not do this, and would have needed a
+//! `page_token` field on a wrapper message — i.e. a breaking proto change.
+//! The absence of the header is definitive: it means this was the last page.
 //!
 //! # `GetAttachment`: chunked well under the frame cap
 //!
@@ -92,7 +104,9 @@
 use std::pin::Pin;
 
 use rmail_core::events::{Event as CoreEvent, EventKind as CoreEventKind};
+use rmail_core::idempotency::IdempotencyStore;
 use rmail_core::mail::{FullMessage, MailStore, MessageWithFlags, ThreadView};
+use rmail_core::page::NEXT_PAGE_TOKEN_METADATA_KEY;
 use rmail_core::repo::Attachment as CoreAttachment;
 use rmail_core::Error;
 use rmail_proto::v1::mail_service_server::MailService;
@@ -132,10 +146,20 @@ const STREAM_BUFFER: usize = 256;
 /// up. See `rmaild::sync_service::REPLAY_PAGE`.
 const REPLAY_PAGE: i64 = 500;
 
+// The method paths the replay fence keys on. Written out rather than derived,
+// because they are the same strings `auth::methods` matches and a mismatch
+// here would silently give two RPCs one key namespace.
+const MOVE_METHOD: &str = "/rmail.v1.MailService/Move";
+const COPY_METHOD: &str = "/rmail.v1.MailService/Copy";
+const SET_FLAGS_METHOD: &str = "/rmail.v1.MailService/SetFlags";
+const DELETE_METHOD: &str = "/rmail.v1.MailService/Delete";
+
 /// The `MailService` handler.
 #[derive(Clone)]
 pub struct MailApi {
     store: MailStore,
+    /// The replay fence behind every mutation's `idempotency_key`.
+    idempotency: IdempotencyStore,
     /// Cancelled when the daemon shuts down, so open streams stop with it
     /// rather than holding shutdown open.
     shutdown: CancellationToken,
@@ -144,8 +168,16 @@ pub struct MailApi {
 impl MailApi {
     /// Create a handler over a mail store.
     #[must_use]
-    pub fn new(store: MailStore, shutdown: CancellationToken) -> Self {
-        Self { store, shutdown }
+    pub fn new(
+        store: MailStore,
+        idempotency: IdempotencyStore,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            store,
+            idempotency,
+            shutdown,
+        }
     }
 }
 
@@ -159,13 +191,37 @@ impl MailService for MailApi {
         request: Request<ListMessagesRequest>,
     ) -> Result<Response<Self::ListStream>, Status> {
         let req = request.into_inner();
-        let messages = self
+        // A negative page size is nonsense rather than a request for the
+        // default, and the other three list RPCs already say so — the same
+        // input has to get the same answer on every one of them.
+        if req.page_size < 0 {
+            return Err(Status::from(Error::invalid_argument(
+                "page_size must not be negative",
+            )));
+        }
+        let page = self
             .store
-            .list(req.mailbox_id, i64::from(req.page_size))
+            .list(req.mailbox_id, i64::from(req.page_size), &req.page_token)
             .await?;
-        let items: Vec<Result<ProtoMessage, Status>> =
-            messages.iter().map(|m| Ok(message_to_proto(m))).collect();
-        Ok(Response::new(Box::pin(tokio_stream::iter(items))))
+        let items: Vec<Result<ProtoMessage, Status>> = page
+            .messages
+            .iter()
+            .map(|m| Ok(message_to_proto(m)))
+            .collect();
+        let mut response: Response<Self::ListStream> =
+            Response::new(Box::pin(tokio_stream::iter(items)));
+        if let Some(token) = page.next_page_token {
+            // Tokens are base64url by construction, so this parse cannot fail
+            // — but a `Status` beats a panic if that ever stops being true,
+            // and an unpaginated answer would be a silent truncation.
+            let value = token.parse().map_err(|_| {
+                Status::from(Error::internal("page token was not a valid header value"))
+            })?;
+            response
+                .metadata_mut()
+                .insert(NEXT_PAGE_TOKEN_METADATA_KEY, value);
+        }
+        Ok(response)
     }
 
     async fn get(
@@ -188,30 +244,72 @@ impl MailService for MailApi {
 
     async fn r#move(&self, request: Request<MoveRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        self.store
-            .move_message(req.message_id, req.dest_mailbox_id)
-            .await?;
-        Ok(Response::new(()))
+        crate::idempotency::guard(
+            &self.idempotency,
+            MOVE_METHOD,
+            &req.idempotency_key,
+            &req,
+            async {
+                self.store
+                    .move_message(req.message_id, req.dest_mailbox_id)
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn copy(&self, request: Request<CopyRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        self.store
-            .copy_message(req.message_id, req.dest_mailbox_id)
-            .await?;
-        Ok(Response::new(()))
+        crate::idempotency::guard(
+            &self.idempotency,
+            COPY_METHOD,
+            &req.idempotency_key,
+            &req,
+            async {
+                self.store
+                    .copy_message(req.message_id, req.dest_mailbox_id)
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn set_flags(&self, request: Request<SetFlagsRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        self.store.set_flags(req.message_id, req.flags).await?;
-        Ok(Response::new(()))
+        crate::idempotency::guard(
+            &self.idempotency,
+            SET_FLAGS_METHOD,
+            &req.idempotency_key,
+            &req,
+            async {
+                self.store
+                    .set_flags(req.message_id, req.flags.clone())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<()>, Status> {
-        let id = request.into_inner().message_id;
-        self.store.delete_message(id).await?;
-        Ok(Response::new(()))
+        let req = request.into_inner();
+        crate::idempotency::guard(
+            &self.idempotency,
+            DELETE_METHOD,
+            &req.idempotency_key,
+            &req,
+            async {
+                self.store.delete_message(req.message_id).await?;
+                Ok(())
+            },
+        )
+        .await
+        .map(Response::new)
     }
 
     type GetAttachmentStream =
@@ -321,7 +419,10 @@ impl MailService for MailApi {
 
                     loop {
                         let received = tokio::select! {
-                            () = cancel.cancelled() => return,
+                            () = cancel.cancelled() => {
+                                crate::stream::terminate_cancelled(&tx).await;
+                                return;
+                            }
                             received = catchup.live.recv() => received,
                         };
                         match received {
@@ -403,7 +504,11 @@ async fn send<T>(
     item: Result<T, Status>,
 ) -> std::ops::ControlFlow<()> {
     tokio::select! {
-        () = cancel.cancelled() => std::ops::ControlFlow::Break(()),
+        () = cancel.cancelled() => {
+            // Never end a cancelled stream silently — see `crate::stream`.
+            crate::stream::terminate_cancelled(tx).await;
+            std::ops::ControlFlow::Break(())
+        }
         sent = tx.send(item) => {
             if sent.is_ok() {
                 std::ops::ControlFlow::Continue(())

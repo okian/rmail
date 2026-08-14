@@ -39,6 +39,11 @@ service IndexService {
   // Dropping the stream stops the work behind it: the producer observes the
   // closed channel and stops leasing, leaving whatever is still queued for the
   // background worker.
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc Reindex(ReindexRequest) returns (stream IndexProgress);
 
   // Drop the derived data for the named stages and rebuild it from scratch,
@@ -48,6 +53,11 @@ service IndexService {
   // nothing until the drain catches up, which for a large mailbox is minutes
   // (lexical) to hours (semantic). `confirm` must be true; the call is
   // rejected with FAILED_PRECONDITION otherwise and nothing is deleted.
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc Rebuild(RebuildRequest) returns (stream IndexProgress);
 
   // Reconcile the index against the message store and the configured model,

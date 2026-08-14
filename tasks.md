@@ -407,7 +407,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmaild --test mail_service` (CRUD, threaded get, watch stream, attachment chunking)
 
 ## 40. Idempotency, pagination & error-model hardening
-- [ ] status
+- [x] status
 - **carried over from task 55:** tags and notes key off the stable `messages.id`, and `prd.md` promises both follow a message across a move ("Message move → tags/notes follow stable `messages.id`, only the keyword re-`STORE`d"). `MailService.Move` does not keep that promise: `mail::MailStore::move_message` deletes the local row and lets the next sync re-insert the message under a **new** id, so its tags and notes are silently orphaned. Fix the move path to preserve the row identity (or re-point the annotations), and prove it with a test that tags a message, moves it, and asserts the tag survives.
 - **depends-on:** 39
 - **parallel-safe:** no

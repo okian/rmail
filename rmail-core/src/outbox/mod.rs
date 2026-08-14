@@ -115,7 +115,28 @@ pub const DEFAULT_LIST_LIMIT: usize = 50;
 
 /// Hard cap on [`OutboxStore::list`]'s page size, matching prd.md's
 /// "server caps 500" pagination rule.
-pub const MAX_LIST_LIMIT: usize = 500;
+pub const MAX_LIST_LIMIT: usize = crate::page::MAX_PAGE_SIZE as usize;
+
+/// One page of [`OutboxStore::list`], plus the token for the next one.
+#[derive(Debug, Clone)]
+pub struct OutboxPage {
+    /// This page's entries, newest first.
+    pub entries: Vec<OutboxEntry>,
+    /// The token for the following page; `None` means this was the last.
+    pub next_page_token: Option<String>,
+}
+
+/// The page-token scope for an outbox listing — see [`crate::page`].
+///
+/// Both filters are bound, not just the account: a token minted while looking
+/// at `failed` sends would otherwise resume a `scheduled` listing at a
+/// position that means nothing in it.
+#[must_use]
+pub fn list_scope(account_id: Option<i64>, state: Option<OutboxState>) -> crate::page::PageScope {
+    crate::page::PageScope::new("rmail.v1.SendSchedulerService/ListOutbox")
+        .opt_field("account_id", account_id)
+        .opt_field("state", state.map(OutboxState::as_str))
+}
 
 /// Longest `body_preview` retained, in characters.
 ///
@@ -639,46 +660,77 @@ impl OutboxStore {
             .ok_or_else(|| Error::not_found(format!("outbox entry {id} not found")))
     }
 
-    /// List an account's outbox, newest first, optionally filtered by state.
+    /// List one page of an account's outbox, newest first, optionally
+    /// filtered by state.
     ///
     /// `limit` of zero means [`DEFAULT_LIST_LIMIT`]; anything above
     /// [`MAX_LIST_LIMIT`] is clamped rather than rejected, matching prd.md's
-    /// "server caps 500" rule.
+    /// "server caps 500" rule. `page_token` resumes a previous page and is
+    /// bound to **both** filters — see [`crate::page`]: a token minted while
+    /// listing one account must not resume into another's queued mail.
     ///
     /// # Errors
     ///
-    /// A mapped storage error.
-    #[tracing::instrument(skip(self))]
+    /// [`Error::InvalidArgument`] if `page_token` is malformed or belongs to a
+    /// different query; otherwise a mapped storage error.
+    #[tracing::instrument(skip(self, page_token))]
     pub async fn list(
         &self,
         account_id: Option<i64>,
         state: Option<OutboxState>,
         limit: usize,
-    ) -> Result<Vec<OutboxEntry>, Error> {
+        page_token: &str,
+    ) -> Result<OutboxPage, Error> {
+        let scope = list_scope(account_id, state);
+        let after = crate::page::decode(page_token, &scope)?;
         let limit = i64::try_from(match limit {
             0 => DEFAULT_LIST_LIMIT,
             n => n.min(MAX_LIST_LIMIT),
         })
         .unwrap_or(i64::MAX);
+        // The overflow probe — see `MailStore::list`.
+        let probe = limit.saturating_add(1);
         let state = state.map(OutboxState::as_str);
 
-        self.db
+        let mut entries: Vec<OutboxEntry> = self
+            .db
             .read(move |conn| {
+                let cursor_sql = match after {
+                    Some(_) => "AND created_at <= ?4 AND (created_at < ?4 OR id < ?5)",
+                    None => "",
+                };
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {COLUMNS} FROM outbox
                      WHERE (?1 IS NULL OR account_id = ?1)
                        AND (?2 IS NULL OR state = ?2)
+                       {cursor_sql}
                      ORDER BY created_at DESC, id DESC LIMIT ?3"
                 ))?;
-                let rows = stmt
-                    .query_map(rusqlite::params![account_id, state, limit], entry_from_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
+                let rows = match after {
+                    Some(cursor) => stmt.query_map(
+                        rusqlite::params![account_id, state, probe, cursor.sort, cursor.id],
+                        entry_from_row,
+                    )?,
+                    None => {
+                        stmt.query_map(rusqlite::params![account_id, state, probe], entry_from_row)?
+                    }
+                };
+                rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .await?
             .into_iter()
             .map(TryInto::try_into)
-            .collect()
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let overflow = i64::try_from(entries.len()).unwrap_or(i64::MAX) > limit;
+        entries.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        let last = entries
+            .last()
+            .map(|e| crate::page::Cursor::new(e.created_at, e.id));
+        Ok(OutboxPage {
+            next_page_token: crate::page::next_token(&scope, last, overflow),
+            entries,
+        })
     }
 
     /// Cancel a scheduled send.

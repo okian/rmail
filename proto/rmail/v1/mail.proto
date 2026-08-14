@@ -20,6 +20,14 @@ service MailService {
   // the page is server-capped (see ListMessagesRequest), so a client never
   // buffers a whole folder — the daemon currently holds one capped page in
   // memory before the first frame goes out, not a true incremental read.
+  //
+  // Paginated by opaque token. A server-streamed response has no envelope to
+  // carry a `next_page_token` field, so it travels in the call's **initial
+  // metadata** under `x-rmail-next-page-token` — which works precisely
+  // because this handler materializes its capped page before the first frame,
+  // so the token is known at header time. The header is absent on the last
+  // page; its absence is definitive, not "call again to find out". Pass it
+  // back as `ListMessagesRequest.page_token`.
   rpc List(ListMessagesRequest) returns (stream Message);
 
   // Fetch one message, with its body and attachment metadata.
@@ -55,6 +63,11 @@ service MailService {
   // no single frame is ever large enough for the transport to reject. The
   // attachment itself is decoded into daemon memory for the life of the
   // stream (the frame cap bounds wire size, not daemon memory).
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc GetAttachment(GetAttachmentRequest) returns (stream AttachmentChunk);
 
   // Stream domain events from the durable log — the same feed
@@ -62,14 +75,26 @@ service MailService {
   // never needs to import SyncService just to watch new mail arrive. See
   // SyncService.WatchEvents for the resume/gap contract (`since_seq`,
   // OUT_OF_RANGE on a retention gap).
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
 }
 
 message ListMessagesRequest {
   int64 mailbox_id = 1;
-  // Server-capped; 0 means the server default. Opaque `page_token` pagination
-  // lands in task 40 — this is a plain newest-first page for now.
+  // Server-capped at 500; 0 means the server default.
   int32 page_size = 2;
+  // The `x-rmail-next-page-token` value from the previous page; empty starts
+  // at the beginning.
+  //
+  // Opaque: clients must not parse or construct one. It is bound to the query
+  // that produced it, so replaying a token against a different `mailbox_id`
+  // is INVALID_ARGUMENT rather than a read at an arbitrary offset into
+  // another folder.
+  string page_token = 3;
 }
 
 // One message as it appears in a listing. Body and attachment metadata are on
@@ -141,11 +166,15 @@ message Thread {
 message MoveRequest {
   int64 message_id = 1;
   int64 dest_mailbox_id = 2;
+  // Optional replay fence. See DeleteRequest.idempotency_key.
+  string idempotency_key = 3;
 }
 
 message CopyRequest {
   int64 message_id = 1;
   int64 dest_mailbox_id = 2;
+  // Optional replay fence. See DeleteRequest.idempotency_key.
+  string idempotency_key = 3;
 }
 
 message SetFlagsRequest {
@@ -153,10 +182,33 @@ message SetFlagsRequest {
   // The complete desired flag set (e.g. "\Seen", "\Flagged") — replaces
   // whatever is currently set, both locally and on the server.
   repeated string flags = 2;
+  // Optional replay fence. See DeleteRequest.idempotency_key.
+  string idempotency_key = 3;
 }
 
 message DeleteRequest {
   int64 message_id = 1;
+  // Optional replay fence: a client-chosen key (a UUID) that makes retrying
+  // this call safe. Empty opts out.
+  //
+  // Within `grpc.idempotency.retention`, a second call with the same key and
+  // the same request replays the first call's response without touching the
+  // mailbox. Reusing the key with a *different* request is ALREADY_EXISTS — a
+  // key names one call.
+  //
+  // A retry that arrives while the first attempt has not reported an outcome
+  // is ABORTED rather than applied a second time: the outcome is genuinely
+  // unknown, and applying it twice is the one irreversible mistake. The usual
+  // cause is not a crashed daemon — it is this client's own deadline elapsing
+  // or its connection dropping mid-call, which stops the server ever
+  // finishing the call. That state clears on its own after
+  // `grpc.idempotency.in_flight` (5 minutes by default), so the right
+  // response to ABORTED is to retry after a short wait; a fresh key applies
+  // the mutation again deliberately, which is a decision and not a default.
+  //
+  // A call that *failed* releases its key immediately, so a transient IMAP
+  // outage is retryable under the same key with no wait at all.
+  string idempotency_key = 2;
 }
 
 message GetAttachmentRequest {

@@ -32,6 +32,11 @@ service NoteService {
   // is made (contrast MailService.WatchEvents' durable, replay-then-follow
   // log — a note change missed while disconnected is recovered with a fresh
   // ListNotes, not replayed).
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
   rpc WatchNotes(WatchNotesRequest) returns (stream NoteEvent);
 }
 

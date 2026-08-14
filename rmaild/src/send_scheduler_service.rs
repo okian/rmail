@@ -37,6 +37,7 @@ use std::pin::Pin;
 
 use rmail_core::compose::{Draft, Mailbox};
 use rmail_core::config::SendConfig;
+use rmail_core::idempotency::IdempotencyStore;
 use rmail_core::outbox::followup::{
     Followup as CoreFollowup, FollowupState as CoreFollowupState, FollowupStore, NewFollowup,
 };
@@ -65,6 +66,10 @@ use tracing::Instrument;
 /// `note_service::STREAM_BUFFER`; the two streams are independent.
 const STREAM_BUFFER: usize = 64;
 
+/// The method path the replay fence keys on — see `mail_service`'s own
+/// constants for why it is spelled out rather than derived.
+const SCHEDULE_SEND_METHOD: &str = "/rmail.v1.SendSchedulerService/ScheduleSend";
+
 /// The `SendScheduler` handler.
 #[derive(Clone)]
 pub struct SendSchedulerApi {
@@ -73,6 +78,8 @@ pub struct SendSchedulerApi {
     db: Database,
     config: SendConfig,
     policy: SendPolicy,
+    /// The replay fence behind `ScheduleSend.idempotency_key`.
+    idempotency: IdempotencyStore,
     /// Cancelled when the daemon shuts down, so an open `WatchOutbox` stream
     /// stops with it rather than holding shutdown open.
     shutdown: CancellationToken,
@@ -86,6 +93,7 @@ impl SendSchedulerApi {
         followups: FollowupStore,
         db: Database,
         config: SendConfig,
+        idempotency: IdempotencyStore,
         shutdown: CancellationToken,
     ) -> Self {
         let policy = SendPolicy::from_config(&config);
@@ -95,6 +103,7 @@ impl SendSchedulerApi {
             db,
             config,
             policy,
+            idempotency,
             shutdown,
         }
     }
@@ -214,9 +223,16 @@ impl SendSchedulerApi {
         // directly from an async fn while its doc claimed otherwise; body
         // size is bounded only by tonic's decode limit, so a multi-megabyte
         // inline body stalled a runtime worker.
+        // `Error::internal`, not `Status::internal`: the boundary conversion is
+        // what attaches a branchable `ErrorInfo.reason` *and* what scrubs the
+        // message — and a `JoinError`'s Display carries a panic payload, which
+        // is exactly the kind of implementation detail that must not cross to
+        // a client.
         let raw_mime = tokio::task::spawn_blocking(move || render_inline(draft))
             .await
-            .map_err(|error| Status::internal(format!("render task failed: {error}")))??;
+            .map_err(|error| {
+                Status::from(Error::internal(format!("render task failed: {error}")))
+            })??;
 
         Ok(Rendered {
             raw_mime,
@@ -269,47 +285,60 @@ impl SendSchedulerService for SendSchedulerApi {
         let origin = origin_from_proto(req.origin);
         tracing::Span::current().record("origin", origin.as_str());
 
-        let tz = self.zone(&req.tz)?;
-        let requested_at = self.resolve_when(
-            tz,
-            req.send_at,
-            req.send_at_nl.as_deref(),
-            req.optimal.unwrap_or(false),
-        )?;
-        let requested_undo = req
-            .undo_window_secs
-            .map(|secs| std::time::Duration::from_secs(u64::try_from(secs).unwrap_or(0)));
-        let schedule = self.policy.resolve(
-            origin,
-            requested_at,
-            requested_undo,
-            chrono::Utc::now().timestamp(),
-        );
+        // The whole handler is inside the fence, not just the enqueue: the
+        // render step reads a draft and can fail, and a retry must be able to
+        // redo the *call*, not resume it halfway.
+        let proto = crate::idempotency::guard(
+            &self.idempotency,
+            SCHEDULE_SEND_METHOD,
+            &req.idempotency_key,
+            &req,
+            async {
+                let tz = self.zone(&req.tz)?;
+                let requested_at = self.resolve_when(
+                    tz,
+                    req.send_at,
+                    req.send_at_nl.as_deref(),
+                    req.optimal.unwrap_or(false),
+                )?;
+                let requested_undo = req
+                    .undo_window_secs
+                    .map(|secs| std::time::Duration::from_secs(u64::try_from(secs).unwrap_or(0)));
+                let schedule = self.policy.resolve(
+                    origin,
+                    requested_at,
+                    requested_undo,
+                    chrono::Utc::now().timestamp(),
+                );
 
-        let rendered = self.render(&req).await?;
-        let entry = self
-            .store
-            .schedule(NewSend {
-                account_id: req.account_id,
-                draft_id: rendered.draft_id,
-                from_addr: rendered.from_addr,
-                to: rendered.to,
-                cc: rendered.cc,
-                bcc: rendered.bcc,
-                subject: rendered.subject,
-                raw_mime: rendered.raw_mime,
-                body_preview: rendered.body_preview,
-                in_reply_to: rendered.in_reply_to,
-                thread_id: None,
-                send_at: schedule.send_at,
-                tz: tz.name().to_owned(),
-                origin,
-                undo_deadline: schedule.undo_deadline,
-                max_retries: self.policy.max_retries(),
-            })
-            .await?;
-        tracing::Span::current().record("outbox_id", entry.id);
-        Ok(Response::new(entry_to_proto(&entry)))
+                let rendered = self.render(&req).await?;
+                let entry = self
+                    .store
+                    .schedule(NewSend {
+                        account_id: req.account_id,
+                        draft_id: rendered.draft_id,
+                        from_addr: rendered.from_addr,
+                        to: rendered.to,
+                        cc: rendered.cc,
+                        bcc: rendered.bcc,
+                        subject: rendered.subject,
+                        raw_mime: rendered.raw_mime,
+                        body_preview: rendered.body_preview,
+                        in_reply_to: rendered.in_reply_to,
+                        thread_id: None,
+                        send_at: schedule.send_at,
+                        tz: tz.name().to_owned(),
+                        origin,
+                        undo_deadline: schedule.undo_deadline,
+                        max_retries: self.policy.max_retries(),
+                    })
+                    .await?;
+                tracing::Span::current().record("outbox_id", entry.id);
+                Ok(entry_to_proto(&entry))
+            },
+        )
+        .await?;
+        Ok(Response::new(proto))
     }
 
     #[tracing::instrument(skip(self, request))]
@@ -385,12 +414,18 @@ impl SendSchedulerService for SendSchedulerApi {
         // it is rejected instead of silently becoming the default.
         let page_size = usize::try_from(req.page_size)
             .map_err(|_| Status::from(Error::invalid_argument("page_size must not be negative")))?;
-        let entries = self
+        let page = self
             .store
-            .list(req.account_id, state_from_proto(req.state), page_size)
+            .list(
+                req.account_id,
+                state_from_proto(req.state),
+                page_size,
+                &req.page_token,
+            )
             .await?;
         Ok(Response::new(ListOutboxResponse {
-            entries: entries.iter().map(entry_to_proto).collect(),
+            entries: page.entries.iter().map(entry_to_proto).collect(),
+            next_page_token: page.next_page_token.unwrap_or_default(),
         }))
     }
 
@@ -411,7 +446,10 @@ impl SendSchedulerService for SendSchedulerApi {
             async move {
                 loop {
                     let received = tokio::select! {
-                        () = cancel.cancelled() => return,
+                        () = cancel.cancelled() => {
+                            crate::stream::terminate_cancelled(&tx).await;
+                            return;
+                        }
                         received = changes.recv() => received,
                     };
                     match received {
@@ -532,16 +570,18 @@ impl SendSchedulerService for SendSchedulerApi {
         let req = request.into_inner();
         let page_size = usize::try_from(req.page_size)
             .map_err(|_| Status::from(Error::invalid_argument("page_size must not be negative")))?;
-        let followups = self
+        let page = self
             .followups
             .list(
                 req.account_id,
                 followup_state_from_proto(req.state),
                 page_size,
+                &req.page_token,
             )
             .await?;
         Ok(Response::new(ListFollowupsResponse {
-            followups: followups.iter().map(followup_to_proto).collect(),
+            followups: page.followups.iter().map(followup_to_proto).collect(),
+            next_page_token: page.next_page_token.unwrap_or_default(),
         }))
     }
 
@@ -713,7 +753,11 @@ async fn send(
     item: Result<OutboxEvent, Status>,
 ) -> std::ops::ControlFlow<()> {
     tokio::select! {
-        () = cancel.cancelled() => std::ops::ControlFlow::Break(()),
+        () = cancel.cancelled() => {
+            // Never end a cancelled stream silently — see `crate::stream`.
+            crate::stream::terminate_cancelled(tx).await;
+            std::ops::ControlFlow::Break(())
+        }
         sent = tx.send(item) => {
             if sent.is_ok() {
                 std::ops::ControlFlow::Continue(())

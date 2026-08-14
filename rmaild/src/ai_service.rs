@@ -321,7 +321,10 @@ impl AiService for AiApi {
 
                     loop {
                         let received = tokio::select! {
-                            () = cancel.cancelled() => return,
+                            () = cancel.cancelled() => {
+                                crate::stream::terminate_cancelled(&tx).await;
+                                return;
+                            }
                             received = live.recv() => received,
                         };
                         match received {
@@ -794,15 +797,17 @@ impl AiApi {
     /// just until the first frame), exactly like a queued job's own permit.
     ///
     /// # Errors
-    /// [`Status`] (`DEADLINE_EXCEEDED`) if `cancel` fires before capacity is
-    /// available.
+    /// [`Status`] (`CANCELLED`) if `cancel` fires before capacity is
+    /// available. Not `DEADLINE_EXCEEDED`: nothing here has a deadline, and
+    /// the token fires on daemon shutdown or a dropped response stream — see
+    /// `crate::stream` on why a cancelled call must say so honestly.
     async fn acquire_capacity(
         &self,
         cancel: &CancellationToken,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
         let permit = tokio::select! {
             () = cancel.cancelled() => {
-                return Err(Status::from(Error::deadline_exceeded(
+                return Err(Status::from(Error::cancelled(
                     "cancelled while waiting for AI concurrency capacity".to_owned(),
                 )));
             }
@@ -818,7 +823,7 @@ impl AiApi {
             ))
         })?;
         tokio::select! {
-            () = cancel.cancelled() => Err(Status::from(Error::deadline_exceeded(
+            () = cancel.cancelled() => Err(Status::from(Error::cancelled(
                 "cancelled while waiting for AI rate-limit capacity".to_owned(),
             ))),
             () = self.rate_limiter.acquire() => Ok(permit),
@@ -874,6 +879,9 @@ impl AiApi {
         loop {
             let next = tokio::select! {
                 () = cancel.cancelled() => {
+                    // A partial analysis must not arrive as a clean end —
+                    // see `crate::stream`.
+                    crate::stream::terminate_cancelled(&tx).await;
                     self.audit_cancelled_analysis(message_id, &prepared, start).await;
                     return;
                 }
@@ -1664,7 +1672,11 @@ async fn send<T>(
     item: Result<T, Status>,
 ) -> std::ops::ControlFlow<()> {
     tokio::select! {
-        () = cancel.cancelled() => std::ops::ControlFlow::Break(()),
+        () = cancel.cancelled() => {
+            // Never end a cancelled stream silently — see `crate::stream`.
+            crate::stream::terminate_cancelled(tx).await;
+            std::ops::ControlFlow::Break(())
+        }
         sent = tx.send(item) => {
             if sent.is_ok() {
                 std::ops::ControlFlow::Continue(())

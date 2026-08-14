@@ -21,6 +21,7 @@ mod auth;
 mod compose_service;
 mod config_service;
 mod hook_service;
+mod idempotency;
 mod index_service;
 mod mail_service;
 mod note_service;
@@ -28,6 +29,7 @@ mod rule_service;
 mod saved_search_service;
 mod search_service;
 mod send_scheduler_service;
+mod stream;
 mod sync_service;
 mod tag_service;
 mod trace;
@@ -653,6 +655,15 @@ where
         }
     });
 
+    // One replay fence, shared by every mutating RPC that takes an
+    // `idempotency_key`: keys are a single namespace (see
+    // `rmail_core::idempotency`), so a second store would be a second
+    // namespace and a key could then be reused across it.
+    let idempotency = rmail_core::idempotency::IdempotencyStore::new(
+        db.clone(),
+        config.grpc.idempotency.retention.into(),
+        config.grpc.idempotency.in_flight.into(),
+    );
     let admin_service = AdminServiceServer::new(AdminApi::new(db.clone()));
     let account_service = AccountServiceServer::new(AccountApi::new(db.clone()));
     let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
@@ -663,7 +674,11 @@ where
     // a rule-applied tag honours the same per-tag sync mode.
     let rules_mail_store = mail_store.clone();
     let rules_tag_store = tag_store.clone();
-    let mail_service = MailServiceServer::new(MailApi::new(mail_store, stopping.clone()));
+    let mail_service = MailServiceServer::new(MailApi::new(
+        mail_store,
+        idempotency.clone(),
+        stopping.clone(),
+    ));
     let tag_service = TagServiceServer::new(TagApi::new(tag_store.clone()));
     // `ComposeService` needs nothing but the database: drafts are local, and
     // this task deliberately stops short of SMTP (task 61 owns submission),
@@ -691,6 +706,7 @@ where
         followup_store.clone(),
         db.clone(),
         config.send.clone(),
+        idempotency.clone(),
         stopping.clone(),
     ));
     let send_handle = SendScheduler::new(

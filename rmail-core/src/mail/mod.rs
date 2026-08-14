@@ -87,6 +87,7 @@ use rusqlite::OptionalExtension;
 use crate::error::Error;
 use crate::events::{EventKind, EventLog, NewEvent};
 use crate::imap::mutate::ImapMutator;
+use crate::page;
 use crate::repo;
 use crate::storage::Database;
 
@@ -99,12 +100,16 @@ mod tests;
 /// particular page size.
 pub const DEFAULT_LIST_LIMIT: i64 = 100;
 
-/// Hard ceiling on [`MailStore::list`], regardless of what is requested.
+/// Hard ceiling on one [`MailStore::list`] page, regardless of what is
+/// requested — prd.md's "server caps 500", and an alias for
+/// [`crate::page::MAX_PAGE_SIZE`] so this module's callers do not have to know
+/// where the number lives.
 ///
-/// Full opaque-token pagination lands in task 40; this cap is what keeps a
-/// pathological request from reading a whole mailbox into memory in the
-/// meantime.
-pub const MAX_LIST_LIMIT: i64 = 500;
+/// The cap is no longer the *only* thing standing between a caller and a whole
+/// mailbox: [`MailStore::list`] now returns an opaque page token, so a client
+/// that wants the rest asks for it a page at a time instead of being cut off.
+/// The cap is what keeps any single request bounded.
+pub const MAX_LIST_LIMIT: i64 = crate::page::MAX_PAGE_SIZE;
 
 /// A message with its flag set attached — `repo::Message` does not carry
 /// flags inline, since they live in their own table.
@@ -114,6 +119,29 @@ pub struct MessageWithFlags {
     pub message: repo::Message,
     /// Its current flags, sorted.
     pub flags: Vec<String>,
+}
+
+/// One page of [`MailStore::list`], plus the token for the next one.
+#[derive(Debug, Clone)]
+pub struct MessagePage {
+    /// This page's messages, newest first.
+    pub messages: Vec<MessageWithFlags>,
+    /// The token to pass back for the following page. `None` means this was
+    /// the last page — not "ask again and find out".
+    pub next_page_token: Option<String>,
+}
+
+/// The page-token scope for a mailbox listing.
+///
+/// Everything that selects rows is in it. `MailService.List` filters on
+/// exactly one field, so that field is the whole scope — but it is built
+/// through [`page::PageScope`] rather than hand-formatted, because the day a
+/// filter is added to this RPC the compiler will not remind anyone that the
+/// scope needs it, and a token that outlives a filter change resumes into rows
+/// the new filter excludes.
+#[must_use]
+pub fn list_scope(mailbox_id: i64) -> page::PageScope {
+    page::PageScope::new("rmail.v1.MailService/List").field("mailbox_id", mailbox_id)
 }
 
 /// A message with its body and attachment metadata — the `Get` view.
@@ -195,22 +223,38 @@ impl MailStore {
         &self.events
     }
 
-    /// List a mailbox's messages, newest first, capped at
+    /// List one page of a mailbox's messages, newest first, capped at
     /// [`MAX_LIST_LIMIT`]. `requested <= 0` uses [`DEFAULT_LIST_LIMIT`].
     ///
+    /// `page_token` is the caller's opaque token from a previous page (empty
+    /// for the first). It is validated against [`list_scope`] — the query it
+    /// was minted for — so a token cannot be re-aimed at another mailbox; see
+    /// [`crate::page`] for why that check exists and what it does and does not
+    /// promise.
+    ///
     /// # Errors
-    /// A mapped storage error.
-    #[tracing::instrument(skip(self), fields(mailbox_id = mailbox_id), err)]
+    /// [`Error::InvalidArgument`] if `page_token` is malformed or belongs to a
+    /// different query; otherwise a mapped storage error.
+    #[tracing::instrument(skip(self, page_token), fields(mailbox_id = mailbox_id), err)]
     pub async fn list(
         &self,
         mailbox_id: i64,
         requested: i64,
-    ) -> Result<Vec<MessageWithFlags>, Error> {
+        page_token: &str,
+    ) -> Result<MessagePage, Error> {
+        let scope = list_scope(mailbox_id);
+        let after = page::decode(page_token, &scope)?;
         let limit = normalize_limit(requested);
-        Ok(self
+        // One extra row, discarded below: it is what distinguishes "the page
+        // is full" from "there is more", and without it a list whose length
+        // divides evenly by the page size always costs one extra empty round
+        // trip to discover it had ended.
+        let probe = limit.saturating_add(1);
+
+        let mut messages = self
             .db
             .read(move |conn| {
-                let messages = repo::list_messages(conn, mailbox_id, limit)?;
+                let messages = repo::list_messages(conn, mailbox_id, after, probe)?;
                 let mut out = Vec::with_capacity(messages.len());
                 for message in messages {
                     let flags = repo::list_flags(conn, message.id)?;
@@ -218,7 +262,17 @@ impl MailStore {
                 }
                 Ok(out)
             })
-            .await?)
+            .await?;
+
+        let overflow = i64::try_from(messages.len()).unwrap_or(i64::MAX) > limit;
+        messages.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        let last = messages
+            .last()
+            .map(|m| page::Cursor::new(m.message.sort_key(), m.message.id));
+        Ok(MessagePage {
+            next_page_token: page::next_token(&scope, last, overflow),
+            messages,
+        })
     }
 
     /// Fetch one message, with its body and attachment metadata.
@@ -602,11 +656,7 @@ impl MailStore {
 /// `requested <= 0` becomes [`DEFAULT_LIST_LIMIT`]; anything larger than
 /// [`MAX_LIST_LIMIT`] is clamped down to it.
 fn normalize_limit(requested: i64) -> i64 {
-    if requested <= 0 {
-        DEFAULT_LIST_LIMIT
-    } else {
-        requested.min(MAX_LIST_LIMIT)
-    }
+    page::clamp_page_size(requested, DEFAULT_LIST_LIMIT)
 }
 
 /// Whether `flag` is safe to interpolate into a hand-built `STORE` command

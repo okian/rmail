@@ -56,11 +56,29 @@ pub enum ErrorReason {
     DeadlineExceeded,
     /// The resource already exists / idempotency replay with a differing payload.
     AlreadyExists,
+    /// A concurrent attempt owns the operation — an idempotency key whose
+    /// first attempt is still in flight (or died holding the fence).
+    ///
+    /// Distinct from [`ErrorReason::AlreadyExists`] on purpose: "you sent a
+    /// different payload under a key you already used" is a client bug the
+    /// caller must fix, while "this exact request is already running" resolves
+    /// on its own. Collapsing them would make the one branch a retrying client
+    /// needs indistinguishable from the one it must never retry.
+    Aborted,
     /// A cursor is past retention (e.g. `WatchEvents` resume gap); carries the
     /// oldest still-available position so the client can resync.
     OutOfRange,
     /// Client input was malformed.
     InvalidArgument,
+    /// The daemon ended the operation before it completed — a shut-down
+    /// server, or a stream whose work was cancelled underneath it.
+    ///
+    /// Load-bearing for **streaming** RPCs. A server-streamed call that simply
+    /// stops yielding frames terminates `OK`, which a client cannot tell apart
+    /// from a complete answer: it keeps half an `AskMailbox` reply, sees
+    /// success, and exits 0. A cancelled stream therefore ends with this
+    /// reason rather than silently.
+    Cancelled,
     /// An unexpected internal error (the detail stays server-side; the boundary
     /// returns a generic message).
     Internal,
@@ -68,7 +86,7 @@ pub enum ErrorReason {
 
 impl ErrorReason {
     /// Every reason, for exhaustive iteration in tests and tooling.
-    pub const ALL: [ErrorReason; 11] = [
+    pub const ALL: [ErrorReason; 13] = [
         ErrorReason::Unauthenticated,
         ErrorReason::PermissionDenied,
         ErrorReason::NotFound,
@@ -77,10 +95,23 @@ impl ErrorReason {
         ErrorReason::ResourceExhausted,
         ErrorReason::DeadlineExceeded,
         ErrorReason::AlreadyExists,
+        ErrorReason::Aborted,
         ErrorReason::OutOfRange,
         ErrorReason::InvalidArgument,
+        ErrorReason::Cancelled,
         ErrorReason::Internal,
     ];
+
+    /// The reason whose wire string is `wire`, if any.
+    ///
+    /// The inverse of [`ErrorReason::as_str`], and the reason that function's
+    /// output is a closed vocabulary: [`Error::from_status`] uses this to
+    /// recover a domain error from a `Status` that crossed a service seam, and
+    /// an unknown string there must degrade rather than guess.
+    #[must_use]
+    pub fn from_wire(wire: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == wire)
+    }
 
     /// The stable wire string placed in `ErrorInfo.reason`.
     #[must_use]
@@ -94,8 +125,10 @@ impl ErrorReason {
             ErrorReason::ResourceExhausted => "RESOURCE_EXHAUSTED",
             ErrorReason::DeadlineExceeded => "DEADLINE_EXCEEDED",
             ErrorReason::AlreadyExists => "ALREADY_EXISTS",
+            ErrorReason::Aborted => "ABORTED",
             ErrorReason::OutOfRange => "OUT_OF_RANGE",
             ErrorReason::InvalidArgument => "INVALID_ARGUMENT",
+            ErrorReason::Cancelled => "CANCELLED",
             ErrorReason::Internal => "INTERNAL",
         }
     }
@@ -112,9 +145,39 @@ impl ErrorReason {
             ErrorReason::ResourceExhausted => Code::ResourceExhausted,
             ErrorReason::DeadlineExceeded => Code::DeadlineExceeded,
             ErrorReason::AlreadyExists => Code::AlreadyExists,
+            ErrorReason::Aborted => Code::Aborted,
             ErrorReason::OutOfRange => Code::OutOfRange,
             ErrorReason::InvalidArgument => Code::InvalidArgument,
+            ErrorReason::Cancelled => Code::Cancelled,
             ErrorReason::Internal => Code::Internal,
+        }
+    }
+
+    /// The reason a bare gRPC [`Code`] implies, for a `Status` that carries no
+    /// rmail `ErrorInfo` at all.
+    ///
+    /// Only [`Error::from_status`] should need this: a `Status` minted by
+    /// tonic itself (a decode failure, an unimplemented method, a transport
+    /// error) has a meaningful code and nothing else, and throwing that code
+    /// away is precisely the flattening `from_status` exists to stop.
+    #[must_use]
+    pub const fn from_code(code: Code) -> Self {
+        match code {
+            Code::Unauthenticated => ErrorReason::Unauthenticated,
+            Code::PermissionDenied => ErrorReason::PermissionDenied,
+            Code::NotFound => ErrorReason::NotFound,
+            Code::FailedPrecondition => ErrorReason::FailedPrecondition,
+            Code::Unavailable => ErrorReason::Unavailable,
+            Code::ResourceExhausted => ErrorReason::ResourceExhausted,
+            Code::DeadlineExceeded => ErrorReason::DeadlineExceeded,
+            Code::AlreadyExists => ErrorReason::AlreadyExists,
+            Code::Aborted => ErrorReason::Aborted,
+            Code::OutOfRange => ErrorReason::OutOfRange,
+            Code::InvalidArgument => ErrorReason::InvalidArgument,
+            Code::Cancelled => ErrorReason::Cancelled,
+            // Ok/Unknown/Unimplemented/DataLoss and anything tonic adds later
+            // have no domain counterpart; `Internal` is the honest floor.
+            _ => ErrorReason::Internal,
         }
     }
 }
@@ -167,6 +230,10 @@ pub enum Error {
     #[error("already exists: {0}")]
     AlreadyExists(String),
 
+    /// A concurrent attempt owns the operation — see [`ErrorReason::Aborted`].
+    #[error("aborted: {0}")]
+    Aborted(String),
+
     /// A cursor is past retention (e.g. a `WatchEvents` resume gap).
     ///
     /// Carries the oldest still-available position when there is one, so a
@@ -184,6 +251,11 @@ pub enum Error {
     /// Client input was malformed.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// The daemon ended the operation before it completed — see
+    /// [`ErrorReason::Cancelled`].
+    #[error("cancelled: {0}")]
+    Cancelled(String),
 
     /// An unexpected internal error.
     ///
@@ -228,6 +300,14 @@ impl Error {
     pub fn already_exists(message: impl Into<String>) -> Self {
         Self::AlreadyExists(message.into())
     }
+    /// Construct an [`Error::Aborted`].
+    pub fn aborted(message: impl Into<String>) -> Self {
+        Self::Aborted(message.into())
+    }
+    /// Construct an [`Error::Cancelled`].
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::Cancelled(message.into())
+    }
     /// Construct an [`Error::OutOfRange`].
     pub fn out_of_range(message: impl Into<String>) -> Self {
         Self::OutOfRange {
@@ -268,8 +348,10 @@ impl Error {
             Error::ResourceExhausted(_) => ErrorReason::ResourceExhausted,
             Error::DeadlineExceeded(_) => ErrorReason::DeadlineExceeded,
             Error::AlreadyExists(_) => ErrorReason::AlreadyExists,
+            Error::Aborted(_) => ErrorReason::Aborted,
             Error::OutOfRange { .. } => ErrorReason::OutOfRange,
             Error::InvalidArgument(_) => ErrorReason::InvalidArgument,
+            Error::Cancelled(_) => ErrorReason::Cancelled,
             Error::Internal(_) => ErrorReason::Internal,
         }
     }
@@ -307,6 +389,110 @@ impl Error {
     #[must_use]
     pub fn into_status(self) -> Status {
         Status::from(self)
+    }
+
+    /// Recover a domain [`Error`] from a [`Status`], preserving its reason.
+    ///
+    /// # Why this exists
+    ///
+    /// The daemon has seams where one component's gRPC-shaped result is fed
+    /// back into a `rmail-core` trait that speaks [`Error`] — `AskMailbox`'s
+    /// retriever and `Evaluate`'s ranked-search adapter both call the search
+    /// pipeline, which returns [`Status`] because every *other* caller of it
+    /// is a tonic handler. Those seams used to wrap the status message in
+    /// [`Error::Internal`], which is lossy twice over: the code became
+    /// `INTERNAL`, and the [`From<Error>`] impl below then scrubbed the
+    /// message — so a caller naming an account that does not exist got
+    /// `INTERNAL`/`"internal error"`, indistinguishable from a daemon bug and
+    /// unactionable by a client that (correctly) branches on `reason`.
+    ///
+    /// Round-tripping through this function is lossless for every reason the
+    /// contract defines, so a `NOT_FOUND` raised deep in retrieval is still a
+    /// `NOT_FOUND` when `AskMailbox` re-raises it.
+    ///
+    /// # Trust
+    ///
+    /// The `ErrorInfo` is only honoured when its `domain` is
+    /// [`ERROR_DOMAIN`] — a status from some other server's interceptor may
+    /// carry an `ErrorInfo` of its own with a colliding `reason` string, and
+    /// adopting that would let a foreign vocabulary drive rmail's own
+    /// branching. Anything else falls back to
+    /// [`ErrorReason::from_code`], which is still strictly better than
+    /// flattening to `INTERNAL`.
+    ///
+    /// `Internal` statuses keep the boundary's generic message: the detail was
+    /// already scrubbed on the way out and there is nothing to recover.
+    #[must_use]
+    pub fn from_status(status: &Status) -> Self {
+        let details = status.get_error_details();
+        let reason = details
+            .error_info()
+            .filter(|info| info.domain == ERROR_DOMAIN)
+            .and_then(|info| ErrorReason::from_wire(&info.reason))
+            .unwrap_or_else(|| ErrorReason::from_code(status.code()));
+
+        let message = status.message().to_owned();
+        match reason {
+            ErrorReason::Unauthenticated => Self::Unauthenticated(message),
+            ErrorReason::PermissionDenied => Self::PermissionDenied(message),
+            ErrorReason::NotFound => Self::NotFound(message),
+            ErrorReason::FailedPrecondition => Self::FailedPrecondition(message),
+            ErrorReason::Unavailable => Self::Unavailable(message),
+            ErrorReason::ResourceExhausted => Self::ResourceExhausted(message),
+            ErrorReason::DeadlineExceeded => Self::DeadlineExceeded(message),
+            ErrorReason::AlreadyExists => Self::AlreadyExists(message),
+            ErrorReason::Aborted => Self::Aborted(message),
+            // The resume cursor rides in metadata, not in the message, so it
+            // survives the round trip too.
+            ErrorReason::OutOfRange => Self::OutOfRange {
+                message,
+                oldest_seq: details
+                    .error_info()
+                    .and_then(|info| info.metadata.get(OLDEST_SEQ_KEY).cloned())
+                    .and_then(|seq| seq.parse().ok()),
+            },
+            ErrorReason::InvalidArgument => Self::InvalidArgument(message),
+            ErrorReason::Cancelled => Self::Cancelled(message),
+            ErrorReason::Internal => Self::Internal(message),
+        }
+    }
+
+    /// This error with `context` prefixed onto its message, keeping its
+    /// reason.
+    ///
+    /// The safe form of `Error::internal(format!("{context}: {err}"))`, which
+    /// is how context normally gets lost: prefixing must not re-code the
+    /// error, because the code is the only part a client is allowed to branch
+    /// on.
+    ///
+    /// The prefix goes on the *inner* message, not on `Display`'s output — the
+    /// latter already carries the variant's own name, so `"ask retrieval: "`
+    /// applied to it would read `"unauthenticated: ask retrieval:
+    /// unauthenticated: ..."` once the boundary re-rendered it.
+    #[must_use]
+    pub fn context(self, context: &str) -> Self {
+        let prefixed = |message: String| format!("{context}: {message}");
+        match self {
+            Self::Unauthenticated(m) => Self::Unauthenticated(prefixed(m)),
+            Self::PermissionDenied(m) => Self::PermissionDenied(prefixed(m)),
+            Self::NotFound(m) => Self::NotFound(prefixed(m)),
+            Self::FailedPrecondition(m) => Self::FailedPrecondition(prefixed(m)),
+            Self::Unavailable(m) => Self::Unavailable(prefixed(m)),
+            Self::ResourceExhausted(m) => Self::ResourceExhausted(prefixed(m)),
+            Self::DeadlineExceeded(m) => Self::DeadlineExceeded(prefixed(m)),
+            Self::AlreadyExists(m) => Self::AlreadyExists(prefixed(m)),
+            Self::Aborted(m) => Self::Aborted(prefixed(m)),
+            Self::OutOfRange {
+                message,
+                oldest_seq,
+            } => Self::OutOfRange {
+                message: prefixed(message),
+                oldest_seq,
+            },
+            Self::InvalidArgument(m) => Self::InvalidArgument(prefixed(m)),
+            Self::Cancelled(m) => Self::Cancelled(prefixed(m)),
+            Self::Internal(m) => Self::Internal(prefixed(m)),
+        }
     }
 }
 
@@ -356,8 +542,10 @@ mod tests {
             ErrorReason::ResourceExhausted => Error::resource_exhausted("daily budget spent"),
             ErrorReason::DeadlineExceeded => Error::deadline_exceeded("search timed out"),
             ErrorReason::AlreadyExists => Error::already_exists("idempotency key reused"),
+            ErrorReason::Aborted => Error::aborted("that idempotency key is still in flight"),
             ErrorReason::OutOfRange => Error::out_of_range("cursor past retention"),
             ErrorReason::InvalidArgument => Error::invalid_argument("empty query"),
+            ErrorReason::Cancelled => Error::cancelled("the daemon is shutting down"),
             ErrorReason::Internal => Error::internal("unexpected null in ranker"),
         }
     }
@@ -374,8 +562,10 @@ mod tests {
             ErrorReason::ResourceExhausted => Code::ResourceExhausted,
             ErrorReason::DeadlineExceeded => Code::DeadlineExceeded,
             ErrorReason::AlreadyExists => Code::AlreadyExists,
+            ErrorReason::Aborted => Code::Aborted,
             ErrorReason::OutOfRange => Code::OutOfRange,
             ErrorReason::InvalidArgument => Code::InvalidArgument,
+            ErrorReason::Cancelled => Code::Cancelled,
             ErrorReason::Internal => Code::Internal,
         }
     }
@@ -446,8 +636,10 @@ mod tests {
         );
         assert_eq!(ErrorReason::DeadlineExceeded.as_str(), "DEADLINE_EXCEEDED");
         assert_eq!(ErrorReason::AlreadyExists.as_str(), "ALREADY_EXISTS");
+        assert_eq!(ErrorReason::Aborted.as_str(), "ABORTED");
         assert_eq!(ErrorReason::OutOfRange.as_str(), "OUT_OF_RANGE");
         assert_eq!(ErrorReason::InvalidArgument.as_str(), "INVALID_ARGUMENT");
+        assert_eq!(ErrorReason::Cancelled.as_str(), "CANCELLED");
         assert_eq!(ErrorReason::Internal.as_str(), "INTERNAL");
     }
 
@@ -482,6 +674,105 @@ mod tests {
     fn non_internal_message_is_preserved() {
         let status: Status = Error::not_found("message 42").into();
         assert!(status.message().contains("message 42"));
+    }
+
+    #[test]
+    fn a_status_round_trips_back_to_its_reason() {
+        // The seam this exists for: a `Status` produced by one component,
+        // handed back to a `rmail-core` trait that speaks `Error`. Every
+        // reason must survive it, or a client's branch silently changes.
+        for reason in ErrorReason::ALL {
+            let status: Status = sample(reason).into();
+            let recovered = Error::from_status(&status);
+            assert_eq!(recovered.reason(), reason, "round trip for {reason:?}");
+            let again: Status = recovered.into();
+            assert_eq!(again.code(), reason.code(), "code for {reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_recovered_error_keeps_its_client_safe_message() {
+        let status: Status = Error::not_found("account 7").into();
+        let recovered = Error::from_status(&status);
+        assert!(recovered.to_string().contains("account 7"));
+    }
+
+    #[test]
+    fn a_recovered_resume_gap_keeps_its_cursor() {
+        let status: Status = Error::resume_gap("cursor past retention", 16).into();
+        let recovered = Error::from_status(&status);
+        assert_eq!(recovered.reason(), ErrorReason::OutOfRange);
+        let oldest_seq = match recovered {
+            Error::OutOfRange { oldest_seq, .. } => oldest_seq,
+            other => unreachable!("expected an OutOfRange, got {other:?}"),
+        };
+        assert_eq!(oldest_seq, Some(16));
+    }
+
+    #[test]
+    fn a_foreign_status_falls_back_to_its_code() {
+        // No ErrorInfo at all — a tonic-minted status (decode failure,
+        // unimplemented method). The code is all there is, and it is still far
+        // better than flattening to INTERNAL.
+        let status = Status::new(Code::NotFound, "no such method");
+        assert_eq!(Error::from_status(&status).reason(), ErrorReason::NotFound);
+
+        let status = Status::new(Code::Unimplemented, "not built");
+        assert_eq!(Error::from_status(&status).reason(), ErrorReason::Internal);
+    }
+
+    #[test]
+    fn a_foreign_error_info_domain_is_not_adopted() {
+        // Another server's ErrorInfo may use the same reason strings for
+        // entirely different semantics; only rmail's own domain is trusted.
+        let mut details = ErrorDetails::new();
+        details.set_error_info("NOT_FOUND", "example.com", HashMap::new());
+        let status = Status::with_error_details(Code::Internal, "boom", details);
+        assert_eq!(Error::from_status(&status).reason(), ErrorReason::Internal);
+    }
+
+    #[test]
+    fn an_unknown_reason_string_falls_back_to_the_code() {
+        // A newer daemon adding a reason this build has never heard of must
+        // degrade to the code rather than guess.
+        let mut details = ErrorDetails::new();
+        details.set_error_info("TEAPOT", ERROR_DOMAIN, HashMap::new());
+        let status = Status::with_error_details(Code::InvalidArgument, "nope", details);
+        assert_eq!(
+            Error::from_status(&status).reason(),
+            ErrorReason::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn context_prefixes_without_re_coding() {
+        for reason in ErrorReason::ALL {
+            let original = sample(reason).to_string();
+            let err = sample(reason).context("ask retrieval");
+            assert_eq!(err.reason(), reason, "context re-coded {reason:?}");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("ask retrieval: "),
+                "context missing for {reason:?}: {rendered}"
+            );
+            // Prefixed once, on the inner message — not wrapped around a
+            // Display that already names the variant.
+            assert_eq!(
+                rendered
+                    .matches(&original[..original.find(':').unwrap_or(0)])
+                    .count(),
+                1,
+                "the variant name was repeated for {reason:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_on_an_internal_still_does_not_reach_the_client() {
+        let status: Status = Error::internal("db password = hunter2")
+            .context("ask retrieval")
+            .into();
+        assert_eq!(status.message(), "internal error");
     }
 
     #[test]

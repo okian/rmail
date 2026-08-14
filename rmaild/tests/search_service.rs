@@ -253,6 +253,27 @@ where
     out
 }
 
+/// Drain a stream, returning its items and the terminal status if it ended
+/// with one rather than cleanly.
+///
+/// The distinction is the whole point for a cancelled stream: "ran out of
+/// hits" and "was stopped" both stop yielding items, and only the terminal
+/// frame tells them apart.
+async fn drain_to_end<S, T>(stream: &mut S) -> (Vec<T>, Option<tonic::Status>)
+where
+    S: tokio_stream::Stream<Item = Result<T, tonic::Status>> + Unpin,
+{
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(STREAM_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(item))) => out.push(item),
+            Ok(Some(Err(status))) => return (out, Some(status)),
+            Ok(None) => return (out, None),
+            Err(_) => panic!("timed out draining stream"),
+        }
+    }
+}
+
 /// Take the next stream item as a `Result`, for a test that expects the
 /// item itself to carry an error status (`Search`'s streaming error path).
 async fn next_result<S, T>(stream: &mut S) -> Result<T, tonic::Status>
@@ -702,8 +723,18 @@ async fn a_fresh_search_request_cancels_the_prior_stream() {
         Some("aquarium maintenance")
     );
 
-    // Whatever `stream_a` produced before it was cancelled.
-    let a_hits = drain(&mut stream_a).await;
+    // Whatever `stream_a` produced before it was cancelled — and then a
+    // terminal CANCELLED, because a superseded stream must not end `OK`. The
+    // generation slot is daemon-wide, so the client whose query lost it is not
+    // necessarily the client that took it, and a clean end would hand that
+    // client a silently truncated page it has no way to recognise.
+    let (a_hits, a_end) = drain_to_end(&mut stream_a).await;
+    let end = a_end.expect("a superseded stream must end with a terminal error");
+    assert_eq!(
+        end.code(),
+        tonic::Code::Cancelled,
+        "a superseded search must be branchable as cancelled: {end:?}"
+    );
 
     // A control run of A's identical, unsuperseded query proves what the
     // full page *would* contain — the comparison is what proves the

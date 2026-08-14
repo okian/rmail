@@ -291,6 +291,47 @@ const fn should_log(cancelled: bool, impressions: usize) -> bool {
     !cancelled && impressions > 0
 }
 
+/// How a streamed search ended, and what it left to log.
+///
+/// `cancelled` is recorded at each exit rather than re-read from the token
+/// afterwards — see [`SearchApi::run_stream`] for the race that makes the
+/// difference visible to a client.
+struct StreamOutcome {
+    logged: Option<LoggedPage>,
+    cancelled: bool,
+}
+
+impl StreamOutcome {
+    /// Ran to the end of the page.
+    const fn completed(logged: Option<LoggedPage>) -> Self {
+        Self {
+            logged,
+            cancelled: false,
+        }
+    }
+
+    /// An error frame is already on the wire; it is the terminal status.
+    const fn failed() -> Self {
+        Self {
+            logged: None,
+            cancelled: false,
+        }
+    }
+
+    /// Stopped early — cancelled, or the consumer went away. Only the first
+    /// warrants a terminal frame, and only the token knows which, *here*.
+    fn stopped(cancel: &CancellationToken) -> Self {
+        Self::stopped_with(None, cancel)
+    }
+
+    fn stopped_with(logged: Option<LoggedPage>, cancel: &CancellationToken) -> Self {
+        Self {
+            logged,
+            cancelled: cancel.is_cancelled(),
+        }
+    }
+}
+
 /// The page to log, or `None` if there is nothing worth logging — see
 /// [`should_log`] for the rule and why it lives there.
 fn finish_page(page: Option<LoggedPage>, cancel: &CancellationToken) -> Option<LoggedPage> {
@@ -575,6 +616,11 @@ impl SearchApi {
     > {
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BUFFER);
         let this = self.clone();
+        // Kept alive past `run_stream` purely to carry the terminal frame — see
+        // below. It also means the response channel does not close until this
+        // task decides it should, which is what makes the ordering explicit
+        // rather than incidental.
+        let terminator = tx.clone();
         tokio::spawn(
             async move {
                 // `tx` is moved into `run_stream` and dropped when it
@@ -583,8 +629,20 @@ impl SearchApi {
                 // whole reason the logging lives out here rather than at the
                 // bottom of `run_stream`: a page held open while the writer
                 // connection is busy would be a search this task made slower.
-                let logged = this.run_stream(req, dense_only, cancel, tx).await;
-                if let Some(page) = logged {
+                let outcome = this.run_stream(req, dense_only, cancel, tx).await;
+                // A superseded pipeline bails at any of half a dozen
+                // `cancel.is_cancelled()` checks *between* stages, most of
+                // which never reach a `send` — so the terminal frame is
+                // emitted here, at the one point every path converges. Without
+                // it the stream ends `OK` and the client that lost the
+                // generation slot cannot tell a short page from a whole one;
+                // the slot is daemon-wide, so that client is not necessarily
+                // the one that took it.
+                if outcome.cancelled {
+                    crate::stream::terminate_cancelled(&terminator).await;
+                }
+                drop(terminator);
+                if let Some(page) = outcome.logged {
                     this.log_page(page).await;
                 }
             }
@@ -627,6 +685,12 @@ impl SearchApi {
     /// docs' "Feedback" section for why logging happens there rather than
     /// here, and why a cancelled stream returns `None` rather than an empty
     /// batch.
+    ///
+    /// It also reports **why** it stopped. That cannot be re-derived by reading
+    /// the token afterwards: between the last hit and that read, a fresh
+    /// `Search` can take the daemon-wide generation slot, and a client that
+    /// received the whole page would then be told `CANCELLED`. Each exit
+    /// records the answer where it is still true.
     #[tracing::instrument(skip(self, req, cancel, tx), fields(dense_only, explain = req.explain))]
     async fn run_stream(
         &self,
@@ -634,7 +698,7 @@ impl SearchApi {
         dense_only: bool,
         cancel: CancellationToken,
         tx: tokio::sync::mpsc::Sender<Result<ProtoSearchHit, Status>>,
-    ) -> Option<LoggedPage> {
+    ) -> StreamOutcome {
         let now = Utc::now();
         // Minted before anything is written, because it has to be on every
         // hit as it streams; `None` when `search.learning` is off, and then
@@ -648,7 +712,9 @@ impl SearchApi {
             Ok(query) => query,
             Err(status) => {
                 let _ = send(&tx, &cancel, Err(status)).await;
-                return None;
+                // An error frame is already terminal; a CANCELLED after it
+                // would be a second terminal status for one call.
+                return StreamOutcome::failed();
             }
         };
 
@@ -656,7 +722,7 @@ impl SearchApi {
             Ok(plan) => plan,
             Err(error) => {
                 let _ = send(&tx, &cancel, Err(Status::from(error))).await;
-                return None;
+                return StreamOutcome::failed();
             }
         };
         if let Some(intent) = decode_intent(req.intent) {
@@ -672,7 +738,7 @@ impl SearchApi {
                 .await
         };
         if cancel.is_cancelled() {
-            return None;
+            return StreamOutcome::stopped(&cancel);
         }
 
         let fused = self
@@ -686,7 +752,7 @@ impl SearchApi {
             )
             .await;
         if cancel.is_cancelled() {
-            return None;
+            return StreamOutcome::stopped(&cancel);
         }
 
         let features = self
@@ -697,7 +763,7 @@ impl SearchApi {
             .ranker
             .rank(&features, plan.intent, self.search.top_k_rerank as usize);
         if ranked.is_empty() || cancel.is_cancelled() {
-            return None;
+            return StreamOutcome::stopped(&cancel);
         }
 
         // Stage 5, over the L1 top-K. Never fails: `L2Stage::rerank` returns
@@ -714,7 +780,7 @@ impl SearchApi {
         // checks above give. (Task 51 wrote a bare `return` here against a
         // `()`-returning `run_stream`; task 64 gave it a return value.)
         if cancel.is_cancelled() {
-            return None;
+            return StreamOutcome::stopped(&cancel);
         }
 
         let limit = if req.limit == 0 {
@@ -781,13 +847,13 @@ impl SearchApi {
             sent.insert(id);
             let score = hit.score;
             if send(&tx, &cancel, Ok(hit)).await.is_break() {
-                return finish_page(page, &cancel);
+                return StreamOutcome::stopped_with(finish_page(page, &cancel), &cancel);
             }
             rank = rank.saturating_add(1);
             record_impression(page.as_mut(), &vectors, id, rank, score);
         }
         if cancel.is_cancelled() {
-            return None;
+            return StreamOutcome::stopped(&cancel);
         }
 
         // Phase 2: the rest of the page.
@@ -803,12 +869,12 @@ impl SearchApi {
         for (id, hit) in rest_hits {
             let score = hit.score;
             if send(&tx, &cancel, Ok(hit)).await.is_break() {
-                return finish_page(page, &cancel);
+                return StreamOutcome::stopped_with(finish_page(page, &cancel), &cancel);
             }
             rank = rank.saturating_add(1);
             record_impression(page.as_mut(), &vectors, id, rank, score);
         }
-        finish_page(page, &cancel)
+        StreamOutcome::completed(finish_page(page, &cancel))
     }
 
     /// Run the pipeline to completion and return the presented message ids,
@@ -1314,9 +1380,12 @@ impl RankedSearch for EvalSearch<'_> {
             // through `RmailError` rather than carrying a `Status` into
             // `rmail-core` keeps the transport type out of the domain crate,
             // which is the whole reason the trait is shaped this way.
-            .map_err(|status| {
-                RmailError::Internal(format!("search pipeline: {}", status.message()))
-            })
+            //
+            // `from_status`, not `Internal(...)`: the round trip must preserve
+            // the reason. An `Evaluate` run over a golden set naming an
+            // account that does not exist should say `NOT_FOUND`, not report
+            // the daemon as broken.
+            .map_err(|status| RmailError::from_status(&status).context("search pipeline"))
     }
 }
 
@@ -1417,7 +1486,13 @@ impl AskRetriever for AskSearch {
             // gRPC handler; the trait speaks the domain error — the identical
             // round trip `EvalSearch` makes, and for the identical reason:
             // the transport type stays out of `rmail-core`.
-            .map_err(|status| RmailError::Internal(format!("ask retrieval: {}", status.message())))
+            //
+            // The reason survives the round trip. Flattening it to `Internal`
+            // (which this used to do) cost the caller twice: the code became
+            // `INTERNAL`, and the boundary then scrubbed the message — so
+            // `mail ask --account 999` reported "internal error" and looked
+            // exactly like a daemon bug.
+            .map_err(|status| RmailError::from_status(&status).context("ask retrieval"))
     }
 }
 
@@ -1772,6 +1847,10 @@ async fn send<T>(
     item: Result<T, Status>,
 ) -> ControlFlow<()> {
     tokio::select! {
+        // No terminal frame here, unlike the other services' `send` helpers:
+        // this stream's producer bails on cancellation at points that never
+        // reach `send`, so `stream_search` emits it once at the single place
+        // every exit path converges. Emitting it in both would be a duplicate.
         () = cancel.cancelled() => ControlFlow::Break(()),
         sent = tx.send(item) => {
             if sent.is_ok() {

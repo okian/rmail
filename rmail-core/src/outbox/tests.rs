@@ -871,27 +871,112 @@ async fn listing_filters_by_state_and_caps_its_page() {
         .unwrap();
     store.mark_permanent_failure(&claim, "550").await.unwrap();
 
-    let all = store.list(Some(fixture.account_id), None, 0).await.unwrap();
+    let all = store
+        .list(Some(fixture.account_id), None, 0, "")
+        .await
+        .unwrap()
+        .entries;
     assert_eq!(all.len(), 2);
     let only_failed = store
-        .list(None, Some(OutboxState::Failed), 0)
+        .list(None, Some(OutboxState::Failed), 0, "")
         .await
-        .unwrap();
+        .unwrap()
+        .entries;
     assert_eq!(only_failed.len(), 1);
     assert_eq!(only_failed[0].id, failed.id);
     assert!(store
-        .list(Some(fixture.account_id + 1), None, 0)
+        .list(Some(fixture.account_id + 1), None, 0, "")
         .await
         .unwrap()
+        .entries
         .is_empty());
     // Over-large pages are clamped, not rejected.
     assert_eq!(
         store
-            .list(None, None, MAX_LIST_LIMIT + 1_000)
+            .list(None, None, MAX_LIST_LIMIT + 1_000, "")
             .await
             .unwrap()
+            .entries
             .len(),
         2
+    );
+}
+
+#[tokio::test]
+async fn paging_the_outbox_visits_every_entry_exactly_once() {
+    // Every row is created in the same second, so `created_at` ties across
+    // all of them — the case a cursor without the `id` tiebreak repeats or
+    // drops rows at a page boundary.
+    let fixture = Fixture::open();
+    let store = fixture.store();
+    let mut expected = Vec::new();
+    for n in 0..7 {
+        expected.push(
+            store
+                .schedule(fixture.new_send(&format!("Note {n}"), now() + 600))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    expected.sort_unstable();
+
+    let mut seen = Vec::new();
+    let mut token = String::new();
+    for _ in 0..10 {
+        let page = store.list(None, None, 2, &token).await.unwrap();
+        assert!(page.entries.len() <= 2, "page over the requested size");
+        seen.extend(page.entries.iter().map(|e| e.id));
+        match page.next_page_token {
+            Some(next) => token = next,
+            None => break,
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, expected, "paging repeated or skipped an outbox entry");
+}
+
+#[tokio::test]
+async fn an_outbox_page_token_is_bound_to_both_of_its_filters() {
+    // A token minted while looking at one account — or one state — names a
+    // position that means nothing in any other listing, so replaying it there
+    // must be refused rather than read.
+    let fixture = Fixture::open();
+    let store = fixture.store();
+    for n in 0..4 {
+        store
+            .schedule(fixture.new_send(&format!("Note {n}"), now() + 600))
+            .await
+            .unwrap();
+    }
+
+    let token = store
+        .list(Some(fixture.account_id), None, 2, "")
+        .await
+        .unwrap()
+        .next_page_token
+        .expect("a full page should carry a token");
+
+    assert_eq!(
+        store
+            .list(Some(fixture.account_id + 1), None, 2, &token)
+            .await
+            .expect_err("another account's listing must refuse it")
+            .reason(),
+        ErrorReason::InvalidArgument
+    );
+    assert_eq!(
+        store
+            .list(
+                Some(fixture.account_id),
+                Some(OutboxState::Scheduled),
+                2,
+                &token
+            )
+            .await
+            .expect_err("another state filter must refuse it")
+            .reason(),
+        ErrorReason::InvalidArgument
     );
 }
 

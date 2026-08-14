@@ -236,6 +236,10 @@ pub async fn send(socket: &Path, args: SendArgs) -> Result<()> {
             tz: args.tz.unwrap_or_default(),
             undo_window_secs: args.undo_window,
             origin: SendOrigin::User as i32,
+            // Empty: this command issues the RPC exactly once and never
+            // retries it, so there is nothing for the fence to protect
+            // against. Minting keys is a client policy task 42 owns.
+            idempotency_key: String::new(),
         })
         .await
         .context("ScheduleSend RPC failed")?
@@ -280,6 +284,8 @@ pub async fn outbox(socket: &Path, args: OutboxArgs) -> Result<()> {
                     account_id: args.account,
                     state: args.state.unwrap_or(OutboxState::Unspecified as i32),
                     page_size: 0,
+                    // First page only; paging is task 42's surface.
+                    page_token: String::new(),
                 })
                 .await
                 .context("ListOutbox RPC failed")?
@@ -380,6 +386,7 @@ async fn one(
             account_id,
             state: OutboxState::Unspecified as i32,
             page_size: 500,
+            page_token: String::new(),
         })
         .await
         .context("ListOutbox RPC failed")?
@@ -428,6 +435,7 @@ pub async fn followup(socket: &Path, action: FollowupAction) -> Result<()> {
                     account_id: account,
                     state: state.unwrap_or(FollowupState::Unspecified as i32),
                     page_size: 0,
+                    page_token: String::new(),
                 })
                 .await
                 .context("ListFollowups RPC failed")?
