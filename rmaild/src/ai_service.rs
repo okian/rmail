@@ -47,6 +47,24 @@
 //! [`rmail_core::ai::provider::spawn_sse_reader`]'s own cancellation race
 //! (see that function's docs) drops the upstream HTTP response — the request
 //! to Claude is aborted, not merely the local relay.
+//!
+//! # `AskMailbox` is a thin adapter over `rmail_core::ai::rag`
+//!
+//! Mailbox RAG (task 52) has none of its logic here. [`rmail_core::ai::rag`]
+//! owns retrieval, the AI policy gate, context packing, the model call,
+//! citation resolution and the grounding verdict; this file converts its
+//! [`AskEvent`](rmail_core::ai::AskEvent)s to wire
+//! [`AskChunk`](rmail_proto::v1::AskChunk)s and nothing else. That split is
+//! deliberate: every property task 52 has to guarantee — no `forbidden`/
+//! `local_only` text reaching a provider, no citation naming a message that
+//! was not retrieved — is provable without a gRPC server, and a transport
+//! layer that could weaken one of them by accident is a transport layer that
+//! would have to be re-audited every time it changed.
+//!
+//! The engine is built via [`AiApi::with_ask`] from this handler's *own*
+//! provider, policy engine, privacy settings, limits, semaphore and rate
+//! limiter, so `ask` draws on exactly the one `ai.limits` budget every other
+//! AI path in this process does.
 #![allow(clippy::result_large_err)] // see mail_service.rs's identical note on `Result<_, Status>`
 
 use std::pin::Pin;
@@ -56,22 +74,25 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use rmail_core::ai::provider::StreamFrame;
 use rmail_core::ai::queue::{assemble_content, payload_bytes, AiLease, PassHandler};
+use rmail_core::ai::rag::{AskEvent, AskOutcome, RagEngine};
 use rmail_core::ai::{
-    self, deep, triage, AiPauseFlag, AiQueue, BudgetEnforcer, BudgetRequest, BudgetVerdict,
-    CallOutcome, CallRecord, CapDecision, CostGate, DeepPassHandler, GuardedRequest, PolicyEngine,
-    PolicyTarget, Provider, RateLimiter, TokenMap, WorkClass,
+    self, deep, triage, AiPauseFlag, AiQueue, AskRequest as CoreAskRequest, AskRetriever,
+    BudgetEnforcer, BudgetRequest, BudgetVerdict, CallOutcome, CallRecord, CapDecision, CostGate,
+    DeepPassHandler, GuardedRequest, PolicyEngine, PolicyTarget, Provider, RateLimiter, TokenMap,
+    WorkClass,
 };
-use rmail_core::config::{AiLimits, AiPrivacy};
+use rmail_core::config::{AiAsk, AiLimits, AiPrivacy};
 use rmail_core::events::{Event as CoreEvent, EventKind, EventLog, NewEvent};
 use rmail_core::{Database, Error};
 use rmail_proto::v1::ai_service_server::AiService;
 use rmail_proto::v1::{
-    analyze_event, AnalyzeEvent, AnalyzeMessageRequest, DayUsage as ProtoDayUsage,
+    analyze_event, ask_chunk, AnalyzeEvent, AnalyzeMessageRequest, AskChunk,
+    AskDone as ProtoAskDone, AskRequest, Citation as ProtoCitation, DayUsage as ProtoDayUsage,
     Done as ProtoDone, Enrichment, Entity as ProtoEntity, GetSummaryRequest, GetUsageRequest,
-    QueueStats as ProtoQueueStats, RetryFailedRequest, RetryFailedResponse, SetPausedRequest,
-    SetPausedResponse, StreamEnrichmentsRequest, SuggestReplyRequest, Summary as ProtoSummary,
-    SummaryStatus, Todo as ProtoTodo, ToolUseStart as ProtoToolUseStart, Usage as ProtoUsage,
-    UsageStats,
+    QueueStats as ProtoQueueStats, RetrievalTrace as ProtoRetrievalTrace, RetryFailedRequest,
+    RetryFailedResponse, SetPausedRequest, SetPausedResponse, StreamEnrichmentsRequest,
+    SuggestReplyRequest, Summary as ProtoSummary, SummaryStatus, Todo as ProtoTodo,
+    ToolUseStart as ProtoToolUseStart, Usage as ProtoUsage, UsageStats,
 };
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
@@ -124,6 +145,11 @@ pub struct AiApi {
     /// Cancelled when the daemon shuts down, so in-flight forced analyses and
     /// open streams stop with it rather than holding shutdown open.
     shutdown: CancellationToken,
+    /// Mailbox RAG (task 52). `None` on a daemon built without a retriever,
+    /// in which case `AskMailbox` is registered — the reflection set and the
+    /// scope table must see every RPC regardless of runtime wiring — but
+    /// answers `FAILED_PRECONDITION` rather than pretending to search.
+    rag: Option<Arc<RagEngine>>,
 }
 
 impl AiApi {
@@ -166,7 +192,32 @@ impl AiApi {
             semaphore,
             rate_limiter,
             shutdown,
+            rag: None,
         }
+    }
+
+    /// Give this handler the mailbox-RAG engine behind `AskMailbox`, over
+    /// `retriever`'s search pipeline.
+    ///
+    /// A builder method rather than another `new` parameter because the
+    /// retriever is `rmaild::SearchApi`, which is constructed *after* the AI
+    /// provider it shares — and because the engine is assembled here, from
+    /// this handler's own fields, so there is no way to hand it a second
+    /// provider, a second policy engine, or a second concurrency budget.
+    #[must_use]
+    pub fn with_ask(mut self, retriever: Arc<dyn AskRetriever>, config: AiAsk) -> Self {
+        self.rag = Some(Arc::new(RagEngine::new(
+            self.db.clone(),
+            Arc::clone(&self.provider),
+            Arc::clone(&self.policy),
+            retriever,
+            self.privacy.clone(),
+            self.limits.clone(),
+            config,
+            Arc::clone(&self.semaphore),
+            Arc::clone(&self.rate_limiter),
+        )));
+        self
     }
 }
 
@@ -447,6 +498,130 @@ impl AiService for AiApi {
             revived: i64::try_from(revived).unwrap_or(i64::MAX),
         }))
     }
+
+    type AskMailboxStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<AskChunk, Status>> + Send + 'static>>;
+
+    #[tracing::instrument(skip(self, request), fields(account_id, top_k))]
+    async fn ask_mailbox(
+        &self,
+        request: Request<AskRequest>,
+    ) -> Result<Response<Self::AskMailboxStream>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current()
+            .record("account_id", req.account_id)
+            .record("top_k", req.top_k);
+
+        // Checked before retrieval rather than left to `NullProvider`: a
+        // disabled daemon should decline in microseconds, not after running a
+        // hybrid search whose only possible use was a call it was never going
+        // to make.
+        if !self.enabled {
+            return Err(Status::from(Error::failed_precondition(
+                "AI is disabled on this daemon (ai.enabled = false, or no provider could be \
+                 built), so ask-mailbox cannot answer"
+                    .to_owned(),
+            )));
+        }
+        let Some(rag) = self.rag.as_ref() else {
+            return Err(Status::from(Error::failed_precondition(
+                "ask-mailbox is not wired on this daemon (no search pipeline)".to_owned(),
+            )));
+        };
+
+        // A child of the shutdown token, exactly as `AnalyzeMessage`'s is, so
+        // daemon shutdown ends an open answer — and so dropping the response
+        // stream propagates to the provider rather than merely to the relay.
+        let cancel = self.shutdown.child_token();
+        let stream = rag
+            .ask(
+                &CoreAskRequest {
+                    question: req.question,
+                    account_id: req.account_id,
+                    filter: req.filter,
+                    top_k: req.top_k,
+                },
+                &cancel,
+            )
+            .await
+            .map_err(Status::from)?;
+
+        // The token is cancelled when the mapped stream is dropped — which is
+        // what tonic does the instant a client disconnects. Without this the
+        // engine's own `tx.closed()` race would still fire, but the *upstream*
+        // HTTP request would only be dropped once the engine noticed; carrying
+        // the guard on the stream makes the cancellation unconditional.
+        let guard = CancelOnDrop(cancel);
+        let stream = stream.map(move |event| {
+            let _ = &guard;
+            event.map(to_proto_chunk).map_err(Status::from)
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+/// Cancels its token when dropped. Carried by the `AskMailbox` response
+/// stream so a client disconnect — which tonic signals by dropping the stream
+/// — aborts the upstream provider call rather than only ending the local
+/// relay.
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// One core [`AskEvent`] as a wire [`AskChunk`].
+fn to_proto_chunk(event: AskEvent) -> AskChunk {
+    let body = match event {
+        AskEvent::Trace(trace) => ask_chunk::Body::Trace(ProtoRetrievalTrace {
+            retrieved: clamp_u32(trace.retrieved),
+            packed: clamp_u32(trace.packed),
+            withheld_by_policy: clamp_u32(trace.withheld_by_policy),
+            dropped_for_budget: clamp_u32(trace.dropped_for_budget),
+            context_tokens: clamp_u32(trace.context_tokens),
+            model: trace.model,
+        }),
+        AskEvent::Token(token) => ask_chunk::Body::Token(token),
+        AskEvent::Citation(citation) => ask_chunk::Body::Citation(ProtoCitation {
+            label: citation.label,
+            message_id: citation.message_id,
+            message_uid: citation.message_uid,
+            account_id: citation.account_id,
+            mailbox: citation.mailbox,
+            subject: citation.subject,
+            from_addr: citation.from_addr,
+            date: citation.date,
+            quote: citation.quote,
+        }),
+        AskEvent::Usage(usage) => ask_chunk::Body::Usage(to_proto_usage(usage)),
+        AskEvent::Done(outcome) => ask_chunk::Body::Done(to_proto_ask_done(outcome)),
+    };
+    AskChunk { body: Some(body) }
+}
+
+fn to_proto_ask_done(outcome: AskOutcome) -> ProtoAskDone {
+    ProtoAskDone {
+        grounded: outcome.grounded,
+        // Empty exactly when grounded, per the proto's own contract — the
+        // refusal text is the engine's, so a client never has to compose one.
+        refusal: outcome
+            .refusal
+            .map(|refusal| refusal.message().to_owned())
+            .unwrap_or_default(),
+        stop_reason: outcome
+            .stop_reason
+            .map(|reason| stop_reason_str(reason).to_owned())
+            .unwrap_or_default(),
+    }
+}
+
+/// A count as a wire `uint32`. Saturating rather than wrapping: these are
+/// display counters bounded by `ai.ask.top_k` in practice, and a wrapped one
+/// would be a lie rather than a large number.
+fn clamp_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 // ---------------------------------------------------------------------------

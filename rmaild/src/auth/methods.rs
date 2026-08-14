@@ -580,6 +580,32 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AiService/RetryFailed",
         Requirement::Scope(Scope::Admin),
     ),
+    // `AskMailbox` (task 52) is the one row in this table that needs *both*
+    // `mail.read` and `ai.invoke`, and neither half is redundant.
+    //
+    // `ai.invoke`, because unlike `Search` this RPC does not merely *reach*
+    // a provider under some configurations — calling the provider is the
+    // entire RPC. `SearchService/Search`'s row above stays at `mail.read`
+    // only because `SearchApi::rerank_for` clamps a request to the backend
+    // `search.rerank` already sanctioned, so a read-scoped token can spend
+    // nothing the operator had not already turned on. There is no equivalent
+    // clamp here and there could not be: an answer with no model call is not
+    // a degraded answer, it is no answer. A `mail.read` token that could
+    // force provider spend is the exact hole task 51's own review caught, and
+    // this is where it would otherwise reopen.
+    //
+    // `mail.read`, because `ai.invoke` alone would be a *content* escalation.
+    // `AnalyzeMessage`/`SuggestReply` sit at `ai.invoke` and disclose one
+    // message the caller already named and could already fetch. This RPC
+    // takes a free-text question, searches every configured account, and
+    // streams back verbatim quotes plus each source's mailbox, sender,
+    // subject and UID — a mailbox-wide read by any reasonable definition. A
+    // token minted to summarize a message it was handed must not become a
+    // way to go fishing through mail it was never given.
+    (
+        "/rmail.v1.AiService/AskMailbox",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
+    ),
     // -- AiPolicyService (task 76) --------------------------------------------
     // Both rows are `admin`, and neither is `AiSpend`.
     //
@@ -1072,6 +1098,46 @@ mod tests {
                 "{method} can spend at a model provider and must require ai.invoke"
             );
         }
+    }
+
+    /// Asking the mailbox a question is two authorities at once, and neither
+    /// alone buys it.
+    ///
+    /// The failure this guards against is specific and has happened once
+    /// already in this codebase's history: a `mail.read` token that can force
+    /// provider spend. `AskMailbox` always calls the model — there is no
+    /// clamp-to-configured-backend escape hatch the way `Search` has — so
+    /// `mail.read` alone must not reach it. The mirror case matters just as
+    /// much: `ai.invoke` alone would turn a token minted to summarize one
+    /// named message into a mailbox-wide content search.
+    ///
+    /// Checked as a relation rather than as literal rows, for the reason
+    /// `evaluating_a_rule_needs_both_automation_and_mail_write` gives: a pair
+    /// of `assert_eq!`s on the row's contents would keep passing even if
+    /// `authorize` stopped treating `AllOf` as a conjunction.
+    #[test]
+    fn asking_the_mailbox_needs_both_mail_read_and_ai_invoke() {
+        let method = "/rmail.v1.AiService/AskMailbox";
+        let Some(Requirement::AllOf(required)) = lookup(method) else {
+            unreachable!("{method} should require every one of a scope set");
+        };
+        assert!(required.contains(&Scope::MailRead));
+        assert!(required.contains(&Scope::AiInvoke));
+        for granted in [Scope::MailRead, Scope::AiInvoke, Scope::MailWrite] {
+            assert!(
+                !required
+                    .iter()
+                    .all(|want| rmail_core::auth::satisfies(std::slice::from_ref(&granted), want)),
+                "{granted:?} alone must not be enough to ask the mailbox a question"
+            );
+        }
+        let both = [Scope::MailRead, Scope::AiInvoke];
+        assert!(
+            required
+                .iter()
+                .all(|want| rmail_core::auth::satisfies(&both, want)),
+            "mail.read + ai.invoke must be enough to ask the mailbox a question"
+        );
     }
 
     /// Listing rules is strictly less than firing one.

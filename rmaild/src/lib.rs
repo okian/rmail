@@ -46,7 +46,7 @@ pub use mail_service::MailApi;
 pub use note_service::NoteApi;
 pub use rule_service::RuleApi;
 pub use saved_search_service::SavedSearchApi;
-pub use search_service::SearchApi;
+pub use search_service::{AskSearch, SearchApi};
 pub use send_scheduler_service::SendSchedulerApi;
 pub use sync_service::SyncApi;
 pub use tag_service::TagApi;
@@ -59,9 +59,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmail_core::ai::{
-    self, AiDispatchLoop, AiPauseFlag, AiQueue, AiWorkerPool, BatchClient, BatchCoordinator,
-    DeepPassGate, DeepPassHandler, PassHandler, PolicyEngine, Provider as AiProvider,
-    QueueOptions as AiQueueOptions, RateLimiter, TriagePassHandler,
+    self, AiDispatchLoop, AiPauseFlag, AiQueue, AiWorkerPool, AskRetriever, BatchClient,
+    BatchCoordinator, DeepPassGate, DeepPassHandler, PassHandler, PolicyEngine,
+    Provider as AiProvider, QueueOptions as AiQueueOptions, RateLimiter, TriagePassHandler,
 };
 use rmail_core::compose::DraftStore;
 use rmail_core::embed::hash::HashEmbedder;
@@ -418,6 +418,48 @@ where
     .await
 }
 
+/// The network-facing dependencies a caller may supply instead of letting
+/// this module build them.
+///
+/// Production has no reason to use this: [`serve_uds`] and every wrapper
+/// below it build the real Anthropic client from `[ai]`. It exists because
+/// there is otherwise **no hermetic path through the daemon's own boot
+/// wiring** to a provider-calling RPC — `ClaudeProvider`'s endpoint is not
+/// configurable at the [`Config`] level (see `rmail_core::ai::provider`'s own
+/// docs), so a test either fakes the provider here or assembles a handler by
+/// hand and tests something other than what ships.
+///
+/// Task 51 left that gap deliberately and named task 52 as the task that
+/// would need it: `AskMailbox` is retrieval *and* a model call, so a test that
+/// hand-built the handler would be testing neither the real search pipeline
+/// nor the real wiring between them. This is the same "fake the one
+/// network-facing dependency, wire everything else for real" seam
+/// [`serve_uds_with_engine_and_mail_store`] already is for `ImapMutator`.
+///
+/// A supplied `ai_provider` also makes the AI subsystem *active* — the
+/// dispatch loop spawns, the reranker is built, `GetUsage.enabled` is true —
+/// because a daemon handed a working provider is, by construction, a daemon
+/// whose AI features work.
+#[derive(Clone, Default)]
+pub struct Injected {
+    /// Stands in for the client `ai::provider::build` would have made.
+    pub ai_provider: Option<Arc<dyn AiProvider>>,
+    /// Stands in for the Claude listwise reranker Stage 5 would have built.
+    /// `None` with an injected provider still yields a real
+    /// [`ClaudeReranker`] over that provider, which is usually what a test
+    /// wants; supply one only to pin the *order* a rerank produces.
+    pub reranker: Option<Arc<dyn CoreReranker>>,
+}
+
+impl std::fmt::Debug for Injected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Injected")
+            .field("ai_provider", &self.ai_provider.is_some())
+            .field("reranker", &self.reranker.is_some())
+            .finish()
+    }
+}
+
 /// [`serve_uds_with_engine_and_mail_store`] over a caller-supplied
 /// [`TagStore`] as well — for tests that need `TagService`'s IMAP calls to
 /// go through a fake [`rmail_core::imap::mutate::ImapMutator`] rather than
@@ -443,6 +485,46 @@ pub async fn serve_uds_with_stores<F>(
     mail_store: MailStore,
     tag_store: TagStore,
     config: &Config,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_uds_injected(
+        socket_path,
+        db,
+        engine,
+        mail_store,
+        tag_store,
+        config,
+        Injected::default(),
+        shutdown,
+    )
+    .await
+}
+
+/// [`serve_uds_with_stores`] with the network-facing dependencies supplied by
+/// the caller — see [`Injected`] for what that is for and why production never
+/// calls this.
+///
+/// This is the function every other `serve_uds*` entry point ultimately
+/// delegates to. It takes [`Injected`] as one parameter rather than two so a
+/// later seam (an embedder, an SMTP sender) is a field here instead of a
+/// fourth `serve_uds_with_…` layer and another round of harness churn across
+/// every sibling test.
+///
+/// # Errors
+///
+/// As [`serve_uds_with_stores`].
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_uds_injected<F>(
+    socket_path: impl AsRef<Path>,
+    db: Database,
+    engine: SyncEngine,
+    mail_store: MailStore,
+    tag_store: TagStore,
+    config: &Config,
+    injected: Injected,
     shutdown: F,
 ) -> Result<(), ServeError>
 where
@@ -711,22 +793,30 @@ where
     // effect on served behavior is already correct).
     let ai_policy =
         Arc::new(PolicyEngine::from_config(config).map_err(ServeError::InvalidAiPolicy)?);
-    let (ai_provider, ai_active): (Arc<dyn AiProvider>, bool) = if config.ai.enabled {
-        match ai::provider::build(&config.ai) {
-            Ok(provider) => (provider, true),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "could not build the configured AI provider; AI features are disabled \
-                     until this is fixed"
-                );
-                (Arc::new(ai_service::NullProvider), false)
+    let (ai_provider, ai_active): (Arc<dyn AiProvider>, bool) =
+        if let Some(provider) = injected.ai_provider.clone() {
+            // A caller-supplied provider bypasses `ai.enabled` on purpose: the
+            // switch exists to stop the daemon dialling out, and a caller that
+            // handed in its own client has already decided what "dialling out"
+            // means here. See `Injected`'s own docs.
+            tracing::info!("using a caller-supplied AI provider; ai.enabled is not consulted");
+            (provider, true)
+        } else if config.ai.enabled {
+            match ai::provider::build(&config.ai) {
+                Ok(provider) => (provider, true),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not build the configured AI provider; AI features are disabled \
+                         until this is fixed"
+                    );
+                    (Arc::new(ai_service::NullProvider), false)
+                }
             }
-        }
-    } else {
-        tracing::info!("ai.enabled = false; AI features are disabled on this daemon");
-        (Arc::new(ai_service::NullProvider), false)
-    };
+        } else {
+            tracing::info!("ai.enabled = false; AI features are disabled on this daemon");
+            (Arc::new(ai_service::NullProvider), false)
+        };
 
     // The one `ai.limits` concurrency/pacing budget for this process. Created
     // here rather than inside `AiWorkerPool` (which is built further down)
@@ -751,16 +841,18 @@ where
     // `ai_policy` is threaded in because a rerank reads message *text*: it is
     // the only stage of search that does, so it is the only one that has to
     // honor `accounts.ai.enabled` and `ai.policy`'s per-folder rules.
-    let claude_reranker: Option<Arc<dyn CoreReranker>> = ai_active.then(|| {
-        Arc::new(ClaudeReranker::new(
-            Arc::clone(&ai_provider),
-            db.clone(),
-            &config.search.reranker,
-            config.ai.limits.clone(),
-            config.ai.privacy.clone(),
-            Arc::clone(&ai_semaphore),
-            Arc::clone(&ai_rate_limiter),
-        )) as Arc<dyn CoreReranker>
+    let claude_reranker: Option<Arc<dyn CoreReranker>> = injected.reranker.clone().or_else(|| {
+        ai_active.then(|| {
+            Arc::new(ClaudeReranker::new(
+                Arc::clone(&ai_provider),
+                db.clone(),
+                &config.search.reranker,
+                config.ai.limits.clone(),
+                config.ai.privacy.clone(),
+                Arc::clone(&ai_semaphore),
+                Arc::clone(&ai_rate_limiter),
+            )) as Arc<dyn CoreReranker>
+        })
     });
     let search_api = SearchApi::new(
         db.clone(),
@@ -881,7 +973,7 @@ where
         db.clone(),
         SavedSearchStore::new(db.clone()),
         smart_folder_store.clone(),
-        search_api,
+        search_api.clone(),
         stopping.clone(),
     ));
     // Membership is always live on read, so this loop exists only to keep
@@ -942,21 +1034,33 @@ where
     // "paused" (which would misleadingly imply `mail ai resume` could make
     // it start running).
     let ai_pause = AiPauseFlag::new(false);
-    let ai_service = AiServiceServer::new(AiApi::new(
-        db.clone(),
-        ai_queue.clone(),
-        events.clone(),
-        Arc::clone(&deep_handler),
-        Arc::clone(&ai_provider),
-        Arc::clone(&ai_policy),
-        config.ai.privacy.clone(),
-        config.ai.limits.clone(),
-        ai_pause.clone(),
-        ai_active,
-        ai_semaphore,
-        ai_rate_limiter,
-        stopping.clone(),
-    ));
+    let ai_service = AiServiceServer::new(
+        AiApi::new(
+            db.clone(),
+            ai_queue.clone(),
+            events.clone(),
+            Arc::clone(&deep_handler),
+            Arc::clone(&ai_provider),
+            Arc::clone(&ai_policy),
+            config.ai.privacy.clone(),
+            config.ai.limits.clone(),
+            ai_pause.clone(),
+            ai_active,
+            ai_semaphore,
+            ai_rate_limiter,
+            stopping.clone(),
+        )
+        // Mailbox RAG (task 52), over the *same* `SearchApi` `SearchService` and
+        // `SavedSearchService` serve — one pipeline, so a question and a search
+        // box rank the same corpus the same way. Wired unconditionally, like the
+        // service registration itself: `AskMailbox` declines on a daemon whose AI
+        // subsystem is off (see `AiApi::ask_mailbox`) rather than disappearing
+        // from the reflection set and the scope table.
+        .with_ask(
+            Arc::new(AskSearch::new(search_api)) as Arc<dyn AskRetriever>,
+            config.ai.ask.clone(),
+        ),
+    );
 
     // The budget control plane. Built unconditionally, unlike `ai_service`'s
     // dispatch loop: an operator must be able to set and inspect a budget on

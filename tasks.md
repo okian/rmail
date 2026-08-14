@@ -502,7 +502,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core rank::l2` (cross-encoder reorder, Claude listwise mock, degrade-on-error, cache key)
 
 ## 52. Mailbox RAG `ask_mailbox`
-- [ ] status
+- [x] status
 - **depends-on:** 51, 50
 - **parallel-safe:** no
 - **acceptance:**

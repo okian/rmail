@@ -139,6 +139,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::Utc;
+use rmail_core::ai::AskRetriever;
 use rmail_core::config::{IndexSemanticConfig, Rerank, RetrieversConfig, SearchConfig, SearchMode};
 use rmail_core::embed::Embedder;
 use rmail_core::eval::{
@@ -812,7 +813,7 @@ impl SearchApi {
 
     /// Run the pipeline to completion and return the presented message ids,
     /// best first — the collected counterpart of [`Self::run_stream`], and
-    /// the one thing `Evaluate` needs.
+    /// what `Evaluate` and `AskMailbox` both need.
     ///
     /// Deliberately measured *after* `present`, not after `rank`: MMR
     /// diversification and thread collapsing reorder and drop results, and
@@ -826,16 +827,19 @@ impl SearchApi {
     /// [`Status`] from account resolution or query planning. Candidate
     /// generation degrades to an empty result rather than erroring, matching
     /// the streaming path.
-    async fn ranked_page(
-        &self,
-        query: &str,
-        account_id: i64,
-        mode: WireMode,
-        limit: usize,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<i64>, Status> {
+    async fn ranked_page(&self, req: &PageRequest<'_>) -> Result<Vec<i64>, Status> {
+        let PageRequest {
+            query,
+            filter,
+            account_id,
+            mode,
+            limit,
+            rerank,
+            kind,
+            cancel,
+        } = *req;
         let now = Utc::now();
-        let text = self.effective_query(query, "", account_id).await?;
+        let text = self.effective_query(query, filter, account_id).await?;
         let plan = self
             .planner
             .plan_at(&text, now)
@@ -864,19 +868,14 @@ impl SearchApi {
         if ranked.is_empty() {
             return Ok(Vec::new());
         }
-        // Stage 5 runs here too, as `SearchKind::Interactive`. An eval run
-        // must score the configuration this daemon actually ships (prd.md's
-        // "Relevance is measured, not asserted"), and skipping the rerank
-        // would report numbers for a pipeline nobody uses. Interactive rather
-        // than deep because an eval sweep is not a user asking one expensive
-        // question — under `search.rerank = "auto"` that keeps a golden-set
-        // run on the local backend instead of billing one Claude call per
-        // judged query.
+        // Stage 5 runs here too, under whichever policy/kind the caller
+        // asked for. Both of this method's callers pick deliberately and
+        // differently — see `PageRequest`'s own fields.
         let ranked = self
             .rerank
             .clone()
-            .with_policy(eval_rerank(self.search.rerank))
-            .rerank(&plan.raw, &ranked, SearchKind::Interactive, cancel)
+            .with_policy(rerank)
+            .rerank(&plan.raw, &ranked, kind, cancel)
             .await
             .ranked;
 
@@ -1293,7 +1292,22 @@ impl RankedSearch for EvalSearch<'_> {
         limit: usize,
     ) -> Result<Vec<i64>, RmailError> {
         self.api
-            .ranked_page(query, account_id, self.mode, limit, &self.cancel)
+            .ranked_page(&PageRequest {
+                query,
+                filter: "",
+                account_id,
+                mode: self.mode,
+                limit,
+                // An eval run must score the configuration this daemon
+                // actually ships (prd.md's "relevance is measured, not
+                // asserted"), so Stage 5 runs — but with the hosted backend
+                // substituted (see `eval_rerank`), and as `Interactive`,
+                // because a golden-set sweep is not a user asking one
+                // expensive question.
+                rerank: eval_rerank(self.api.search.rerank),
+                kind: SearchKind::Interactive,
+                cancel: &self.cancel,
+            })
             .await
             // `ranked_page` speaks `Status` because every other caller is a
             // gRPC handler; the trait speaks the domain error. Going back
@@ -1303,6 +1317,107 @@ impl RankedSearch for EvalSearch<'_> {
             .map_err(|status| {
                 RmailError::Internal(format!("search pipeline: {}", status.message()))
             })
+    }
+}
+
+/// The inputs [`SearchApi::ranked_page`] needs that its two callers disagree
+/// about.
+///
+/// A struct rather than eight positional parameters because the two
+/// disagreements that matter — the rerank policy and the [`SearchKind`] — are
+/// exactly the two a reader would otherwise have to count commas to find, and
+/// getting either wrong is a silent behaviour change (an eval run that bills a
+/// Claude call per judged query; an `ask` that quietly used the interactive
+/// reranker).
+#[derive(Clone, Copy)]
+struct PageRequest<'a> {
+    query: &'a str,
+    /// Extra operator-DSL terms, folded onto `query` exactly as
+    /// `SearchRequest.filter` is. Empty for `Evaluate`.
+    filter: &'a str,
+    account_id: i64,
+    mode: WireMode,
+    limit: usize,
+    /// The Stage 5 policy for this run.
+    rerank: Rerank,
+    /// What `search.rerank = "auto"` resolves against.
+    kind: SearchKind,
+    cancel: &'a CancellationToken,
+}
+
+/// Adapts [`SearchApi`] to `rmail_core::ai::AskRetriever` — the retrieval half
+/// of `AiService.AskMailbox` (task 52).
+///
+/// The adapter is what keeps mailbox RAG on the *same* pipeline every other
+/// surface uses rather than a second assembly of it (prd.md: "built on the
+/// same pipeline (retrieve → rerank → generate)"). Two choices in it are
+/// deliberate and load-bearing:
+///
+/// - **[`SearchKind::Deep`]**, which is the seam task 51 built for exactly
+///   this caller: under the default `search.rerank = "auto"`, deep is what
+///   routes to the Claude listwise reranker instead of the interactive
+///   cross-encoder. A question is the quality-bound case prd.md names.
+/// - **The daemon's configured `search.rerank`, unclamped** — unlike
+///   `SearchRequest.rerank`, which `clamp_rerank` only ever lets *reduce* the
+///   configured backend. There is nothing to clamp here: `AskMailbox` already
+///   requires `ai.invoke` (see `auth::methods`) precisely because calling a
+///   provider is the whole RPC, so a rerank cannot escalate a caller past an
+///   authority it does not already hold.
+///
+/// [`rmail_core::ai::RagEngine`] owns everything after this point — the policy
+/// gate, packing, the model call, citations. This type's whole job is "a
+/// question in, ranked message ids out."
+#[derive(Clone)]
+pub struct AskSearch {
+    api: SearchApi,
+}
+
+impl std::fmt::Debug for AskSearch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskSearch").finish_non_exhaustive()
+    }
+}
+
+impl AskSearch {
+    /// Wrap the daemon's one [`SearchApi`].
+    #[must_use]
+    pub const fn new(api: SearchApi) -> Self {
+        Self { api }
+    }
+}
+
+#[async_trait::async_trait]
+impl AskRetriever for AskSearch {
+    async fn retrieve(
+        &self,
+        question: &str,
+        filter: &str,
+        account_id: i64,
+        top_k: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<i64>, RmailError> {
+        self.api
+            .ranked_page(&PageRequest {
+                query: question,
+                filter,
+                account_id,
+                // Hybrid regardless of `search.default_mode`: a question is
+                // the case dense recall exists for ("how much did AWS bill
+                // me" shares few literal words with the invoice), and a
+                // lexical-only default would silently make RAG worse than the
+                // search box over the same corpus.
+                mode: WireMode::Hybrid,
+                limit: top_k,
+                rerank: self.api.search.rerank,
+                kind: SearchKind::Deep,
+                cancel,
+            })
+            .await
+            // `ranked_page` speaks `Status` because every other caller is a
+            // gRPC handler; the trait speaks the domain error — the identical
+            // round trip `EvalSearch` makes, and for the identical reason:
+            // the transport type stays out of `rmail-core`.
+            .map_err(|status| RmailError::Internal(format!("ask retrieval: {}", status.message())))
     }
 }
 

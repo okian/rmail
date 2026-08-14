@@ -68,6 +68,7 @@ pub mod injection;
 pub mod policy;
 pub mod provider;
 pub mod queue;
+pub mod rag;
 pub mod redact;
 pub mod triage;
 
@@ -105,6 +106,10 @@ pub use queue::{
     BatchOutcome, BatchPollOutcome, BatchRequestCounts, BatchRequestItem, BatchResult, BatchStatus,
     CapDecision, CostGate, DeadLetter, DispatchSummary, Failure, JobState, MessageContent,
     NewAiJob, PassHandler, QueueOptions, QueueStats, RateLimiter,
+};
+pub use rag::{
+    AskEvent, AskOutcome, AskRequest, AskRetriever, AskStream, Citation, RagEngine, Refusal,
+    RetrievalTrace,
 };
 pub use redact::{
     guard, preview, rehydrate, GuardedRequest, RedactPreview, RedactionKind, TokenMap,

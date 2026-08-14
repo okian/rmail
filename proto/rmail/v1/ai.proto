@@ -58,6 +58,32 @@ service AiService {
   // rmail_core::ai::AiQueue::revive_all_dead; the next dispatch tick picks
   // the revived jobs up like any other pending work.
   rpc RetryFailed(RetryFailedRequest) returns (RetryFailedResponse);
+
+  // Mailbox RAG: answer a natural-language question over the local mailbox,
+  // grounded strictly on messages this daemon retrieved for it — the RPC
+  // behind `mail ask "<question>"`.
+  //
+  // Retrieval runs the same hybrid pipeline SearchService.Search does, as a
+  // *deep* search (so `search.rerank = auto` routes to the Claude listwise
+  // reranker rather than the interactive cross-encoder), then the top
+  // messages are packed under a token budget and handed to the model.
+  //
+  // Two properties are structural rather than best-effort, and clients may
+  // rely on them:
+  //
+  //   * Every Citation names a message this daemon actually retrieved. The
+  //     model cites positional labels, never message ids, and a label with
+  //     no source behind it produces no citation — so a fabricated or
+  //     dangling citation is not something the wire can carry.
+  //   * `AskDone.grounded` is the daemon's verdict, not the model's: it is
+  //     true only when the answer cited at least one real source. An answer
+  //     that cites nothing still streams (it is usually the model correctly
+  //     saying it found nothing) but arrives marked ungrounded.
+  //
+  // Messages in folders `ai.policy` marks `local_only` or `forbidden` are
+  // never packed and never reach the provider; a question whose every match
+  // is withheld refuses without a model call at all.
+  rpc AskMailbox(AskRequest) returns (stream AskChunk);
 }
 
 // Where a Summary's data came from — every set field is honest about which
@@ -270,4 +296,91 @@ message RetryFailedRequest {}
 message RetryFailedResponse {
   // How many jobs moved from `dead` back to `pending`.
   int64 revived = 1;
+}
+
+message AskRequest {
+  // The natural-language question. Required; an empty one is
+  // INVALID_ARGUMENT.
+  string question = 1;
+  // Restrict retrieval to one account. 0 (or unset) means every configured
+  // account, matching SearchRequest.account_id.
+  int64 account_id = 2;
+  // Extra operator-DSL terms folded into retrieval (`in:`, `from:`,
+  // `after:` ...), exactly as SearchRequest.filter is.
+  string filter = 3;
+  // How many messages to retrieve before the token budget cuts further.
+  // 0 means `ai.ask.top_k`.
+  uint32 top_k = 4;
+}
+
+// One source the answer pointed at.
+//
+// `label` is the bracketed marker the answer used inline, so a client can
+// align a citation with the prose it already streamed. It is positional
+// within *this* answer and means nothing outside it.
+message Citation {
+  uint32 label = 1;
+  int64 message_id = 2;
+  // The IMAP UID — prd.md's `message_uid`. Only unique within
+  // (account, mailbox, uidvalidity), which is why message_id travels beside
+  // it rather than instead of it.
+  int64 message_uid = 3;
+  int64 account_id = 4;
+  string mailbox = 5;
+  string subject = 6;
+  string from_addr = 7;
+  // The message's Date header, unix seconds; unset when it has none.
+  optional int64 date = 8;
+  // A verbatim excerpt of the text that was actually in the prompt for this
+  // source, chosen for relevance to the question. Extracted locally from the
+  // packed message, never taken from the model — so a quote is a fact about
+  // the mailbox, not a claim by the answer. Empty when the message had no
+  // indexed body to quote.
+  string quote = 9;
+}
+
+// What retrieval found, sent before any token so a client can render "asked
+// over N messages" while the answer is still arriving.
+message RetrievalTrace {
+  uint32 retrieved = 1;
+  // How many of those made it into the prompt.
+  uint32 packed = 2;
+  // How many were withheld because `ai.policy` does not let their folder
+  // reach a network provider.
+  uint32 withheld_by_policy = 3;
+  // How many were dropped because the context token budget was full.
+  uint32 dropped_for_budget = 4;
+  uint32 context_tokens = 5;
+  // The model actually called, which a soft budget cap may have downgraded
+  // from `ai.ask.model`. Empty when no call was made (the refusal path).
+  string model = 6;
+}
+
+// The terminal frame of an AskMailbox stream.
+message AskDone {
+  // Whether the answer cited at least one message this daemon retrieved.
+  // Set by the daemon from the resolved citations, never by the model.
+  bool grounded = 1;
+  // Why not, when grounded is false. Empty when grounded.
+  string refusal = 2;
+  // end_turn | max_tokens | stop_sequence | tool_use | pause_turn, when a
+  // model call was made at all.
+  string stop_reason = 3;
+}
+
+// One frame of an AskMailbox stream.
+//
+// The order is fixed and total: exactly one trace, then zero or more tokens,
+// then zero or more citations, then at most one usage, then exactly one done
+// — unless the stream fails, in which case the error is terminal and no done
+// follows it. Citations come after the prose because a citation is only
+// resolvable once the whole answer has been seen.
+message AskChunk {
+  oneof body {
+    RetrievalTrace trace = 1;
+    string token = 2;
+    Citation citation = 3;
+    Usage usage = 4;
+    AskDone done = 5;
+  }
 }

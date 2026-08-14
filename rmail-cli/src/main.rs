@@ -24,11 +24,12 @@ use rmail_proto::v1::ai_safety_service_client::AiSafetyServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
-    analyze_event, AnalyzeMessageRequest, BudgetCaps, BudgetClass, BudgetWindowCaps, ClassSpend,
-    ConfirmInjectionRequest, EventKind, GetSpendRequest, GetSummaryRequest, GetUsageRequest,
-    InjectionSeverity, ListTokensRequest, MintTokenRequest, RetryFailedRequest, RevokeTokenRequest,
-    ScanInjectionRequest, ScanInjectionResponse, SetBudgetRequest, SetPausedRequest,
-    SuggestReplyRequest, Summary, SyncFolderRequest, SyncMode, WatchEventsRequest,
+    analyze_event, ask_chunk, AnalyzeMessageRequest, AskRequest, BudgetCaps, BudgetClass,
+    BudgetWindowCaps, Citation, ClassSpend, ConfirmInjectionRequest, EventKind, GetSpendRequest,
+    GetSummaryRequest, GetUsageRequest, InjectionSeverity, ListTokensRequest, MintTokenRequest,
+    RetryFailedRequest, RevokeTokenRequest, ScanInjectionRequest, ScanInjectionResponse,
+    SetBudgetRequest, SetPausedRequest, SuggestReplyRequest, Summary, SyncFolderRequest, SyncMode,
+    WatchEventsRequest,
 };
 use search_cli::{SearchArgs, SimilarArgs};
 use tag_cli::{TagArgs, TagsArgs, UntagArgs};
@@ -90,6 +91,9 @@ enum Command {
         #[command(subcommand)]
         action: AiAction,
     },
+    /// Ask a question about your mail and get a cited answer
+    /// (`AiService.AskMailbox`).
+    Ask(AskArgs),
     /// Add/edit/delete a note on a message or thread (`NoteService`).
     Note {
         #[command(subcommand)]
@@ -169,6 +173,27 @@ enum Command {
         #[command(subcommand)]
         action: FollowupAction,
     },
+}
+
+/// `mail ask "<question>"` — retrieval-augmented question answering over the
+/// local mailbox.
+#[derive(Debug, clap::Args)]
+struct AskArgs {
+    /// The question, in plain English.
+    question: String,
+    /// Restrict retrieval to one account (default: every configured account).
+    #[arg(long)]
+    account: Option<i64>,
+    /// Extra filter terms, in the same operator DSL `mail search` uses
+    /// (`in:`, `from:`, `after:` ...).
+    #[arg(long, default_value = "")]
+    filter: String,
+    /// How many messages to retrieve before packing (default: `ai.ask.top_k`).
+    #[arg(long)]
+    top_k: Option<u32>,
+    /// Print what retrieval found before the answer starts.
+    #[arg(long)]
+    trace: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -376,6 +401,7 @@ async fn main() -> Result<()> {
                 revoke,
             } => ai_scan_injection(&socket, message_id, confirm, revoke).await,
         },
+        Command::Ask(args) => ask(&socket, args).await,
         Command::Note { action } => note_cli::dispatch(&socket, action).await,
         Command::Notes(args) => note_cli::list(&socket, args).await,
         Command::Hook { action } => hook_cli::run(&socket, action).await,
@@ -718,6 +744,103 @@ async fn ai_process(socket: &Path, message_id: i64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Ask the mailbox a question and stream the grounded answer.
+///
+/// Tokens stream to stdout as they arrive; citations arrive after the prose
+/// (they are only resolvable once the whole answer has been seen — see
+/// `rmail_core::ai::rag`) and are printed as a numbered source list matching
+/// the `[n]` markers already in the text.
+///
+/// An ungrounded answer is called out explicitly rather than printed as if it
+/// were sourced: `AskDone.grounded` is the daemon's verdict on whether the
+/// answer cited anything real, and silently dropping it would be presenting an
+/// uncited answer as a cited one.
+async fn ask(socket: &Path, args: AskArgs) -> Result<()> {
+    let mut stream = ai_client(socket)
+        .await?
+        .ask_mailbox(AskRequest {
+            question: args.question,
+            account_id: args.account.unwrap_or(0),
+            filter: args.filter,
+            top_k: args.top_k.unwrap_or(0),
+        })
+        .await
+        .context("AskMailbox RPC failed")?
+        .into_inner();
+
+    let mut citations: Vec<Citation> = Vec::new();
+    let mut printed_any_token = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("ask stream ended with an error")?;
+        match chunk.body {
+            Some(ask_chunk::Body::Trace(trace)) => {
+                if args.trace {
+                    println!(
+                        "retrieved {} · packed {} · withheld by policy {} · dropped for budget \
+                         {} · ~{} context tokens{}",
+                        trace.retrieved,
+                        trace.packed,
+                        trace.withheld_by_policy,
+                        trace.dropped_for_budget,
+                        trace.context_tokens,
+                        if trace.model.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}", trace.model)
+                        }
+                    );
+                    println!();
+                }
+            }
+            Some(ask_chunk::Body::Token(token)) => {
+                print!("{token}");
+                printed_any_token = true;
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            Some(ask_chunk::Body::Citation(citation)) => citations.push(citation),
+            // Streamed live as it arrives; the durable count that matters
+            // (and is billed) lives in the audit ledger, not this echo.
+            Some(ask_chunk::Body::Usage(_)) => {}
+            Some(ask_chunk::Body::Done(done)) => {
+                if printed_any_token {
+                    println!();
+                }
+                if !citations.is_empty() {
+                    println!("\nSources:");
+                    for citation in &citations {
+                        print_citation(citation);
+                    }
+                }
+                if !done.grounded {
+                    println!("\nnot grounded: {}", done.refusal);
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn print_citation(citation: &Citation) {
+    let subject = if citation.subject.is_empty() {
+        "(no subject)"
+    } else {
+        &citation.subject
+    };
+    println!(
+        "  [{}] #{} {} — {} ({}, uid {})",
+        citation.label,
+        citation.message_id,
+        subject,
+        citation.from_addr,
+        citation.mailbox,
+        citation.message_uid
+    );
+    if !citation.quote.is_empty() {
+        println!("      {}", citation.quote);
+    }
 }
 
 /// Print a message's cached AI summary. Never calls the model.

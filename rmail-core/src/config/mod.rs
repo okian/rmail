@@ -1177,6 +1177,8 @@ pub struct AiConfig {
     pub models: AiModels,
     /// Deep-pass gating.
     pub deep_pass: AiDeepPass,
+    /// Mailbox-RAG (`AskMailbox`) settings.
+    pub ask: AiAsk,
     /// Concurrency/cost limits.
     pub limits: AiLimits,
     /// Batch-API settings.
@@ -1201,6 +1203,7 @@ impl Default for AiConfig {
             api_key_command: "security find-generic-password -s anthropic -w".to_owned(),
             models: AiModels::default(),
             deep_pass: AiDeepPass::default(),
+            ask: AiAsk::default(),
             limits: AiLimits::default(),
             batching: AiBatching::default(),
             prompt_cache: AiPromptCache::default(),
@@ -1258,6 +1261,48 @@ impl Default for AiDeepPass {
                 .map(|s| (*s).to_owned())
                 .collect(),
             suggest_reply: true,
+        }
+    }
+}
+
+/// Mailbox-RAG (`AiService.AskMailbox`, `mail ask`) settings.
+///
+/// Deliberately a small table. Everything that governs *whether* a call may
+/// happen at all — spend caps, concurrency, redaction, per-folder
+/// eligibility — already lives in `[ai.limits]`, `[ai.privacy]` and
+/// `[ai.policy]`, and `ask` draws on those rather than restating them: a
+/// second set of caps here would be a second answer to "may this call be
+/// made", and the two would drift.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AiAsk {
+    /// The model that writes the grounded answer. prd.md's
+    /// "`claude-sonnet-5` default for RAG/drafting" — not `ai.models.deep`,
+    /// which is the *opus* tier a per-message deep pass uses.
+    pub model: String,
+    /// How many retrieved messages the context is built from, before the
+    /// token budget cuts it further.
+    pub top_k: u32,
+    /// Ceiling on the assembled context, in estimated tokens. Packing stops
+    /// at the first message that would cross it (see
+    /// [`crate::ai::rag`]'s own docs on why it stops rather than skips).
+    pub max_context_tokens: u32,
+    /// How much of one message's body may enter the context. Bounded per
+    /// message as well as in aggregate so a single enormous message cannot
+    /// consume the entire budget and crowd out every other citation.
+    pub max_chars_per_message: u32,
+    /// Output-token ceiling for the answer.
+    pub max_tokens: u32,
+}
+
+impl Default for AiAsk {
+    fn default() -> Self {
+        Self {
+            model: "claude-sonnet-5".to_owned(),
+            top_k: 12,
+            max_context_tokens: 8_000,
+            max_chars_per_message: 2_000,
+            max_tokens: 1_024,
         }
     }
 }
