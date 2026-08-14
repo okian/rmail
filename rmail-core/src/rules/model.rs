@@ -243,6 +243,42 @@ const fn is_false(value: &bool) -> bool {
 }
 
 impl Actions {
+    /// The TOML key of every action configured here, in the order
+    /// [`super::ActionRunner::apply`] would fire them.
+    ///
+    /// Exists for the prompt-injection shield's withhold path
+    /// ([`super::RuleEngine`]): reporting "actions withheld" as a single
+    /// opaque line would tell a user nothing about what did not happen to
+    /// their mail, and re-deriving the list at that call site would be a
+    /// second copy of this struct's shape that drifts the first time an
+    /// action is added.
+    #[must_use]
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if !self.add_labels.is_empty() {
+            names.push("add_labels");
+        }
+        if !self.add_flags.is_empty() {
+            names.push("add_flags");
+        }
+        if self.notify {
+            names.push("notify");
+        }
+        if self.run_hook.is_some() {
+            names.push("run_hook");
+        }
+        if self.draft_reply.is_some() {
+            names.push("draft_reply");
+        }
+        if self.archive {
+            names.push("archive");
+        }
+        if self.move_to.is_some() {
+            names.push("move_to");
+        }
+        names
+    }
+
     /// Whether any action is configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {

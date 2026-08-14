@@ -1187,6 +1187,8 @@ pub struct AiConfig {
     pub retry: AiRetry,
     /// Privacy/redaction settings.
     pub privacy: AiPrivacy,
+    /// Prompt-injection shield settings.
+    pub injection: AiInjection,
     /// Data-residency / per-account/folder/pattern AI eligibility rules.
     pub policy: AiPolicyConfig,
 }
@@ -1204,6 +1206,7 @@ impl Default for AiConfig {
             prompt_cache: AiPromptCache::default(),
             retry: AiRetry::default(),
             privacy: AiPrivacy::default(),
+            injection: AiInjection::default(),
             policy: AiPolicyConfig::default(),
         }
     }
@@ -1456,6 +1459,82 @@ impl Default for AiPrivacy {
                 .collect(),
             strip_attachments: true,
             max_body_chars: 40000,
+        }
+    }
+}
+
+/// Prompt-injection shield settings — see
+/// [`crate::ai::injection`]'s module docs.
+///
+/// Neither knob here can turn off the *structural* half of the shield.
+/// Untrusted mail is fenced and labelled as data on every path that shows it
+/// to a model, unconditionally, because a switch that could put
+/// attacker-authored text back into instruction position would be a switch
+/// labelled "be exploitable". What is configurable is the second control:
+/// whether the pattern detector runs at all, and how much it has to find
+/// before a model-decided *action* is withheld pending confirmation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AiInjection {
+    /// Whether the injection detector runs and records what it finds.
+    ///
+    /// Turning this off necessarily disables the action gate too — a gate
+    /// with nothing to gate on cannot fail closed — so it is an explicit,
+    /// documented opt-out for an operator who has decided their mail source
+    /// is trusted, not a performance knob.
+    pub enabled: bool,
+    /// The lowest severity that withholds an AI-decided action pending
+    /// confirmation: `hostile`, `suspicious`, or `never`.
+    ///
+    /// `hostile` (the default) covers text addressed to the model — an
+    /// instruction override, forged system/tool framing, an exfiltration
+    /// request. `suspicious` additionally covers obfuscation on its own
+    /// (zero-width characters, homoglyphs, CSS-hidden text), which real
+    /// marketing mail carries often enough that it is not the default: a
+    /// gate that fires on half a mailbox is a gate an operator turns off.
+    pub block_actions_at: String,
+}
+
+impl Default for AiInjection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            block_actions_at: "hostile".to_owned(),
+        }
+    }
+}
+
+impl AiInjection {
+    /// [`Self::block_actions_at`] parsed, or `None` for `never` **and** for
+    /// an unrecognized value.
+    ///
+    /// Folding "off" and "typo" into the same answer is deliberate, and it
+    /// is the opposite of what [`crate::ai::deep`]'s `priority_at_least`
+    /// does with its own unvalidated operator string. The asymmetry is about
+    /// which direction the mistake runs: an unrecognized *spend* threshold
+    /// that failed open would let cost escape, so that one fails closed;
+    /// an unrecognized threshold here that failed closed would silently
+    /// withhold every AI-decided rule action in the mailbox, with the only
+    /// evidence being actions that quietly stop happening. A misconfigured
+    /// shield that warns loudly and keeps the mailbox working is the better
+    /// failure — and it does warn: [`Self::warn_if_unrecognized`] is called
+    /// once at startup rather than on every evaluation.
+    #[must_use]
+    pub fn block_at(&self) -> Option<crate::ai::injection::Severity> {
+        crate::ai::injection::Severity::parse(&self.block_actions_at)
+    }
+
+    /// Warn, once, if [`Self::block_actions_at`] is neither a severity nor
+    /// the literal `never` — the startup-time counterpart to
+    /// [`Self::block_at`]'s deliberate fail-open.
+    pub fn warn_if_unrecognized(&self) {
+        if self.block_at().is_none() && self.block_actions_at != "never" {
+            tracing::warn!(
+                block_actions_at = %self.block_actions_at,
+                recognized = ?["hostile", "suspicious", "never"],
+                "ai.injection.block_actions_at is not a recognized value; no AI-decided rule \
+                 action will be withheld for a suspected prompt injection until this is fixed"
+            );
         }
     }
 }

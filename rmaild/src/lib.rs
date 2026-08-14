@@ -5,7 +5,7 @@
 //! `AccountService`/`SyncService`/`AdminService`/`AuditService`/
 //! `MailService`/`NoteService`/`TagService`/`SearchService`/
 //! `SavedSearchService`/`ComposeService`/`SendSchedulerService`/`AiService`/
-//! `AiPolicyService`/`IndexService`/`HookService`/`RuleService` handlers — all wrapped in a
+//! `AiPolicyService`/`AiSafetyService`/`IndexService`/`HookService`/`RuleService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -14,6 +14,7 @@
 mod account_service;
 mod admin_service;
 mod ai_policy_service;
+mod ai_safety_service;
 mod ai_service;
 mod audit_service;
 mod auth;
@@ -33,6 +34,7 @@ mod trace;
 
 pub use account_service::AccountApi;
 pub use admin_service::AdminApi;
+pub use ai_safety_service::AiSafetyApi;
 pub use ai_service::AiApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
@@ -90,6 +92,7 @@ use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
 use rmail_proto::v1::ai_policy_service_server::AiPolicyServiceServer;
+use rmail_proto::v1::ai_safety_service_server::AiSafetyServiceServer;
 use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::compose_service_server::ComposeServiceServer;
@@ -904,6 +907,7 @@ where
     ));
     let triage_handler: Arc<dyn PassHandler> = Arc::new(
         TriagePassHandler::new(db.clone(), config.ai.models.triage.clone())
+            .with_injection_config(config.ai.injection.clone())
             .with_deep_pass_gate(DeepPassGate::new(config.ai.deep_pass.clone())),
     );
     let ai_handlers: Vec<Arc<dyn PassHandler>> = vec![
@@ -961,6 +965,18 @@ where
     let ai_policy_service = AiPolicyServiceServer::new(ai_policy_service::AiPolicyApi::new(
         db.clone(),
         config.ai.limits.clone(),
+    ));
+
+    // The prompt-injection shield's read-and-confirm surface. Also
+    // unconditional, and for a sharper reason than the budget plane's: a
+    // daemon whose AI subsystem is off can still be holding withheld rule
+    // actions from when it was on, and the RPC that releases them must not
+    // become unreachable at exactly the moment an operator turns AI off to
+    // deal with the problem. Neither RPC touches a provider.
+    let ai_safety_service = AiSafetyServiceServer::new(ai_safety_service::AiSafetyApi::new(
+        db.clone(),
+        config.ai.privacy.clone(),
+        config.ai.injection.clone(),
     ));
 
     // Only spawned when the subsystem is actually active — a disabled/
@@ -1054,7 +1070,8 @@ where
         ),
         Arc::clone(&ai_policy),
         config.rules.max_window_messages as usize,
-    );
+    )
+    .with_injection_config(config.ai.injection.clone());
     let rule_service = RuleServiceServer::new(RuleApi::new(
         rule_engine.clone(),
         RuleSynthesizer::new(
@@ -1110,6 +1127,7 @@ where
         .add_service(saved_search_service)
         .add_service(ai_service)
         .add_service(ai_policy_service)
+        .add_service(ai_safety_service)
         .add_service(hook_service)
         .add_service(rule_service)
         .serve_with_incoming_shutdown(incoming, shutdown)

@@ -115,6 +115,18 @@ impl ActionOutcome {
     fn planned(action: &str, detail: impl Into<String>) -> Self {
         Self::failed(action, detail)
     }
+
+    /// An action the prompt-injection shield withheld: it was configured, the
+    /// rule matched, and it did not run because the model's contribution to
+    /// that match came from a message flagged as hostile.
+    ///
+    /// `pub(super)` so [`super::RuleEngine`] can build one without this
+    /// module's private constructors leaking further. Reported per configured
+    /// action rather than as one summary line — "your mail was not archived
+    /// and no hook ran" is the useful sentence; "actions withheld" is not.
+    pub(super) fn withheld(action: &str, detail: impl Into<String>) -> Self {
+        Self::failed(action, detail)
+    }
 }
 
 /// Everything a rule's actions need to reach.

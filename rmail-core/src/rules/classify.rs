@@ -54,13 +54,45 @@
 //! caller decides what to do with the error — the background evaluator logs
 //! and moves on, a backtest records it against that message, an RPC turns it
 //! into a `Status`.
+//!
+//! # The highest-consequence prompt in the tree
+//!
+//! Every other model call in this crate produces something a user reads. A
+//! `claude_is` verdict produces something that *moves the user's mail* — the
+//! matched rule's actions run, and those include archive, move, run-hook and
+//! draft-reply. So this is the one prompt where a successful injection is a
+//! mailbox mutation rather than a bad summary, and the shield is applied here
+//! at three points rather than one:
+//!
+//! - [`user_turn`] fences the rendered message under
+//!   [`crate::ai::injection::untrusted_block`], and fences each replayed
+//!   few-shot example the same way — a correction freezes real mail text
+//!   into `rule_examples`, so an example is untrusted content sitting in a
+//!   *prior turn*, which is a more privileged position than the final user
+//!   turn, not a less privileged one.
+//! - The model's `explanation` is put through
+//!   [`crate::ai::injection::sanitize_model_text`] before it is cached or
+//!   shown, so a body cannot steer the model into writing bidi overrides
+//!   into a string this codebase prints to a terminal.
+//! - The verdict itself is gated in [`super::RuleEngine`], not here. That
+//!   split is deliberate: this type must keep returning the model's honest
+//!   answer (a backtest asking "what would the model say" needs it, and so
+//!   does the cache), while the decision to *act* on that answer belongs
+//!   next to the code that claims `rule_actions_fired` and calls
+//!   [`super::ActionRunner`]. See [`super::RuleEngine::evaluate_rule`].
+//!
+//! What the model *cannot* do, and never could, is choose an action: the
+//! answer is a `bool`, and which actions a match fires comes from the user's
+//! own TOML. The escalation an injection buys is therefore bounded to
+//! "flip one boolean", which is exactly what the confirmation gate covers.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::ai::injection;
 use crate::ai::policy::PolicyEngine;
 use crate::ai::provider::{ChatRequest, OutputFormat, Provider};
 use crate::ai::queue::{payload_bytes, RateLimiter};
@@ -87,22 +119,38 @@ pub const PASS: &str = "rule";
 /// *same* rendering the model was shown, and a second constant would drift.
 pub const MAX_BODY_CHARS: usize = 4_000;
 
-/// Bumped whenever [`SYSTEM_PROMPT`] or [`schema`] changes. It is part of
-/// [`prompt_hash`], so bumping it invalidates every cached verdict — which is
-/// the point: a cached answer to a question this build no longer asks is
-/// worse than no cache at all.
-const PROMPT_VERSION: u32 = 1;
+/// Bumped whenever [`SYSTEM_PROMPT`], [`user_turn`] or [`schema`] changes. It
+/// is part of [`prompt_hash`], so bumping it invalidates every cached verdict
+/// — which is the point: a cached answer to a question this build no longer
+/// asks is worse than no cache at all.
+///
+/// `2`: task 77 appended [`injection::DATA_BOUNDARY_CLAUSE`] to the system
+/// prompt and moved the message inside an untrusted-data block in
+/// [`user_turn`]. A verdict cached under `1` was produced by a model that
+/// was never told the mail was data, and for a hostile message that is
+/// exactly the verdict this build must not keep serving.
+const PROMPT_VERSION: u32 = 2;
 
 /// A yes/no answer with a one-line reason needs very few tokens; a ceiling
 /// this low is also a hard bound on what one classification can cost.
 const MAX_TOKENS: u32 = 512;
 
+/// This predicate's own instructions with
+/// [`injection::DATA_BOUNDARY_CLAUSE`] appended, built once — see
+/// [`crate::ai::triage`]'s equivalent `static`.
+///
+/// Bumping [`PROMPT_VERSION`] alongside any change here is not optional:
+/// [`SYSTEM_PROMPT`] is part of what the cache key stands for, and appending
+/// the boundary clause changed the question being asked.
+static SYSTEM_PROMPT: LazyLock<String> =
+    LazyLock::new(|| injection::with_data_boundary(SYSTEM_PROMPT_BASE));
+
 /// Frozen and byte-identical across calls so it forms the stable prefix the
 /// provider's prompt cache covers — the same discipline
-/// `crate::ai::triage::SYSTEM_PROMPT` documents. Everything that varies per
-/// call (the predicate, the examples, the message) is in the turns below,
+/// `crate::ai::triage`'s own system prompt documents. Everything that varies
+/// per call (the predicate, the examples, the message) is in the turns below,
 /// never here.
-const SYSTEM_PROMPT: &str = "You decide whether one email satisfies one \
+const SYSTEM_PROMPT_BASE: &str = "You decide whether one email satisfies one \
 natural-language criterion, for an email client's rules engine. Answer with a \
 single structured JSON object only -- no prose, no markdown, nothing outside \
 the schema.
@@ -376,7 +424,7 @@ fn build_request(
     facts: &MessageFacts,
     examples: &[Example],
 ) -> ChatRequest {
-    let mut request = ChatRequest::new(model.to_owned(), MAX_TOKENS).system(SYSTEM_PROMPT);
+    let mut request = ChatRequest::new(model.to_owned(), MAX_TOKENS).system(SYSTEM_PROMPT.as_str());
     for example in examples {
         request = request
             .user(user_turn(prompt, &example.rendered))
@@ -393,11 +441,18 @@ fn build_request(
         .output_format(OutputFormat::json_schema(schema()))
 }
 
-/// The user turn. The criterion is labelled and separated from the message so
-/// that mail whose body contains the word "criterion" cannot be read as one —
-/// the same separation the system prompt states outright.
+/// The user turn. The criterion is this codebase's own text (it comes from
+/// the user's rule TOML) and stays outside the fence; the rendered message is
+/// entirely sender-authored and goes inside one, so mail whose body writes
+/// "Criterion:" — or writes the fence's own closing marker — cannot promote
+/// itself out of data position. The plain `--- email ---` separator this
+/// replaced was a convention a sender could simply restate.
 fn user_turn(prompt: &str, rendered: &str) -> String {
-    format!("Criterion: {}\n\n--- email ---\n{rendered}", prompt.trim())
+    format!(
+        "Criterion: {}\n\n{}",
+        prompt.trim(),
+        injection::untrusted_block("email", rendered)
+    )
 }
 
 /// The JSON Schema every classification is constrained to. Byte-stable across
@@ -436,6 +491,16 @@ impl Answer {
                 "a claude_is answer did not match the requested schema: {e}"
             ))
         })?;
+        // `verdict` needs no vocabulary check — the schema's `boolean` and
+        // serde between them leave exactly two values, which is the
+        // narrowest closed vocabulary there is. `explanation` is free text
+        // the model wrote while reading attacker-authored mail, and it gets
+        // cached, returned over gRPC, and printed to a terminal, so the
+        // characters that could reorder or hide what a human reads come out
+        // first — see `crate::ai::injection::sanitize_model_text`. Stripping
+        // before truncating, so the character budget is spent on text a
+        // reader can actually see.
+        parsed.explanation = injection::sanitize_model_text(&parsed.explanation).into_owned();
         // Truncated, not rejected: an over-long explanation is the model
         // being verbose, not a broken contract worth failing a rule over.
         if let Some((idx, _)) = parsed.explanation.char_indices().nth(MAX_EXPLANATION_CHARS) {

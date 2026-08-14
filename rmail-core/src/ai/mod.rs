@@ -4,8 +4,19 @@
 //! # The pipeline, now that every stage has landed
 //!
 //! ```text
-//! Sync Engine ──▶ AI Queue ──▶ policy ──▶ assemble ──▶ redact ──▶ Provider ──▶ audit
+//! Sync Engine ──▶ AI Queue ──▶ policy ──▶ assemble ──▶ fence ──▶ redact ──▶ Provider ──▶ audit
 //! ```
+//!
+//! [`injection`] (task 77) is the `fence` step, and unlike every other box
+//! it is not a stage the queue calls: it is a discipline each request
+//! *builder* follows, because only the builder knows which parts of the text
+//! it is assembling came from a sender and which it wrote itself. Untrusted
+//! text is wrapped in labelled delimiters and the system prompt says what
+//! those delimiters mean; the same module's detector records what a message
+//! tried, and gates the one path — [`crate::rules`]' `claude_is` — where a
+//! model answer mutates the mailbox. See its module docs for why the
+//! structural separation, not the detector, is the control that carries the
+//! weight.
 //!
 //! [`queue::AiWorkerPool`]/[`queue::BatchCoordinator`] (task 47) are what
 //! actually sequence this: [`policy::PolicyEngine::resolve`] first (a
@@ -53,6 +64,7 @@ pub mod audit;
 pub mod budget;
 pub mod deep;
 pub mod dispatch;
+pub mod injection;
 pub mod policy;
 pub mod provider;
 pub mod queue;
@@ -76,6 +88,13 @@ pub use provider::{
     build, ChatMessage, ChatRequest, ChatResponse, ClaudeProvider, OutputFormat, Provider,
     ProviderStream, Role, StopReason, StreamFrame, Usage,
 };
+
+// Deliberately not flattened into this module the way `redact`'s items are:
+// `injection::Severity` would collide with `budget::Severity` (a spend
+// severity and an attack severity are not the same concept and must not read
+// as one), and every call site is clearer naming the module — `guard(...)`
+// says what it does on its own, `untrusted_block(...)` needs the
+// `injection::` prefix to.
 
 pub use policy::{
     AiPolicyMode, PolicyDecision, PolicyEngine, PolicyExplanation, PolicyTarget, PolicyTier,

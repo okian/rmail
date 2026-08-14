@@ -608,6 +608,38 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AiPolicyService/GetSpend",
         Requirement::Scope(Scope::Admin),
     ),
+    // -- AiSafetyService (task 77) --------------------------------------------
+    // The two RPCs of the prompt-injection shield sit at very different
+    // privileges, and the gap between them is the point of splitting them.
+    //
+    // `ScanInjection` reads. It makes no provider call at all — the detector
+    // is a local pattern scan over text this daemon already holds — so
+    // `ai.invoke` would be the wrong requirement twice over: it neither
+    // spends nor invokes anything, and requiring it would mean a token that
+    // may read mail but not call a model could not see that a message tried
+    // to attack one. What it *does* return is quoted message content (the
+    // excerpts are the whole point of the answer), which is exactly what
+    // `mail.read` governs everywhere else in this table.
+    (
+        "/rmail.v1.AiSafetyService/ScanInjection",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // `ConfirmInjection` is the release valve on a *fail-closed* control, so
+    // it inherits the authority of what it releases rather than of what it
+    // touches. Its entire effect is that a rule whose `claude_is` matched a
+    // flagged message may now move, archive, label, run a hook and draft a
+    // reply — the same pair `RuleService/EvaluateRules` requires, and for the
+    // identical reason its own row gives: `automation` alone would let a
+    // token that cannot write mail cause mail to be written, and `mail.write`
+    // alone would let a token that cannot run automation cause a process to
+    // be spawned. `ai.invoke` is deliberately *not* in the set: confirming
+    // spends nothing, and a caller who has already been trusted with both
+    // halves of "a rule may act" should not additionally need the scope for
+    // paying a provider.
+    (
+        "/rmail.v1.AiSafetyService/ConfirmInjection",
+        Requirement::AllOf(&[Scope::Automation, Scope::MailWrite]),
+    ),
     // -- HookService (task 67) ------------------------------------------------
     // Hooks execute operator-configured shell commands (config-driven, never
     // user-supplied at the RPC layer — see `rmail_core::hooks`'s own module

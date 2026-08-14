@@ -66,9 +66,33 @@
 //! "keep the L1 order." Nothing in this module can fail a search: not a
 //! spend cap, not a provider outage, not a malformed answer, not a model that
 //! returns six results for thirty candidates.
+//!
+//! # Thirty senders in one prompt
+//!
+//! This is the widest injection surface in the crate — up to
+//! `search.reranker.claude_max_candidates` messages from
+//! `claude_max_candidates` different senders, all in a single request — and
+//! it is also the one where the *structural* half of the shield does nearly
+//! all the work. [`prompt`] fences each candidate's document in its own
+//! [`crate::ai::injection::untrusted_block`], labelled with that candidate's
+//! own position, so one hostile document cannot break out and pose as the
+//! instructions for the twenty-nine around it.
+//!
+//! What it cannot do is stop a document *arguing* for its own relevance, and
+//! that is deliberately not treated as an emergency: the worst case is a
+//! search result in the wrong order, which the user sees and can ignore.
+//! [`parse`] already bounds the damage on the other side — the answer's
+//! labels are validated against the positions actually sent, so a hostile
+//! document cannot make the reranker surface a message that was not already
+//! a candidate, and cannot drop one either (unranked candidates keep their
+//! L1 order rather than disappearing). This module records no injection
+//! flag: a rerank spans accounts and folders, and attributing a scan to one
+//! of thirty candidates would be the same misattribution [`ClaudeReranker::audit`]
+//! already refuses to make for the ledger entry. Flagging is
+//! [`crate::ai::triage`]'s job, on the message's own path.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -82,6 +106,7 @@ use crate::ai::audit::{record_call, CallOutcome, CallRecord};
 use crate::ai::budget::{
     BudgetEnforcer, BudgetRequest, BudgetVerdict, WorkClass, GLOBAL_ACCOUNT_ID,
 };
+use crate::ai::injection;
 use crate::ai::provider::{ChatRequest, OutputFormat, Provider};
 use crate::ai::queue::{payload_bytes, CapDecision, CostGate, RateLimiter};
 use crate::ai::redact::{guard, rehydrate, GuardedRequest};
@@ -93,10 +118,15 @@ use crate::storage::Database;
 /// fields.
 pub const PASS: &str = "search_rerank";
 
+/// [`SYSTEM_BASE`] with [`injection::DATA_BOUNDARY_CLAUSE`] appended, built
+/// once — see [`crate::ai::triage`]'s equivalent `static` for why the
+/// concatenation is not done per request.
+static SYSTEM: LazyLock<String> = LazyLock::new(|| injection::with_data_boundary(SYSTEM_BASE));
+
 /// The system prompt. Deliberately terse and deliberately explicit about the
 /// two failure modes a listwise reranker actually has: inventing labels, and
 /// quietly dropping candidates it did not rank.
-const SYSTEM: &str = "You re-rank email search results for relevance to a user's query. \
+const SYSTEM_BASE: &str = "You re-rank email search results for relevance to a user's query. \
      You are given a query and a numbered list of candidate messages. \
      Return every candidate exactly once, ordered best-match first, with a \
      one-line reason (at most 12 words) explaining why that message matches \
@@ -308,7 +338,7 @@ impl Reranker for ClaudeReranker {
         span.record("cached", false);
 
         let request = ChatRequest::new(model, self.max_tokens)
-            .system(SYSTEM)
+            .system(SYSTEM.as_str())
             .user(prompt(query, candidates, self.max_body_chars))
             .output_format(OutputFormat::json_schema(schema()));
 
@@ -413,22 +443,35 @@ impl ClaudeReranker {
     }
 }
 
-/// The user turn: the query, then one labelled block per candidate, each cut
-/// to `max_chars` (`ai.privacy.max_body_chars`).
+/// The user turn: the query, then one labelled untrusted-data block per
+/// candidate, each cut to `max_chars` (`ai.privacy.max_body_chars`).
+///
+/// The query is the user's own text and stays outside the fences; every
+/// candidate document is sender-authored and goes inside one, labelled
+/// `candidate-N` so the block a hostile document sits in is the block that
+/// names its own position. The `[N]` label line stays *outside* its block —
+/// it is this codebase's addressing scheme, and a document able to write a
+/// convincing `[7]` inside the fence still cannot make [`parse`] resolve to
+/// candidate 7, because labels are read from the model's structured answer,
+/// never from the prompt.
 fn prompt(query: &str, candidates: &[RerankCandidate], max_chars: usize) -> String {
     let mut out = String::with_capacity(candidates.len() * 512);
     out.push_str("Query: ");
     out.push_str(query);
     out.push_str("\n\nCandidates:\n");
     for (index, candidate) in candidates.iter().enumerate() {
-        out.push_str(&format!("\n[{}]\n", index + 1));
+        let label = index + 1;
+        out.push_str(&format!("\n[{label}]\n"));
         // By `char`, not by byte: slicing a UTF-8 string at an arbitrary byte
         // offset panics, and mail is full of multi-byte text.
         let document = match candidate.document.char_indices().nth(max_chars) {
             Some((cut, _)) => candidate.document.get(..cut).unwrap_or_default(),
             None => candidate.document.as_str(),
         };
-        out.push_str(document);
+        out.push_str(&injection::untrusted_block(
+            &format!("candidate-{label}"),
+            document,
+        ));
         out.push('\n');
     }
     out.push_str(&format!(
@@ -528,7 +571,12 @@ fn parse(
         // magnitude for it would imply a confidence the model never
         // expressed. `super::L2Stage` only ever reads the relative order.
         let score = candidates.len().saturating_sub(ordered.len()) as f64;
-        let why = rehydrate(entry.why.trim(), tokens);
+        // Sanitized after rehydration, not before: rehydration can splice a
+        // real value back in, and it is the *final* string a UI renders that
+        // must be free of invisible and bidi-override characters. A "why this
+        // matched" line is model text written while reading up to thirty
+        // attacker-authored documents and goes straight to a terminal.
+        let why = injection::sanitize_model_text(&rehydrate(entry.why.trim(), tokens)).into_owned();
         ordered.push(RerankVerdict {
             message_id: candidate.message_id,
             score,

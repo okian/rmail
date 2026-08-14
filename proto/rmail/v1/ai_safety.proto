@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// AiSafetyService is the prompt-injection shield's read-and-confirm surface
+// (prd.md #43, task 77).
+//
+// Email is attacker-controlled text, and this daemon feeds it to a model in
+// three places: per-message triage/deep analysis, the rules engine's
+// `claude_is` predicate, and the listwise search reranker. Every one of them
+// wraps untrusted content in explicit delimiters and tells the model that
+// what is inside them is data, never instruction — that structural
+// separation is the actual control and it needs no RPC. What this service
+// exposes is the second half: the detector's findings, so a user can see
+// that a message tried something, and the confirmation that releases a rule
+// action the shield withheld because of it.
+//
+// Deliberately separate from AiService and AiPolicyService. AiService is the
+// data plane (what did the pipeline produce for this message) and
+// AiPolicyService is the spend control plane (what may be spent). These RPCs
+// are neither: ScanInjection makes no provider call at all — it is a local
+// pattern scan over text this daemon already holds — and ConfirmInjection
+// grants permission for *mail mutations* a rule would otherwise be refused,
+// which is why the two sit behind very different scopes in rmaild's
+// method->scope table (see that file: mail.read for the scan, automation +
+// mail.write for the confirmation).
+service AiSafetyService {
+  // Scan one message exactly as the AI pipeline would see it and return
+  // every injection signal found, refreshing the stored flag as a side
+  // effect. Makes no model call and costs nothing.
+  //
+  // The scan covers the assembled, bounded text a pass would actually send
+  // *and* the message's raw HTML when it has any — hidden-text tricks
+  // (display:none, a zero-height div) are invisible by the time HTML has
+  // been stripped to the plain text a prompt carries, so looking only at
+  // what the model sees would miss the class of attack that hides itself
+  // from the human instead.
+  rpc ScanInjection(ScanInjectionRequest) returns (ScanInjectionResponse);
+
+  // Record, or withdraw, a human's confirmation that AI-decided actions may
+  // act on a flagged message.
+  //
+  // This is the only thing that releases a rule action the shield withheld.
+  // Nothing in the AI pipeline can set it — a confirmation is consent, and
+  // consent that a machine can grant itself is not consent. It is also
+  // scoped to the findings that were present when it was given: a later scan
+  // that turns up *different* detections clears it, because the message is
+  // no longer the one that was approved.
+  rpc ConfirmInjection(ConfirmInjectionRequest) returns (ConfirmInjectionResponse);
+}
+
+// How seriously a scan's findings are taken. Ordered: HOSTILE is stricter
+// than SUSPICIOUS.
+enum InjectionSeverity {
+  INJECTION_SEVERITY_UNSPECIFIED = 0;
+  // Obfuscation with no legible instruction behind it: zero-width
+  // characters, homoglyphs, CSS-hidden text. Common enough in real
+  // marketing mail that it does not withhold an action by default.
+  INJECTION_SEVERITY_SUSPICIOUS = 1;
+  // Something in the text is addressed to the model: an instruction
+  // override, forged system/tool framing, an exfiltration request.
+  INJECTION_SEVERITY_HOSTILE = 2;
+}
+
+// One signal the scan found.
+message InjectionDetection {
+  // The kind's stable wire name: instruction_override, role_spoof,
+  // exfiltration, invisible, bidi_control, homoglyph, hidden_html.
+  //
+  // A string rather than an enum on purpose. The kind list is a detector
+  // detail that will grow as new tricks appear, and a client that renders an
+  // unknown kind as its own name degrades gracefully where one holding a
+  // stale enum would render UNSPECIFIED and lose the finding entirely.
+  string kind = 1;
+  // The offending text as the sender wrote it, bounded and with invisible
+  // and bidi-override characters stripped so quoting it into a terminal is
+  // safe — an excerpt of a bidi attack must not reorder the report that
+  // describes it.
+  string excerpt = 2;
+  // Byte offset of the excerpt in the scanned text, for a client that wants
+  // to highlight it in place.
+  int64 offset = 3;
+}
+
+message ScanInjectionRequest {
+  int64 message_id = 1;
+}
+
+message ScanInjectionResponse {
+  int64 message_id = 1;
+  // False when the scan found nothing. Every other field below is then
+  // empty/unset, and no flag row exists for this message.
+  bool flagged = 2;
+  InjectionSeverity severity = 3;
+  // Distinct kinds found, for a badge.
+  repeated string kinds = 4;
+  // What was found, capped at 32 detections per message.
+  repeated InjectionDetection detections = 5;
+  // Unix seconds when this scan ran.
+  int64 scanned_at = 6;
+  // Unix seconds when a human confirmed these findings, or 0 for none.
+  // While this is 0 and `severity` is at or above
+  // `ai.injection.block_actions_at`, a rule whose claude_is decided the
+  // match will not fire its actions on this message.
+  int64 confirmed_at = 7;
+  // Whether the shield is, right now, withholding AI-decided actions on this
+  // message. Derived from severity, the configured threshold, and
+  // confirmed_at together, so a client does not have to re-implement that
+  // comparison (and get it subtly wrong) to render the state.
+  bool actions_withheld = 8;
+}
+
+message ConfirmInjectionRequest {
+  int64 message_id = 1;
+  // True to confirm, false to withdraw a confirmation already given.
+  bool confirmed = 2;
+}
+
+message ConfirmInjectionResponse {
+  // The flag as it now stands, so a client sees exactly what took effect.
+  ScanInjectionResponse flag = 1;
+}

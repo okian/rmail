@@ -83,13 +83,35 @@
 //!   real fix is [`PassHandler::on_success`] receiving the token map
 //!   alongside the *redacted* text and letting a handler parse first,
 //!   rehydrate per field — out of scope for this module to change.
+//!
+//! # This pass is also the mailbox's injection scanner
+//!
+//! Triage runs on every newly synced message, which makes it the one place
+//! that sees everything — so [`TriagePassHandler::build_request`] is where
+//! [`crate::ai::injection::scan`] runs and where its findings are recorded
+//! (task 77). The scan is over the *rendered user turn*, not over the
+//! database row: what matters is what the model was actually shown, and by
+//! this point that has already been bounded, HTML-stripped and
+//! attachment-folded by [`crate::ai::queue::assemble_content`].
+//!
+//! Recording is best-effort and never fails the request — see
+//! [`crate::ai::injection::store::record`]. Triage is a *read* path: a
+//! message that tries something still gets triaged, because refusing to
+//! summarize it would let any sender blind this pass by pasting the word
+//! "instructions" into a footer. The failing-closed half of the shield lives
+//! on the one path where a model answer mutates the mailbox, which is
+//! [`crate::rules`], not here.
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 
 use crate::ai::deep::DeepPassGate;
+use crate::ai::injection;
 use crate::ai::provider::{ChatRequest, OutputFormat};
 use crate::ai::queue::{AiLease, MessageContent, NewAiJob, PassHandler};
+use crate::config::AiInjection;
 use crate::error::Error;
 use crate::storage::Database;
 
@@ -133,12 +155,22 @@ const SENTIMENTS: [&str; 4] = ["positive", "neutral", "negative", "urgent"];
 /// that function's docs).
 const MAX_SUGGESTED_TAGS: usize = 5;
 
+/// This pass's own instructions, with
+/// [`injection::DATA_BOUNDARY_CLAUSE`] appended — the paragraph that gives
+/// the `⟪untrusted email⟫` delimiters in the user turn their meaning. Built
+/// once into a `static` rather than per call, so it stays byte-identical
+/// across calls and keeps sitting behind `ClaudeProvider`'s prompt-cache
+/// `cache_control` boundary (see [`SYSTEM_PROMPT_BASE`]).
+static SYSTEM_PROMPT: LazyLock<String> =
+    LazyLock::new(|| injection::with_data_boundary(SYSTEM_PROMPT_BASE));
+
 /// Frozen, cacheable system prompt — kept byte-identical across calls so it
 /// forms the stable prefix `ClaudeProvider`'s prompt-cache `cache_control`
 /// covers (see [`ChatRequest::system`](crate::ai::provider::ChatRequest::system)'s
 /// own docs on why that matters). Everything that varies per call — the
 /// message itself — belongs in the user turn, never here.
-const SYSTEM_PROMPT: &str = "You are the triage stage of an email client's AI pipeline. You read \
+const SYSTEM_PROMPT_BASE: &str =
+    "You are the triage stage of an email client's AI pipeline. You read \
 one email at a time and answer with a single structured JSON object only \
 -- no prose, no markdown, nothing outside the schema.
 
@@ -178,6 +210,11 @@ pub struct TriagePassHandler {
     db: Database,
     model: String,
     max_tokens: u32,
+    /// `ai.injection` — whether the detector runs at all. The *fence* is
+    /// unconditional and does not consult this; see
+    /// [`crate::ai::injection`]'s module docs on why that switch does not
+    /// exist.
+    injection: AiInjection,
     /// Enqueues a deep pass once a triage verdict this handler just wrote
     /// qualifies under `ai.deep_pass`'s thresholds — see
     /// [`crate::ai::deep::DeepPassGate`]. `None` when no gate was
@@ -196,8 +233,18 @@ impl TriagePassHandler {
             db,
             model: model.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            injection: AiInjection::default(),
             deep_gate: None,
         }
+    }
+
+    /// Run the injection detector under `injection` rather than under its
+    /// defaults — what the daemon passes so `ai.injection.enabled` is
+    /// honored. Fencing is unaffected either way.
+    #[must_use]
+    pub fn with_injection_config(mut self, injection: AiInjection) -> Self {
+        self.injection = injection;
+        self
     }
 
     /// Override the default output token ceiling — mainly for tests that
@@ -229,10 +276,24 @@ impl PassHandler for TriagePassHandler {
         PASS
     }
 
+    #[tracing::instrument(
+        skip(self, content),
+        fields(message_id = content.message_id, injection_severity)
+    )]
     async fn build_request(&self, content: &MessageContent) -> Result<ChatRequest, Error> {
+        let user = render_user_message(content);
+        // Scanned after rendering, not before: the fence and the headers are
+        // this codebase's own text, and what the shield has to reason about
+        // is exactly the bytes the model will read. Scanning `content.body`
+        // instead would miss a payload split across the subject and the body.
+        let report = injection::scan_if_enabled(&user, &self.injection);
+        if let Some(severity) = report.severity() {
+            tracing::Span::current().record("injection_severity", severity.as_str());
+        }
+        injection::store::record(&self.db, content.message_id, content.account_id, &report).await;
         Ok(ChatRequest::new(self.model.clone(), self.max_tokens)
-            .system(SYSTEM_PROMPT)
-            .user(render_user_message(content))
+            .system(SYSTEM_PROMPT.as_str())
+            .user(user)
             .output_format(OutputFormat::json_schema(schema())))
     }
 
@@ -274,7 +335,21 @@ impl PassHandler for TriagePassHandler {
 /// and by the time it reaches [`Provider::complete`](crate::ai::provider::Provider::complete)
 /// it will also have been through the redaction firewall; this function's
 /// only job is to render it into readable text.
-fn render_user_message(content: &MessageContent) -> String {
+///
+/// Every byte of that text came from a sender — the display name, the
+/// address, the subject and the body alike — so the whole rendering goes
+/// inside one [`injection::untrusted_block`] rather than only the body. An
+/// earlier shape that fenced `content.body` alone would have left a forged
+/// `Subject:` line able to write the closing delimiter and everything after
+/// it back into instruction position, which is the exact failure the fence
+/// exists to prevent. The `[body truncated]` marker is this codebase's own
+/// statement about the data and stays outside the block, where the model can
+/// trust it.
+///
+/// `pub(crate)` so `AiSafetyService.ScanInjection` can scan the same bytes
+/// this builds rather than a second, drifting rendering of them — a scan
+/// report that described text no pass ever sends would be worse than none.
+pub(crate) fn render_user_message(content: &MessageContent) -> String {
     let from = match (&content.from_name, &content.from_addr) {
         (Some(name), Some(addr)) => format!("{name} <{addr}>"),
         (Some(name), None) => name.clone(),
@@ -282,7 +357,10 @@ fn render_user_message(content: &MessageContent) -> String {
         (None, None) => "(unknown sender)".to_owned(),
     };
     let subject = content.subject.as_deref().unwrap_or("(no subject)");
-    let mut out = format!("From: {from}\nSubject: {subject}\n\n{}", content.body);
+    let mut out = injection::untrusted_block(
+        "email",
+        &format!("From: {from}\nSubject: {subject}\n\n{}", content.body),
+    );
     if content.truncated {
         out.push_str("\n\n[body truncated]");
     }

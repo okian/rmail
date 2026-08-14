@@ -20,12 +20,14 @@ use outbox_cli::{FollowupAction, OutboxArgs, SendArgs, UndoArgs};
 use rmail_core::socket_path_from_env;
 use rmail_proto::v1::admin_service_client::AdminServiceClient;
 use rmail_proto::v1::ai_policy_service_client::AiPolicyServiceClient;
+use rmail_proto::v1::ai_safety_service_client::AiSafetyServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
     analyze_event, AnalyzeMessageRequest, BudgetCaps, BudgetClass, BudgetWindowCaps, ClassSpend,
-    EventKind, GetSpendRequest, GetSummaryRequest, GetUsageRequest, ListTokensRequest,
-    MintTokenRequest, RetryFailedRequest, RevokeTokenRequest, SetBudgetRequest, SetPausedRequest,
+    ConfirmInjectionRequest, EventKind, GetSpendRequest, GetSummaryRequest, GetUsageRequest,
+    InjectionSeverity, ListTokensRequest, MintTokenRequest, RetryFailedRequest, RevokeTokenRequest,
+    ScanInjectionRequest, ScanInjectionResponse, SetBudgetRequest, SetPausedRequest,
     SuggestReplyRequest, Summary, SyncFolderRequest, SyncMode, WatchEventsRequest,
 };
 use search_cli::{SearchArgs, SimilarArgs};
@@ -220,6 +222,29 @@ enum AiAction {
         #[command(subcommand)]
         action: BudgetAction,
     },
+    /// Scan one message for prompt-injection signals, exactly as the AI
+    /// pipeline sees it (`AiSafetyService.ScanInjection`). Makes no model
+    /// call and costs nothing.
+    ///
+    /// A rule that matched on a `claude_is` verdict will not fire its
+    /// actions on a message flagged at or above
+    /// `ai.injection.block_actions_at` until a human confirms it — that is
+    /// what `--confirm` is for. Read the excerpts before you do: confirming
+    /// says "I have looked at what this message tried and I still want the
+    /// rule to act on it".
+    #[command(name = "scan-injection")]
+    ScanInjection {
+        /// Message id.
+        message_id: i64,
+        /// Confirm the reported findings, releasing any withheld rule
+        /// actions on this message (`AiSafetyService.ConfirmInjection`).
+        #[arg(long)]
+        confirm: bool,
+        /// Withdraw a confirmation given earlier, so the shield withholds
+        /// again.
+        #[arg(long, conflicts_with = "confirm")]
+        revoke: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -345,6 +370,11 @@ async fn main() -> Result<()> {
             AiAction::Resume => ai_set_paused(&socket, false).await,
             AiAction::Cost { month } => ai_cost(&socket, month).await,
             AiAction::Budget { action } => ai_budget(&socket, action).await,
+            AiAction::ScanInjection {
+                message_id,
+                confirm,
+                revoke,
+            } => ai_scan_injection(&socket, message_id, confirm, revoke).await,
         },
         Command::Note { action } => note_cli::dispatch(&socket, action).await,
         Command::Notes(args) => note_cli::list(&socket, args).await,
@@ -784,6 +814,97 @@ async fn ai_policy_client(
         .await
         .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
     Ok(AiPolicyServiceClient::new(channel))
+}
+
+async fn ai_safety_client(
+    socket: &Path,
+) -> Result<AiSafetyServiceClient<tonic::transport::Channel>> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    Ok(AiSafetyServiceClient::new(channel))
+}
+
+/// `mail ai scan-injection <id> [--confirm|--revoke]`.
+///
+/// Always scans first, even when confirming: a confirmation is consent to a
+/// specific set of findings (the daemon clears it when a re-scan turns up
+/// different ones), so confirming without having just seen them would be
+/// consenting to whatever a stale row happened to hold.
+async fn ai_scan_injection(
+    socket: &Path,
+    message_id: i64,
+    confirm: bool,
+    revoke: bool,
+) -> Result<()> {
+    let mut client = ai_safety_client(socket).await?;
+    let scan = client
+        .scan_injection(ScanInjectionRequest { message_id })
+        .await
+        .context("ScanInjection RPC failed")?
+        .into_inner();
+    print_injection_scan(&scan);
+
+    if !confirm && !revoke {
+        return Ok(());
+    }
+    if !scan.flagged {
+        // Not an error: the user asked for a state this message is already
+        // in. Saying so is more useful than a NOT_FOUND from the daemon.
+        println!(
+            "\nnothing to {}: this message is not flagged",
+            if confirm { "confirm" } else { "revoke" }
+        );
+        return Ok(());
+    }
+    let flag = client
+        .confirm_injection(ConfirmInjectionRequest {
+            message_id,
+            confirmed: confirm,
+        })
+        .await
+        .context("ConfirmInjection RPC failed")?
+        .into_inner()
+        .flag;
+    match flag {
+        Some(flag) if flag.confirmed_at > 0 => {
+            println!("\nconfirmed: AI-decided rule actions may now act on message {message_id}")
+        }
+        Some(_) => println!(
+            "\nconfirmation withdrawn: AI-decided rule actions on message {message_id} are \
+             withheld again"
+        ),
+        None => println!("\nthe daemon returned no flag"),
+    }
+    Ok(())
+}
+
+fn print_injection_scan(scan: &ScanInjectionResponse) {
+    if !scan.flagged {
+        println!("message {}: no prompt-injection signals", scan.message_id);
+        return;
+    }
+    let severity = match InjectionSeverity::try_from(scan.severity) {
+        Ok(InjectionSeverity::Hostile) => "hostile",
+        Ok(InjectionSeverity::Suspicious) => "suspicious",
+        _ => "unknown",
+    };
+    println!("message {}: FLAGGED ({severity})", scan.message_id);
+    println!("kinds:   {}", scan.kinds.join(", "));
+    println!(
+        "actions: {}",
+        if scan.actions_withheld {
+            "WITHHELD — a rule matching on claude_is will not act on this message"
+        } else if scan.confirmed_at > 0 {
+            "allowed (confirmed)"
+        } else {
+            "allowed (below the configured block threshold)"
+        }
+    );
+    println!("\nwhat it tried:");
+    for detection in &scan.detections {
+        println!("  [{}] {}", detection.kind, detection.excerpt);
+    }
 }
 
 /// `mail ai budget set/status`.

@@ -57,6 +57,43 @@
 //! which matters because `ai.policy` eligibility is resolved per account and
 //! folder, and a rule that could reach across accounts would be a way around
 //! it.
+//!
+//! # The prompt-injection gate, and why it is here rather than in `classify`
+//!
+//! This is the only place in the codebase where a model's answer mutates the
+//! mailbox: a `claude_is` verdict decides whether a rule matches, and a match
+//! archives, moves, labels, runs a hook, or drafts a reply. A message whose
+//! body talks the model into answering "yes" therefore gets to *act*, which
+//! is a different order of consequence from a wrong summary, and it is what
+//! task 77's shield fails closed on.
+//!
+//! [`RuleEngine::evaluate_rule`] withholds a matched rule's actions when all
+//! three of these hold:
+//!
+//! 1. the rule matched,
+//! 2. its `claude_is` predicate was actually consulted — a rule settled
+//!    entirely by `from`/`subject`/`header` predicates had no model input to
+//!    subvert, and gating it would be security theatre that stops working
+//!    rules for no reduction in risk,
+//! 3. the text the model was shown scans at or above
+//!    `ai.injection.block_actions_at`, and no human has confirmed *these*
+//!    findings.
+//!
+//! The scan runs here, on the evaluation path, rather than trusting
+//! [`crate::ai::triage`]'s flag to already exist. Triage does scan every
+//! synced message, but a rule must not be safe only because another
+//! subsystem happened to run first — an account with AI triage disabled, or
+//! a message evaluated before its triage job was dispatched, would otherwise
+//! have an unguarded action path.
+//!
+//! Withholding does **not** claim `rule_actions_fired`. That is deliberate:
+//! the claim is what makes actions at-most-once, and burning it on a
+//! withheld evaluation would mean confirming the message later fired
+//! nothing, because the rule would look like it had already run.
+//!
+//! The gate never runs on the dry-run/backtest path's mutations (there are
+//! none) but it *is* reported there, so `mail rule backtest` tells the truth
+//! about what a real run would refuse to do.
 
 pub mod actions;
 pub mod classify;
@@ -73,7 +110,9 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::ai::injection;
 use crate::ai::policy::{PolicyEngine, PolicyTarget};
+use crate::config::AiInjection;
 use crate::error::{Error, ErrorReason};
 use crate::events::{EventKind, EventLog};
 use crate::storage::Database;
@@ -243,6 +282,10 @@ pub struct RuleEngine {
     /// a message in an allowed one. Redaction is not policy exclusion: the
     /// guard tokenizes PII, it does not remove the prose.
     policy: Arc<PolicyEngine>,
+    /// `ai.injection` — the shield's detector switch and the severity at
+    /// which a model-decided match stops being allowed to act. See the
+    /// module docs' "prompt-injection gate" section.
+    injection: AiInjection,
     /// Cap on how many messages one backtest/dry-run window materializes.
     max_window: usize,
 }
@@ -264,10 +307,23 @@ impl RuleEngine {
             classifier,
             actions,
             policy,
+            injection: AiInjection::default(),
             // A zero here would make every backtest silently empty; one is
             // the smallest window that still answers a question.
             max_window: max_window.max(1),
         }
+    }
+
+    /// Gate model-decided actions under `injection` rather than under the
+    /// shield's defaults — what the daemon passes so `ai.injection` is
+    /// honored. Withholding is on by default (`block_actions_at =
+    /// "hostile"`), so an engine built without this call is gated, not
+    /// ungated.
+    #[must_use]
+    pub fn with_injection_config(mut self, injection: AiInjection) -> Self {
+        injection.warn_if_unrecognized();
+        self.injection = injection;
+        self
     }
 
     /// The pattern bounds this engine validates and compiles under.
@@ -567,6 +623,18 @@ impl RuleEngine {
             return Ok(report);
         }
 
+        // The prompt-injection gate — see the module docs. Checked before the
+        // dry-run branch so a backtest reports what a real run would refuse,
+        // and before `repo::claim` so a withheld evaluation does not burn the
+        // at-most-once claim it will need after a confirmation.
+        if let Some(withheld) = self
+            .injection_withhold(&report.outcomes, compiled, facts)
+            .await?
+        {
+            report.actions = withheld;
+            return Ok(report);
+        }
+
         if dry_run {
             report.already_fired = match rule_id {
                 Some(id) => repo::already_fired(&self.db, id, facts.message_id).await?,
@@ -594,6 +662,103 @@ impl RuleEngine {
             .apply(&compiled.spec.name, &compiled.spec.then, facts, cancel)
             .await;
         Ok(report)
+    }
+
+    /// The withheld-action report for a matched rule whose `claude_is` was
+    /// consulted on a message flagged as a prompt injection, or `None` when
+    /// the rule may act.
+    ///
+    /// Returns `Some` only when every condition in the module docs' gate
+    /// section holds. The scan itself is pure and synchronous; the two things
+    /// this touches durable state for are recording the finding (best effort
+    /// — the decision does not depend on the write landing) and reading back
+    /// whether a human has confirmed it (propagated, never swallowed: not
+    /// knowing whether consent exists is exactly the case that has to fail
+    /// closed).
+    ///
+    /// # Errors
+    /// A mapped storage error from reading the flag back.
+    async fn injection_withhold(
+        &self,
+        outcomes: &[Outcome],
+        compiled: &Compiled,
+        facts: &MessageFacts,
+    ) -> Result<Option<Vec<ActionOutcome>>, Error> {
+        // Condition 2 of the gate: a rule the deterministic predicates
+        // settled on their own had no model input to subvert. `evaluated`,
+        // not `matched` — under `MatchMode::Any` a consulted `claude_is` that
+        // said "no" still contributed to the verdict's shape, and under
+        // `All` it must have said "yes" for the rule to be here at all.
+        if !outcomes
+            .iter()
+            .any(|o| o.predicate == eval::CLAUDE_IS && o.evaluated)
+        {
+            return Ok(None);
+        }
+
+        // Exactly the text `ClaudeClassifier` renders for the model, at the
+        // same budget — scanning the untruncated body would flag a message
+        // for a payload the model never saw, and scanning something else
+        // entirely would miss one it did.
+        let rendered = facts.render_for_model(classify::MAX_BODY_CHARS);
+        let scan = injection::scan_if_enabled(&rendered, &self.injection);
+        if !injection::blocks_actions(scan.severity(), &self.injection) {
+            // Still recorded when it found something below the threshold:
+            // "this message tried something and we let the rule act anyway"
+            // is exactly the history a user needs after the fact.
+            if !scan.is_clean() {
+                injection::store::record(&self.db, facts.message_id, facts.account_id, &scan).await;
+            }
+            return Ok(None);
+        }
+        injection::store::record(&self.db, facts.message_id, facts.account_id, &scan).await;
+
+        let confirmed = injection::store::get(&self.db, facts.message_id)
+            .await?
+            .is_some_and(|flag| flag.is_confirmed());
+        if confirmed {
+            tracing::info!(
+                message_id = facts.message_id,
+                rule = %compiled.spec.name,
+                "acting on a prompt-injection-flagged message: a human confirmed these findings"
+            );
+            return Ok(None);
+        }
+
+        let kinds: Vec<&str> = scan
+            .kinds()
+            .into_iter()
+            .map(injection::InjectionKind::as_str)
+            .collect();
+        tracing::warn!(
+            message_id = facts.message_id,
+            account_id = facts.account_id,
+            rule = %compiled.spec.name,
+            severity = scan.severity().map(injection::Severity::as_str),
+            ?kinds,
+            "withholding a rule's actions: its claude_is verdict came from a message flagged \
+             for prompt injection and no human has confirmed it"
+        );
+        let detail = format!(
+            "withheld: this rule matched on a claude_is verdict, and the message is flagged \
+             for prompt injection ({}). Review it with `mail ai scan-injection {}` and, if it \
+             is safe, re-run the rule after `mail ai scan-injection {} --confirm`.",
+            kinds.join(", "),
+            facts.message_id,
+            facts.message_id
+        );
+        let names = compiled.spec.then.names();
+        Ok(Some(if names.is_empty() {
+            // A rule with no actions cannot mutate anything, but reporting an
+            // empty list here would be indistinguishable from "it acted and
+            // nothing happened". One entry keeps the withhold visible.
+            vec![ActionOutcome::withheld("none", detail)]
+        } else {
+            names
+                .into_iter()
+                .map(|name| ActionOutcome::withheld(name, detail.clone()))
+                .collect()
+        }))
     }
 
     /// Run `selector` over every message in `account_id` from the last

@@ -723,7 +723,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-core ai::budget` (soft-cap downgrade, hard-cap block, bulk sub-budget)
 
 ## 77. Prompt-injection shield
-- [ ] status
+- [x] status
 - **depends-on:** 43, 47
 - **parallel-safe:** yes
 - **acceptance:**
