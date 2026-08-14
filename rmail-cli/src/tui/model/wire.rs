@@ -155,6 +155,9 @@ pub fn draft_request(
 
     CreateDraftRequest {
         account_id,
+        // No fence from the TUI: a draft is created from a keystroke, not a
+        // retried RPC, and an empty key means "no fence" (see the proto).
+        idempotency_key: String::new(),
         from: Some(DraftAddress {
             address: from.to_owned(),
             display_name: String::new(),

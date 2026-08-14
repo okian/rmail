@@ -80,7 +80,14 @@ impl TestServer {
             .await
             .unwrap();
 
-        let api = rmaild::ComposeApi::new(DraftStore::new(db.clone()));
+        let api = rmaild::ComposeApi::new(
+            DraftStore::new(db.clone()),
+            rmail_core::idempotency::IdempotencyStore::new(
+                db.clone(),
+                std::time::Duration::from_secs(3600),
+                std::time::Duration::from_secs(60),
+            ),
+        );
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let incoming = UnixListenerStream::new(listener);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -142,6 +149,7 @@ impl TestServer {
     fn create_request(&self) -> CreateDraftRequest {
         CreateDraftRequest {
             account_id: self.account_id,
+            idempotency_key: String::new(),
             from: Some(address("alice@example.com", "Alice")),
             to: vec![address("bob@example.net", "")],
             cc: Vec::new(),

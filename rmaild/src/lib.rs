@@ -683,7 +683,10 @@ where
     // `ComposeService` needs nothing but the database: drafts are local, and
     // this task deliberately stops short of SMTP (task 61 owns submission),
     // so there is no client, pool, or background loop to wire up here.
-    let compose_service = ComposeServiceServer::new(ComposeApi::new(DraftStore::new(db.clone())));
+    let compose_service = ComposeServiceServer::new(ComposeApi::new(
+        DraftStore::new(db.clone()),
+        idempotency.clone(),
+    ));
     // The keymap the TUI reads directly; served for palette/MCP clients that
     // have no other way to discover the action-id registry. See
     // `config_service`'s own docs for why the daemon serves a client-side file.
@@ -735,7 +738,11 @@ where
         IndexQueue::new(db.clone(), IndexQueueOptions::default()),
         config.notes.index,
     );
-    let note_service = NoteServiceServer::new(NoteApi::new(note_store, stopping.clone()));
+    let note_service = NoteServiceServer::new(NoteApi::new(
+        note_store,
+        stopping.clone(),
+        idempotency.clone(),
+    ));
     // `HookService` is always registered (reflection and the auth scope
     // table must see every RPC regardless of runtime config, the same
     // convention `AiService`/`ai_active` established below); `hooks.enabled`

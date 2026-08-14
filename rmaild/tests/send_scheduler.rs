@@ -162,9 +162,17 @@ impl TestServer {
 
     /// Create a draft through the same `DraftStore` the handler renders from.
     async fn draft(&self, body: &str, attachment: bool) -> i64 {
-        let api = rmaild::ComposeApi::new(self.store.drafts().clone());
+        let api = rmaild::ComposeApi::new(
+            self.store.drafts().clone(),
+            rmail_core::idempotency::IdempotencyStore::new(
+                self.db.clone(),
+                std::time::Duration::from_secs(3600),
+                std::time::Duration::from_secs(60),
+            ),
+        );
         use rmail_proto::v1::compose_service_server::ComposeService as _;
         api.create_draft(tonic::Request::new(CreateDraftRequest {
+            idempotency_key: String::new(),
             account_id: self.account_id,
             from: Some(DraftAddress {
                 address: "alice@example.com".to_owned(),

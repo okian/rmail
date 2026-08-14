@@ -27,6 +27,7 @@ use rmail_core::compose::{
     Draft as CoreDraft, DraftAttachment as CoreAttachment, DraftPatch, DraftStore, Mailbox,
     NewAttachment, NewDraft,
 };
+use rmail_core::idempotency::IdempotencyStore;
 use rmail_core::Error;
 use rmail_proto::v1::compose_service_server::ComposeService;
 use rmail_proto::v1::{
@@ -40,15 +41,21 @@ use tonic::{Request, Response, Status};
 #[derive(Clone)]
 pub struct ComposeApi {
     store: DraftStore,
+    /// The replay fence behind `CreateDraft`'s `idempotency_key`. `drafts`
+    /// carries no uniqueness of its own, so without this a retried create
+    /// leaves two identical drafts and no way to tell which id is live.
+    idempotency: IdempotencyStore,
 }
 
 impl ComposeApi {
     /// Build a handler over a draft store.
     #[must_use]
-    pub fn new(store: DraftStore) -> Self {
-        Self { store }
+    pub fn new(store: DraftStore, idempotency: IdempotencyStore) -> Self {
+        Self { store, idempotency }
     }
 }
+
+const CREATE_DRAFT_METHOD: &str = "/rmail.v1.ComposeService/CreateDraft";
 
 #[tonic::async_trait]
 impl ComposeService for ComposeApi {
@@ -60,27 +67,37 @@ impl ComposeService for ComposeApi {
         tracing::Span::current().record(rmail_core::telemetry::FIELD_ACCOUNT, req.account_id);
         let from = req
             .from
+            .clone()
             .ok_or_else(|| Status::from(Error::invalid_argument("from is required")))?;
-        let draft = self
-            .store
-            .create(NewDraft {
-                account_id: req.account_id,
-                from: mailbox_from_proto(&from)?,
-                to: mailboxes_from_proto(&req.to)?,
-                cc: mailboxes_from_proto(&req.cc)?,
-                bcc: mailboxes_from_proto(&req.bcc)?,
-                subject: req.subject,
-                body_text: req.body_text,
-                body_html: req.body_html,
-                attachments: req
-                    .attachments
-                    .into_iter()
-                    .map(attachment_from_proto)
-                    .collect(),
-                in_reply_to_message_id: req.in_reply_to_message_id,
-            })
-            .await?;
-        Ok(Response::new(draft_to_proto(&draft)))
+        let new = NewDraft {
+            account_id: req.account_id,
+            from: mailbox_from_proto(&from)?,
+            to: mailboxes_from_proto(&req.to)?,
+            cc: mailboxes_from_proto(&req.cc)?,
+            bcc: mailboxes_from_proto(&req.bcc)?,
+            subject: req.subject.clone(),
+            body_text: req.body_text.clone(),
+            body_html: req.body_html.clone(),
+            attachments: req
+                .attachments
+                .iter()
+                .cloned()
+                .map(attachment_from_proto)
+                .collect(),
+            in_reply_to_message_id: req.in_reply_to_message_id,
+        };
+        crate::idempotency::guard(
+            &self.idempotency,
+            CREATE_DRAFT_METHOD,
+            &req.idempotency_key,
+            &req,
+            async {
+                let draft = self.store.create(new).await?;
+                Ok(draft_to_proto(&draft))
+            },
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn get_draft(

@@ -127,6 +127,10 @@ message CreateDraftRequest {
   optional string body_html = 8;
   repeated NewDraftAttachment attachments = 9;
   optional int64 in_reply_to_message_id = 10;
+  // Optional replay fence — see `MoveRequest.idempotency_key`. `drafts` has no
+  // uniqueness of its own, so a retried `CreateDraft` would otherwise leave two
+  // identical drafts behind, and the client cannot tell which id is the live one.
+  string idempotency_key = 11;
 }
 
 message GetDraftRequest {

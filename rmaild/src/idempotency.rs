@@ -76,17 +76,34 @@ impl Replay for () {
     }
 }
 
-impl Replay for rmail_proto::v1::OutboxEntry {
-    fn encode_replay(&self) -> Vec<u8> {
-        self.encode_to_vec()
-    }
-    fn decode_replay(bytes: &[u8]) -> Result<Self, Status> {
-        Self::decode(bytes).map_err(|error| {
-            tracing::error!(%error, "a cached idempotent response did not decode");
-            Status::from(Error::internal("cached response could not be decoded"))
-        })
-    }
+/// `impl Replay` for a `prost::Message`, which is every cacheable response
+/// except `()`.
+///
+/// A macro rather than a blanket `impl<T: prost::Message> Replay for T`
+/// because `()` is not a `prost::Message` and is the response type of the
+/// RPCs this fence matters most for — a blanket impl would collide with the
+/// hand-written one above.
+macro_rules! replay_via_prost {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl Replay for $ty {
+            fn encode_replay(&self) -> Vec<u8> {
+                self.encode_to_vec()
+            }
+            fn decode_replay(bytes: &[u8]) -> Result<Self, Status> {
+                Self::decode(bytes).map_err(|error| {
+                    tracing::error!(%error, "a cached idempotent response did not decode");
+                    Status::from(Error::internal("cached response could not be decoded"))
+                })
+            }
+        })+
+    };
 }
+
+replay_via_prost!(
+    rmail_proto::v1::OutboxEntry,
+    rmail_proto::v1::Note,
+    rmail_proto::v1::Draft,
+);
 
 /// Run `work` under the replay fence named by `key`, or replay an identical
 /// earlier call.

@@ -133,6 +133,7 @@ async fn add(socket: &Path, id: i64, thread: bool, message: Option<String>) -> R
     let target = to_target(id, thread);
     let note = client
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: Some(target),
             body_md,
             author: NoteAuthor::User as i32,

@@ -86,6 +86,11 @@ message AddNoteRequest {
   // MCP-originated `add_note` call sets NOTE_AUTHOR_AI explicitly (prd.md:
   // "author defaults to ai when Claude calls").
   NoteAuthor author = 3;
+  // Optional replay fence — see `MoveRequest.idempotency_key`. `notes` has no
+  // uniqueness of its own (a message can legitimately carry several notes), so
+  // a retried `AddNote` would otherwise leave the user with two copies of the
+  // same note and no way to tell which retry made which.
+  string idempotency_key = 4;
 }
 
 message EditNoteRequest {

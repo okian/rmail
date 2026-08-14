@@ -94,7 +94,15 @@ impl TestServer {
         let index_queue = IndexQueue::new(db.clone(), IndexQueueOptions::default());
         let store = NoteStore::new(db.clone(), index_queue, index_enabled);
         let shutdown_cancel = CancellationToken::new();
-        let api = rmaild::NoteApi::new(store, shutdown_cancel.clone());
+        let api = rmaild::NoteApi::new(
+            store,
+            shutdown_cancel.clone(),
+            rmail_core::idempotency::IdempotencyStore::new(
+                db.clone(),
+                std::time::Duration::from_secs(3600),
+                std::time::Duration::from_secs(60),
+            ),
+        );
 
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let incoming = UnixListenerStream::new(listener);
@@ -209,6 +217,7 @@ async fn add_edit_delete_and_list_round_trip_over_grpc() {
     let markdown = "# heading\n\n- one\n- two\n\nsome *emphasis*";
     let note = client
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: Some(message_target(message_id)),
             body_md: markdown.to_owned(),
             author: NoteAuthor::User as i32,
@@ -273,6 +282,7 @@ async fn add_and_list_round_trip_on_a_thread_target() {
 
     let note = client
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: Some(thread_target(thread_id)),
             body_md: "thread-wide context".to_owned(),
             author: NoteAuthor::Ai as i32,
@@ -303,6 +313,7 @@ async fn an_unset_target_is_rejected_as_invalid_argument() {
 
     let status = client
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: None,
             body_md: "orphan".to_owned(),
             author: NoteAuthor::Unspecified as i32,
@@ -321,6 +332,7 @@ async fn a_target_naming_a_message_that_does_not_exist_is_not_found() {
 
     let status = client
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: Some(message_target(999_999)),
             body_md: "orphan".to_owned(),
             author: NoteAuthor::Unspecified as i32,
@@ -363,6 +375,7 @@ async fn concurrent_edits_over_grpc_are_last_write_wins() {
 
     let note = client
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: Some(message_target(message_id)),
             body_md: "v1".to_owned(),
             author: NoteAuthor::User as i32,
@@ -422,6 +435,7 @@ async fn watch_notes_streams_add_edit_and_delete_live() {
 
     let note = writer
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: Some(message_target(message_id)),
             body_md: "first".to_owned(),
             author: NoteAuthor::User as i32,
@@ -498,6 +512,7 @@ async fn watch_notes_filters_out_changes_for_a_different_target() {
     // A change on a different target must not appear on this subscription.
     writer
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: Some(message_target(other)),
             body_md: "not for you".to_owned(),
             author: NoteAuthor::User as i32,
@@ -507,6 +522,7 @@ async fn watch_notes_filters_out_changes_for_a_different_target() {
     // Then a change on the watched target, which must appear.
     let note = writer
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: Some(message_target(watched)),
             body_md: "for you".to_owned(),
             author: NoteAuthor::User as i32,
@@ -539,6 +555,7 @@ async fn indexing_disabled_still_serves_the_grpc_surface_normally() {
 
     let note = client
         .add_note(AddNoteRequest {
+            idempotency_key: String::new(),
             target: Some(message_target(message_id)),
             body_md: "still works".to_owned(),
             author: NoteAuthor::User as i32,
@@ -549,4 +566,58 @@ async fn indexing_disabled_still_serves_the_grpc_surface_normally() {
     assert_eq!(note.body_md, "still works");
 
     server.stop().await;
+}
+
+/// A retried `AddNote` under the same key leaves one note, not two.
+///
+/// `notes` has no uniqueness of its own — several notes on one message is a
+/// feature, not an accident — so nothing below the fence can tell a retry from
+/// a second note the user genuinely wrote. Task 40 built the fence and wired
+/// it to the IMAP-facing mutations; this is the local-store half, where a
+/// duplicate is silent and permanent rather than reconciled by the next sync.
+#[tokio::test]
+async fn a_retried_add_note_under_one_key_leaves_a_single_note() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    let message_id = server.message().await;
+
+    let request = AddNoteRequest {
+        idempotency_key: "note-retry-1".to_owned(),
+        target: Some(message_target(message_id)),
+        body_md: "chase this on Friday".to_owned(),
+        author: NoteAuthor::User as i32,
+    };
+
+    let first = client.add_note(request.clone()).await.unwrap().into_inner();
+    // The replay returns the *same* note, byte for byte — not a new one that
+    // merely looks alike.
+    let replay = client.add_note(request.clone()).await.unwrap().into_inner();
+    assert_eq!(
+        replay.id, first.id,
+        "the retry replayed the cached response"
+    );
+
+    let listed = client
+        .list_notes(ListNotesRequest {
+            target: Some(message_target(message_id)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        listed.notes.len(),
+        1,
+        "a retry must not leave the user with two copies of one note"
+    );
+
+    // Same key, different body: the caller has changed the call under a key it
+    // already used, which is a client bug the fence names rather than guesses at.
+    let status = client
+        .add_note(AddNoteRequest {
+            body_md: "a different note entirely".to_owned(),
+            ..request
+        })
+        .await
+        .expect_err("a reused key with a changed payload is refused");
+    assert_eq!(status.code(), tonic::Code::AlreadyExists);
 }

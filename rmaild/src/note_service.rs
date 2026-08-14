@@ -20,6 +20,7 @@
 
 use std::pin::Pin;
 
+use rmail_core::idempotency::IdempotencyStore;
 use rmail_core::notes::{
     NewNote, Note as CoreNote, NoteAuthor as CoreAuthor, NoteChange, NoteStore,
     Target as CoreTarget,
@@ -51,15 +52,29 @@ pub struct NoteApi {
     /// Cancelled when the daemon shuts down, so an open `WatchNotes` stream
     /// stops with it rather than holding shutdown open.
     shutdown: CancellationToken,
+    /// The replay fence behind `AddNote`'s `idempotency_key`. `notes` carries
+    /// no uniqueness of its own — several notes on one message is a feature —
+    /// so a retry is otherwise indistinguishable from a second note.
+    idempotency: IdempotencyStore,
 }
 
 impl NoteApi {
     /// Build a handler over a note store.
     #[must_use]
-    pub fn new(store: NoteStore, shutdown: CancellationToken) -> Self {
-        Self { store, shutdown }
+    pub fn new(
+        store: NoteStore,
+        shutdown: CancellationToken,
+        idempotency: IdempotencyStore,
+    ) -> Self {
+        Self {
+            store,
+            shutdown,
+            idempotency,
+        }
     }
 }
+
+const ADD_NOTE_METHOD: &str = "/rmail.v1.NoteService/AddNote";
 
 #[tonic::async_trait]
 impl NoteService for NoteApi {
@@ -70,15 +85,26 @@ impl NoteService for NoteApi {
         let req = request.into_inner();
         let target = target_from_proto(req.target)?;
         let author = author_from_proto(req.author());
-        let note = self
-            .store
-            .add(NewNote {
-                target,
-                body_md: req.body_md,
-                author,
-            })
-            .await?;
-        Ok(Response::new(note_to_proto(&note)))
+        let body_md = req.body_md.clone();
+        crate::idempotency::guard(
+            &self.idempotency,
+            ADD_NOTE_METHOD,
+            &req.idempotency_key,
+            &req,
+            async {
+                let note = self
+                    .store
+                    .add(NewNote {
+                        target,
+                        body_md,
+                        author,
+                    })
+                    .await?;
+                Ok(note_to_proto(&note))
+            },
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn edit_note(
