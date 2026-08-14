@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// ConfigService exposes the client-side keymap (task 84) over gRPC.
+//
+// # Why this exists when `mail keys` already edits the file
+//
+// `keys.toml` is client state: it lives next to the keyboard, and the TUI
+// reads it directly rather than asking the daemon what `j` means. So this is
+// deliberately *not* the TUI's path — it is the one task 84's acceptance calls
+// for so that action ids are "shared by palette/gRPC/MCP". A palette or an MCP
+// tool surface (tasks 53/54) has no other way to learn which chords exist,
+// which actions they resolve to, or what an action is called.
+//
+// # One writer, not two
+//
+// The obvious hazard is the daemon and `mail keys set` growing two editors
+// that disagree about the same file. They do not: both call
+// `rmail_core::keymap::file::edit`, a pure string-to-string transform that is
+// the single authority on what an edited `keys.toml` looks like. This service
+// supplies the IO around it and nothing else.
+service ConfigService {
+  // The effective keymap — the built-in defaults with the user's `keys.toml`
+  // layered over them — plus the full action registry, including actions no
+  // chord is currently bound to. A palette needs the latter: an action with
+  // no binding is exactly the kind a user reaches for by name.
+  rpc GetKeymap(GetKeymapRequest) returns (GetKeymapResponse);
+
+  // Bind, rebind, or unbind one chord in one mode, by rewriting `keys.toml`.
+  //
+  // Refuses anything `Keymap::bind` refuses — notably a chord starting with a
+  // reserved key (`Esc`/`Ctrl-C`), since a mode nobody can leave is the worst
+  // failure a modal UI has. Refuses on a `keys.toml` that is already
+  // malformed rather than half-fixing it: the user needs to hear about their
+  // own typo.
+  rpc SetBinding(SetBindingRequest) returns (SetBindingResponse);
+}
+
+message GetKeymapRequest {}
+
+message GetKeymapResponse {
+  // Every binding in effect, defaults included.
+  repeated Binding bindings = 1;
+  // Every action id the engine knows, bound or not.
+  repeated ActionInfo actions = 2;
+  // Absolute path of the file consulted, whether or not it exists — so a
+  // client can tell the user where to look.
+  string keys_path = 3;
+  // False when no `keys.toml` is present, in which case every binding above
+  // is a built-in default.
+  bool keys_file_present = 4;
+}
+
+message Binding {
+  // Mode id, e.g. "normal", "visual".
+  string mode = 1;
+  // The chord as it is written in `keys.toml`, e.g. "gg" or "<c-d>".
+  string chord = 2;
+  // The action id this chord resolves to, e.g. "message.archive".
+  string action = 3;
+  // The action's one-line description, for a palette or a help overlay.
+  string description = 4;
+  // True when this binding comes from `keys.toml` rather than the defaults.
+  bool overridden = 5;
+}
+
+message ActionInfo {
+  // Stable id — the thing a palette or MCP tool names.
+  string id = 1;
+  // One-line description.
+  string description = 2;
+}
+
+message SetBindingRequest {
+  // Mode id. Must be one the engine knows and one that is configurable.
+  string mode = 1;
+  // The chord to bind, in `keys.toml` notation.
+  string chord = 2;
+  // The action id to bind it to. Empty **unbinds**: the line is removed so
+  // the built-in default applies again, rather than a binding to nothing
+  // being written.
+  string action = 3;
+}
+
+message SetBindingResponse {
+  // The keymap as it stands after the edit, so a caller need not re-read.
+  repeated Binding bindings = 1;
+  // Absolute path written.
+  string keys_path = 2;
+}

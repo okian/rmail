@@ -88,6 +88,16 @@ use term::{Crossterm, TerminalGuard};
 /// session is over.
 const INPUT_POLL: Duration = Duration::from_millis(100);
 
+/// How often `keys.toml` is re-read.
+///
+/// Hot reload is the point (prd.md: "fully rebindable and hot-reloadable"),
+/// and a second is the longest a person editing a binding in the next window
+/// will believe the file was read. The cost is one `read_to_string` of a
+/// few hundred bytes on a thread that does nothing else; see
+/// `keymap::file`'s own docs on why this is a poll rather than a filesystem
+/// watcher.
+const KEYMAP_POLL: Duration = Duration::from_secs(1);
+
 /// `mail tui`.
 #[derive(Debug, clap::Args)]
 pub struct TuiArgs {
@@ -117,6 +127,15 @@ pub async fn run(socket: &Path, args: TuiArgs) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let stop = Arc::new(AtomicBool::new(false));
     let input = spawn_input(tx.clone(), Arc::clone(&stop));
+    // The model starts on the built-in bindings and the watcher's first poll
+    // delivers whatever `keys.toml` says, so startup and every later edit
+    // take exactly the same path — there is no "load the keymap" step that
+    // could succeed at boot and be wrong afterwards.
+    let keys = spawn_keymap_watcher(
+        crate::keymap::file::keys_path_from_env(),
+        tx.clone(),
+        Arc::clone(&stop),
+    );
 
     // Boot is a message like any other, so the first loads follow exactly the
     // same path a key press would — nothing special-cased at startup.
@@ -139,10 +158,16 @@ pub async fn run(socket: &Path, args: TuiArgs) -> Result<()> {
     // still leaves a usable shell.
     stop.store(true, Ordering::SeqCst);
     exec.shutdown();
-    // The input thread can be up to `INPUT_POLL` from noticing the flag, and
+    // Either thread can be up to `INPUT_POLL` from noticing the flag, and
     // `JoinHandle::join` is a blocking wait — on the blocking pool, not on a
-    // runtime worker.
-    let _ = tokio::task::spawn_blocking(move || input.join()).await;
+    // runtime worker. Both are joined rather than detached: a watcher still
+    // reading `keys.toml` while the terminal is being restored is a thread
+    // this function promised to have finished with.
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = input.join();
+        keys.join()
+    })
+    .await;
     // Decoded HTML mail this session wrote to /tmp. Safe to remove now: any
     // browser it was written for opened it long ago.
     html::sweep();
@@ -150,6 +175,48 @@ pub async fn run(socket: &Path, args: TuiArgs) -> Result<()> {
     drop(terminal);
 
     result.map(|_| ())
+}
+
+/// Poll `keys.toml` on its own thread, delivering every load — the first one
+/// included — as a [`Msg::Keymap`].
+///
+/// A thread rather than a task for the same reason `spawn_input` is one: the
+/// poll does a small blocking file read, and doing that on the runtime would
+/// stall every RPC in flight for as long as the filesystem takes.
+///
+/// A send failure ends the thread rather than retrying: the only way the
+/// receiver is gone is that the session is already shutting down.
+fn spawn_keymap_watcher(
+    path: std::path::PathBuf,
+    tx: mpsc::UnboundedSender<Msg>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut source = crate::keymap::file::Source::at(path);
+        while !stop.load(Ordering::SeqCst) {
+            if let Some(reload) = source.poll() {
+                let msg = Msg::Keymap {
+                    result: reload.result,
+                    announce: reload.announce,
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+            // Coarser than `INPUT_POLL` because a keymap edit is a human
+            // action with human latency tolerance — but slept in `INPUT_POLL`
+            // slices, so quitting does not wait out a whole poll interval
+            // before this thread can be joined.
+            let mut waited = Duration::ZERO;
+            while waited < KEYMAP_POLL {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(INPUT_POLL);
+                waited += INPUT_POLL;
+            }
+        }
+    })
 }
 
 /// Read key presses on their own OS thread until `stop` is set or the channel
@@ -198,7 +265,7 @@ fn spawn_input(
 fn to_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
     if modifiers.contains(KeyModifiers::CONTROL) {
         return match code {
-            KeyCode::Char('c') => Some(Key::CtrlC),
+            KeyCode::Char(c) => Some(Key::ctrl(c)),
             _ => None,
         };
     }

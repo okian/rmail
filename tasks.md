@@ -781,7 +781,7 @@ through. Do not run `cargo test`/`cargo nextest` on the host.
 - **verify:** `cargo nextest run -p rmail-cli tui::model` (headless model/update tests; render smoke test)
 
 ## 84. TUI modal vim keymap engine
-- [ ] status
+- [x] status
 - **depends-on:** 83
 - **parallel-safe:** no
 - **acceptance:**

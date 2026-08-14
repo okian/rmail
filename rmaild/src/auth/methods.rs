@@ -238,6 +238,23 @@ const TABLE: &[(&str, Requirement)] = &[
     // `DeleteDraft` mutate it, so they need `mail.write`. Nothing here
     // reaches IMAP, SMTP, or a model provider — this task builds the draft
     // and MIME layer only.
+    // ConfigService (task 84) serves the client-side keymap. Asymmetric on
+    // purpose. `GetKeymap` is `automation`: a command palette or an MCP tool
+    // listing what a chord does is tooling, and gating it behind `admin` would
+    // make the shared action-id registry the acceptance asks for unreachable
+    // by exactly the clients it exists for. `SetBinding` is `admin`, because
+    // it rewrites a file that changes what every keystroke on this machine
+    // does — including, if it were allowed to, the keys a user quits with.
+    //
+    // Neither is `mail.read`/`mail.write`: no mail is read or written here.
+    (
+        "/rmail.v1.ConfigService/GetKeymap",
+        Requirement::Scope(Scope::Automation),
+    ),
+    (
+        "/rmail.v1.ConfigService/SetBinding",
+        Requirement::Scope(Scope::Admin),
+    ),
     (
         "/rmail.v1.ComposeService/CreateDraft",
         Requirement::Scope(Scope::MailWrite),

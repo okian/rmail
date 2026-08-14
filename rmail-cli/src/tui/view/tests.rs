@@ -6,7 +6,8 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use super::*;
-use crate::tui::model::{Account, Folder, InputFor, MessageRow, OpenMessage, PickFor};
+use crate::keymap::Key;
+use crate::tui::model::{update, Account, Folder, InputFor, MessageRow, Msg, OpenMessage, PickFor};
 
 /// Render `model` and flatten the buffer into one string per row.
 fn draw(model: &Model, width: u16, height: u16) -> Vec<String> {
@@ -24,6 +25,13 @@ fn draw(model: &Model, width: u16, height: u16) -> Vec<String> {
 
 fn screen(model: &Model) -> String {
     draw(model, 120, 30).join("\n")
+}
+
+/// Drive one key through the state machine, so the render tests see the
+/// states a user can actually get the TUI into rather than ones assembled by
+/// hand.
+fn press(model: &mut Model, key: Key) {
+    update(model, Msg::Key(key));
 }
 
 fn loaded() -> Model {
@@ -167,16 +175,110 @@ fn the_busy_marker_appears_only_while_something_is_in_flight() {
 }
 
 #[test]
-fn the_help_overlay_lists_every_binding_the_task_promises() {
+fn the_help_overlay_lists_the_bindings_that_are_actually_in_force() {
+    // Read out of the keymap rather than from a table beside it: task 83's
+    // hand-written list was right while the bindings were a `match` nobody
+    // could change, and became a list that lies the moment `keys.toml` could
+    // rebind anything.
     let mut model = loaded();
     model.overlay = Some(Overlay::Help);
-    let rendered = draw(&model, 120, 40).join("\n");
+    let rendered = draw(&model, 120, 44).join("\n");
 
-    for expected in [
-        "j / k", "gg / G", "Enter", "q", "?", "a", "d", "s", "f", "r / F", "o",
+    for (chords, description) in [
+        ("j / <down>", "down"),
+        ("k / <up>", "up"),
+        ("gg", "first row"),
+        ("G", "last row"),
+        ("<tab>", "switch between the folder and message panes"),
+        ("<enter>", "open the folder or the message"),
+        ("q", "back, or quit from the message list"),
+        ("<c-c>", "quit from anywhere"),
+        ("?", "this help"),
+        ("a", "archive"),
+        ("d", "delete"),
+        ("s", "toggle read"),
+        ("f", "toggle flagged"),
+        ("r", "reply"),
+        ("F", "forward"),
+        ("o", "open the HTML part in a browser"),
+        ("v", "visual selection"),
     ] {
-        assert!(rendered.contains(expected), "help is missing {expected:?}");
+        assert!(
+            rendered.contains(chords),
+            "help is missing the chord {chords:?}"
+        );
+        assert!(
+            rendered.contains(description),
+            "help is missing {description:?}"
+        );
     }
+    assert!(
+        rendered.contains("mail keys set"),
+        "the help says how to change what it lists"
+    );
+}
+
+#[test]
+fn a_rebound_key_shows_up_in_the_help() {
+    let mut model = loaded();
+    model.keymap =
+        crate::keymap::file::parse("[normal]\n\"<c-d>\" = \"cursor.down\"\n", "keys.toml").unwrap();
+    model.overlay = Some(Overlay::Help);
+    let rendered = draw(&model, 120, 44).join("\n");
+    assert!(
+        rendered.contains("j / <c-d> / <down>"),
+        "the help lists the built-in bindings and not the user's:\n{rendered}"
+    );
+}
+
+#[test]
+fn the_status_line_shows_the_mode_and_what_is_half_typed() {
+    // A half-typed command that is invisible is indistinguishable from a
+    // keyboard that has stopped responding — and the user's next move,
+    // mashing keys, is the thing that makes it worse.
+    let mut model = loaded();
+    press(&mut model, Key::Char('3'));
+    press(&mut model, Key::Char('g'));
+    assert!(screen(&model).contains("3g"), "{}", screen(&model));
+
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    assert!(
+        screen(&model).contains("-- VISUAL --"),
+        "{}",
+        screen(&model)
+    );
+}
+
+#[test]
+fn a_selected_row_the_cursor_is_not_on_is_still_marked() {
+    // The row under the cursor is highlighted either way, so that one proves
+    // nothing. What matters is the *rest* of the selection: a bulk archive
+    // acting on rows the user could not see would be indistinguishable from a
+    // bug in the selection arithmetic.
+    //
+    // Column 30 is inside the message pane (it starts at 20% of 120 columns);
+    // row 0 is the pane's border, so row 1 is the first message.
+    let background = |model: &Model| {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| render(model, frame)).unwrap();
+        terminal.backend().buffer()[(30, 1)].style().bg
+    };
+
+    // Same cursor position in both, so the only difference is the selection.
+    let mut plain = loaded();
+    press(&mut plain, Key::Char('j'));
+
+    let mut selected = loaded();
+    press(&mut selected, Key::Char('v'));
+    press(&mut selected, Key::Char('j'));
+    assert_eq!(selected.selection(), Some((0, 1)));
+
+    assert_ne!(
+        background(&selected),
+        background(&plain),
+        "a selected row the cursor is not on looks exactly like an unselected one"
+    );
 }
 
 #[test]
@@ -184,7 +286,7 @@ fn the_folder_picker_overlay_lists_the_folders() {
     let mut model = loaded();
     model.overlay = Some(Overlay::Pick {
         what: PickFor::Move,
-        message_id: 10,
+        message_ids: vec![10],
         idx: 1,
     });
     let rendered = screen(&model);
@@ -197,7 +299,7 @@ fn the_confirm_and_input_overlays_show_their_prompts() {
     let mut model = loaded();
     model.overlay = Some(Overlay::Confirm {
         prompt: "delete permanently (expunges on the server)? [y/N]".to_owned(),
-        message_id: 10,
+        message_ids: vec![10],
     });
     assert!(screen(&model).contains("expunges on the server"));
 
@@ -223,7 +325,7 @@ fn a_terminal_smaller_than_the_overlays_still_renders() {
 
     model.overlay = Some(Overlay::Pick {
         what: PickFor::Copy,
-        message_id: 10,
+        message_ids: vec![10],
         idx: 0,
     });
     assert_eq!(draw(&model, 12, 3).len(), 3);

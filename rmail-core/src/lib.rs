@@ -22,6 +22,7 @@ pub mod fuse;
 pub mod hooks;
 pub mod imap;
 pub mod index;
+pub mod keymap;
 pub mod mail;
 pub mod message;
 pub mod notes;

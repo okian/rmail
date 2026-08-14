@@ -2,6 +2,8 @@
 
 mod hook_cli;
 mod index_cli;
+mod keymap;
+mod keys_cli;
 mod note_cli;
 mod outbox_cli;
 mod search_cli;
@@ -71,6 +73,12 @@ enum Command {
     },
     /// The terminal UI: folders, message list, preview (`tui`).
     Tui(tui::TuiArgs),
+    /// Inspect and rebind the TUI's keys (`keys.toml`; see `keys_cli`'s own
+    /// module docs on why this edits a file rather than calling an RPC).
+    Keys {
+        #[command(subcommand)]
+        action: keys_cli::KeysAction,
+    },
     /// Ranked search over the local index (`SearchService.Search`).
     Search(SearchArgs),
     /// Embedding-kNN neighbors of a message (`SearchService.Semantic`).
@@ -324,6 +332,7 @@ async fn main() -> Result<()> {
             TokenAction::Revoke { id } => token_revoke(&socket, id).await,
         },
         Command::Tui(args) => tui::run(&socket, args).await,
+        Command::Keys { action } => keys_cli::run(action),
         Command::Search(args) => search_cli::search(&socket, args).await,
         Command::Similar(args) => search_cli::similar(&socket, args).await,
         Command::Ai { action } => match action {

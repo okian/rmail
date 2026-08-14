@@ -4,6 +4,12 @@
 //! runtime — which is the point of the model/terminal split, and the reason
 //! these can cover the error paths (no archive folder, no sender to reply to,
 //! a failed RPC) that a hand-driven TUI never reaches.
+//!
+//! `panic!` in a match arm that cannot happen reads better here than the
+//! `unreachable!` dance, and this module is test-only — the same exemption
+//! `tag_cli::tests` takes (`clippy.toml` carves out `unwrap`/`expect` in
+//! tests but not `panic`).
+#![allow(clippy::panic)]
 
 use std::time::Instant;
 
@@ -256,7 +262,7 @@ fn gg_jumps_to_the_top_and_capital_g_to_the_bottom() {
     assert!(cmds.is_empty());
     assert_eq!(model.message_idx, 0);
     assert!(
-        !model.pending_g,
+        model.pending.is_empty(),
         "the chord is consumed, not left half-typed"
     );
 }
@@ -268,7 +274,11 @@ fn a_single_g_is_inert_until_its_partner_arrives() {
     assert_eq!(model.message_idx, 2);
 
     press(&mut model, Key::Char('g'));
-    assert!(model.pending_g);
+    assert_eq!(
+        model.pending.keys(),
+        [Key::Char('g')],
+        "the g is held, waiting for its partner"
+    );
     assert_eq!(model.message_idx, 2, "a lone g moves nothing");
 }
 
@@ -282,7 +292,7 @@ fn partial_g_does_not_swallow_the_next_key() {
 
     press(&mut model, Key::Char('g'));
     press(&mut model, Key::Char('k'));
-    assert!(!model.pending_g, "the pending g was cleared");
+    assert!(model.pending.is_empty(), "the pending g was cleared");
     assert_eq!(model.message_idx, 1, "the k was handled, not swallowed");
 
     press(&mut model, Key::Char('g'));
@@ -507,7 +517,7 @@ fn q_backs_out_of_the_viewer_before_it_quits() {
 fn ctrl_c_quits_from_anywhere_including_a_modal() {
     let mut model = loaded();
     model.overlay = Some(Overlay::Help);
-    press(&mut model, Key::CtrlC);
+    press(&mut model, Key::CTRL_C);
     assert!(model.quit);
 }
 
@@ -730,7 +740,7 @@ fn copy_and_move_pick_a_destination_folder_first() {
         model.overlay,
         Some(Overlay::Pick {
             what: PickFor::Copy,
-            message_id: 10,
+            message_ids: vec![10],
             idx: 0
         })
     );
@@ -1093,18 +1103,602 @@ fn losing_the_event_stream_is_reported_and_does_not_disturb_the_inflight_count()
 // ---------------------------------------------------------------------------
 
 #[test]
-fn flags_toggled_is_order_independent_and_deduplicated() {
+fn the_intended_flag_set_is_order_independent_and_deduplicated() {
     let row = MessageRow {
         flags: vec![SEEN.to_owned(), FLAGGED.to_owned(), SEEN.to_owned()],
         ..row(1)
     };
     assert_eq!(
-        row.flags_toggled(FLAGGED),
+        row.flags_with(FLAGGED, false),
         vec![SEEN.to_owned()],
         "the duplicate \\Seen collapses and \\Flagged is removed"
     );
     assert_eq!(
-        row.flags_toggled("\\Draft"),
+        row.flags_with("\\Draft", true),
         vec!["\\Draft".to_owned(), FLAGGED.to_owned(), SEEN.to_owned()]
     );
+    assert_eq!(
+        row.flags_with(SEEN, true),
+        vec![FLAGGED.to_owned(), SEEN.to_owned()],
+        "asking for a flag that is already there is not a toggle"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the keymap engine, as the model sees it (task 84)
+// ---------------------------------------------------------------------------
+
+use crate::keymap::{Keymap, Mode, MAX_COUNT};
+
+/// A model in each mode the TUI can be in, with the keys that got it there.
+/// Table-driven so a mode added later cannot quietly skip the escape checks.
+fn in_every_mode() -> Vec<(Mode, Model)> {
+    let viewer = {
+        let mut model = loaded();
+        model.screen = Screen::Viewer;
+        model.open = Some(OpenMessage {
+            id: 10,
+            ..OpenMessage::default()
+        });
+        model
+    };
+    let mut modes = vec![(Mode::Normal, loaded()), (Mode::Viewer, viewer)];
+    for (mode, key) in [
+        (Mode::Visual, 'v'),
+        (Mode::Insert, 'F'),
+        (Mode::Pick, 'c'),
+        (Mode::Confirm, 'd'),
+        (Mode::Help, '?'),
+    ] {
+        let mut model = loaded();
+        press(&mut model, Key::Char(key));
+        assert_eq!(model.mode(), mode, "{key} did not open {mode:?}");
+        modes.push((mode, model));
+    }
+    modes
+}
+
+#[test]
+fn ctrl_c_quits_from_every_mode_there_is() {
+    for (mode, mut model) in in_every_mode() {
+        press(&mut model, Key::CTRL_C);
+        assert!(model.quit, "Ctrl-C did not quit from {mode:?}");
+    }
+}
+
+#[test]
+fn esc_always_makes_progress_out_and_never_quits() {
+    // The other half of "no mode is a trap": Esc leaves whatever is innermost
+    // — and from the list, where there is nothing left to leave, it does
+    // nothing at all rather than dropping the user out of the TUI.
+    for (mode, mut model) in in_every_mode() {
+        press(&mut model, Key::Esc);
+        assert!(!model.quit, "Esc quit from {mode:?}");
+        assert_eq!(
+            model.mode(),
+            Mode::Normal,
+            "Esc did not get out of {mode:?}"
+        );
+    }
+}
+
+#[test]
+fn esc_gets_out_even_from_inside_a_half_typed_chord() {
+    let mut model = loaded();
+    model.screen = Screen::Viewer;
+    model.open = Some(OpenMessage {
+        id: 10,
+        ..OpenMessage::default()
+    });
+    keys(&mut model, "3g");
+    assert!(!model.pending.is_empty(), "something is half-typed");
+
+    press(&mut model, Key::Esc);
+    assert!(model.pending.is_empty(), "the fragment is gone");
+    assert_eq!(model.screen, Screen::List, "and Esc still did its job");
+}
+
+#[test]
+fn an_unbound_key_does_nothing_and_leaves_nothing_behind() {
+    let mut model = loaded();
+    let cmds = keys(&mut model, "zZ");
+    assert!(cmds.is_empty());
+    assert!(model.pending.is_empty(), "an unbound key is not pending");
+    assert_eq!(model.message_idx, 0);
+    assert!(!model.quit);
+    // And the next key still works, which is the whole point.
+    press(&mut model, Key::Char('j'));
+    assert_eq!(model.message_idx, 1);
+}
+
+#[test]
+fn a_count_repeats_a_motion() {
+    let mut model = loaded();
+    model.messages = (0..10).map(row).collect();
+
+    let cmds = keys(&mut model, "3j");
+    assert!(cmds.is_empty(), "a motion issues no work");
+    assert_eq!(model.message_idx, 3);
+
+    keys(&mut model, "2k");
+    assert_eq!(model.message_idx, 1);
+}
+
+#[test]
+fn a_count_names_a_row_for_gg_and_g() {
+    let mut model = loaded();
+    model.messages = (0..10).map(row).collect();
+
+    keys(&mut model, "4G");
+    assert_eq!(model.message_idx, 3, "4G is the fourth row, 1-based");
+    keys(&mut model, "2gg");
+    assert_eq!(model.message_idx, 1);
+    keys(&mut model, "G");
+    assert_eq!(model.message_idx, 9, "a bare G is still the last row");
+}
+
+#[test]
+fn an_enormous_count_clamps_instead_of_running_away() {
+    let mut model = loaded();
+    let cmds = keys(&mut model, "99999999j");
+    assert!(cmds.is_empty());
+    assert_eq!(
+        model.message_idx, 2,
+        "the cursor stops at the last row however big the count is"
+    );
+}
+
+#[test]
+fn a_count_never_multiplies_the_work_an_action_does() {
+    // The bound that matters most: a count repeats *cursor arithmetic*, which
+    // is O(1) and clamped. It must never turn one keystroke into 999 RPCs.
+    let mut model = loaded();
+    let cmds = keys(&mut model, "999d");
+    assert!(cmds.is_empty(), "the confirmation comes first");
+    let cmds = press(&mut model, Key::Char('y'));
+    assert_eq!(
+        cmds,
+        vec![Cmd::Delete { message_id: 10 }],
+        "one message was selected, so exactly one delete goes out"
+    );
+
+    let mut model = loaded();
+    let cmds = keys(&mut model, "999a");
+    assert_eq!(
+        cmds.len(),
+        1,
+        "a counted archive is still one archive: {cmds:?}"
+    );
+}
+
+#[test]
+fn holding_a_digit_key_cannot_make_the_model_grow() {
+    let mut model = loaded();
+    for _ in 0..5_000 {
+        let cmds = press(&mut model, Key::Char('9'));
+        assert!(cmds.is_empty());
+        assert!(
+            model
+                .pending
+                .count()
+                .is_some_and(|count| count <= MAX_COUNT),
+            "the count ran past {MAX_COUNT}"
+        );
+        assert!(
+            model.pending.label().len() <= 5,
+            "the status indicator grew with the key being held: {:?}",
+            model.pending.label()
+        );
+    }
+    // And the TUI is still usable afterwards.
+    press(&mut model, Key::Esc);
+    assert!(model.pending.is_empty());
+    press(&mut model, Key::Char('j'));
+    assert_eq!(model.message_idx, 1);
+}
+
+#[test]
+fn a_text_prompt_stops_accepting_characters_at_its_limit() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('F'));
+    for _ in 0..(MAX_INPUT * 2) {
+        press(&mut model, Key::Char('a'));
+    }
+    let typed = match &model.overlay {
+        Some(Overlay::Input { buffer, .. }) => buffer.clone(),
+        other => panic!("the prompt closed: {other:?}"),
+    };
+    assert_eq!(
+        typed.chars().count(),
+        MAX_INPUT,
+        "a key held against a prompt grew the buffer without limit"
+    );
+}
+
+#[test]
+fn a_pending_chord_does_not_survive_a_mode_change_it_did_not_cause() {
+    // A slow `Get` landing opens the viewer while a `g` is half-typed. The
+    // fragment was typed against the list; carrying it over would resolve a
+    // chord the user never started.
+    let mut model = loaded();
+    press(&mut model, Key::Enter);
+    press(&mut model, Key::Char('g'));
+    assert!(!model.pending.is_empty());
+
+    update(
+        &mut model,
+        Msg::Opened {
+            message_id: 10,
+            result: Ok(OpenMessage {
+                id: 10,
+                body: (0..5).map(|n| format!("line {n}")).collect(),
+                ..OpenMessage::default()
+            }),
+        },
+    );
+    assert_eq!(model.screen, Screen::Viewer);
+    assert!(model.pending.is_empty(), "the fragment did not follow");
+}
+
+#[test]
+fn the_folder_picker_navigates_with_the_same_bindings_as_the_list() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('c'));
+    keys(&mut model, "G");
+    let cmds = press(&mut model, Key::Enter);
+    assert_eq!(
+        cmds,
+        vec![Cmd::Copy {
+            message_id: 10,
+            dest_mailbox_id: 3,
+        }],
+        "G reached the last folder"
+    );
+
+    press(&mut model, Key::Char('c'));
+    keys(&mut model, "2j");
+    keys(&mut model, "gg");
+    let cmds = press(&mut model, Key::Enter);
+    assert_eq!(
+        cmds,
+        vec![Cmd::Copy {
+            message_id: 10,
+            dest_mailbox_id: 1,
+        }],
+        "gg came back to the first"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rebinding and hot reload
+// ---------------------------------------------------------------------------
+
+fn keymap_from(toml: &str) -> Keymap {
+    match crate::keymap::file::parse(toml, "keys.toml") {
+        Ok(keymap) => keymap,
+        Err(error) => panic!("{toml:?} should have parsed: {error}"),
+    }
+}
+
+#[test]
+fn a_reloaded_keymap_changes_what_a_key_does() {
+    let mut model = loaded();
+    let cmds = update(
+        &mut model,
+        Msg::Keymap {
+            result: Ok(keymap_from("[normal]\nx = \"message.archive\"\nj = \"\"\n")),
+            announce: true,
+        },
+    );
+    assert!(cmds.is_empty());
+    assert!(model.status.contains("reloaded"), "{}", model.status);
+
+    let cmds = press(&mut model, Key::Char('x'));
+    assert_eq!(
+        cmds,
+        vec![Cmd::Move {
+            message_id: 10,
+            dest_mailbox_id: 2,
+            label: "archived".to_owned(),
+        }],
+        "the new binding took effect without a restart"
+    );
+
+    press(&mut model, Key::Char('j'));
+    assert_eq!(model.message_idx, 0, "and the unbound one stopped working");
+}
+
+#[test]
+fn a_silent_load_does_not_stamp_on_the_status_line() {
+    let mut model = Model::new();
+    update(&mut model, Msg::Boot);
+    let booting = model.status.clone();
+
+    update(
+        &mut model,
+        Msg::Keymap {
+            result: Ok(Keymap::defaults()),
+            announce: false,
+        },
+    );
+    assert_eq!(
+        model.status, booting,
+        "the load at startup must not overwrite the boot progress"
+    );
+}
+
+#[test]
+fn a_broken_keys_file_is_reported_and_the_working_bindings_stay() {
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Keymap {
+            result: Ok(keymap_from("[normal]\nx = \"quit\"\n")),
+            announce: true,
+        },
+    );
+
+    update(
+        &mut model,
+        Msg::Keymap {
+            result: Err("keys.toml is not valid TOML: expected `]`".to_owned()),
+            announce: true,
+        },
+    );
+    assert_eq!(model.level, Level::Error);
+    assert!(model.status.contains("not valid TOML"), "{}", model.status);
+
+    press(&mut model, Key::Char('x'));
+    assert!(
+        model.quit,
+        "a typo mid-edit must not take the user's bindings away"
+    );
+}
+
+#[test]
+fn a_reload_drops_whatever_was_half_typed_under_the_old_bindings() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('g'));
+    assert!(!model.pending.is_empty());
+
+    update(
+        &mut model,
+        Msg::Keymap {
+            result: Ok(Keymap::defaults()),
+            announce: false,
+        },
+    );
+    assert!(model.pending.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// visual mode
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v_starts_a_selection_that_j_and_k_extend() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    assert_eq!(model.mode(), Mode::Visual);
+    assert_eq!(model.selection(), Some((0, 0)));
+
+    press(&mut model, Key::Char('j'));
+    assert_eq!(model.selection(), Some((0, 1)));
+    assert!(model.is_selected(0) && model.is_selected(1) && !model.is_selected(2));
+
+    // Back past the anchor: the selection is a range, not a direction.
+    keys(&mut model, "kk");
+    assert_eq!(model.selection(), Some((0, 0)));
+}
+
+#[test]
+fn a_visual_selection_archives_every_message_in_it() {
+    let mut model = loaded();
+    keys(&mut model, "vj");
+    let cmds = press(&mut model, Key::Char('a'));
+    assert_eq!(
+        cmds,
+        vec![
+            Cmd::Move {
+                message_id: 10,
+                dest_mailbox_id: 2,
+                label: "archived".to_owned(),
+            },
+            Cmd::Move {
+                message_id: 11,
+                dest_mailbox_id: 2,
+                label: "archived".to_owned(),
+            }
+        ]
+    );
+    assert_eq!(model.inflight, 2, "both are counted, not one");
+    assert_eq!(
+        model.mode(),
+        Mode::Normal,
+        "the selection ends with the action"
+    );
+}
+
+#[test]
+fn a_bulk_flag_toggle_picks_one_intent_for_the_whole_selection() {
+    let mut model = loaded();
+    model.messages[0].flags = vec![SEEN.to_owned()];
+
+    keys(&mut model, "vj");
+    let cmds = press(&mut model, Key::Char('s'));
+    assert_eq!(
+        cmds,
+        vec![
+            Cmd::SetFlags {
+                message_id: 10,
+                flags: vec![SEEN.to_owned()],
+                label: "marked read".to_owned(),
+            },
+            Cmd::SetFlags {
+                message_id: 11,
+                flags: vec![SEEN.to_owned()],
+                label: "marked read".to_owned(),
+            }
+        ],
+        "a mixed selection is marked read, not toggled row by row"
+    );
+
+    // Now that every message in the selection has it, the same key clears it.
+    let mut model = loaded();
+    model.messages[0].flags = vec![SEEN.to_owned()];
+    model.messages[1].flags = vec![SEEN.to_owned()];
+    keys(&mut model, "vj");
+    let cmds = press(&mut model, Key::Char('s'));
+    assert_eq!(
+        cmds.first(),
+        Some(&Cmd::SetFlags {
+            message_id: 10,
+            flags: Vec::new(),
+            label: "marked not read".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn a_visual_delete_asks_once_and_names_the_count() {
+    let mut model = loaded();
+    keys(&mut model, "vjj");
+    let cmds = press(&mut model, Key::Char('d'));
+    assert!(cmds.is_empty());
+    let prompt = match &model.overlay {
+        Some(Overlay::Confirm { prompt, .. }) => prompt.clone(),
+        other => panic!("no confirmation: {other:?}"),
+    };
+    assert!(prompt.contains('3'), "{prompt}");
+
+    let cmds = press(&mut model, Key::Char('y'));
+    assert_eq!(
+        cmds,
+        vec![
+            Cmd::Delete { message_id: 10 },
+            Cmd::Delete { message_id: 11 },
+            Cmd::Delete { message_id: 12 },
+        ]
+    );
+}
+
+#[test]
+fn a_selection_bigger_than_the_bulk_cap_is_refused_rather_than_truncated() {
+    let mut model = loaded();
+    model.messages = (0..(i64::try_from(MAX_BULK).unwrap_or(i64::MAX) + 50))
+        .map(row)
+        .collect();
+
+    keys(&mut model, "vG");
+    let cmds = press(&mut model, Key::Char('a'));
+    assert!(
+        cmds.is_empty(),
+        "acting on the first {MAX_BULK} of a bigger selection is worse than acting on none"
+    );
+    assert_eq!(model.level, Level::Error);
+    assert!(
+        model.status.contains(&MAX_BULK.to_string()),
+        "the cap is named so the user can narrow the selection: {}",
+        model.status
+    );
+    assert_eq!(
+        model.mode(),
+        Mode::Visual,
+        "the selection survives the refusal"
+    );
+}
+
+#[test]
+fn visual_mode_refuses_the_actions_that_only_make_sense_on_one_message() {
+    for key in ['r', 'F'] {
+        let mut model = loaded();
+        keys(&mut model, "vj");
+        let cmds = press(&mut model, Key::Char(key));
+        assert!(cmds.is_empty(), "{key} acted on a selection");
+        assert_eq!(model.level, Level::Error);
+        assert!(model.status.contains("one message"), "{}", model.status);
+        assert_eq!(model.mode(), Mode::Visual, "and nothing was lost");
+    }
+
+    let mut model = loaded();
+    keys(&mut model, "vj");
+    let cmds = press(&mut model, Key::Enter);
+    assert!(cmds.is_empty(), "Enter opened one of a selection");
+}
+
+#[test]
+fn o_swaps_the_ends_of_the_selection_instead_of_opening_html() {
+    // Visual mode's own layer shadows `o`; the single-message action it hides
+    // is refused on a selection anyway.
+    let mut model = loaded();
+    keys(&mut model, "vj");
+    assert_eq!((model.visual, model.message_idx), (Some(0), 1));
+
+    press(&mut model, Key::Char('o'));
+    assert_eq!(
+        (model.visual, model.message_idx),
+        (Some(1), 0),
+        "the cursor moved to the other end"
+    );
+    assert_eq!(model.selection(), Some((0, 1)), "covering the same rows");
+}
+
+#[test]
+fn a_selection_ends_when_its_rows_do() {
+    let mut model = loaded();
+    keys(&mut model, "vj");
+
+    update(
+        &mut model,
+        Msg::Messages {
+            mailbox_id: 1,
+            result: Ok(Vec::new()),
+        },
+    );
+    assert_eq!(model.visual, None, "a selection over no rows is not one");
+    assert_eq!(model.mode(), Mode::Normal);
+}
+
+#[test]
+fn visual_mode_needs_messages_to_select() {
+    let mut model = loaded();
+    model.messages.clear();
+    press(&mut model, Key::Char('v'));
+    assert_eq!(model.mode(), Mode::Normal);
+    assert_eq!(model.level, Level::Error);
+
+    let mut model = loaded();
+    model.focus = Focus::Folders;
+    press(&mut model, Key::Char('v'));
+    assert_eq!(model.mode(), Mode::Normal);
+    assert!(model.status.contains("message list"), "{}", model.status);
+}
+
+#[test]
+fn an_overlays_own_action_bound_elsewhere_does_not_close_the_wrong_overlay() {
+    // Every action id is bindable in every mode, so `confirm.accept` can end
+    // up bound where there is no confirmation to accept. Each of these takes
+    // the overlay to read what it captured; taking it first and checking
+    // afterwards would close whatever *was* up and do nothing else — a modal
+    // that vanishes without acting, from a key the user rebound themselves.
+    for (opener, mode, foreign) in [
+        ('c', Mode::Pick, ["confirm.accept", "input.submit"]),
+        ('d', Mode::Confirm, ["pick.accept", "input.submit"]),
+        ('F', Mode::Insert, ["pick.accept", "confirm.accept"]),
+    ] {
+        for action in foreign {
+            let mut model = loaded();
+            model.keymap = keymap_from(&format!("[{}]\nz = \"{action}\"\n", mode.id()));
+            press(&mut model, Key::Char(opener));
+            assert_eq!(model.mode(), mode, "{opener} did not open {mode:?}");
+
+            let cmds = press(&mut model, Key::Char('z'));
+            assert!(cmds.is_empty(), "{action} in {mode:?} issued work");
+            assert_eq!(
+                model.mode(),
+                mode,
+                "{action} closed the {mode:?} overlay it has nothing to do with"
+            );
+        }
+    }
 }

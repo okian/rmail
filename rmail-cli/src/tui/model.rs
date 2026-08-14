@@ -35,13 +35,16 @@
 //! [`Model::inflight`] counts the outstanding work purely so the status bar
 //! can say so.
 //!
-//! # Multi-key sequences
+//! # Keys
 //!
-//! `gg` is the only chord in this shell (task 84 owns the general modal
-//! keymap engine). It is modelled as a single [`Model::pending_g`] flag that
-//! *any* other key clears before that key is handled normally — a half-typed
-//! `g` must never swallow the keystroke that follows it. See
-//! `partial_g_does_not_swallow_the_next_key` for the regression proof.
+//! No key is decided here. [`on_key`] hands the press to
+//! [`crate::keymap`]'s engine along with the mode the model is currently in
+//! ([`Model::mode`]), gets back an [`Action`] — a named, rebindable id — and
+//! runs it. What is left in this module is the *meaning* of each action,
+//! which is genuinely context-sensitive: `cursor.down` moves the folder
+//! cursor, the message cursor, the folder picker's cursor or the viewer's
+//! scroll depending on what is on screen, and none of those distinctions
+//! belong in a key table.
 
 use std::collections::BTreeSet;
 
@@ -50,6 +53,9 @@ pub mod wire;
 
 #[cfg(test)]
 mod tests;
+
+pub use crate::keymap::Key;
+use crate::keymap::{Action, Keymap, Mode, Pending, Resolution};
 
 /// The IMAP flag marking a message read.
 pub const SEEN: &str = "\\Seen";
@@ -64,6 +70,21 @@ pub const FLAGGED: &str = "\\Flagged";
 /// convention visible and lets the TUI say "no archive folder on this
 /// account" instead of failing an RPC the user cannot act on.
 const ARCHIVE_NAMES: &[&str] = &["Archive", "Archives", "All Mail"];
+
+/// The most messages one action may act on at once.
+///
+/// A visual selection is bounded by the loaded page (`grpc::PAGE_SIZE`, 500
+/// rows), and every message in it becomes its own RPC — 500 concurrent IMAP
+/// mutations from one keystroke is not a bulk action, it is an outage. The
+/// cap is refused loudly rather than silently truncated: acting on the first
+/// hundred of what the user selected would be worse than acting on none.
+pub const MAX_BULK: usize = 100;
+
+/// The most characters a text prompt accepts.
+///
+/// Long enough for any address or subject a person types, short enough that a
+/// key held down against a prompt cannot grow a `String` without limit.
+pub const MAX_INPUT: usize = 512;
 
 /// One account, as the folder pane needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,16 +136,23 @@ impl MessageRow {
         self.flags.iter().any(|f| f == flag)
     }
 
-    /// The flag set with `flag` added or removed, deduplicated and ordered so
-    /// the result is a function of the desired set and not of arrival order.
+    /// The flag set with `flag` present or absent, deduplicated and ordered
+    /// so the result is a function of the desired set and not of arrival
+    /// order.
     ///
     /// `SetFlags` is a wholesale replace (IMAP `STORE FLAGS` semantics), so a
-    /// toggle has to send the complete intended set, not a delta.
+    /// toggle has to send the complete intended set, not a delta — and it
+    /// takes the *intended* state rather than toggling per message, because
+    /// over a selection "toggle" has to mean one thing for the whole
+    /// selection. Toggling each row independently would leave exactly the
+    /// already-read half of a mixed selection unread.
     #[must_use]
-    pub fn flags_toggled(&self, flag: &str) -> Vec<String> {
+    pub fn flags_with(&self, flag: &str, present: bool) -> Vec<String> {
         let mut set: BTreeSet<&str> = self.flags.iter().map(String::as_str).collect();
-        if !set.remove(flag) {
+        if present {
             set.insert(flag);
+        } else {
+            set.remove(flag);
         }
         set.into_iter().map(str::to_owned).collect()
     }
@@ -198,14 +226,14 @@ pub enum Overlay {
     Pick {
         /// What the pick is for.
         what: PickFor,
-        /// The message the pick applies to.
+        /// The messages the pick applies to.
         ///
         /// Captured when the overlay opens, never re-derived when it closes:
         /// the message list is live (a `Msg::Changed` reload can arrive and
         /// re-clamp the cursor while the picker is up) and the viewer's
         /// message is not the one under the list cursor at all. Resolving the
         /// target late moved a message the user had not selected.
-        message_id: i64,
+        message_ids: Vec<i64>,
         /// Cursor within the folder list.
         idx: usize,
     },
@@ -213,8 +241,9 @@ pub enum Overlay {
     Confirm {
         /// What is being asked.
         prompt: String,
-        /// The message the answer applies to.
-        message_id: i64,
+        /// The messages the answer applies to, captured when the question was
+        /// asked for the same reason the picker captures its own.
+        message_ids: Vec<i64>,
     },
     /// Collect a line of text.
     Input {
@@ -236,31 +265,6 @@ pub enum Level {
     Info,
     /// Something failed. Rendered in red.
     Error,
-}
-
-/// A key press, in the TUI's own vocabulary rather than crossterm's.
-///
-/// Decoupled on purpose: the model tests construct key presses directly, and
-/// they should not have to build a `crossterm::event::KeyEvent` (with its
-/// modifiers, kind and state) to say "the user pressed j".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Key {
-    /// A printable character.
-    Char(char),
-    /// Return.
-    Enter,
-    /// Escape.
-    Esc,
-    /// Tab.
-    Tab,
-    /// Backspace.
-    Backspace,
-    /// Cursor up.
-    Up,
-    /// Cursor down.
-    Down,
-    /// Ctrl-C — quits from anywhere, including a modal overlay.
-    CtrlC,
 }
 
 /// What a completed action did to the model.
@@ -325,6 +329,15 @@ pub enum Msg {
     /// nothing counted it into [`Model::inflight`], so reporting it as a
     /// finished request would decrement a counter it never incremented.
     LiveUpdatesStopped(String),
+    /// `keys.toml` was read (see [`crate::keymap::file::Source`]).
+    Keymap {
+        /// The bindings to switch to, or why the file was refused — in which
+        /// case the ones already loaded keep working.
+        result: Result<Keymap, String>,
+        /// Whether to say so in the status line. False for the silent load at
+        /// startup; see [`crate::keymap::file::Reload`].
+        announce: bool,
+    },
 }
 
 /// Work for the outside world. Returned by [`update`], never performed by it.
@@ -446,8 +459,15 @@ pub struct Model {
     pub screen: Screen,
     /// The modal layer, if any.
     pub overlay: Option<Overlay>,
-    /// Whether a bare `g` is waiting for its partner.
-    pub pending_g: bool,
+    /// Where a visual selection started, when one is running. The other end
+    /// is [`Model::message_idx`], so extending the selection is the ordinary
+    /// cursor movement and needs no second set of bindings.
+    pub visual: Option<usize>,
+    /// The bindings in force. Replaced wholesale when `keys.toml` changes;
+    /// never patched, so a half-applied reload cannot exist.
+    pub keymap: Keymap,
+    /// What has been typed towards a binding but has not resolved yet.
+    pub pending: Pending,
     /// How many background requests are outstanding. Displayed, never waited
     /// on.
     pub inflight: usize,
@@ -495,7 +515,9 @@ impl Model {
             focus: Focus::Messages,
             screen: Screen::List,
             overlay: None,
-            pending_g: false,
+            visual: None,
+            keymap: Keymap::defaults(),
+            pending: Pending::default(),
             inflight: 0,
             status: "connecting…".to_owned(),
             level: Level::Info,
@@ -521,6 +543,50 @@ impl Model {
         self.account.as_ref()
     }
 
+    /// Which layer of bindings a key press is read against.
+    ///
+    /// Derived from what is on screen rather than stored, so there is no way
+    /// for the mode to disagree with what the user is looking at — the class
+    /// of bug where a modal closes and the keyboard stays trapped in it.
+    #[must_use]
+    pub fn mode(&self) -> Mode {
+        match &self.overlay {
+            Some(Overlay::Help) => Mode::Help,
+            Some(Overlay::Pick { .. }) => Mode::Pick,
+            Some(Overlay::Confirm { .. }) => Mode::Confirm,
+            Some(Overlay::Input { .. }) => Mode::Insert,
+            None if self.visual.is_some() => Mode::Visual,
+            None => match self.screen {
+                Screen::List => Mode::Normal,
+                Screen::Viewer => Mode::Viewer,
+            },
+        }
+    }
+
+    /// The rows a visual selection covers, low index first, or `None` when
+    /// there is no selection.
+    #[must_use]
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.visual?;
+        if self.messages.is_empty() {
+            return None;
+        }
+        let last = self.messages.len() - 1;
+        let (from, to) = if anchor <= self.message_idx {
+            (anchor, self.message_idx)
+        } else {
+            (self.message_idx, anchor)
+        };
+        Some((from.min(last), to.min(last)))
+    }
+
+    /// Whether row `idx` is inside the visual selection.
+    #[must_use]
+    pub fn is_selected(&self, idx: usize) -> bool {
+        self.selection()
+            .is_some_and(|(from, to)| (from..=to).contains(&idx))
+    }
+
     fn info(&mut self, text: impl Into<String>) {
         self.status = text.into();
         self.level = Level::Info;
@@ -531,10 +597,19 @@ impl Model {
         self.level = Level::Error;
     }
 
-    /// Keep both cursors inside their lists after rows arrive or vanish.
+    /// Keep both cursors — and a visual selection's anchor — inside their
+    /// lists after rows arrive or vanish.
     fn clamp(&mut self) {
         self.message_idx = self.message_idx.min(self.messages.len().saturating_sub(1));
         self.folder_idx = self.folder_idx.min(self.folders.len().saturating_sub(1));
+        // A selection whose rows are gone is not a selection. Leaving the
+        // anchor dangling would make `selection()` report a range over rows
+        // the user never picked once the list reloaded shorter.
+        self.visual = match (self.visual, self.messages.len()) {
+            (_, 0) => None,
+            (Some(anchor), len) => Some(anchor.min(len - 1)),
+            (None, _) => None,
+        };
     }
 }
 
@@ -543,6 +618,20 @@ impl Model {
 /// Pure: no I/O, no clock, no terminal. This is the whole of the TUI's
 /// behaviour, and the whole of what its tests drive.
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
+    let mode_before = model.mode();
+    let cmds = dispatch(model, msg);
+    // A chord half-typed in one mode means nothing in another, and a
+    // non-key message can change the mode underneath it — a slow `Get`
+    // landing opens the viewer, a `Removed` closes it. Dropping the
+    // fragment is what stops the *next* key from being read against a
+    // prefix the user typed for a screen that is no longer there.
+    if model.mode() != mode_before {
+        model.pending.clear();
+    }
+    cmds
+}
+
+fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
         Msg::Boot => {
             model.info("loading accounts…");
@@ -685,6 +774,25 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             ));
             Vec::new()
         }
+        Msg::Keymap { result, announce } => {
+            match result {
+                Ok(keymap) => {
+                    model.keymap = keymap;
+                    // Whatever was half-typed was typed against the old
+                    // bindings; carrying it over would resolve a chord the
+                    // user never started.
+                    model.pending.clear();
+                    if announce {
+                        model.info("key bindings reloaded");
+                    }
+                }
+                // The bindings already loaded keep working: a typo saved
+                // mid-edit must not leave someone holding a TUI whose keys
+                // have all changed at once.
+                Err(error) => model.fail(format!("key bindings: {error}")),
+            }
+            Vec::new()
+        }
         Msg::Changed => match model.open_folder {
             // Re-read rather than patch: the event says a folder changed, and
             // the authoritative answer to "what is in it now" is the local
@@ -733,153 +841,455 @@ fn inbox_index(folders: &[Folder]) -> usize {
         .unwrap_or(0)
 }
 
-/// Route a key press, clearing any half-typed `gg` first.
+/// Route a key press through the keymap engine.
+///
+/// The whole of "which key does what" is this one call: the mode comes from
+/// the model's own state, the bindings from [`Model::keymap`], and what comes
+/// back is an action to run, a request to wait for the rest of a chord, or a
+/// key nothing claims.
 fn on_key(model: &mut Model, key: Key) -> Vec<Cmd> {
-    if key == Key::CtrlC {
-        model.quit = true;
+    let mode = model.mode();
+    match model.keymap.resolve(mode, &mut model.pending, key) {
+        Resolution::Pending => Vec::new(),
+        Resolution::Run { action, count } => run_action(model, action, count),
+        Resolution::Unbound(key) => on_unbound(model, mode, key),
+    }
+}
+
+/// A key no binding claims.
+///
+/// In a text prompt that is not a mistake, it is the text — which is why
+/// insert mode binds almost nothing and lets the rest fall through here.
+/// Everywhere else it is silence: an error line per stray keystroke would
+/// bury the messages that matter.
+fn on_unbound(model: &mut Model, mode: Mode, key: Key) -> Vec<Cmd> {
+    if mode != Mode::Insert {
         return Vec::new();
     }
-
-    // A pending `g` is consumed by *this* key whatever it is. Taking it
-    // before dispatch is what stops `g` followed by `j` from eating the `j`:
-    // the chord fails, and `j` is then handled as an ordinary key.
-    let pending_g = std::mem::take(&mut model.pending_g);
-
-    if let Some(overlay) = model.overlay.clone() {
-        return on_overlay_key(model, overlay, key);
+    let Key::Char(c) = key else {
+        return Vec::new();
+    };
+    if let Some(Overlay::Input { buffer, .. }) = model.overlay.as_mut() {
+        // Bounded: the prompt collects an address, and a key held down
+        // against it must not grow a `String` for as long as it is leaned on.
+        if buffer.chars().count() < MAX_INPUT {
+            buffer.push(c);
+        }
     }
-
-    match model.screen {
-        Screen::List => on_list_key(model, key, pending_g),
-        Screen::Viewer => on_viewer_key(model, key, pending_g),
-    }
+    Vec::new()
 }
 
-fn on_overlay_key(model: &mut Model, overlay: Overlay, key: Key) -> Vec<Cmd> {
-    match overlay {
-        Overlay::Help => {
-            if matches!(key, Key::Esc | Key::Char('q') | Key::Char('?') | Key::Enter) {
-                model.overlay = None;
-            }
+/// Do one named thing.
+///
+/// This match is the model's entire key-driven surface, and the seam a later
+/// task extends: task 85's search, palette and ask panes each add their
+/// actions here and their bindings to `keymap`'s defaults, and no arm below
+/// has to learn they exist.
+fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd> {
+    match action {
+        Action::CursorDown => move_cursor(model, Direction::Down, count),
+        Action::CursorUp => move_cursor(model, Direction::Up, count),
+        Action::CursorTop => jump(model, Edge::Top, count),
+        Action::CursorBottom => jump(model, Edge::Bottom, count),
+        Action::FocusToggle => set_focus(
+            model,
+            match model.focus {
+                Focus::Folders => Focus::Messages,
+                Focus::Messages => Focus::Folders,
+            },
+        ),
+        Action::FocusFolders => set_focus(model, Focus::Folders),
+        Action::FocusMessages => set_focus(model, Focus::Messages),
+        Action::Open => open(model),
+        Action::Back => leave(model, Leave::ThenQuit),
+        Action::Cancel => leave(model, Leave::ThenNothing),
+        Action::Quit => {
+            model.quit = true;
             Vec::new()
         }
-        Overlay::Pick {
-            what,
-            message_id,
-            idx,
-        } => on_pick_key(model, what, message_id, idx, key),
-        Overlay::Confirm { message_id, .. } => match key {
-            Key::Char('y') | Key::Char('Y') => {
-                model.overlay = None;
-                model.inflight += 1;
-                vec![Cmd::Delete { message_id }]
-            }
-            Key::Esc | Key::Char('n') | Key::Char('N') | Key::Char('q') => {
-                model.overlay = None;
-                model.info("cancelled");
-                Vec::new()
-            }
-            _ => Vec::new(),
-        },
-        Overlay::Input {
-            prompt,
-            mut buffer,
-            what,
-            message_id,
-        } => match key {
-            Key::Esc => {
-                model.overlay = None;
-                model.info("cancelled");
-                Vec::new()
-            }
-            Key::Enter => {
-                model.overlay = None;
-                submit_input(model, what, buffer.trim(), message_id)
-            }
-            Key::Backspace => {
-                buffer.pop();
-                model.overlay = Some(Overlay::Input {
-                    prompt,
-                    buffer,
-                    what,
-                    message_id,
-                });
-                Vec::new()
-            }
-            Key::Char(c) => {
-                buffer.push(c);
-                model.overlay = Some(Overlay::Input {
-                    prompt,
-                    buffer,
-                    what,
-                    message_id,
-                });
-                Vec::new()
-            }
-            _ => {
-                model.overlay = Some(Overlay::Input {
-                    prompt,
-                    buffer,
-                    what,
-                    message_id,
-                });
-                Vec::new()
-            }
+        Action::Help => {
+            model.overlay = Some(Overlay::Help);
+            Vec::new()
+        }
+        Action::VisualToggle => toggle_visual(model),
+        Action::VisualSwapEnds => swap_ends(model),
+        Action::Archive => archive(model),
+        Action::Delete => confirm_delete(model),
+        Action::ToggleRead => toggle_flag(model, SEEN, "read"),
+        Action::ToggleFlag => toggle_flag(model, FLAGGED, "flagged"),
+        Action::CopyTo => pick(model, PickFor::Copy),
+        Action::MoveTo => pick(model, PickFor::Move),
+        Action::Reply => reply(model),
+        Action::Forward => forward(model),
+        Action::OpenHtml => open_html(model),
+        Action::PickAccept => accept_pick(model),
+        Action::ConfirmAccept => accept_confirm(model),
+        Action::InputSubmit => submit(model),
+        Action::InputBackspace => backspace(model),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cursors
+// ---------------------------------------------------------------------------
+
+/// Which way a movement goes.
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    /// Towards the end of the list.
+    Down,
+    /// Towards the start.
+    Up,
+}
+
+/// Which end of a list a jump lands on.
+#[derive(Debug, Clone, Copy)]
+enum Edge {
+    /// The first row.
+    Top,
+    /// The last row.
+    Bottom,
+}
+
+/// Which cursor `cursor.down` and friends move.
+///
+/// One binding, four cursors: the point of naming the *action* rather than
+/// the field is that `j` keeps meaning "down" in the folder pane, the message
+/// pane, the folder picker and the message body without four bindings that
+/// could drift apart.
+#[derive(Debug, Clone, Copy)]
+enum Cursor {
+    /// The folder picker's highlight.
+    Pick,
+    /// The viewer's scroll offset, in body lines.
+    Scroll,
+    /// The folder list.
+    Folders,
+    /// The message list.
+    Messages,
+}
+
+fn active_cursor(model: &Model) -> Option<Cursor> {
+    match &model.overlay {
+        Some(Overlay::Pick { .. }) => Some(Cursor::Pick),
+        // A confirm, a prompt or the help screen has nothing to scroll, and
+        // must not scroll what is behind it.
+        Some(_) => None,
+        None => match model.screen {
+            Screen::Viewer => Some(Cursor::Scroll),
+            Screen::List => Some(match model.focus {
+                Focus::Folders => Cursor::Folders,
+                Focus::Messages => Cursor::Messages,
+            }),
         },
     }
 }
 
-fn on_pick_key(
-    model: &mut Model,
-    what: PickFor,
-    message_id: i64,
-    idx: usize,
-    key: Key,
-) -> Vec<Cmd> {
-    let last = model.folders.len().saturating_sub(1);
-    match key {
-        Key::Esc | Key::Char('q') => {
-            model.overlay = None;
+/// Where `cursor` is and how far it can go, or `None` when it has no rows to
+/// sit on at all.
+fn cursor_span(model: &Model, cursor: Cursor) -> Option<(usize, usize)> {
+    let (idx, len) = match cursor {
+        Cursor::Pick => match &model.overlay {
+            Some(Overlay::Pick { idx, .. }) => (*idx, model.folders.len()),
+            _ => return None,
+        },
+        Cursor::Scroll => (
+            model.scroll,
+            model.open.as_ref().map_or(0, |open| open.body.len()),
+        ),
+        Cursor::Folders => (model.folder_idx, model.folders.len()),
+        Cursor::Messages => (model.message_idx, model.messages.len()),
+    };
+    (len > 0).then(|| (idx, len - 1))
+}
+
+fn set_cursor(model: &mut Model, cursor: Cursor, at: usize) {
+    match cursor {
+        Cursor::Pick => {
+            if let Some(Overlay::Pick { idx, .. }) = model.overlay.as_mut() {
+                *idx = at;
+            }
+        }
+        Cursor::Scroll => model.scroll = at,
+        Cursor::Folders => model.folder_idx = at,
+        Cursor::Messages => model.message_idx = at,
+    }
+}
+
+fn move_cursor(model: &mut Model, direction: Direction, count: Option<u32>) -> Vec<Cmd> {
+    let Some(cursor) = active_cursor(model) else {
+        return Vec::new();
+    };
+    let Some((idx, last)) = cursor_span(model, cursor) else {
+        return Vec::new();
+    };
+    // Saturating and clamped, so a count costs the same arithmetic whether it
+    // is 3 or `keymap::MAX_COUNT`. A count never multiplies *commands* — no
+    // arm of `run_action` issues more than the one the action names.
+    let by = rows(count);
+    let at = match direction {
+        Direction::Down => idx.saturating_add(by).min(last),
+        Direction::Up => idx.saturating_sub(by),
+    };
+    set_cursor(model, cursor, at);
+    Vec::new()
+}
+
+fn jump(model: &mut Model, edge: Edge, count: Option<u32>) -> Vec<Cmd> {
+    let Some(cursor) = active_cursor(model) else {
+        return Vec::new();
+    };
+    let Some((_, last)) = cursor_span(model, cursor) else {
+        return Vec::new();
+    };
+    // vim's rule: with a count, both `gg` and `G` mean "row N" (1-based);
+    // without one they mean the ends.
+    let at = match (count, edge) {
+        (Some(n), _) => rows(Some(n)).saturating_sub(1).min(last),
+        (None, Edge::Top) => 0,
+        (None, Edge::Bottom) => last,
+    };
+    set_cursor(model, cursor, at);
+    Vec::new()
+}
+
+/// A count as a number of rows. Saturating: `MAX_COUNT` is well inside
+/// `usize` on every platform this builds for, and a hypothetical one that is
+/// not should clamp rather than wrap into a jump backwards.
+fn rows(count: Option<u32>) -> usize {
+    usize::try_from(count.unwrap_or(1)).unwrap_or(usize::MAX)
+}
+
+fn set_focus(model: &mut Model, focus: Focus) -> Vec<Cmd> {
+    model.focus = focus;
+    Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// leaving things
+// ---------------------------------------------------------------------------
+
+/// What to do once there is nothing left to back out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leave {
+    /// `q`: quit the TUI.
+    ThenQuit,
+    /// `Esc`: stay where you are.
+    ThenNothing,
+}
+
+/// Close the innermost thing that is open: an overlay, then a selection, then
+/// the viewer.
+///
+/// One function for both `q` and `Esc` because "get me out of here" has one
+/// meaning; the difference between them is only what happens when there is
+/// nothing left to leave. This is also the guarantee that no mode is a trap:
+/// `Esc` is bound in the global layer, cannot be rebound
+/// (`keymap::Chord::is_reserved`), and always makes progress towards the
+/// message list.
+fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
+    if let Some(overlay) = model.overlay.take() {
+        // The help screen was not collecting anything, so "cancelled" would
+        // be a lie; the other three were.
+        if !matches!(overlay, Overlay::Help) {
             model.info("cancelled");
-            Vec::new()
         }
-        Key::Char('j') | Key::Down => {
-            model.overlay = Some(Overlay::Pick {
-                what,
-                message_id,
-                idx: idx.saturating_add(1).min(last),
-            });
-            Vec::new()
-        }
-        Key::Char('k') | Key::Up => {
-            model.overlay = Some(Overlay::Pick {
-                what,
-                message_id,
-                idx: idx.saturating_sub(1),
-            });
-            Vec::new()
-        }
-        Key::Enter => {
-            model.overlay = None;
-            let Some(dest) = model.folders.get(idx).cloned() else {
-                model.fail("no such folder");
-                return Vec::new();
-            };
-            model.inflight += 1;
-            match what {
-                PickFor::Copy => vec![Cmd::Copy {
-                    message_id,
-                    dest_mailbox_id: dest.id,
-                }],
-                PickFor::Move => vec![Cmd::Move {
-                    message_id,
-                    dest_mailbox_id: dest.id,
-                    label: format!("moved to {}", dest.name),
-                }],
-            }
-        }
-        _ => Vec::new(),
+        return Vec::new();
     }
+    if model.visual.take().is_some() {
+        model.info("selection cleared");
+        return Vec::new();
+    }
+    if model.screen == Screen::Viewer {
+        model.screen = Screen::List;
+        model.open = None;
+        model.opening = None;
+        return Vec::new();
+    }
+    if then == Leave::ThenQuit {
+        model.quit = true;
+    }
+    Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// visual selection
+// ---------------------------------------------------------------------------
+
+fn toggle_visual(model: &mut Model) -> Vec<Cmd> {
+    if model.visual.take().is_some() {
+        model.info("selection cleared");
+        return Vec::new();
+    }
+    if model.screen != Screen::List || model.focus != Focus::Messages {
+        model.fail("visual selects messages — Tab to the message list first");
+        return Vec::new();
+    }
+    if model.messages.is_empty() {
+        model.fail("no messages to select");
+        return Vec::new();
+    }
+    model.visual = Some(model.message_idx);
+    model.info("visual — j/k extend · a archive · d delete · s/f flags · c/M copy/move · Esc ends");
+    Vec::new()
+}
+
+/// vim's `o`: put the cursor on the other end of the selection, so the end
+/// that is wrong can be adjusted without starting again.
+fn swap_ends(model: &mut Model) -> Vec<Cmd> {
+    if let Some(anchor) = model.visual {
+        model.visual = Some(model.message_idx);
+        model.message_idx = anchor.min(model.messages.len().saturating_sub(1));
+    }
+    Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// targets
+// ---------------------------------------------------------------------------
+
+/// The messages an action applies to: the visual selection when there is one,
+/// otherwise the viewer's message, otherwise the row under the cursor.
+fn targets(model: &Model) -> Vec<i64> {
+    if let Some((from, to)) = model.selection() {
+        return model
+            .messages
+            .get(from..=to)
+            .map(|rows| rows.iter().map(|row| row.id).collect())
+            .unwrap_or_default();
+    }
+    match target_message(model) {
+        Some(id) => vec![id],
+        None => Vec::new(),
+    }
+}
+
+/// The messages a bulk-capable action applies to — or `None`, having said
+/// why, when there are none or too many.
+fn bulk_targets(model: &mut Model, what: &str) -> Option<Vec<i64>> {
+    let ids = targets(model);
+    if ids.is_empty() {
+        model.fail("no message selected");
+        return None;
+    }
+    if ids.len() > MAX_BULK {
+        // Refused rather than truncated: acting on the first hundred of what
+        // somebody selected is worse than acting on none of it.
+        model.fail(format!(
+            "{} messages selected — {what} acts on at most {MAX_BULK} at a time",
+            ids.len()
+        ));
+        return None;
+    }
+    Some(ids)
+}
+
+/// The single message an action that has no bulk form applies to.
+fn single_target(model: &mut Model) -> Option<i64> {
+    if model.visual.is_some() {
+        model.fail("that acts on one message — Esc ends the selection");
+        return None;
+    }
+    match target_message(model) {
+        Some(id) => Some(id),
+        None => {
+            model.fail("no message selected");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// actions
+// ---------------------------------------------------------------------------
+
+fn open(model: &mut Model) -> Vec<Cmd> {
+    if model.screen == Screen::Viewer {
+        return Vec::new();
+    }
+    if model.visual.is_some() {
+        model.fail("that acts on one message — Esc ends the selection");
+        return Vec::new();
+    }
+    match model.focus {
+        Focus::Folders => open_folder(model),
+        Focus::Messages => open_message(model),
+    }
+}
+
+fn accept_pick(model: &mut Model) -> Vec<Cmd> {
+    // Put back anything that is not a picker rather than dropping it: these
+    // actions are bindable in any mode, and `pick.accept` bound somewhere it
+    // does not belong should do nothing, not silently close the overlay that
+    // happens to be up.
+    let (what, message_ids, idx) = match model.overlay.take() {
+        Some(Overlay::Pick {
+            what,
+            message_ids,
+            idx,
+        }) => (what, message_ids, idx),
+        other => {
+            model.overlay = other;
+            return Vec::new();
+        }
+    };
+    let Some(dest) = model.folders.get(idx).cloned() else {
+        model.fail("no such folder");
+        return Vec::new();
+    };
+    model.inflight += message_ids.len();
+    message_ids
+        .into_iter()
+        .map(|message_id| match what {
+            PickFor::Copy => Cmd::Copy {
+                message_id,
+                dest_mailbox_id: dest.id,
+            },
+            PickFor::Move => Cmd::Move {
+                message_id,
+                dest_mailbox_id: dest.id,
+                label: format!("moved to {}", dest.name),
+            },
+        })
+        .collect()
+}
+
+fn accept_confirm(model: &mut Model) -> Vec<Cmd> {
+    let message_ids = match model.overlay.take() {
+        Some(Overlay::Confirm { message_ids, .. }) => message_ids,
+        other => {
+            model.overlay = other;
+            return Vec::new();
+        }
+    };
+    model.inflight += message_ids.len();
+    message_ids
+        .into_iter()
+        .map(|message_id| Cmd::Delete { message_id })
+        .collect()
+}
+
+fn submit(model: &mut Model) -> Vec<Cmd> {
+    let (buffer, what, message_id) = match model.overlay.take() {
+        Some(Overlay::Input {
+            buffer,
+            what,
+            message_id,
+            ..
+        }) => (buffer, what, message_id),
+        other => {
+            model.overlay = other;
+            return Vec::new();
+        }
+    };
+    submit_input(model, what, buffer.trim(), message_id)
+}
+
+fn backspace(model: &mut Model) -> Vec<Cmd> {
+    if let Some(Overlay::Input { buffer, .. }) = model.overlay.as_mut() {
+        buffer.pop();
+    }
+    Vec::new()
 }
 
 fn submit_input(model: &mut Model, what: InputFor, value: &str, message_id: i64) -> Vec<Cmd> {
@@ -894,149 +1304,6 @@ fn submit_input(model: &mut Model, what: InputFor, value: &str, message_id: i64)
     }
 }
 
-fn on_list_key(model: &mut Model, key: Key, pending_g: bool) -> Vec<Cmd> {
-    match key {
-        Key::Char('g') => {
-            if pending_g {
-                jump_top(model);
-            } else {
-                model.pending_g = true;
-            }
-            Vec::new()
-        }
-        Key::Char('G') => {
-            jump_bottom(model);
-            Vec::new()
-        }
-        Key::Char('j') | Key::Down => {
-            step(model, 1);
-            Vec::new()
-        }
-        Key::Char('k') | Key::Up => {
-            step(model, -1);
-            Vec::new()
-        }
-        Key::Tab => {
-            model.focus = match model.focus {
-                Focus::Folders => Focus::Messages,
-                Focus::Messages => Focus::Folders,
-            };
-            Vec::new()
-        }
-        Key::Char('h') => {
-            model.focus = Focus::Folders;
-            Vec::new()
-        }
-        Key::Char('l') => {
-            model.focus = Focus::Messages;
-            Vec::new()
-        }
-        Key::Enter => match model.focus {
-            Focus::Folders => open_folder(model),
-            Focus::Messages => open_message(model),
-        },
-        Key::Char('q') => {
-            model.quit = true;
-            Vec::new()
-        }
-        Key::Char('?') => {
-            model.overlay = Some(Overlay::Help);
-            Vec::new()
-        }
-        _ => action_key(model, key),
-    }
-}
-
-fn on_viewer_key(model: &mut Model, key: Key, pending_g: bool) -> Vec<Cmd> {
-    let last = model
-        .open
-        .as_ref()
-        .map_or(0, |o| o.body.len().saturating_sub(1));
-    match key {
-        Key::Char('g') => {
-            if pending_g {
-                model.scroll = 0;
-            } else {
-                model.pending_g = true;
-            }
-            Vec::new()
-        }
-        Key::Char('G') => {
-            model.scroll = last;
-            Vec::new()
-        }
-        Key::Char('j') | Key::Down => {
-            model.scroll = model.scroll.saturating_add(1).min(last);
-            Vec::new()
-        }
-        Key::Char('k') | Key::Up => {
-            model.scroll = model.scroll.saturating_sub(1);
-            Vec::new()
-        }
-        Key::Char('q') | Key::Esc => {
-            model.screen = Screen::List;
-            model.open = None;
-            model.opening = None;
-            Vec::new()
-        }
-        Key::Char('?') => {
-            model.overlay = Some(Overlay::Help);
-            Vec::new()
-        }
-        _ => action_key(model, key),
-    }
-}
-
-/// The action keys, shared by the list and the viewer so an action means the
-/// same thing wherever the message is looked at.
-fn action_key(model: &mut Model, key: Key) -> Vec<Cmd> {
-    match key {
-        Key::Char('a') => archive(model),
-        Key::Char('d') => confirm_delete(model),
-        Key::Char('s') => toggle_flag(model, SEEN, "read"),
-        Key::Char('f') => toggle_flag(model, FLAGGED, "flagged"),
-        Key::Char('c') => pick(model, PickFor::Copy),
-        Key::Char('M') => pick(model, PickFor::Move),
-        Key::Char('r') => reply(model),
-        Key::Char('F') => forward(model),
-        Key::Char('o') => open_html(model),
-        _ => Vec::new(),
-    }
-}
-
-fn step(model: &mut Model, delta: isize) {
-    let (len, idx) = match model.focus {
-        Focus::Folders => (model.folders.len(), model.folder_idx),
-        Focus::Messages => (model.messages.len(), model.message_idx),
-    };
-    if len == 0 {
-        return;
-    }
-    let next = if delta < 0 {
-        idx.saturating_sub(delta.unsigned_abs())
-    } else {
-        idx.saturating_add(delta.unsigned_abs()).min(len - 1)
-    };
-    match model.focus {
-        Focus::Folders => model.folder_idx = next,
-        Focus::Messages => model.message_idx = next,
-    }
-}
-
-fn jump_top(model: &mut Model) {
-    match model.focus {
-        Focus::Folders => model.folder_idx = 0,
-        Focus::Messages => model.message_idx = 0,
-    }
-}
-
-fn jump_bottom(model: &mut Model) {
-    match model.focus {
-        Focus::Folders => model.folder_idx = model.folders.len().saturating_sub(1),
-        Focus::Messages => model.message_idx = model.messages.len().saturating_sub(1),
-    }
-}
-
 fn open_folder(model: &mut Model) -> Vec<Cmd> {
     let Some(folder) = model.current_folder().cloned() else {
         return Vec::new();
@@ -1044,6 +1311,9 @@ fn open_folder(model: &mut Model) -> Vec<Cmd> {
     model.focus = Focus::Messages;
     model.message_idx = 0;
     model.messages.clear();
+    // A selection is a range of *these* rows; the folder it was made in is
+    // the only place it means anything.
+    model.visual = None;
     model.opening = None;
     model.open_folder = Some(folder.id);
     model.info(format!("loading {}…", folder.name));
@@ -1064,20 +1334,22 @@ fn open_message(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn archive(model: &mut Model) -> Vec<Cmd> {
-    let Some(message_id) = target_message(model) else {
-        model.fail("no message selected");
+    let Some(ids) = bulk_targets(model, "archive") else {
         return Vec::new();
     };
     let Some(dest) = archive_folder(&model.folders, model.open_folder) else {
         model.fail("no archive folder on this account");
         return Vec::new();
     };
-    model.inflight += 1;
-    vec![Cmd::Move {
-        message_id,
-        dest_mailbox_id: dest,
-        label: "archived".to_owned(),
-    }]
+    model.visual = None;
+    model.inflight += ids.len();
+    ids.into_iter()
+        .map(|message_id| Cmd::Move {
+            message_id,
+            dest_mailbox_id: dest,
+            label: "archived".to_owned(),
+        })
+        .collect()
 }
 
 /// The mailbox id to archive into, or `None` when the account has no folder
@@ -1109,38 +1381,59 @@ fn leaf(name: &str) -> &str {
 }
 
 fn confirm_delete(model: &mut Model) -> Vec<Cmd> {
-    let Some(message_id) = target_message(model) else {
-        model.fail("no message selected");
+    let Some(ids) = bulk_targets(model, "delete") else {
         return Vec::new();
     };
     // `MailService.Delete` marks \Deleted and expunges on the server: the
     // message is gone from the account, not moved to a trash folder. That is
     // not something a stray keystroke should be able to do.
+    let prompt = if ids.len() == 1 {
+        "delete permanently (expunges on the server)? [y/N]".to_owned()
+    } else {
+        format!(
+            "delete {} messages permanently (expunges on the server)? [y/N]",
+            ids.len()
+        )
+    };
+    model.visual = None;
     model.overlay = Some(Overlay::Confirm {
-        prompt: "delete permanently (expunges on the server)? [y/N]".to_owned(),
-        message_id,
+        prompt,
+        message_ids: ids,
     });
     Vec::new()
 }
 
 fn toggle_flag(model: &mut Model, flag: &str, noun: &str) -> Vec<Cmd> {
-    let Some(row) = current_row(model).cloned() else {
-        model.fail("no message selected");
+    let Some(ids) = bulk_targets(model, &format!("marking {noun}")) else {
         return Vec::new();
     };
-    let flags = row.flags_toggled(flag);
-    let now_set = flags.iter().any(|f| f == flag);
-    let label = if now_set {
+    let rows: Vec<MessageRow> = ids
+        .iter()
+        .filter_map(|id| model.messages.iter().find(|row| row.id == *id))
+        .cloned()
+        .collect();
+    if rows.is_empty() {
+        model.fail("no message selected");
+        return Vec::new();
+    }
+    // One intent for the whole selection: clear the flag only when every
+    // message already has it, so marking a mixed selection read does not
+    // leave the already-read half unread.
+    let present = !rows.iter().all(|row| row.has_flag(flag));
+    let label = if present {
         format!("marked {noun}")
     } else {
         format!("marked not {noun}")
     };
-    model.inflight += 1;
-    vec![Cmd::SetFlags {
-        message_id: row.id,
-        flags,
-        label,
-    }]
+    model.visual = None;
+    model.inflight += rows.len();
+    rows.into_iter()
+        .map(|row| Cmd::SetFlags {
+            message_id: row.id,
+            flags: row.flags_with(flag, present),
+            label: label.clone(),
+        })
+        .collect()
 }
 
 fn pick(model: &mut Model, what: PickFor) -> Vec<Cmd> {
@@ -1148,20 +1441,29 @@ fn pick(model: &mut Model, what: PickFor) -> Vec<Cmd> {
         model.fail("no folders to pick from");
         return Vec::new();
     }
-    let Some(message_id) = target_message(model) else {
-        model.fail("no message selected");
+    let Some(ids) = bulk_targets(
+        model,
+        match what {
+            PickFor::Copy => "copy",
+            PickFor::Move => "move",
+        },
+    ) else {
         return Vec::new();
     };
+    model.visual = None;
     model.overlay = Some(Overlay::Pick {
         what,
-        message_id,
+        message_ids: ids,
         idx: 0,
     });
     Vec::new()
 }
 
 fn reply(model: &mut Model) -> Vec<Cmd> {
-    let Some(row) = current_row(model).cloned() else {
+    let Some(id) = single_target(model) else {
+        return Vec::new();
+    };
+    let Some(row) = model.messages.iter().find(|row| row.id == id).cloned() else {
         model.fail("no message selected");
         return Vec::new();
     };
@@ -1173,8 +1475,7 @@ fn reply(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn forward(model: &mut Model) -> Vec<Cmd> {
-    let Some(message_id) = target_message(model) else {
-        model.fail("no message selected");
+    let Some(message_id) = single_target(model) else {
         return Vec::new();
     };
     model.overlay = Some(Overlay::Input {
@@ -1232,11 +1533,4 @@ fn target_message(model: &Model) -> Option<i64> {
         Screen::Viewer => model.open.as_ref().map(|o| o.id),
         Screen::List => model.current_message().map(|m| m.id),
     }
-}
-
-/// The list row an action applies to. The viewer's message is still a row in
-/// the list behind it, so flag toggles and replies work identically in both.
-fn current_row(model: &Model) -> Option<&MessageRow> {
-    let id = target_message(model)?;
-    model.messages.iter().find(|m| m.id == id)
 }

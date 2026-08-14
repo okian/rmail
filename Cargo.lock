@@ -3182,11 +3182,14 @@ dependencies = [
  "rmaild",
  "serde",
  "serde_json",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml",
  "tonic",
  "tonic-health",
+ "tracing",
 ]
 
 [[package]]

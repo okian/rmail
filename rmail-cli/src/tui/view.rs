@@ -24,26 +24,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::model::{Focus, Level, Model, Overlay, Screen, FLAGGED, SEEN};
+use crate::keymap::{Action, Mode};
 
-/// Key bindings, shown by `?`. One list, so the help can never drift from
-/// what the reader believes is bound.
-const HELP: &[(&str, &str)] = &[
-    ("j / k", "down / up"),
-    ("gg / G", "top / bottom"),
-    ("Tab, h / l", "switch folder and message panes"),
-    ("Enter", "open the folder or the message"),
-    ("q", "back, or quit from the message list"),
-    ("Ctrl-C", "quit from anywhere"),
-    ("?", "this help"),
-    ("a", "archive"),
-    ("d", "delete (asks first — this expunges)"),
-    ("s", "toggle read"),
-    ("f", "toggle flagged"),
-    ("c / M", "copy / move to a folder"),
-    ("r / F", "reply / forward (creates a draft)"),
-    ("o", "open the HTML part in a browser"),
-];
+use super::model::{Focus, Level, Model, Overlay, Screen, FLAGGED, SEEN};
 
 /// Draw one frame.
 pub fn render(model: &Model, frame: &mut Frame) {
@@ -60,7 +43,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
     render_status(model, frame, rows[1]);
 
     match &model.overlay {
-        Some(Overlay::Help) => render_help(frame, area),
+        Some(Overlay::Help) => render_help(model, frame, area),
         Some(Overlay::Pick { what, idx, .. }) => render_pick(model, frame, area, *what, *idx),
         Some(Overlay::Confirm { prompt, .. }) => render_modal(frame, area, "confirm", prompt),
         Some(Overlay::Input { prompt, buffer, .. }) => {
@@ -108,7 +91,8 @@ fn render_messages(model: &Model, frame: &mut Frame, area: Rect) {
     let items: Vec<ListItem> = model
         .messages
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(idx, row)| {
             let unread = !row.has_flag(SEEN);
             let marks = format!(
                 "{}{}{}",
@@ -124,11 +108,17 @@ fn render_messages(model: &Model, frame: &mut Frame, area: Rect) {
                 ),
                 Span::raw(format!("{:<20.20} {}", row.from, row.subject)),
             ]);
-            let style = if unread {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let mut style = Style::default();
+            if unread {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            // A visual selection has to be visible on every row it covers,
+            // not only the one under the cursor: a bulk archive that acted on
+            // rows the user could not see would be indistinguishable from a
+            // bug in the selection arithmetic.
+            if model.is_selected(idx) {
+                style = style.bg(Color::DarkGray).fg(Color::White);
+            }
             ListItem::new(line).style(style)
         })
         .collect();
@@ -235,27 +225,71 @@ fn render_status(model: &Model, frame: &mut Frame, area: Rect) {
     } else {
         String::new()
     };
+    // The mode, and what has been typed towards a binding but not resolved.
+    // vim shows both for the same reason: a half-typed `3g` that is invisible
+    // is indistinguishable from a keyboard that has stopped responding, and
+    // the user's next move — mashing keys — is the one thing that makes it
+    // worse.
+    let mode = match model.mode() {
+        Mode::Visual => " -- VISUAL --",
+        Mode::Insert => " -- INSERT --",
+        _ => "",
+    };
+    let pending = if model.pending.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", model.pending.label())
+    };
     let line = Line::from(vec![
         Span::styled(model.status.clone(), Style::default().fg(color)),
         Span::styled(busy, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            mode,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(pending, Style::default().fg(Color::Yellow)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    let lines: Vec<Line> = HELP
-        .iter()
-        .map(|(keys, what)| {
-            Line::from(vec![
-                Span::styled(
-                    format!("  {keys:<12}"),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(*what),
-            ])
-        })
-        .collect();
-    let area = centered(area, 60, u16::try_from(lines.len()).unwrap_or(u16::MAX) + 2);
+/// The key reference, read out of the keymap rather than written alongside it.
+///
+/// Task 83 kept this as a hand-maintained table, which was right while the
+/// bindings were a `match` nobody could change. Once `keys.toml` can rebind
+/// anything, a hand-maintained list is a list that lies to exactly the users
+/// who customised something — so the rows are generated from the bindings in
+/// force, and a rebind shows up here the moment it is loaded.
+///
+/// Normal mode's chain, because that is the screen `?` is pressed from; the
+/// viewer and the overlays inherit or restate it.
+fn render_help(model: &Model, frame: &mut Frame, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    for action in Action::ALL {
+        let chords = model.keymap.chords_for(Mode::Normal, *action);
+        if chords.is_empty() {
+            continue;
+        }
+        let keys = chords
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" / ");
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {keys:<14}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(action.describe()),
+        ]));
+    }
+    lines.push(Line::styled(
+        "  rebind with `mail keys set <chord> <action>` — no restart needed",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let area = centered(area, 72, u16::try_from(lines.len()).unwrap_or(u16::MAX) + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(pane("keys — any of q, Esc or ? closes", true)),

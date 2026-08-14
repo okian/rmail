@@ -50,6 +50,16 @@ chrono-tz.workspace = true
 serde.workspace = true
 # `mail ai summary --json`.
 serde_json.workspace = true
+# `keys.toml` (task 84): the TUI's key bindings, parsed on their own rather
+# than layered through figment — already in the tree, so no new code or
+# license surface (see the workspace `Cargo.toml`'s own note).
+toml.workspace = true
+# `keymap` reports what it did with `keys.toml` through `tracing`. This crate
+# installs no subscriber today, so the user-visible channel is still the TUI's
+# status line; the spans are here for `RUST_LOG` when something needs
+# debugging without a status line to read.
+tracing.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 rmaild.workspace = true

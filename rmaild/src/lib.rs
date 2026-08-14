@@ -18,6 +18,7 @@ mod ai_service;
 mod audit_service;
 mod auth;
 mod compose_service;
+mod config_service;
 mod hook_service;
 mod index_service;
 mod mail_service;
@@ -36,6 +37,7 @@ pub use ai_service::AiApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
 pub use compose_service::ComposeApi;
+pub use config_service::ConfigApi;
 pub use hook_service::HookApi;
 pub use index_service::IndexApi;
 pub use mail_service::MailApi;
@@ -91,6 +93,7 @@ use rmail_proto::v1::ai_policy_service_server::AiPolicyServiceServer;
 use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::compose_service_server::ComposeServiceServer;
+use rmail_proto::v1::config_service_server::ConfigServiceServer;
 use rmail_proto::v1::hook_service_server::HookServiceServer;
 use rmail_proto::v1::index_service_server::IndexServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
@@ -581,6 +584,12 @@ where
     // this task deliberately stops short of SMTP (task 61 owns submission),
     // so there is no client, pool, or background loop to wire up here.
     let compose_service = ComposeServiceServer::new(ComposeApi::new(DraftStore::new(db.clone())));
+    // The keymap the TUI reads directly; served for palette/MCP clients that
+    // have no other way to discover the action-id registry. See
+    // `config_service`'s own docs for why the daemon serves a client-side file.
+    let config_service = ConfigServiceServer::new(ConfigApi::new(
+        rmail_core::keymap::file::keys_path_from_env(),
+    ));
 
     // Scheduled send (task 61). `SendScheduler` is always registered — the
     // reflection set and the auth scope table must see every RPC regardless of
@@ -1094,6 +1103,7 @@ where
         .add_service(note_service)
         .add_service(tag_service)
         .add_service(compose_service)
+        .add_service(config_service)
         .add_service(send_scheduler_service)
         .add_service(search_service)
         .add_service(index_service)
