@@ -47,6 +47,12 @@ EMAILL = "EMAILL"
 # server in `outbox::mock` has to answer both EHLO and HELO.
 HELO = "HELO"
 
+# The tail of "ig<ZWSP>nore", left behind when the splitter cuts a deliberate
+# zero-width-character evasion fixture in `ai::injection`'s tests. The whole
+# point of that string is that a naive reader does not see the word "ignore" in
+# it — the checker is agreeing with the attacker here, not catching a typo.
+nore = "nore"
+
 # Not ours to spell correctly: `fastembed`'s own enum variant is
 # `RerankerModel::JINARerankerV2BaseMultiligual`, and the cross-encoder backend
 # has to name it as the upstream crate does or it does not compile.
