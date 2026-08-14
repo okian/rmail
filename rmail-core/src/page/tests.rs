@@ -66,10 +66,12 @@ fn an_absent_filter_is_not_the_same_scope_as_a_present_one() {
 
 #[test]
 fn field_names_are_hashed_so_values_cannot_swap() {
-    let ab = PageScope::new("m").field("a", 1).field("b", 2);
-    let ba = PageScope::new("m").field("a", 2).field("b", 1);
-    let token = encode(&ab, Cursor::new(1, 1));
-    assert!(decode(&token, &ba).is_err());
+    // Same field names, values swapped between them: a scope digest that
+    // hashed only the values would call these two identical.
+    let a_one_b_two = PageScope::new("m").field("a", 1).field("b", 2);
+    let a_two_b_one = PageScope::new("m").field("a", 2).field("b", 1);
+    let token = encode(&a_one_b_two, Cursor::new(1, 1));
+    assert!(decode(&token, &a_two_b_one).is_err());
 }
 
 #[test]
