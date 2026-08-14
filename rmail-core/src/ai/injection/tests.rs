@@ -915,3 +915,97 @@ fn realistic_ordinary_mail_is_not_flagged() {
         );
     }
 }
+
+/// Every model-facing system prompt in this crate is fenced, or is a listed
+/// exception with a reason.
+///
+/// This is the gate that was missing. Task 52 added `ai::rag` — a sixth
+/// `Provider` caller — while task 77 was adding the shield in a sibling
+/// worktree. Neither change was wrong on its own, both gates were green, and
+/// the result shipped an un-fenced path that sent the same message text to
+/// Claude raw that the reranker was sending fenced in the very same request.
+/// A reviewer caught it; nothing in the suite could have.
+///
+/// Source-level rather than type-level. Making it impossible to build an
+/// unfenced `ChatRequest` (a `SystemPrompt` newtype constructible only through
+/// [`with_data_boundary`]) would be stronger, and is the right end state — but
+/// it touches every AI caller at once, which is not a change to land while
+/// three agents are editing this crate. This test costs nothing and fails by
+/// name the moment a seventh sink appears.
+#[test]
+fn every_model_facing_system_prompt_is_fenced_or_a_listed_exception() {
+    /// Files that call `.system(` without `with_data_boundary`, and why.
+    ///
+    /// Adding to this list is a deliberate act. The bar: the prompt carries no
+    /// attacker-controlled text at all. "The model only reads it" is not a
+    /// reason — the fence exists because model *output* drives behaviour.
+    const EXCEPTIONS: &[(&str, &str)] = &[(
+        "rules/synth.rs",
+        "carries the user's own natural-language instruction and no message \
+         content, so there is no untrusted text to fence; the redaction guard \
+         still runs over it",
+    )];
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut unfenced: Vec<String> = Vec::new();
+    let mut exercised: Vec<&str> = Vec::new();
+
+    let mut stack = vec![src.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            // Test modules build hostile fixtures on purpose.
+            if rel.contains("tests") {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            if !text.contains(".system(") {
+                continue;
+            }
+            if text.contains("with_data_boundary") {
+                continue;
+            }
+            match EXCEPTIONS.iter().find(|(file, _)| rel.ends_with(file)) {
+                Some((file, _)) => exercised.push(file),
+                None => unfenced.push(rel),
+            }
+        }
+    }
+
+    assert!(
+        unfenced.is_empty(),
+        "these send a system prompt to a model without \
+         `injection::with_data_boundary`, so any untrusted text they carry is \
+         in instruction position: {unfenced:?}. Fence it the way \
+         `ai::triage`/`ai::deep`/`ai::rag`/`rules::classify`/`rank::l2::claude` \
+         do, or add it to EXCEPTIONS with a reason that survives scrutiny."
+    );
+    // A stale exception is its own bug: it says a sink is unfenced when it is
+    // not, and the next person trusts the list.
+    for (file, _) in EXCEPTIONS {
+        assert!(
+            exercised.contains(file),
+            "EXCEPTIONS lists {file}, but it no longer calls `.system(` \
+             unfenced — remove the entry"
+        );
+    }
+}
