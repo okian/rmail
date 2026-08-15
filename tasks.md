@@ -804,7 +804,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core keymap::` · `cargo nextest run -p rmail-cli keys_cli::` · `cargo nextest run -p rmaild config_service::` (chord resolution, rebind, hot-reload, action-id shared registry)
 
 ## 85. TUI overlays (search / finder / AI panel / ask pane / palette / outbox)
-- [ ] status
+- [x] status
 - **depends-on:** 83, 84, 33, 59, 52, 61
 - **parallel-safe:** no
 - **acceptance:**
