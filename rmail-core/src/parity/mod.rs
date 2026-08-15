@@ -530,6 +530,46 @@ commands! {
         summary: "Re-evaluate a smart folder, auto-tagging and notifying on genuinely new members.",
     }
 
+    // -- FinderService (task 59) ----------------------------------------------
+    // `Find` is `Read` on the same grounds `SearchSearch` is: it reads a
+    // denormalized copy of local mail, reaches no provider, and writes
+    // nothing an observer outside this process could see. `RebuildIndex` is
+    // `Mutate` even though it only recomputes what the mailbox already
+    // implies — it rewrites a table another reader can observe, and it holds
+    // the single writer connection while it does, which is an effect.
+    FinderFind {
+        rpc: "/rmail.v1.FinderService/Find",
+        tool: "fuzzy_find",
+        effect: Read,
+        cli: ["find"],
+        actions: [],
+        summary: "Fuzzy-match a prompt against messages, folders, contacts, saved searches, tags and commands.",
+    }
+    FinderBatchAction {
+        rpc: "/rmail.v1.FinderService/BatchAction",
+        tool: "fuzzy_batch_action",
+        effect: Mutate,
+        cli: ["find"],
+        actions: [],
+        summary: "Archive, delete or re-flag every message in a finder selection at once.",
+    }
+    FinderRebuildIndex {
+        rpc: "/rmail.v1.FinderService/RebuildIndex",
+        tool: "rebuild_finder_index",
+        effect: Mutate,
+        cli: ["find"],
+        actions: [],
+        summary: "Re-derive the whole fuzzy-finder index from the source tables.",
+    }
+    FinderIndexStatus {
+        rpc: "/rmail.v1.FinderService/IndexStatus",
+        tool: "finder_index_status",
+        effect: Read,
+        cli: ["find"],
+        actions: [],
+        summary: "Report how complete, how large and how fresh the fuzzy-finder index is.",
+    }
+
     // -- IndexService (task 24) -----------------------------------------------
     IndexStatus {
         rpc: "/rmail.v1.IndexService/Status",

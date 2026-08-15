@@ -18,6 +18,7 @@ pub mod eval;
 pub mod events;
 pub mod features;
 pub mod feedback;
+pub mod finder;
 pub mod fuse;
 pub mod hooks;
 pub mod idempotency;

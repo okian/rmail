@@ -1,0 +1,225 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// FinderService is prd.md's Part III-1 fuzzy finder (task 59): one prompt
+// that jumps to anything — a message, a folder, a contact, a saved search, a
+// tag, or a command.
+//
+// It is deliberately not SearchService. Search *ranks by relevance* over
+// message bodies and answers "what is the best answer to this question";
+// the finder *jumps by name* over short heterogeneous labels and answers
+// "which of the things I already know about did I mean". Different corpus,
+// different scorer, and — the reason this is its own service — a different
+// latency budget: search is per *query*, the finder is per **keystroke**.
+//
+// The whole index is resident in memory (bounded by `finder.max_entries` and
+// `finder.max_memory_mb`), so `Find` touches no disk at all. It never
+// contacts IMAP, and it works offline.
+service FinderService {
+  // Fuzzy-match `query` against the in-memory index, streaming the ranked
+  // top-K as it fills in.
+  //
+  // Cancellation is by supersession: starting a new `Find` cancels whichever
+  // one held the interactive slot before it, and the abandoned scan stops
+  // rather than running to completion. A client typing into a prompt should
+  // simply issue a new `Find` per keystroke (debounced to taste) and drop
+  // the previous stream.
+  rpc Find(FindRequest) returns (stream FindBatch);
+
+  // Apply one action to a set of items — `mail find … --select --action
+  // archive`. Message-kind refs only; see BatchActionRequest.
+  rpc BatchAction(BatchActionRequest) returns (BatchActionResponse);
+
+  // Re-derive the whole index from the source tables. The change feed keeps
+  // it current without this; this is the repair path (and what a first run
+  // after the schema landed does automatically).
+  rpc RebuildIndex(FinderRebuildRequest) returns (FinderRebuildResponse);
+
+  // How complete and how fresh the index is.
+  rpc IndexStatus(FinderStatusRequest) returns (FinderStatusResponse);
+}
+
+// What sort of thing an item is.
+//
+// The numbers are the wire's own: proto3 reserves 0 for UNSPECIFIED, so these
+// are one higher than the storage codes in `finder_index.kind`.
+// `rmail_core::finder::ItemKind` maps between the two explicitly rather than
+// letting either side infer the other's numbering.
+enum ItemKind {
+  ITEM_KIND_UNSPECIFIED = 0;
+  ITEM_KIND_MESSAGE = 1;
+  ITEM_KIND_MAILBOX = 2;
+  ITEM_KIND_CONTACT = 3;
+  ITEM_KIND_SAVED_SEARCH = 4;
+  ITEM_KIND_TAG = 5;
+  ITEM_KIND_COMMAND = 6;
+}
+
+// Which kinds a query searches.
+enum FinderScope {
+  // Use the server's `finder.default_scope`.
+  FINDER_SCOPE_UNSPECIFIED = 0;
+  FINDER_SCOPE_ALL = 1;
+  FINDER_SCOPE_MESSAGES = 2;
+  FINDER_SCOPE_MAILBOXES = 3;
+  FINDER_SCOPE_CONTACTS = 4;
+  FINDER_SCOPE_SAVED_SEARCHES = 5;
+  FINDER_SCOPE_TAGS = 6;
+  FINDER_SCOPE_COMMANDS = 7;
+}
+
+message FindRequest {
+  // The prompt text, *including* any leading sigil. `>` selects commands,
+  // `#` tags, `@` contacts, `/` saved searches, `:` mailboxes; the sigil is
+  // stripped before matching and overrides `scope`.
+  //
+  // Sent raw, not pre-parsed, for the same reason SearchRequest.query is:
+  // the grammar has exactly one implementation
+  // (`rmail_core::finder::Query::parse`), so no client can drift from it.
+  //
+  // An empty query is valid and means "rank by signals alone" — the recents
+  // and frequent items a picker shows the moment it opens.
+  string query = 1;
+
+  // The scope to search in when the query carries no sigil.
+  FinderScope scope = 2;
+
+  // Restrict to one account. 0 searches every account. Kinds that are not
+  // per-account (contacts, commands) are returned regardless.
+  int64 account_id = 3;
+
+  // Restrict to one mailbox — prd.md's `in-folder` scope. Non-zero implies
+  // messages only, since nothing else has a mailbox.
+  int64 mailbox_id = 4;
+
+  // 0 uses the server's `finder.max_results`; anything larger is clamped to
+  // it.
+  uint32 limit = 5;
+
+  // Compute `FindResult.positions`. Off by default because a caller that is
+  // piping ids into another command has no use for highlights, and computing
+  // them costs a matrix traceback and a fold per returned row.
+  bool with_positions = 6;
+}
+
+// One flush of the ranked top-K.
+//
+// **A batch is a snapshot, not a delta.** It carries the complete current
+// best, descending, and replaces whatever the client was showing. Sending
+// only what is new since the last flush would be wrong for a bounded heap: an
+// item that qualified early can be evicted later, and a client accumulating
+// deltas would keep showing a result the server has since rejected. Snapshots
+// also make a dropped batch harmless — the one with `complete` set is
+// authoritative on its own.
+message FindBatch {
+  repeated FindResult results = 1;
+  // Whether the scan has finished. Exactly one batch per stream has this set,
+  // and it is always the last.
+  bool complete = 2;
+  // Index entries walked so far. Diagnostic; a UI can show "searching…".
+  uint64 scanned = 3;
+  // Whether the scan stopped early because a newer Find superseded it. A
+  // superseded stream still ends cleanly (with `complete` set) rather than
+  // erroring, so a client can tell "stopped" from "still running".
+  bool superseded = 4;
+}
+
+message FindResult {
+  // `finder_index.item_id` — stable for as long as the entry exists.
+  int64 item_id = 1;
+  ItemKind kind = 2;
+  // The row id in the source table: a message id, a mailbox id, a contact id,
+  // and so on. This is what an action acts on.
+  int64 ref_id = 3;
+  // The blended score. Higher is better. Comparable only within one response
+  // — it mixes a subsequence score with recency, unread, importance,
+  // frequency and kind terms whose weights are configurable.
+  double score = 4;
+  // What a picker row renders: subject / folder path / display name /
+  // saved-search name / tag / command title. Original text, never folded.
+  string primary_text = 5;
+  // The dimmer second line: sender / address / query text / action id.
+  string secondary = 6;
+  // Where the query matched, as **char** offsets into `primary_text` —
+  // ascending, deduplicated, and never byte offsets. Matching runs over a
+  // Unicode-folded copy whose length differs from `primary_text`'s (`ﬁ`
+  // folds to `fi`, `café` to `cafe`), so these are mapped back through that
+  // fold; a renderer can index `primary_text.chars()` with them directly.
+  //
+  // Positions that matched inside `secondary` are not reported: a row
+  // renders one highlightable line, and an offset into a different string
+  // than the one named here would be worse than no highlight.
+  //
+  // Empty unless `FindRequest.with_positions` was set.
+  repeated uint32 positions = 7;
+  // The account this item belongs to, or 0 for a kind that has none.
+  int64 account_id = 8;
+  // The mailbox, for messages; 0 otherwise.
+  int64 mailbox_id = 9;
+}
+
+// Apply one action to a set of items.
+//
+// Message kinds only, and a closed action vocabulary. Both are deliberate:
+// the finder is a *selector*, and the authority to change mail belongs to the
+// services that own it. Every action here is executed through the same
+// `rmail_core::mail::MailStore` MailService uses, so an archive from a
+// picker and an archive from `mail archive` are the same operation, with the
+// same IMAP reconciliation and the same event.
+message BatchActionRequest {
+  // One of: `archive`, `delete`, `read`, `unread`, `flag`, `unflag`.
+  // Anything else is INVALID_ARGUMENT rather than a silent no-op.
+  string action = 1;
+  // Message ids, as returned in `FindResult.ref_id`.
+  repeated int64 ref_ids = 2;
+  // What `ref_ids` are ids *of*. Must be ITEM_KIND_MESSAGE; anything else,
+  // including UNSPECIFIED, is INVALID_ARGUMENT.
+  //
+  // Required rather than assumed, because `ref_id` is a row id in whichever
+  // source table the kind names, and those id spaces overlap: tag 7, mailbox
+  // 7 and message 7 all exist. A `--scope all` result set mixes them into one
+  // field, so a client that forwards a selection without filtering would
+  // otherwise archive *message* 7 because the user picked *tag* 7. Making the
+  // caller state what its ids mean turns that from a silent wrong-object
+  // mutation into a rejected request.
+  ItemKind kind = 3;
+}
+
+message BatchActionResponse {
+  // How many items the action was applied to.
+  uint32 applied = 1;
+  // Ids that no longer exist. prd.md's "stale ref → action returns
+  // not_found": a picker's selection can outlive the mail it names, and one
+  // vanished id must not fail the other nineteen.
+  repeated int64 not_found = 2;
+}
+
+message FinderRebuildRequest {}
+
+message FinderRebuildResponse {
+  // Entries resident after the rebuild.
+  uint64 entries = 1;
+}
+
+// Named `Finder…` rather than `IndexStatus…`: `rmail.v1` is one flat
+// namespace, and `IndexService` (task 24) already owns those two names for
+// the *search* index, which is a different index with a different status.
+message FinderStatusRequest {}
+
+message FinderStatusResponse {
+  // Entries resident in memory.
+  uint64 entries = 1;
+  // Measured heap bytes those entries occupy.
+  uint64 bytes = 2;
+  // Change-feed rows waiting to be drained. Non-zero is normal between
+  // ticks; persistently large means the mailbox is changing faster than
+  // `finder.refresh_interval_ms` drains it.
+  uint64 pending = 3;
+  // Entries a cap refused since the last full load. Non-zero means the index
+  // is deliberately incomplete — raise `finder.max_entries` or
+  // `finder.max_memory_mb` if that matters.
+  uint64 rejected = 4;
+  // Unix seconds of the last successful refresh; 0 if never.
+  int64 refreshed_at = 5;
+}

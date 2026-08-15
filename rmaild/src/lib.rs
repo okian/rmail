@@ -4,7 +4,7 @@
 //! health (`SERVING`), reflection over the `rmail.v1` descriptor set, and the
 //! `AccountService`/`SyncService`/`AdminService`/`AuditService`/
 //! `MailService`/`NoteService`/`TagService`/`SearchService`/
-//! `SavedSearchService`/`ComposeService`/`SendSchedulerService`/`AiService`/
+//! `SavedSearchService`/`FinderService`/`ComposeService`/`SendSchedulerService`/`AiService`/
 //! `AiPolicyService`/`AiSafetyService`/`IndexService`/`HookService`/`RuleService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
@@ -20,6 +20,7 @@ mod audit_service;
 mod auth;
 mod compose_service;
 mod config_service;
+mod finder_service;
 mod hook_service;
 mod idempotency;
 mod index_service;
@@ -42,6 +43,7 @@ pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
 pub use compose_service::ComposeApi;
 pub use config_service::ConfigApi;
+pub use finder_service::FinderApi;
 pub use hook_service::HookApi;
 pub use index_service::IndexApi;
 pub use mail_service::MailApi;
@@ -69,6 +71,9 @@ use rmail_core::compose::DraftStore;
 use rmail_core::embed::hash::HashEmbedder;
 use rmail_core::embed::Embedder;
 use rmail_core::events::{EventLog, Retention};
+use rmail_core::finder::index::FinderIndex;
+use rmail_core::finder::store::FinderStore;
+use rmail_core::finder::Finder;
 use rmail_core::hooks::HookDispatcher;
 use rmail_core::imap::mutate::LiveImapMutator;
 use rmail_core::index::semantic::{SemanticIndex, VECTOR_DIM};
@@ -99,6 +104,7 @@ use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::compose_service_server::ComposeServiceServer;
 use rmail_proto::v1::config_service_server::ConfigServiceServer;
+use rmail_proto::v1::finder_service_server::FinderServiceServer;
 use rmail_proto::v1::hook_service_server::HookServiceServer;
 use rmail_proto::v1::index_service_server::IndexServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
@@ -674,6 +680,10 @@ where
     // a rule-applied tag honours the same per-tag sync mode.
     let rules_mail_store = mail_store.clone();
     let rules_tag_store = tag_store.clone();
+    // The finder's `BatchAction` runs through the *same* store, so archiving
+    // from a picker and archiving from `mail archive` are one operation with
+    // one IMAP reconciliation and one event.
+    let finder_mail_store = mail_store.clone();
     let mail_service = MailServiceServer::new(MailApi::new(
         mail_store,
         idempotency.clone(),
@@ -1005,6 +1015,35 @@ where
         .spawn(stopping.clone())
         .await;
 
+    // The fuzzy finder (task 59). One `FinderStore` per daemon, shared by the
+    // drain loop that maintains it and the handler that queries it — see
+    // `rmail_core::finder`'s module docs on why the query side deliberately
+    // holds no `Database` at all.
+    let finder_store = Arc::new(std::sync::RwLock::new(FinderStore::new()));
+    let finder_index = FinderIndex::new(db.clone(), Arc::clone(&finder_store), &config.finder);
+    let finder_service = FinderServiceServer::new(FinderApi::new(
+        Finder::new(finder_store, &config.finder),
+        finder_index.clone(),
+        finder_mail_store,
+        db.clone(),
+        &config.finder,
+        config.rules.archive_mailbox.clone(),
+        stopping.clone(),
+    ));
+    // `finder.enabled = false` stops the index being maintained; the service
+    // still answers, over whatever the store holds (nothing, on a daemon that
+    // has never had the loop running). One mechanism rather than two: an
+    // absent RPC would make a disabled finder indistinguishable from an old
+    // daemon, where a served-but-empty one says plainly what is going on
+    // through `IndexStatus`.
+    let finder_handle = config
+        .finder
+        .enabled
+        .then(|| finder_index.spawn(stopping.clone()));
+    if !config.finder.enabled {
+        tracing::info!("finder.enabled = false; the finder index is not maintained");
+    }
+
     // AI subsystem: the durable queue, the two pass handlers, the worker
     // pool/batch coordinator that drive them, and the dispatch loop that
     // closes the loop between "a message synced" and "a triage job ran" —
@@ -1252,6 +1291,7 @@ where
         .add_service(search_service)
         .add_service(index_service)
         .add_service(saved_search_service)
+        .add_service(finder_service)
         .add_service(ai_service)
         .add_service(ai_policy_service)
         .add_service(ai_safety_service)
@@ -1274,6 +1314,9 @@ where
     }
     let _ = index_handle.await;
     let _ = smart_folder_handle.await;
+    if let Some(handle) = finder_handle {
+        let _ = handle.await;
+    }
     // Awaited rather than dropped: an in-flight SMTP conversation that is
     // abandoned mid-`DATA` is exactly the crash the at-most-once fence exists
     // to survive, and paying for a recovery on every clean shutdown would be

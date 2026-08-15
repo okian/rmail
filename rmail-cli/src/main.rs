@@ -1,5 +1,6 @@
 //! The `mail` CLI — a thin gRPC client for the rmail daemon.
 
+mod find_cli;
 mod hook_cli;
 mod index_cli;
 mod keymap;
@@ -19,6 +20,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use find_cli::FindArgs;
 use note_cli::{NoteAction, NotesArgs};
 use outbox_cli::{FollowupAction, OutboxArgs, SendArgs, UndoArgs};
 use rmail_core::socket_path_from_env;
@@ -88,6 +90,13 @@ enum Command {
     },
     /// Ranked search over the local index (`SearchService.Search`).
     Search(SearchArgs),
+    /// Jump to anything by name — messages, folders, contacts, saved
+    /// searches, tags, commands (`FinderService.Find`).
+    ///
+    /// The known-item complement to `mail search`: search ranks by
+    /// relevance over message bodies, the finder matches short labels
+    /// as-you-type over an in-memory index.
+    Find(FindArgs),
     /// Embedding-kNN neighbors of a message (`SearchService.Semantic`).
     Similar(SimilarArgs),
     /// AI pipeline verbs (`AiService`).
@@ -388,6 +397,7 @@ async fn main() -> Result<()> {
         Command::Tui(args) => tui::run(&socket, args).await,
         Command::Keys { action } => keys_cli::run(action),
         Command::Search(args) => search_cli::search(&socket, args).await,
+        Command::Find(args) => find_cli::find(&socket, args).await,
         Command::Similar(args) => search_cli::similar(&socket, args).await,
         Command::Ai { action } => match action {
             AiAction::Status => ai_status(&socket).await,

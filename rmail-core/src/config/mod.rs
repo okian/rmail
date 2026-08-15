@@ -2128,6 +2128,28 @@ pub struct FinderConfig {
     pub max_results: u32,
     /// Maximum snippet length (bytes).
     pub snippet_max_bytes: u32,
+    /// The most entries the in-memory index holds, across every kind.
+    ///
+    /// The first of the finder's two hard bounds (see
+    /// `rmail_core::finder::store`). It exists because "load the index into
+    /// memory" is not a size: a mailbox is however big it is, and an
+    /// unbounded store turns a large one into both an unbounded scan and an
+    /// unbounded allocation. Entries load newest-first, so what a full store
+    /// turns away is the oldest mail.
+    pub max_entries: u32,
+    /// The most heap, in MiB, the in-memory index may occupy.
+    ///
+    /// The second bound, and prd.md's own budget ("< 25 MB for 100k
+    /// messages"). Measured against real string capacities rather than
+    /// estimated per row, so a mailbox of unusually long subject lines hits
+    /// it honestly instead of overshooting.
+    pub max_memory_mb: u32,
+    /// The most dirty-feed rows one drain pass applies.
+    ///
+    /// prd.md's "large dirty backlog → capped batched drain": a resync that
+    /// rewrites an entire mailbox must cost the finder a few seconds of
+    /// staleness, not a stall on the writer connection.
+    pub max_drain_batch: u32,
     /// Dirty-feed drain interval (ms).
     pub refresh_interval_ms: u64,
     /// Smart-case matching.
@@ -2147,6 +2169,9 @@ impl Default for FinderConfig {
             default_scope: FinderScope::All,
             max_results: 200,
             snippet_max_bytes: 160,
+            max_entries: 200_000,
+            max_memory_mb: 25,
+            max_drain_batch: 2_000,
             refresh_interval_ms: 250,
             smart_case: true,
             preview: true,
@@ -2188,6 +2213,18 @@ impl Default for FinderRanking {
 }
 
 /// Finder key bindings.
+///
+/// **Superseded by the keymap engine** (task 84). prd.md wrote this block
+/// before the TUI had a rebindable key layer; it now does, and every binding
+/// goes through `keymap::Keymap` — a table of `(mode, chord) -> Action` that
+/// `keys.toml` edits, `?` renders, and `mail keys set` writes. A second place
+/// to configure one key is a second place for the two to disagree, so nothing
+/// reads this block: the finder's own bindings land as `keymap::Action` ids
+/// when task 85 adds the overlay that can respond to them.
+///
+/// Kept rather than deleted because removing a field from a
+/// `deny_unknown_fields` struct turns an existing `[finder.keys]` block into
+/// a hard startup failure, which is a worse outcome than an ignored setting.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FinderKeys {

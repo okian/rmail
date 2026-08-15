@@ -581,7 +581,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmaild smart_folder:: compile_query::` (NL→plan compile+cache, live membership)
 
 ## 59. Fuzzy finder (III-1)
-- [ ] status
+- [x] status
 - **depends-on:** 6, 14, 38
 - **parallel-safe:** no
 - **acceptance:**

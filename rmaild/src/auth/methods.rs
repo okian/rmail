@@ -386,6 +386,40 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.IndexService/SetPaused",
         Requirement::Scope(Scope::Admin),
     ),
+    // -- FinderService (task 59) ----------------------------------------------
+    // `Find` reads a denormalized copy of subject lines, folder paths, contact
+    // names, saved-search text and tag names — nothing a `mail.read` token
+    // could not already fetch from `MailService`/`TagService`/`SearchService`,
+    // so it sits at the same level `SearchService/Search` does. `IndexStatus`
+    // reports counts and a timestamp about that same index and discloses less.
+    (
+        "/rmail.v1.FinderService/Find",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.FinderService/IndexStatus",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // `BatchAction` archives, deletes, and re-flags mail — against several
+    // messages at once, from a selection the caller made in a picker. It is
+    // exactly the authority `MailService/Move`, `/Delete` and `/SetFlags` sit
+    // behind, executed through the same `MailStore`, so it gets the same
+    // scope. Not `AnyOf`, and not `admin`: widening an RPC that can empty an
+    // inbox is the case that row's own doc comment warns against.
+    (
+        "/rmail.v1.FinderService/BatchAction",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    // `RebuildIndex` re-derives the finder index from the source tables. It
+    // recomputes only what the mail already implies, touches no other
+    // subsystem, and leaves nothing degraded for other callers — the same
+    // "mutates local derived state" test `IndexService/Reindex` sits behind,
+    // not the daemon-wide `IndexService/Rebuild` one (which deletes whole
+    // stages and leaves search broken for hours).
+    (
+        "/rmail.v1.FinderService/RebuildIndex",
+        Requirement::Scope(Scope::MailWrite),
+    ),
     // `Evaluate` (task 37) runs caller-supplied queries through the same
     // pipeline and reports aggregate metrics. It reads no more than `Search`
     // does — but note it *does* let a caller confirm whether a given
