@@ -292,9 +292,12 @@ fn sanitizing_rewrites_a_data_derived_key() {
 /// the successful path does, or it would be the one string that skipped it.
 #[test]
 fn a_tool_error_is_sanitized_like_any_other_output() {
-    let result = tool_error("upstream said: BAD\u{202e}gnp.exe");
+    // An RLO filename spoof: `safe<RLO>gnp.exe` renders to a reader as
+    // `safeexe.png` while actually naming an executable. Sanitizing must strip
+    // the override so the text says what it is.
+    let result = tool_error("upstream said: safe\u{202e}gnp.exe");
     assert_eq!(result["isError"], true);
-    assert_eq!(result["content"][0]["text"], "upstream said: BADgnp.exe");
+    assert_eq!(result["content"][0]["text"], "upstream said: safegnp.exe");
 }
 
 /// A local timeout must not be reported as the daemon having failed: the model
