@@ -946,11 +946,24 @@ fn every_model_facing_system_prompt_is_fenced_or_a_listed_exception() {
          still runs over it",
     )];
 
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Every crate, not just this one. `rmaild` holds an `Arc<dyn Provider>`
+    // and today delegates every prompt to this crate — but nothing *stops* a
+    // future task from building one there, and a gate that cannot see the
+    // place the next sink might appear is a gate with a blind spot. Task 52's
+    // P0 was exactly a new sink nobody thought to look for.
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .expect("the crate directory has a workspace parent");
+    let crates: Vec<std::path::PathBuf> = ["rmail-core", "rmaild", "rmail-cli"]
+        .iter()
+        .map(|name| workspace.join(name).join("src"))
+        .collect();
+
     let mut unfenced: Vec<String> = Vec::new();
     let mut exercised: Vec<&str> = Vec::new();
 
-    let mut stack = vec![src.clone()];
+    let mut stack = crates.clone();
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -966,7 +979,7 @@ fn every_model_facing_system_prompt_is_fenced_or_a_listed_exception() {
                 continue;
             }
             let rel = path
-                .strip_prefix(&src)
+                .strip_prefix(&workspace)
                 .unwrap_or(&path)
                 .display()
                 .to_string();
@@ -991,6 +1004,11 @@ fn every_model_facing_system_prompt_is_fenced_or_a_listed_exception() {
         }
     }
 
+    assert!(
+        crates.iter().any(|dir| dir.is_dir()),
+        "no crate source directories found under {}",
+        workspace.display()
+    );
     assert!(
         unfenced.is_empty(),
         "these send a system prompt to a model without \
