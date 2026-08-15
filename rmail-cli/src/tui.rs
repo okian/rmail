@@ -65,6 +65,7 @@
 pub mod grpc;
 pub mod html;
 pub mod model;
+pub mod overlays;
 pub mod term;
 pub mod view;
 

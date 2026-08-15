@@ -486,14 +486,26 @@ pub fn blocks_actions(severity: Option<Severity>, config: &AiInjection) -> bool 
 /// overwhelmingly common case.
 #[must_use]
 pub fn sanitize_model_text(text: &str) -> Cow<'_, str> {
-    if !text.chars().any(|c| is_invisible(c) || is_bidi_control(c)) {
+    if text.chars().all(is_display_safe) {
         return Cow::Borrowed(text);
     }
-    Cow::Owned(
-        text.chars()
-            .filter(|c| !is_invisible(*c) && !is_bidi_control(*c))
-            .collect(),
-    )
+    Cow::Owned(text.chars().filter(|c| is_display_safe(*c)).collect())
+}
+
+/// Whether one character survives [`sanitize_model_text`].
+///
+/// The same rule, per character, for callers that already walk the text
+/// themselves and cannot afford a `String` per character. Task 85's TUI
+/// highlighter is the case that needs it: it must decide "is this character
+/// highlighted" from the character's position in the *original* string and
+/// only then emit its safe form, so it sanitizes one `char` at a time on the
+/// render path. Exposing the predicate rather than letting it build a
+/// one-character `String` per glyph keeps a single definition of "safe to
+/// show" — `sanitize_model_text` is written in terms of this, so the two
+/// cannot disagree.
+#[must_use]
+pub fn is_display_safe(ch: char) -> bool {
+    !is_invisible(ch) && !is_bidi_control(ch)
 }
 
 /// Bound how much text one scan looks at — see [`MAX_SCAN_BYTES`]. Walks

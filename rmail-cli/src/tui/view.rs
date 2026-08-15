@@ -27,20 +27,35 @@ use ratatui::Frame;
 use crate::keymap::{Action, Mode};
 
 use super::model::{Focus, Level, Model, Overlay, Screen, FLAGGED, SEEN};
+use super::overlays::{
+    self, AskPane, AskPhase, FinderPane, OutboxPane, PalettePane, QuickAction, QuickPane,
+    SearchFocus, SearchPane, UndoToast,
+};
 
 /// Draw one frame.
 pub fn render(model: &Model, frame: &mut Frame) {
     let area = frame.area();
+    // The toast gets a row of its own rather than sharing the status line: it
+    // is a countdown with an offer attached, and an offer that scrolls away
+    // behind the next "3 messages" is not an offer.
+    let toast_height = u16::from(model.toast.is_some());
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(toast_height),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     match model.screen {
         Screen::List => render_panes(model, frame, rows[0]),
-        Screen::Viewer => render_viewer(model, frame, rows[0]),
+        Screen::Viewer => render_main_with_panel(model, frame, rows[0], render_viewer),
     }
-    render_status(model, frame, rows[1]);
+    if let Some(toast) = model.toast.as_ref() {
+        render_toast(toast, frame, rows[1]);
+    }
+    render_status(model, frame, rows[2]);
 
     match &model.overlay {
         Some(Overlay::Help) => render_help(model, frame, area),
@@ -49,23 +64,54 @@ pub fn render(model: &Model, frame: &mut Frame) {
         Some(Overlay::Input { prompt, buffer, .. }) => {
             render_modal(frame, area, prompt, &format!("{buffer}▏"));
         }
+        Some(Overlay::Search(pane)) => render_search(pane, frame, area),
+        Some(Overlay::Finder(pane)) => render_finder(pane, frame, area),
+        Some(Overlay::Palette(pane)) => render_palette(pane, frame, area),
+        Some(Overlay::Ask(pane)) => render_ask(pane, frame, area),
+        Some(Overlay::Outbox(pane)) => render_outbox(pane, frame, area),
+        Some(Overlay::Quick(pane)) => render_quick(pane, frame, area),
         None => {}
     }
 }
 
 fn render_panes(model: &Model, frame: &mut Frame, area: Rect) {
+    render_main_with_panel(model, frame, area, |model, frame, area| {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(20),
+                Constraint::Percentage(40),
+                Constraint::Percentage(40),
+            ])
+            .split(area);
+
+        render_folders(model, frame, columns[0]);
+        render_messages(model, frame, columns[1]);
+        render_preview(model, frame, columns[2]);
+    });
+}
+
+/// Draw `main` in `area`, giving the collapsible AI panel a column of its own
+/// when it is open.
+///
+/// A column rather than an overlay, because the panel is *about* what the
+/// cursor is on: covering the message to explain the message would be an odd
+/// thing to do, and the panel has to stay useful while the list is navigated
+/// underneath it.
+fn render_main_with_panel<F>(model: &Model, frame: &mut Frame, area: Rect, main: F)
+where
+    F: FnOnce(&Model, &mut Frame, Rect),
+{
+    if !model.ai_panel {
+        main(model, frame, area);
+        return;
+    }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(20),
-            Constraint::Percentage(40),
-            Constraint::Percentage(40),
-        ])
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(area);
-
-    render_folders(model, frame, columns[0]);
-    render_messages(model, frame, columns[1]);
-    render_preview(model, frame, columns[2]);
+    main(model, frame, columns[0]);
+    render_ai_panel(model, frame, columns[1]);
 }
 
 fn render_folders(model: &Model, frame: &mut Frame, area: Rect) {
@@ -82,7 +128,7 @@ fn render_folders(model: &Model, frame: &mut Frame, area: Rect) {
     });
 
     let list = List::new(items)
-        .block(pane("folders", model.focus == Focus::Folders))
+        .block(pane_block("folders", model.focus == Focus::Folders))
         .highlight_style(selected_style(model.focus == Focus::Folders));
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -134,7 +180,7 @@ fn render_messages(model: &Model, frame: &mut Frame, area: Rect) {
         .current_folder()
         .map_or_else(|| "messages".to_owned(), |f| f.name.clone());
     let list = List::new(items)
-        .block(pane(&title, model.focus == Focus::Messages))
+        .block(pane_block(&title, model.focus == Focus::Messages))
         .highlight_style(selected_style(model.focus == Focus::Messages));
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -164,7 +210,7 @@ fn render_preview(model: &Model, frame: &mut Frame, area: Rect) {
         None => vec![Line::raw("no message selected")],
     };
     let paragraph = Paragraph::new(lines)
-        .block(pane("preview", false))
+        .block(pane_block("preview", false))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -172,7 +218,7 @@ fn render_preview(model: &Model, frame: &mut Frame, area: Rect) {
 fn render_viewer(model: &Model, frame: &mut Frame, area: Rect) {
     let Some(open) = model.open.as_ref() else {
         frame.render_widget(
-            Paragraph::new("nothing open").block(pane("message", true)),
+            Paragraph::new("nothing open").block(pane_block("message", true)),
             area,
         );
         return;
@@ -208,7 +254,7 @@ fn render_viewer(model: &Model, frame: &mut Frame, area: Rect) {
     lines.extend(open.body[from..].iter().map(|line| Line::raw(line.clone())));
 
     let paragraph = Paragraph::new(lines)
-        .block(pane("message", true))
+        .block(pane_block("message", true))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -232,7 +278,8 @@ fn render_status(model: &Model, frame: &mut Frame, area: Rect) {
     // worse.
     let mode = match model.mode() {
         Mode::Visual => " -- VISUAL --",
-        Mode::Insert => " -- INSERT --",
+        Mode::Insert | Mode::Prompt => " -- INSERT --",
+        Mode::Menu => " -- SELECT --",
         _ => "",
     };
     let pending = if model.pending.is_empty() {
@@ -241,7 +288,15 @@ fn render_status(model: &Model, frame: &mut Frame, area: Rect) {
         format!(" {}", model.pending.label())
     };
     let line = Line::from(vec![
-        Span::styled(model.status.clone(), Style::default().fg(color)),
+        // Sanitized here rather than at each call site: the status line is
+        // the one surface every part of the TUI writes to, and task 85 is
+        // what first puts third-party text into it — an SMTP server's verbatim
+        // rejection (`OutboxRow::last_error`), a recipient address, a folder
+        // name. One place covers every present and future caller.
+        Span::styled(
+            overlays::safe_line(&model.status),
+            Style::default().fg(color),
+        ),
         Span::styled(busy, Style::default().fg(Color::DarkGray)),
         Span::styled(
             mode,
@@ -292,7 +347,7 @@ fn render_help(model: &Model, frame: &mut Frame, area: Rect) {
     let area = centered(area, 72, u16::try_from(lines.len()).unwrap_or(u16::MAX) + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines).block(pane("keys — any of q, Esc or ? closes", true)),
+        Paragraph::new(lines).block(pane_block("keys — any of q, Esc or ? closes", true)),
         area,
     );
 }
@@ -320,7 +375,7 @@ fn render_pick(
     let area = centered(area, 40, height);
     frame.render_widget(Clear, area);
     let list = List::new(items)
-        .block(pane(title, true))
+        .block(pane_block(title, true))
         .highlight_style(selected_style(true));
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -329,7 +384,7 @@ fn render_modal(frame: &mut Frame, area: Rect, title: &str, body: &str) {
     let area = centered(area, 60, 3);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(body.to_owned()).block(pane(title, true)),
+        Paragraph::new(body.to_owned()).block(pane_block(title, true)),
         area,
     );
 }
@@ -358,7 +413,7 @@ fn header_line<'a>(name: &str, value: &str) -> Line<'a> {
     ])
 }
 
-fn pane<'a>(title: &str, focused: bool) -> Block<'a> {
+fn pane_block<'a>(title: &str, focused: bool) -> Block<'a> {
     let style = if focused {
         Style::default().fg(Color::Cyan)
     } else {
@@ -379,6 +434,598 @@ fn selected_style(focused: bool) -> Style {
     } else {
         Style::default().add_modifier(Modifier::REVERSED)
     }
+}
+
+// ---------------------------------------------------------------------------
+// task 85's overlays
+// ---------------------------------------------------------------------------
+
+/// How many characters of a one-line cell are drawn before it is elided.
+///
+/// The panes are a percentage of the terminal, so this is a backstop rather
+/// than the layout: it keeps one absurd subject from pushing everything after
+/// it off the row, and it truncates on **characters** so it cannot split a
+/// code point.
+const CELL: usize = 96;
+
+/// A line built from [`overlays::runs_from_char_positions`]-style runs, with
+/// the matched pieces picked out.
+///
+/// Highlighting is bold plus a color rather than a background: a background
+/// run through a fuzzy match's scattered single characters reads as noise.
+fn highlighted<'a>(runs: Vec<(String, bool)>) -> Line<'a> {
+    Line::from(
+        runs.into_iter()
+            .map(|(text, on)| {
+                if on {
+                    Span::styled(
+                        text,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw(text)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The prompt line every typing overlay shares: what has been typed, a block
+/// cursor, and a hint.
+fn prompt_line<'a>(sigil: &str, text: &str, hint: &str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            format!("{sigil} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        // The typed text is the user's own, so it needs no sanitizing for
+        // safety — but it goes through the same one-line treatment as
+        // everything else so a pasted control character cannot reach the
+        // terminal through the search box either.
+        Span::raw(overlays::safe_line(text)),
+        Span::styled("▏", Style::default().fg(Color::Cyan)),
+        Span::styled(format!("  {hint}"), Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+fn render_search(pane: &SearchPane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 88, 80);
+    frame.render_widget(Clear, area);
+
+    let why_height = if pane.explain { 9 } else { 0 };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(why_height),
+        ])
+        .split(inner(
+            frame,
+            area,
+            &format!(
+                "search{}",
+                if pane.complete {
+                    ""
+                } else {
+                    " — searching…"
+                }
+            ),
+        ));
+
+    frame.render_widget(
+        Paragraph::new(prompt_line(
+            "/",
+            &pane.query,
+            "~ semantic · = lexical · Tab completes · Enter walks",
+        )),
+        rows[0],
+    );
+
+    let items: Vec<ListItem> = pane
+        .hits
+        .iter()
+        .map(|hit| {
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<12} ", short_date(hit.date)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        overlays::truncate_chars(&overlays::safe_line(&hit.subject), CELL),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}", overlays::safe_line(&hit.from)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                // The snippet's highlights are byte ranges into its *original*
+                // text; `runs_from_byte_ranges` applies them and the sanitizer
+                // together, one character at a time, so a dropped control byte
+                // cannot shift a highlight onto the wrong word.
+                highlighted(overlays::runs_from_byte_ranges(
+                    &hit.snippet,
+                    &hit.highlights,
+                )),
+            ])
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select((!pane.hits.is_empty()).then_some(pane.cursor));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selected_style(pane.focus == SearchFocus::Results)),
+        rows[1],
+        &mut state,
+    );
+
+    if pane.explain {
+        render_why(pane, frame, rows[2]);
+    }
+}
+
+/// The `x` why-panel: the ranker's own feature breakdown for the highlighted
+/// hit.
+fn render_why(pane: &SearchPane, frame: &mut Frame, area: Rect) {
+    let lines: Vec<Line> = match pane.explanation.as_ref() {
+        None => vec![Line::styled(
+            "  explaining…",
+            Style::default().fg(Color::DarkGray),
+        )],
+        Some(why) => {
+            let mut lines = vec![Line::from(vec![
+                Span::styled("  score ", Style::default().fg(Color::DarkGray)),
+                Span::raw(why.score.clone()),
+                Span::styled(
+                    format!("   via {}", why.sources.join(", ")),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])];
+            lines.extend(why.features.iter().map(|(name, detail)| {
+                Line::from(vec![
+                    Span::styled(format!("  {name:<24}"), Style::default().fg(Color::Cyan)),
+                    Span::raw(detail.clone()),
+                ])
+            }));
+            if let Some(matched) = why.matched.as_ref() {
+                lines.push(Line::raw(format!(
+                    "  matched: {}",
+                    overlays::truncate_chars(&overlays::safe_line(matched), CELL)
+                )));
+            }
+            if !why.claude_reason.is_empty() {
+                // Model-authored, and therefore steerable by any message that
+                // reached the reranker's context.
+                lines.push(Line::raw(format!(
+                    "  claude: {}",
+                    overlays::truncate_chars(&overlays::safe_line(&why.claude_reason), CELL)
+                )));
+            }
+            lines
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(pane_block("why — x closes", false)),
+        area,
+    );
+}
+
+fn render_finder(pane: &FinderPane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 76, 70);
+    frame.render_widget(Clear, area);
+    let title = match (pane.complete, pane.superseded) {
+        // Superseded is not an error and not a completed scan either: the
+        // results on screen are the best of a partial walk, and saying so is
+        // the difference between "that is all there is" and "that is all it
+        // got to".
+        (true, true) => format!("find — {} so far (superseded)", pane.items.len()),
+        (true, false) => format!("find — {} of {} scanned", pane.items.len(), pane.scanned),
+        (false, _) => "find — searching…".to_owned(),
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner(frame, area, &title));
+
+    frame.render_widget(
+        Paragraph::new(prompt_line(
+            "❯",
+            &pane.query,
+            "> cmd · # tag · @ person · / saved · : folder",
+        )),
+        rows[0],
+    );
+
+    let items: Vec<ListItem> = pane
+        .items
+        .iter()
+        .map(|item| {
+            ListItem::new(Line::from({
+                let mut spans = vec![Span::styled(
+                    format!("{:<7}", item.kind.label()),
+                    Style::default().fg(Color::Magenta),
+                )];
+                // `positions` are char offsets into `primary`, which is why
+                // this indexes characters and never bytes.
+                spans.extend(
+                    highlighted(overlays::runs_from_char_positions(
+                        &item.primary,
+                        &item.positions,
+                    ))
+                    .spans,
+                );
+                if !item.secondary.trim().is_empty() {
+                    spans.push(Span::styled(
+                        format!(
+                            "  {}",
+                            overlays::truncate_chars(&overlays::safe_line(&item.secondary), CELL)
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                spans
+            }))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select((!pane.items.is_empty()).then_some(pane.cursor));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selected_style(true)),
+        rows[1],
+        &mut state,
+    );
+}
+
+fn render_palette(pane: &PalettePane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 70, 66);
+    frame.render_widget(Clear, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner(
+            frame,
+            area,
+            &format!("commands — {} match", pane.matches.len()),
+        ));
+
+    frame.render_widget(
+        Paragraph::new(prompt_line(":", &pane.input, "Enter runs · Esc closes")),
+        rows[0],
+    );
+
+    let items: Vec<ListItem> = pane
+        .matches
+        .iter()
+        .map(|entry| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<22}", entry.action.id()),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<12}", entry.chords),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    entry.action.describe(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select((!pane.matches.is_empty()).then_some(pane.cursor));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selected_style(true)),
+        rows[1],
+        &mut state,
+    );
+}
+
+fn render_ask(pane: &AskPane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 88, 84);
+    frame.render_widget(Clear, area);
+    let citations_height = u16::try_from(pane.citations.len().min(8)).unwrap_or(8);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(citations_height),
+        ])
+        .split(inner(frame, area, ask_title(pane)));
+
+    frame.render_widget(
+        Paragraph::new(prompt_line(
+            "?",
+            &pane.question,
+            match pane.phase {
+                AskPhase::Asking => "Enter asks · Esc closes",
+                AskPhase::Streaming => "answering…",
+                AskPhase::Done => "Esc closes",
+            },
+        )),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            overlays::safe_line(pane.trace.as_deref().unwrap_or_default()),
+            Style::default().fg(Color::DarkGray),
+        )),
+        rows[1],
+    );
+
+    // Model-authored prose: neutralized, but with its paragraph breaks kept,
+    // because they carry meaning in an answer in a way they do not in a row.
+    let mut body: Vec<Line> = overlays::safe_prose(&pane.answer)
+        .lines()
+        .map(|line| Line::raw(line.to_owned()))
+        .collect();
+    if let Some(error) = pane.error.as_ref() {
+        body.push(Line::styled(
+            format!("({error})"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    if pane.phase == AskPhase::Done && !pane.grounded {
+        body.push(Line::styled(
+            format!(
+                "not grounded — the daemon found nothing in your mail behind this answer{}",
+                if pane.refusal.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", overlays::safe_line(&pane.refusal))
+                }
+            ),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[2]);
+
+    let items: Vec<ListItem> = pane
+        .citations
+        .iter()
+        .map(|citation| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", citation.label),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(overlays::truncate_chars(
+                    &overlays::safe_line(&citation.subject),
+                    CELL,
+                )),
+                Span::styled(
+                    format!(
+                        "  {} · {}",
+                        overlays::safe_line(&citation.from_addr),
+                        overlays::safe_line(&citation.mailbox)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select((!pane.citations.is_empty()).then_some(pane.cursor));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selected_style(true)),
+        rows[3],
+        &mut state,
+    );
+}
+
+/// The ask pane's title says whose verdict "grounded" is, because it is the
+/// daemon's — computed from the citations it actually resolved — and not a
+/// claim the model made about its own answer.
+fn ask_title(pane: &AskPane) -> &'static str {
+    match (pane.phase, pane.grounded) {
+        (AskPhase::Asking, _) => "ask your mailbox",
+        (AskPhase::Streaming, _) => "ask — answering…",
+        (AskPhase::Done, true) => "ask — grounded in your mail (daemon-verified)",
+        (AskPhase::Done, false) => "ask — NOT grounded (daemon's verdict)",
+    }
+}
+
+fn render_outbox(pane: &OutboxPane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 76, 60);
+    frame.render_widget(Clear, area);
+    let inner_area = inner(frame, area, "outbox — u cancels · Esc closes");
+
+    // Only when there is nothing else to show. A cancel reports through the
+    // same message as a listing, and a refused cancel must not blank the
+    // outbox the user is looking at — the status line already carries why.
+    if let Some(error) = pane.error.as_ref().filter(|_| pane.rows.is_empty()) {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                overlays::safe_line(error),
+                Style::default().fg(Color::Red),
+            )),
+            inner_area,
+        );
+        return;
+    }
+    if pane.loading {
+        frame.render_widget(Paragraph::new("listing…"), inner_area);
+        return;
+    }
+    if pane.rows.is_empty() {
+        frame.render_widget(Paragraph::new("nothing waiting to go out"), inner_area);
+        return;
+    }
+
+    let items: Vec<ListItem> = pane
+        .rows
+        .iter()
+        .map(|row| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<10}", row.state),
+                    Style::default().fg(match row.state.as_str() {
+                        "failed" | "uncertain" => Color::Red,
+                        "sent" => Color::Green,
+                        _ => Color::Yellow,
+                    }),
+                ),
+                Span::styled(
+                    format!("{:<12} ", short_date(Some(row.send_at))),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(overlays::truncate_chars(
+                    &overlays::safe_line(&row.subject),
+                    CELL,
+                )),
+                Span::styled(
+                    format!("  → {}", overlays::safe_line(&row.to)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(pane.cursor.min(pane.rows.len().saturating_sub(1))));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selected_style(true)),
+        inner_area,
+        &mut state,
+    );
+}
+
+fn render_quick(pane: &QuickPane, frame: &mut Frame, area: Rect) {
+    let height = u16::try_from(QuickAction::ALL.len()).unwrap_or(3) + 2;
+    let area = centered(area, 56, height);
+    frame.render_widget(Clear, area);
+    let items: Vec<ListItem> = QuickAction::ALL
+        .iter()
+        .map(|(_, label)| ListItem::new(Line::raw(*label)))
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(
+        pane.cursor.min(QuickAction::ALL.len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(pane_block(
+                &format!(
+                    "AI · {}",
+                    overlays::truncate_chars(&overlays::safe_line(&pane.subject), 40)
+                ),
+                true,
+            ))
+            .highlight_style(selected_style(true)),
+        area,
+        &mut state,
+    );
+}
+
+/// The collapsible AI panel.
+fn render_ai_panel(model: &Model, frame: &mut Frame, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    match model.summary.as_ref() {
+        None => lines.push(Line::styled(
+            "reading…",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Some(summary) => {
+            lines.push(Line::styled(
+                summary.status.clone(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            // Every string below was written by a model that a hostile message
+            // can steer, so all of it goes through the sanitizer.
+            for (label, value) in [
+                ("priority", summary.priority.as_ref()),
+                ("tl;dr", summary.tl_dr.as_ref()),
+                ("summary", summary.summary.as_ref()),
+                ("reply", summary.suggested_reply.as_ref()),
+            ] {
+                if let Some(value) = value {
+                    lines.push(Line::styled(
+                        format!("{label}:"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                    lines.push(Line::raw(overlays::safe_prose(value)));
+                }
+            }
+            if let Some(needs) = summary.needs_reply {
+                lines.push(Line::raw(if needs {
+                    "needs a reply".to_owned()
+                } else {
+                    "no reply needed".to_owned()
+                }));
+            }
+            push_bullets(&mut lines, "key points", &summary.key_points);
+            push_bullets(&mut lines, "to-do", &summary.todos);
+            push_bullets(&mut lines, "tags", &summary.tags);
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(pane_block("AI · \\ hides · . acts", false))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn push_bullets(lines: &mut Vec<Line<'_>>, label: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    lines.push(Line::styled(
+        format!("{label}:"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    lines.extend(
+        values
+            .iter()
+            .map(|value| Line::raw(format!("· {}", overlays::safe_prose(value)))),
+    );
+}
+
+/// The undo-send countdown.
+fn render_toast(toast: &UndoToast, frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(
+                    " sending to {} in {}s ",
+                    overlays::safe_line(&toast.to),
+                    toast.remaining
+                ),
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  u undoes", Style::default().fg(Color::Yellow)),
+        ])),
+        area,
+    );
+}
+
+/// Draw `title`'s border around `area` and return what is left inside it.
+///
+/// Every overlay wants the same border and the same "what is left" arithmetic,
+/// and `Block::inner` is the only thing that gets that arithmetic right when
+/// the area is smaller than the border.
+fn inner(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+    let block = pane_block(title, true);
+    let inside = block.inner(area);
+    frame.render_widget(block, area);
+    inside
+}
+
+/// A percentage-sized rectangle in the middle of `area`.
+fn centered_pct(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
+    let width = area.width.saturating_mul(width_pct.min(100)) / 100;
+    let height = area.height.saturating_mul(height_pct.min(100)) / 100;
+    centered(area, width.max(1), height.max(1))
 }
 
 /// A `width` x `height` rectangle in the middle of `area`, clamped so an

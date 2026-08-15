@@ -347,6 +347,18 @@ actions! {
     Reply         => "message.reply",       "reply (creates a draft)";
     Forward       => "message.forward",     "forward (creates a draft)";
     OpenHtml      => "message.open-html",   "open the HTML part in a browser";
+    SearchOpen    => "search",              "search this mailbox (~ semantic, = lexical)";
+    SearchExplain => "search.explain",      "why did this result match";
+    FinderOpen    => "finder",              "jump to anything (>#@/: scope it)";
+    PaletteOpen   => "palette",             "run a command by name";
+    AskOpen       => "ask",                 "ask a question about this mailbox";
+    AiPanel       => "ai.panel",            "show or hide the AI panel";
+    AiQuick       => "ai.quick",            "AI actions for this message";
+    OutboxOpen    => "outbox",              "the outbox: scheduled, failed and undoable sends";
+    OutboxCancel  => "outbox.cancel",       "cancel the highlighted send (undo)";
+    PromptAccept  => "prompt.accept",       "accept what has been typed";
+    PromptComplete => "prompt.complete",    "complete the operator being typed";
+    MenuAccept    => "menu.accept",         "use the highlighted row";
     PickAccept    => "pick.accept",         "use the highlighted folder";
     ConfirmAccept => "confirm.accept",      "confirm";
     InputSubmit   => "input.submit",        "submit what has been typed";
@@ -372,6 +384,20 @@ pub enum Mode {
     Visual,
     /// A text prompt is up: keys are text, not commands.
     Insert,
+    /// One of task 85's typing overlays — the search box, the fuzzy finder,
+    /// the command palette, the ask pane's question line.
+    ///
+    /// One mode for four overlays rather than four modes, for the same reason
+    /// `cursor.down` is one action driving four cursors: what `<enter>` or
+    /// `<tab>` *means* is context-sensitive (accept a hit, take an item, run
+    /// a command, send a question) and that context is the overlay, not the
+    /// key table. Four modes would be four copies of the same five bindings,
+    /// free to drift apart in a user's `keys.toml`.
+    Prompt,
+    /// One of task 85's list overlays — search results once the query is
+    /// submitted, the ask pane's citations, the outbox, the AI quick-action
+    /// menu. Keys are commands again.
+    Menu,
     /// The folder picker.
     Pick,
     /// A yes/no question.
@@ -389,6 +415,8 @@ impl Mode {
         Mode::Viewer,
         Mode::Visual,
         Mode::Insert,
+        Mode::Prompt,
+        Mode::Menu,
         Mode::Pick,
         Mode::Confirm,
         Mode::Help,
@@ -403,6 +431,8 @@ impl Mode {
             Self::Viewer => "viewer",
             Self::Visual => "visual",
             Self::Insert => "insert",
+            Self::Prompt => "prompt",
+            Self::Menu => "menu",
             Self::Pick => "pick",
             Self::Confirm => "confirm",
             Self::Help => "help",
@@ -428,6 +458,8 @@ impl Mode {
             Self::Viewer => &[Mode::Viewer, Mode::Normal, Mode::Global],
             Self::Visual => &[Mode::Visual, Mode::Normal, Mode::Global],
             Self::Insert => &[Mode::Insert, Mode::Global],
+            Self::Prompt => &[Mode::Prompt, Mode::Global],
+            Self::Menu => &[Mode::Menu, Mode::Global],
             Self::Pick => &[Mode::Pick, Mode::Global],
             Self::Confirm => &[Mode::Confirm, Mode::Global],
             Self::Help => &[Mode::Help, Mode::Global],
@@ -436,21 +468,22 @@ impl Mode {
 
     /// Whether a leading digit starts a count here.
     ///
-    /// False in [`Mode::Insert`], where digits are text: an address with a
-    /// `3` in it must not become a repeat count.
+    /// False in [`Mode::Insert`] and [`Mode::Prompt`], where digits are text:
+    /// an address — or a `from:alice2` search — with a `3` in it must not
+    /// become a repeat count.
     #[must_use]
     pub const fn takes_counts(self) -> bool {
-        !matches!(self, Self::Insert)
+        !matches!(self, Self::Insert | Self::Prompt)
     }
 
     /// Whether a multi-key chord may be bound in this mode.
     ///
-    /// False in [`Mode::Insert`] for the same reason counts are: the first key
-    /// of a chord is *held*, and holding a keystroke back inside a text field
-    /// is indistinguishable from dropping it.
+    /// False in [`Mode::Insert`] and [`Mode::Prompt`] for the same reason
+    /// counts are: the first key of a chord is *held*, and holding a keystroke
+    /// back inside a text field is indistinguishable from dropping it.
     #[must_use]
     pub const fn allows_chords(self) -> bool {
-        !matches!(self, Self::Insert)
+        !matches!(self, Self::Insert | Self::Prompt)
     }
 }
 
@@ -580,6 +613,20 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Normal, "r", Action::Reply),
     (Mode::Normal, "F", Action::Forward),
     (Mode::Normal, "o", Action::OpenHtml),
+    // Task 85's overlays. Every one of them opens from the message list and
+    // is left with Esc, which the global layer owns and no config file can
+    // take away — see `Chord::is_reserved`.
+    (Mode::Normal, "/", Action::SearchOpen),
+    (Mode::Normal, "<c-p>", Action::FinderOpen),
+    (Mode::Normal, "<c-k>", Action::PaletteOpen),
+    (Mode::Normal, "A", Action::AskOpen),
+    (Mode::Normal, ".", Action::AiQuick),
+    (Mode::Normal, "\\", Action::AiPanel),
+    (Mode::Normal, "O", Action::OutboxOpen),
+    // `u` is "undo the send that is still inside its window" — the toast's
+    // key. Bound in Normal as well as Menu because the toast is visible from
+    // the message list, where the outbox pane is not up.
+    (Mode::Normal, "u", Action::OutboxCancel),
     // Viewer inherits all of the above; `o` there is still "open the HTML
     // part", which is the only place it can do anything.
     //
@@ -588,6 +635,29 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Visual, "o", Action::VisualSwapEnds),
     (Mode::Insert, "<enter>", Action::InputSubmit),
     (Mode::Insert, "<bs>", Action::InputBackspace),
+    // Prompt binds only what cannot be typed. Everything else falls through
+    // as text, which is why a search for `q` or a contact called `Jan` is
+    // possible at all.
+    (Mode::Prompt, "<enter>", Action::PromptAccept),
+    (Mode::Prompt, "<bs>", Action::InputBackspace),
+    (Mode::Prompt, "<tab>", Action::PromptComplete),
+    (Mode::Prompt, "<up>", Action::CursorUp),
+    (Mode::Prompt, "<down>", Action::CursorDown),
+    // Menu is a list again, so the list bindings come back — restated rather
+    // than inherited from Normal, because an overlay whose chain reached
+    // Normal would let `d` delete the mail behind it.
+    (Mode::Menu, "j", Action::CursorDown),
+    (Mode::Menu, "<down>", Action::CursorDown),
+    (Mode::Menu, "k", Action::CursorUp),
+    (Mode::Menu, "<up>", Action::CursorUp),
+    (Mode::Menu, "gg", Action::CursorTop),
+    (Mode::Menu, "G", Action::CursorBottom),
+    (Mode::Menu, "<enter>", Action::MenuAccept),
+    (Mode::Menu, "x", Action::SearchExplain),
+    (Mode::Menu, "u", Action::OutboxCancel),
+    // Back to the query line of whichever overlay is up.
+    (Mode::Menu, "/", Action::SearchOpen),
+    (Mode::Menu, "q", Action::Cancel),
     (Mode::Pick, "j", Action::CursorDown),
     (Mode::Pick, "<down>", Action::CursorDown),
     (Mode::Pick, "k", Action::CursorUp),

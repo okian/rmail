@@ -140,19 +140,14 @@ fn defaults_are_all_installable() {
     // is broken. This is what keeps that log line unreachable rather than
     // merely unlikely: every default must survive the trip.
     let keymap = Keymap::defaults();
-    let installed: usize = [
-        Mode::Global,
-        Mode::Normal,
-        Mode::Viewer,
-        Mode::Visual,
-        Mode::Insert,
-        Mode::Pick,
-        Mode::Confirm,
-        Mode::Help,
-    ]
-    .iter()
-    .map(|mode| keymap.layer(*mode).count())
-    .sum();
+    // Derived from `CONFIGURABLE` rather than restated: a hand-written mode
+    // list here silently *under*-counts when a mode is added (task 85 added
+    // two), so this assertion would have kept passing while the new layers
+    // went unchecked.
+    let installed: usize = std::iter::once(&Mode::Global)
+        .chain(Mode::CONFIGURABLE)
+        .map(|mode| keymap.layer(*mode).count())
+        .sum();
     assert_eq!(
         installed,
         DEFAULTS.len(),
@@ -612,4 +607,10 @@ fn modes_name_themselves_the_way_keys_toml_spells_them() {
     assert!(!Mode::Insert.takes_counts());
     assert!(!Mode::Insert.allows_chords());
     assert!(Mode::Normal.takes_counts() && Mode::Normal.allows_chords());
+    // A typing overlay is a text field too: `from:alice2` must not turn its
+    // `2` into a repeat count, and a chord there would hold back the next
+    // character of the query.
+    assert!(!Mode::Prompt.takes_counts());
+    assert!(!Mode::Prompt.allows_chords());
+    assert!(Mode::Menu.takes_counts() && Mode::Menu.allows_chords());
 }

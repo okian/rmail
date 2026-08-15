@@ -514,6 +514,40 @@ fn split_operator(token: &str) -> Option<(&str, &str)> {
     Some((key, value))
 }
 
+/// Every registered operator name, with a value of the shape it accepts.
+///
+/// Exists so a UI can *offer* the grammar instead of restating it: task 85's
+/// search overlay completes `fr` to `from:` from this table, and the example
+/// is what its hint line shows so `larger:` does not read as taking a
+/// filename. Hand-copying the names into the TUI would be a second registry
+/// with nothing to keep it honest — `operator_table_matches_the_parser` walks
+/// this list through [`parse_operator`] and fails the moment the two disagree.
+///
+/// Order is the order a completion menu offers them: the ones people actually
+/// type first.
+pub const OPERATORS: &[(&str, &str)] = &[
+    ("from", "alice@example.com"),
+    ("to", "bob@example.com"),
+    ("cc", "team@example.com"),
+    ("subject", "invoice"),
+    ("body", "renewal"),
+    ("in", "INBOX"),
+    ("tag", "work"),
+    ("is", "unread"),
+    ("has", "attachment"),
+    ("after", "2026-01-01"),
+    ("before", "2026-03-01"),
+    ("on", "2026-02-14"),
+    ("date", "2026-01-01..2026-02-01"),
+    ("larger", "5mb"),
+    ("smaller", "100kb"),
+    ("filename", "report.pdf"),
+    ("note", "follow up"),
+    ("thread", "88"),
+    ("account", "personal"),
+    ("ai", "priority>=high"),
+];
+
 /// Resolve `(key, value)` — `value` already unquoted — into an [`Operator`],
 /// or `None` if `key` is not a registered operator name or `value` doesn't
 /// fit that operator's shape.

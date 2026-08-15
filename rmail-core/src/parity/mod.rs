@@ -412,7 +412,7 @@ commands! {
         tool: "search_mail",
         effect: Read,
         cli: ["search"],
-        actions: [],
+        actions: [SearchOpen],
         summary: "Ranked hybrid search over the local index, streaming hits as they rank.",
     }
     SearchSemantic {
@@ -428,7 +428,7 @@ commands! {
         tool: "explain_ranking",
         effect: Read,
         cli: [],
-        actions: [],
+        actions: [SearchExplain],
         summary: "Re-derive why one hit ranked where it did: feature contributions and matched spans.",
     }
     SearchEvaluate {
@@ -542,7 +542,7 @@ commands! {
         tool: "fuzzy_find",
         effect: Read,
         cli: ["find"],
-        actions: [],
+        actions: [FinderOpen],
         summary: "Fuzzy-match a prompt against messages, folders, contacts, saved searches, tags and commands.",
     }
     FinderBatchAction {
@@ -805,7 +805,7 @@ commands! {
         tool: "cancel_scheduled_send",
         effect: Mutate,
         cli: ["undo", "outbox cancel"],
-        actions: [],
+        actions: [OutboxCancel],
         summary: "Cancel a queued send — inside its undo window, or any time before it is due.",
     }
     SendSchedulerRescheduleSend {
@@ -846,7 +846,7 @@ commands! {
         effect: Read,
         // `outbox show` is the same listing narrowed to one id.
         cli: ["outbox", "outbox show"],
-        actions: [],
+        actions: [OutboxOpen],
         summary: "List queued, sent and failed outbound mail with its state.",
     }
     SendSchedulerWatchOutbox {
@@ -896,7 +896,7 @@ commands! {
         tool: "get_summary",
         effect: Read,
         cli: ["ai summary"],
-        actions: [],
+        actions: [AiPanel],
         summary: "Read a message's cached AI summary. Never calls the model.",
     }
     AiAnalyzeMessage {
@@ -920,7 +920,7 @@ commands! {
         tool: "suggest_reply",
         effect: Mutate,
         cli: ["ai reply"],
-        actions: [],
+        actions: [AiQuick],
         summary: "Return a suggested reply, generating and caching one if none exists yet.",
     }
     AiGetUsage {
@@ -954,7 +954,7 @@ commands! {
         tool: "ask_mailbox",
         effect: Mutate,
         cli: ["ask"],
-        actions: [],
+        actions: [AskOpen],
         summary: "Answer a plain-English question over the mailbox, streaming a cited answer.",
     }
 
@@ -1264,6 +1264,17 @@ pub const LOCAL_CLI: &[(&str, &str)] = &[
 /// `ComposeCreateDraft` — so nothing the TUI can reach is undeclared; a
 /// two-keystroke interaction is declared once, on the keystroke that says
 /// what it is for.
+///
+/// Task 85's overlays follow that second rule exactly. `prompt.accept` and
+/// `menu.accept` are the keystrokes that dispatch a search, a jump, a
+/// question or a cancel, and they are local for the same reason
+/// `confirm.accept` is: what they complete depends on which overlay is up.
+/// The capability sits on the key that opened it — `search` on
+/// `SearchSearch`, `finder` on `FinderFind`, `ask` on `AiAskMailbox`,
+/// `outbox`/`outbox.cancel` on the two scheduler rows, `ai.panel` on
+/// `AiGetSummary`, and `ai.quick` on `AiSuggestReply` because `.` is the only
+/// key in the TUI that can reach a paid reply suggestion. `palette` is local
+/// like `help`: it opens a list of the other actions and performs none.
 pub const LOCAL_ACTIONS: &[Action] = &[
     Action::CursorDown,
     Action::CursorUp,
@@ -1284,4 +1295,8 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     Action::ConfirmAccept,
     Action::InputSubmit,
     Action::InputBackspace,
+    Action::PaletteOpen,
+    Action::PromptAccept,
+    Action::PromptComplete,
+    Action::MenuAccept,
 ];

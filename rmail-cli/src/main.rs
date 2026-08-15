@@ -860,16 +860,33 @@ async fn ask(socket: &Path, args: AskArgs) -> Result<()> {
 ///
 /// `\n` survives; `\t` becomes a space so it cannot be used for alignment
 /// tricks in the citation block.
-fn terminal_safe(text: &str) -> String {
-    rmail_core::ai::injection::sanitize_model_text(text)
-        .chars()
-        .filter_map(|c| match c {
-            '\n' => Some('\n'),
-            '\t' => Some(' '),
-            c if c.is_control() => None,
-            c => Some(c),
-        })
-        .collect()
+///
+/// The TUI's overlays (task 85) draw the same two families of text onto a
+/// screen an attacker would very much like to repaint, and go through this
+/// same function — see `tui::overlays::safe_line`, which only adds the
+/// newline folding a one-line table row needs.
+pub(crate) fn terminal_safe(text: &str) -> String {
+    text.chars().filter_map(terminal_safe_char).collect()
+}
+
+/// [`terminal_safe`] for one character, and the definition the whole-string
+/// form is built from.
+///
+/// `None` means the character is dropped. Exposed per-character because the
+/// TUI's highlighter cannot use the string form: it decides highlighting from
+/// each character's position in the *original* text and only then emits the
+/// safe form, and building a one-character `String` per glyph on every frame
+/// of a streaming search is a lot of allocation for nothing.
+pub(crate) fn terminal_safe_char(ch: char) -> Option<char> {
+    if !rmail_core::ai::injection::is_display_safe(ch) {
+        return None;
+    }
+    match ch {
+        '\n' => Some('\n'),
+        '\t' => Some(' '),
+        c if c.is_control() => None,
+        c => Some(c),
+    }
 }
 
 fn print_citation(citation: &Citation) {

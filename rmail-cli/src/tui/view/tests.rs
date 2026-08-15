@@ -1,6 +1,11 @@
 //! Render smoke tests, against ratatui's `TestBackend` — a real render into
 //! a real buffer, with no terminal involved, which is what lets these run in
 //! the container the gate uses.
+//!
+//! `panic!` in a branch that cannot happen reads better here than the
+//! `unreachable!` dance, and this module is test-only — the same exemption
+//! `tui::model::tests` and `tui::overlays::tests` take.
+#![allow(clippy::panic)]
 
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -350,4 +355,312 @@ fn a_body_far_longer_than_the_pane_scrolls_rather_than_overflowing() {
     let scrolled = screen(&model);
     assert!(scrolled.contains("line 400"), "{scrolled}");
     assert!(!scrolled.contains("line 0 "), "the top scrolled away");
+}
+
+// ---------------------------------------------------------------------------
+// task 85's overlays
+// ---------------------------------------------------------------------------
+
+use crate::tui::model::{AskEvent, Cmd, SearchEvent};
+use crate::tui::overlays::{AiSummary, Citation, Hit, OutboxRow};
+
+/// The generation of the last streaming command in `cmds` — how a test
+/// addresses the query the model is currently running.
+fn generation(cmds: &[Cmd]) -> u64 {
+    for cmd in cmds.iter().rev() {
+        match cmd {
+            Cmd::Search { generation, .. }
+            | Cmd::Find { generation, .. }
+            | Cmd::Ask { generation, .. } => return *generation,
+            _ => {}
+        }
+    }
+    panic!("no streaming command in {cmds:?}");
+}
+
+fn type_in(model: &mut Model, text: &str) -> Vec<Cmd> {
+    let mut cmds = Vec::new();
+    for c in text.chars() {
+        cmds.extend(update(model, Msg::Key(Key::Char(c))));
+    }
+    cmds
+}
+
+/// A search overlay with one hit streamed into it.
+fn with_hit(subject: &str, snippet: &str, highlights: Vec<(usize, usize)>) -> Model {
+    let mut model = loaded();
+    press(&mut model, Key::Char('/'));
+    let generation = generation(&type_in(&mut model, "invoice"));
+    update(
+        &mut model,
+        Msg::Search {
+            generation,
+            event: SearchEvent::Hit(Box::new(Hit {
+                message_id: 10,
+                subject: subject.to_owned(),
+                from: "billing@acme.com".to_owned(),
+                date: Some(1_700_000_000),
+                snippet: snippet.to_owned(),
+                highlights,
+                sources: vec!["lexical".to_owned()],
+            })),
+        },
+    );
+    update(
+        &mut model,
+        Msg::Search {
+            generation,
+            event: SearchEvent::Done(Ok(())),
+        },
+    );
+    model
+}
+
+#[test]
+fn the_search_overlay_renders_the_query_and_the_hits_that_streamed_in() {
+    let model = with_hit("Quarterly invoice", "your invoice for June", vec![(5, 12)]);
+    let screen = screen(&model);
+    assert!(screen.contains("invoice"), "{screen}");
+    assert!(screen.contains("Quarterly invoice"), "{screen}");
+    assert!(screen.contains("your invoice for June"), "{screen}");
+    assert!(
+        screen.contains("billing@acme.com"),
+        "the sender is on the row: {screen}"
+    );
+}
+
+#[test]
+fn a_snippet_highlight_is_styled_without_changing_the_text() {
+    // The highlight must be *style*, never markup spliced into the text —
+    // splicing is what re-introduces the escaping bugs offsets exist to avoid.
+    let model = with_hit("Quarterly invoice", "your invoice for June", vec![(5, 12)]);
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| render(&model, frame)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let mut bold_run = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            if cell.style().fg == Some(Color::Yellow)
+                && cell.style().add_modifier.contains(Modifier::BOLD)
+            {
+                bold_run.push_str(cell.symbol());
+            }
+        }
+    }
+    assert!(
+        bold_run.contains("invoice"),
+        "the matched span is the styled one, got {bold_run:?}"
+    );
+    let screen = screen(&model);
+    assert!(
+        !screen.contains('*') && !screen.contains('['),
+        "no markup was spliced into the snippet: {screen}"
+    );
+}
+
+#[test]
+fn a_hostile_subject_never_reaches_the_rendered_buffer() {
+    // The end-to-end version of the unit test in `tui::overlays`: a subject
+    // carrying an ANSI run and a bidi override, all the way through the
+    // renderer into a real buffer.
+    let model = with_hit(
+        "pay \u{1b}[2Jnow \u{202e}esrever\u{202c}",
+        "body \u{1b}[31mred\u{1b}[0m\u{7}",
+        Vec::new(),
+    );
+    let screen = screen(&model);
+    for bad in ['\u{1b}', '\u{7}', '\u{202e}', '\u{202c}'] {
+        assert!(
+            !screen.contains(bad),
+            "{bad:?} reached the terminal buffer: {screen:?}"
+        );
+    }
+    assert!(screen.contains("pay"), "and the real text survived");
+}
+
+#[test]
+fn the_ask_pane_renders_its_citations_and_says_whose_verdict_grounded_is() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('A'));
+    let generation = generation(&{
+        type_in(&mut model, "who owes me");
+        update(&mut model, Msg::Key(Key::Enter))
+    });
+    for event in [
+        AskEvent::Trace("retrieved 9 · packed 4".to_owned()),
+        AskEvent::Token("Acme owes you [1].".to_owned()),
+        AskEvent::Cite(Box::new(Citation {
+            label: 1,
+            message_id: 501,
+            subject: "invoice 338".to_owned(),
+            from_addr: "billing@acme.com".to_owned(),
+            mailbox: "INBOX".to_owned(),
+            quote: "Total $4,200".to_owned(),
+        })),
+        AskEvent::Done {
+            grounded: false,
+            refusal: "nothing says so".to_owned(),
+        },
+    ] {
+        update(&mut model, Msg::Ask { generation, event });
+    }
+
+    let screen = screen(&model);
+    assert!(screen.contains("retrieved 9"), "{screen}");
+    assert!(screen.contains("Acme owes you [1]."), "{screen}");
+    assert!(screen.contains("invoice 338"), "{screen}");
+    assert!(
+        screen.contains("NOT grounded") && screen.contains("daemon"),
+        "an ungrounded answer is labelled as the daemon's verdict: {screen}"
+    );
+}
+
+#[test]
+fn the_undo_toast_renders_its_countdown_above_the_status_line() {
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Outbox {
+            now: 1_000,
+            result: Ok(vec![OutboxRow {
+                id: 9,
+                to: "bob@example.com".to_owned(),
+                subject: "the one you regret".to_owned(),
+                state: "scheduled".to_owned(),
+                send_at: 1_010,
+                undo_deadline: Some(1_007),
+                last_error: None,
+            }]),
+        },
+    );
+    let rows = draw(&model, 120, 30);
+    let toast = rows
+        .get(rows.len() - 2)
+        .cloned()
+        .unwrap_or_else(|| panic!("no toast row"));
+    assert!(toast.contains("bob@example.com"), "{toast}");
+    assert!(toast.contains("7s"), "the countdown is on it: {toast}");
+    assert!(toast.contains("u undoes"), "{toast}");
+}
+
+#[test]
+fn the_ai_panel_takes_a_column_and_leaves_the_list_visible() {
+    let mut model = loaded();
+    let before = screen(&model);
+    assert!(before.contains("Quarterly invoice"));
+
+    press(&mut model, Key::Char('\\'));
+    update(
+        &mut model,
+        Msg::Summarized {
+            message_id: 10,
+            result: Ok(AiSummary {
+                message_id: 10,
+                status: "ok".to_owned(),
+                tl_dr: Some("an invoice is due".to_owned()),
+                key_points: vec!["due Friday".to_owned()],
+                ..AiSummary::default()
+            }),
+        },
+    );
+    let after = screen(&model);
+    assert!(after.contains("an invoice is due"), "{after}");
+    assert!(after.contains("due Friday"), "{after}");
+    assert!(
+        after.contains("Quarterly invoice"),
+        "the panel is a column, not a cover: {after}"
+    );
+}
+
+#[test]
+fn the_palette_renders_ids_bindings_and_help_together() {
+    let mut model = loaded();
+    press(&mut model, Key::ctrl('k'));
+    type_in(&mut model, "archive");
+    let screen = screen(&model);
+    assert!(screen.contains("message.archive"), "{screen}");
+    assert!(screen.contains("archive"), "{screen}");
+}
+
+#[test]
+fn a_terminal_far_too_small_for_an_overlay_still_renders() {
+    // `centered`/`centered_pct` clamp rather than panic inside ratatui's
+    // layout arithmetic, and every overlay has to survive an 8x4 window.
+    let model = with_hit("Quarterly invoice", "your invoice for June", Vec::new());
+    for (width, height) in [(8, 4), (1, 1), (40, 6)] {
+        let rows = draw(&model, width, height);
+        assert_eq!(rows.len(), usize::from(height));
+    }
+}
+
+#[test]
+fn a_refused_cancel_leaves_the_outbox_listing_on_screen() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('O'));
+    update(
+        &mut model,
+        Msg::Outbox {
+            now: 1_000,
+            result: Ok(vec![OutboxRow {
+                id: 1,
+                to: "bob@example.com".to_owned(),
+                subject: "still queued".to_owned(),
+                state: "scheduled".to_owned(),
+                send_at: 1_010,
+                undo_deadline: None,
+                last_error: None,
+            }]),
+        },
+    );
+    press(&mut model, Key::Char('u'));
+    update(
+        &mut model,
+        Msg::Outbox {
+            now: 1_001,
+            result: Err("already claimed by a worker".to_owned()),
+        },
+    );
+
+    let screen = screen(&model);
+    assert!(
+        screen.contains("still queued"),
+        "a refused cancel must not replace the listing with its error: {screen}"
+    );
+    assert!(screen.contains("already claimed"), "{screen}");
+}
+
+#[test]
+fn hostile_text_reaching_the_status_line_is_neutralized() {
+    // `OutboxEntry.last_error` is a remote SMTP server's verbatim reply, and
+    // `Enter` on an outbox row puts it in the status line — the one surface
+    // every part of the TUI writes to.
+    let mut model = loaded();
+    press(&mut model, Key::Char('O'));
+    update(
+        &mut model,
+        Msg::Outbox {
+            now: 1_000,
+            result: Ok(vec![OutboxRow {
+                id: 1,
+                to: "bob@example.com".to_owned(),
+                subject: "rejected".to_owned(),
+                state: "failed".to_owned(),
+                send_at: 1_010,
+                undo_deadline: None,
+                last_error: Some("550 \u{1b}[2Jdenied \u{202e}esrever\u{202c}".to_owned()),
+            }]),
+        },
+    );
+    press(&mut model, Key::Enter);
+
+    let screen = screen(&model);
+    for bad in ['\u{1b}', '\u{202e}', '\u{202c}'] {
+        assert!(
+            !screen.contains(bad),
+            "{bad:?} reached the status line: {screen:?}"
+        );
+    }
+    assert!(screen.contains("550"), "and the real text survived");
 }

@@ -31,8 +31,13 @@
 mod tests;
 
 use rmail_proto::v1::{
-    Account as ProtoAccount, Attachment, CreateDraftRequest, DraftAddress, FolderStatus,
-    FullMessage, Message as ProtoMessage,
+    Account as ProtoAccount, Attachment, Citation as ProtoCitation, CreateDraftRequest,
+    DraftAddress, FindResult, FolderStatus, FullMessage, ItemKind, Message as ProtoMessage,
+    OutboxEntry, OutboxState, RankExplanation, RetrievalTrace, SearchHit, Summary,
+};
+
+use crate::tui::overlays::{
+    valid_byte_ranges, AiSummary, Citation, Explanation, FinderItem, FinderKind, Hit, OutboxRow,
 };
 
 use super::{Account, DraftKind, Folder, MessageRow, OpenMessage};
@@ -277,4 +282,208 @@ fn attachment_line(attachment: &Attachment) -> String {
 
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.trim().is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// task 85's overlays
+// ---------------------------------------------------------------------------
+
+/// Project a `SearchHit` into what the search overlay draws.
+///
+/// The snippet's text is carried verbatim and its highlights are validated
+/// against *it*, not against a sanitized copy — sanitizing here would move
+/// every byte offset after the first dropped control character. The renderer
+/// applies the offsets and the sanitizer together, one character at a time;
+/// see `overlays::runs_from_byte_ranges`.
+pub fn hit(proto: SearchHit) -> Hit {
+    let message = proto.message.unwrap_or_default();
+    let snippet = proto.snippet.unwrap_or_default();
+    let highlights: Vec<(u32, u32)> = snippet
+        .highlights
+        .iter()
+        .map(|range| (range.start, range.end))
+        .collect();
+    Hit {
+        message_id: message.id,
+        subject: non_empty(message.subject).unwrap_or_else(|| NO_SUBJECT.to_owned()),
+        from: message
+            .from_name
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| message.from_addr.clone())
+            .unwrap_or_else(|| "(unknown sender)".to_owned()),
+        date: message.date.or(message.internaldate),
+        highlights: valid_byte_ranges(&snippet.text, &highlights),
+        snippet: snippet.text,
+        sources: proto.sources,
+    }
+}
+
+/// Project a `RankExplanation` into the why-panel's rows.
+///
+/// The floats are rendered here rather than carried into the model: `Model`
+/// is compared with `assert_eq!` throughout its tests, and an `f64` in it
+/// would cost `Eq` on every enum that reaches it to buy a renderer nothing.
+pub fn explanation(message_id: i64, proto: RankExplanation) -> Explanation {
+    Explanation {
+        message_id,
+        score: format!("{:.3}", proto.score),
+        features: proto
+            .features
+            .into_iter()
+            .map(|feature| {
+                (
+                    feature.name,
+                    format!(
+                        "value={:>8.3} weight={:>6.3} -> {:>8.3}",
+                        feature.value, feature.weight, feature.weighted_contribution
+                    ),
+                )
+            })
+            .collect(),
+        sources: proto.sources,
+        matched: proto
+            .matched
+            .map(|snippet| snippet.text)
+            .filter(|text| !text.trim().is_empty()),
+        claude_reason: proto.claude_reason,
+    }
+}
+
+/// Project a `FindResult` into a finder row.
+///
+/// `positions` are char offsets and stay char offsets. Converting them to
+/// bytes here would be a second place for the two coordinate systems to be
+/// confused, and the renderer wants characters anyway.
+pub fn finder_item(proto: FindResult) -> FinderItem {
+    FinderItem {
+        kind: match proto.kind() {
+            ItemKind::Message => FinderKind::Message,
+            ItemKind::Mailbox => FinderKind::Mailbox,
+            ItemKind::Contact => FinderKind::Contact,
+            ItemKind::SavedSearch => FinderKind::SavedSearch,
+            ItemKind::Tag => FinderKind::Tag,
+            ItemKind::Command => FinderKind::Command,
+            ItemKind::Unspecified => FinderKind::Unknown,
+        },
+        ref_id: proto.ref_id,
+        primary: proto.primary_text,
+        secondary: proto.secondary,
+        positions: proto
+            .positions
+            .into_iter()
+            .filter_map(|at| usize::try_from(at).ok())
+            .collect(),
+        mailbox_id: proto.mailbox_id,
+    }
+}
+
+/// Project a `Citation` into the ask pane's source list.
+pub fn citation(proto: ProtoCitation) -> Citation {
+    Citation {
+        label: proto.label,
+        message_id: proto.message_id,
+        subject: if proto.subject.trim().is_empty() {
+            NO_SUBJECT.to_owned()
+        } else {
+            proto.subject
+        },
+        from_addr: proto.from_addr,
+        mailbox: proto.mailbox,
+        quote: proto.quote,
+    }
+}
+
+/// One line summarising what retrieval found, shown while the answer streams.
+pub fn ask_trace(proto: &RetrievalTrace) -> String {
+    let mut line = format!(
+        "retrieved {} · packed {} · ~{} context tokens",
+        proto.retrieved, proto.packed, proto.context_tokens
+    );
+    // Both counts are things the user would otherwise experience as "the
+    // answer is oddly thin" with no way to find out why.
+    if proto.withheld_by_policy > 0 {
+        line.push_str(&format!(
+            " · {} withheld by policy",
+            proto.withheld_by_policy
+        ));
+    }
+    if proto.dropped_for_budget > 0 {
+        line.push_str(&format!(
+            " · {} dropped for budget",
+            proto.dropped_for_budget
+        ));
+    }
+    if !proto.model.is_empty() {
+        line.push_str(&format!(" · {}", proto.model));
+    }
+    line
+}
+
+/// Project an `OutboxEntry` into the pseudo-folder's row.
+pub fn outbox_row(proto: OutboxEntry) -> OutboxRow {
+    let state = outbox_state(proto.state());
+    OutboxRow {
+        id: proto.id,
+        to: if proto.to.is_empty() {
+            "(no recipient)".to_owned()
+        } else {
+            proto.to.join(", ")
+        },
+        subject: if proto.subject.trim().is_empty() {
+            NO_SUBJECT.to_owned()
+        } else {
+            proto.subject
+        },
+        state,
+        send_at: proto.send_at,
+        undo_deadline: proto.undo_deadline,
+        last_error: proto.last_error.filter(|error| !error.trim().is_empty()),
+    }
+}
+
+/// The state's name, as the pane prints it and as `undo_send` matches on it.
+fn outbox_state(state: OutboxState) -> String {
+    match state {
+        OutboxState::Scheduled => "scheduled",
+        OutboxState::Sending => "sending",
+        OutboxState::Sent => "sent",
+        OutboxState::Failed => "failed",
+        OutboxState::Canceled => "canceled",
+        OutboxState::Uncertain => "uncertain",
+        OutboxState::Unspecified => "unknown",
+    }
+    .to_owned()
+}
+
+/// Project a `Summary` into what the AI panel draws.
+pub fn summary(proto: Summary) -> AiSummary {
+    AiSummary {
+        message_id: proto.message_id,
+        // Named rather than numbered: "no summary yet" and "AI is off for
+        // this folder" look identical to a reader unless something says which.
+        status: match proto.status() {
+            rmail_proto::v1::SummaryStatus::Ok => "ok",
+            rmail_proto::v1::SummaryStatus::Pending => "queued — check back shortly",
+            rmail_proto::v1::SummaryStatus::NotQueued => "not queued",
+            rmail_proto::v1::SummaryStatus::Unspecified => "unknown",
+        }
+        .to_owned(),
+        tl_dr: non_empty(proto.tl_dr),
+        summary: non_empty(proto.summary),
+        key_points: proto.key_points,
+        todos: proto
+            .todos
+            .into_iter()
+            .map(|todo| match (todo.due, todo.owner) {
+                (Some(due), Some(owner)) => format!("{} — {owner}, due {due}", todo.text),
+                (Some(due), None) => format!("{} — due {due}", todo.text),
+                (None, Some(owner)) => format!("{} — {owner}", todo.text),
+                (None, None) => todo.text,
+            })
+            .collect(),
+        tags: proto.suggested_tags,
+        priority: non_empty(proto.priority),
+        needs_reply: proto.needs_reply,
+        suggested_reply: non_empty(proto.suggested_reply),
+    }
 }

@@ -40,24 +40,32 @@ mod tests;
 
 use std::future::Future;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use rmail_proto::v1::account_service_client::AccountServiceClient;
+use rmail_proto::v1::ai_service_client::AiServiceClient;
 use rmail_proto::v1::compose_service_client::ComposeServiceClient;
+use rmail_proto::v1::finder_service_client::FinderServiceClient;
 use rmail_proto::v1::mail_service_client::MailServiceClient;
+use rmail_proto::v1::search_service_client::SearchServiceClient;
+use rmail_proto::v1::send_scheduler_service_client::SendSchedulerServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
-    CopyRequest, DeleteRequest, EventKind, GetMessageRequest, ListAccountsRequest,
-    ListMessagesRequest, MoveRequest, SetFlagsRequest, SyncStatusRequest, WatchEventsRequest,
+    ask_chunk, AskRequest, CancelRequest, CopyRequest, DeleteRequest, EventKind, ExplainRequest,
+    FindRequest, GetMessageRequest, GetSummaryRequest, ListAccountsRequest, ListMessagesRequest,
+    ListOutboxRequest, MoveRequest, SearchRequest, SetFlagsRequest, SuggestReplyRequest,
+    SyncStatusRequest, WatchEventsRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::AbortHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::transport::Channel;
 
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
-use super::model::{wire, Cmd, Effect, Msg};
+use super::model::{wire, AskEvent, Cmd, Effect, FinderEvent, Msg, SearchEvent, Stream};
 
 /// Deadline for a unary RPC. Generous: these are local reads over a Unix
 /// socket, and the ones that reach IMAP (move/copy/delete) are several
@@ -73,12 +81,57 @@ const COALESCE: Duration = Duration::from_millis(300);
 /// with room to scroll, not an attempt to fetch the folder.
 const PAGE_SIZE: i32 = 500;
 
+/// How long a keystroke waits before its search goes out.
+///
+/// The debounce lives here rather than in the model because the model is pure
+/// and has no clock — `update` cannot sleep, and making it able to would make
+/// blocking the UI expressible. Typing at speed therefore costs one round
+/// trip, not one per character, and the character that stopped the typing is
+/// the one that gets searched for.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+
+/// The finder's own. Shorter: its index is resident in memory and its whole
+/// design point is per-keystroke latency, so waiting on it buys much less.
+const FIND_DEBOUNCE: Duration = Duration::from_millis(40);
+
+/// How many results the overlays ask for. A screenful with room to scroll —
+/// the daemon caps both of these server-side anyway.
+const OVERLAY_LIMIT: u32 = 50;
+
+/// How many outbox entries one listing asks for.
+const OUTBOX_PAGE: i32 = 200;
+
+/// How often the undo countdown ticks.
+const TICK: Duration = Duration::from_secs(1);
+
 /// Runs the TUI's commands against a live `rmaild`.
 pub struct GrpcExec {
     mail: MailServiceClient<Channel>,
     sync: SyncServiceClient<Channel>,
     accounts: AccountServiceClient<Channel>,
     compose: ComposeServiceClient<Channel>,
+    search: SearchServiceClient<Channel>,
+    finder: FinderServiceClient<Channel>,
+    ai: AiServiceClient<Channel>,
+    scheduler: SendSchedulerServiceClient<Channel>,
+    /// The task feeding the search overlay, so the next keystroke can abort
+    /// it. One slot per stream kind: a search and a find can be outstanding
+    /// at once (they are different overlays), but two searches cannot.
+    ///
+    /// Aborting is the client half of cancellation; the server half is
+    /// supersession, which both services already do on their own. Neither is
+    /// sufficient alone — the daemon cannot know the client stopped caring
+    /// until the next request arrives, and the client cannot stop work the
+    /// daemon has already started.
+    searching: Mutex<Option<AbortHandle>>,
+    finding: Mutex<Option<AbortHandle>>,
+    asking: Mutex<Option<AbortHandle>>,
+    /// The why-panel's `Explain`. A slot even though the RPC is unary:
+    /// holding `j` down the results issues one per row, each re-running the
+    /// whole retrieval pipeline server-side, and only the last one can ever
+    /// be drawn.
+    explaining: Mutex<Option<AbortHandle>>,
+    ticking: Mutex<Option<AbortHandle>>,
     opener: CommandOpener,
     cancel: CancellationToken,
     /// Cancels `cancel` when this struct is dropped.
@@ -105,7 +158,7 @@ impl GrpcExec {
         Ok(Self::with_channel(channel))
     }
 
-    /// Build the four clients over an already-established channel.
+    /// Build every client over an already-established channel.
     #[must_use]
     pub fn with_channel(channel: Channel) -> Self {
         let cancel = CancellationToken::new();
@@ -113,7 +166,16 @@ impl GrpcExec {
             mail: MailServiceClient::new(channel.clone()),
             sync: SyncServiceClient::new(channel.clone()),
             accounts: AccountServiceClient::new(channel.clone()),
-            compose: ComposeServiceClient::new(channel),
+            compose: ComposeServiceClient::new(channel.clone()),
+            search: SearchServiceClient::new(channel.clone()),
+            finder: FinderServiceClient::new(channel.clone()),
+            ai: AiServiceClient::new(channel.clone()),
+            scheduler: SendSchedulerServiceClient::new(channel),
+            searching: Mutex::new(None),
+            finding: Mutex::new(None),
+            asking: Mutex::new(None),
+            explaining: Mutex::new(None),
+            ticking: Mutex::new(None),
             opener: CommandOpener::platform(),
             _guard: cancel.clone().drop_guard(),
             cancel,
@@ -138,6 +200,42 @@ impl GrpcExec {
                 msg = work => { let _ = out.send(msg); }
             }
         });
+    }
+
+    /// Spawn `work`, aborting whatever was previously in `slot`.
+    ///
+    /// This is what "keystroke cancellation" is on the client side: the task
+    /// holding the old stream is dropped, which drops the `tonic` stream,
+    /// which closes it. A stream `work` sends into after being aborted cannot
+    /// exist — the abort happens between polls — so the model never has to
+    /// reason about a half-delivered generation, only about a *stale* one.
+    fn spawn_superseding<F>(&self, slot: &Mutex<Option<AbortHandle>>, work: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let cancel = self.cancel.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {}
+                () = work => {}
+            }
+        });
+        match slot.lock() {
+            Ok(mut slot) => {
+                if let Some(previous) = slot.replace(handle.abort_handle()) {
+                    previous.abort();
+                }
+            }
+            // Only reachable if a previous holder panicked while holding it,
+            // which nothing here does. The new task still runs; the old one
+            // ends when its own stream does. Degraded, never wedged.
+            Err(poisoned) => tracing::warn!(
+                error = %poisoned,
+                "a superseding slot was poisoned; the previous stream was not aborted",
+            ),
+        }
+        tracing::trace!("started a superseding stream");
     }
 }
 
@@ -309,8 +407,362 @@ impl CmdExec for GrpcExec {
                     }
                 });
             }
+            Cmd::Search {
+                query,
+                generation,
+                account_id,
+            } => {
+                let mut client = self.search.clone();
+                self.spawn_superseding(&self.searching, async move {
+                    tokio::time::sleep(SEARCH_DEBOUNCE).await;
+                    stream_search(&mut client, query, generation, account_id, &out).await;
+                });
+            }
+            Cmd::Find {
+                query,
+                generation,
+                account_id,
+            } => {
+                let mut client = self.finder.clone();
+                self.spawn_superseding(&self.finding, async move {
+                    tokio::time::sleep(FIND_DEBOUNCE).await;
+                    stream_find(&mut client, query, generation, account_id, &out).await;
+                });
+            }
+            Cmd::Explain {
+                query,
+                message_id,
+                account_id,
+            } => {
+                let mut client = self.search.clone();
+                self.spawn_superseding(&self.explaining, async move {
+                    let result = call(client.explain(ExplainRequest {
+                        query,
+                        message_id,
+                        account_id,
+                        // The same question the hits were ranked under.
+                        // `Search` collapses threads; explaining without it
+                        // would re-derive a score for a page that was never
+                        // the one on screen, and widens the window for the
+                        // NOT_FOUND that a hit which no longer reproduces
+                        // returns.
+                        thread_collapse: true,
+                        ..ExplainRequest::default()
+                    }))
+                    .await
+                    .map(|response| wire::explanation(message_id, response.into_inner()));
+                    let _ = out.send(Msg::Explained { message_id, result });
+                });
+            }
+            Cmd::Ask {
+                question,
+                generation,
+                account_id,
+            } => {
+                let mut client = self.ai.clone();
+                self.spawn_superseding(&self.asking, async move {
+                    stream_ask(&mut client, question, generation, account_id, &out).await;
+                });
+            }
+            Cmd::LoadSummary {
+                message_id,
+                suggest_reply,
+            } => {
+                let mut client = self.ai.clone();
+                self.spawn(out, async move {
+                    let result = if suggest_reply {
+                        call(client.suggest_reply(SuggestReplyRequest { message_id })).await
+                    } else {
+                        call(client.get_summary(GetSummaryRequest { message_id })).await
+                    }
+                    .map(|response| wire::summary(response.into_inner()));
+                    Msg::Summarized { message_id, result }
+                });
+            }
+            Cmd::LoadOutbox { account_id } => {
+                let mut client = self.scheduler.clone();
+                self.spawn(out, async move {
+                    let result = list_outbox(&mut client, account_id).await;
+                    Msg::Outbox {
+                        now: now_unix(),
+                        result,
+                    }
+                });
+            }
+            Cmd::CancelSend { outbox_id } => {
+                let mut client = self.scheduler.clone();
+                self.spawn(out, async move {
+                    // Cancel, then re-list: the fresh listing *is* the
+                    // confirmation, and it is what takes the cancelled entry
+                    // out of the pane and its toast off the screen. One
+                    // command, one message, one `inflight` decrement.
+                    let result = async {
+                        let entry = call(client.cancel_scheduled(CancelRequest {
+                            id: Some(outbox_id),
+                            account_id: None,
+                        }))
+                        .await?
+                        .into_inner();
+                        list_outbox(&mut client, entry.account_id).await
+                    }
+                    .await;
+                    Msg::Outbox {
+                        now: now_unix(),
+                        result,
+                    }
+                });
+            }
+            Cmd::CancelStream { which } => {
+                let slot = match which {
+                    Stream::Search => &self.searching,
+                    Stream::Find => &self.finding,
+                    Stream::Ask => &self.asking,
+                    Stream::Explain => &self.explaining,
+                };
+                abort(slot);
+            }
+            Cmd::Countdown { until } => {
+                self.spawn_superseding(&self.ticking, async move {
+                    loop {
+                        let now = now_unix();
+                        // Sent before the deadline check so the frame that
+                        // retires the toast is delivered rather than skipped.
+                        if out.send(Msg::Tick(now)).is_err() || now >= until {
+                            return;
+                        }
+                        tokio::time::sleep(TICK).await;
+                    }
+                });
+            }
         }
     }
+}
+
+/// Stop whatever is in `slot`.
+///
+/// A poisoned lock leaves the task running rather than propagating: the
+/// session stays usable, and the stream ends on its own when the daemon
+/// finishes it.
+fn abort(slot: &Mutex<Option<AbortHandle>>) {
+    match slot.lock() {
+        Ok(mut slot) => {
+            if let Some(handle) = slot.take() {
+                handle.abort();
+            }
+        }
+        Err(poisoned) => tracing::warn!(
+            error = %poisoned,
+            "a superseding slot was poisoned; a stream was left running",
+        ),
+    }
+}
+
+/// The wall clock, as the undo countdown reads it.
+///
+/// Unix seconds, matching `outbox.undo_deadline`'s own units, and read here
+/// rather than in the model because the model is pure by type.
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Drive one `SearchService.Search` stream into the model.
+///
+/// Hits are forwarded one at a time, as they arrive: the whole point of that
+/// RPC is that the first hit is flushed before the rest of the page is
+/// computed, and collecting into a `Vec` would throw away exactly the latency
+/// it exists to deliver.
+async fn stream_search(
+    client: &mut SearchServiceClient<Channel>,
+    query: String,
+    generation: u64,
+    account_id: i64,
+    out: &UnboundedSender<Msg>,
+) {
+    tracing::debug!(generation, account_id, "search stream opening");
+    let request = SearchRequest {
+        query,
+        account_id,
+        limit: OVERLAY_LIMIT,
+        // One row per conversation, which is what a list of results should
+        // be; the why-panel asks for the explanation separately, so `explain`
+        // stays off and nobody pays for a breakdown they did not open.
+        thread_collapse: true,
+        ..SearchRequest::default()
+    };
+    let mut stream = match client.search(request).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            let _ = out.send(Msg::Search {
+                generation,
+                event: SearchEvent::Done(Err(status.message().to_owned())),
+            });
+            return;
+        }
+    };
+    loop {
+        let event = match stream.next().await {
+            Some(Ok(hit)) => SearchEvent::Hit(Box::new(wire::hit(hit))),
+            Some(Err(status)) => SearchEvent::Done(Err(status.message().to_owned())),
+            None => SearchEvent::Done(Ok(())),
+        };
+        let done = matches!(event, SearchEvent::Done(_));
+        if out.send(Msg::Search { generation, event }).is_err() || done {
+            return;
+        }
+    }
+}
+
+/// Drive one `FinderService.Find` stream into the model.
+///
+/// Each batch is a complete snapshot of the current top-K, so it is forwarded
+/// whole and the model replaces what it was showing. A superseded stream ends
+/// with `complete` set and `superseded` flagged rather than with a
+/// `CANCELLED` status, which is why nothing here treats the end of a stream
+/// as an error.
+async fn stream_find(
+    client: &mut FinderServiceClient<Channel>,
+    query: String,
+    generation: u64,
+    account_id: i64,
+    out: &UnboundedSender<Msg>,
+) {
+    tracing::debug!(generation, account_id, "find stream opening");
+    let request = FindRequest {
+        query,
+        account_id,
+        limit: OVERLAY_LIMIT,
+        // The overlay highlights what matched, which is the one thing that
+        // makes a fuzzy result legible.
+        with_positions: true,
+        ..FindRequest::default()
+    };
+    let mut stream = match client.find(request).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            let _ = out.send(Msg::Finder {
+                generation,
+                event: FinderEvent::Failed(status.message().to_owned()),
+            });
+            return;
+        }
+    };
+    while let Some(next) = stream.next().await {
+        let event = match next {
+            Ok(batch) => FinderEvent::Batch {
+                items: batch.results.into_iter().map(wire::finder_item).collect(),
+                complete: batch.complete,
+                superseded: batch.superseded,
+                scanned: batch.scanned,
+            },
+            Err(status) => FinderEvent::Failed(status.message().to_owned()),
+        };
+        let failed = matches!(event, FinderEvent::Failed(_));
+        if out.send(Msg::Finder { generation, event }).is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// Drive one `AiService.AskMailbox` stream into the model.
+///
+/// The frame order is the proto's and is not re-derived here: trace, then
+/// tokens, then citations, then usage, then done. A stream that ends without
+/// a `done` frame ended abnormally — that RPC terminates with `CANCELLED`
+/// rather than a clean `OK` precisely so a partial answer cannot read as a
+/// whole one — so this reports that rather than letting the pane sit on
+/// "streaming" forever.
+async fn stream_ask(
+    client: &mut AiServiceClient<Channel>,
+    question: String,
+    generation: u64,
+    account_id: i64,
+    out: &UnboundedSender<Msg>,
+) {
+    tracing::debug!(generation, account_id, "ask stream opening");
+    let request = AskRequest {
+        question,
+        account_id,
+        ..AskRequest::default()
+    };
+    // A deadline on *opening* the stream, unlike `WatchEvents`: a quiet event
+    // stream is working correctly, whereas an ask that never starts leaves
+    // the pane on "answering…" with nothing to say why. The stream itself is
+    // deliberately unbounded once open — a long answer is a long answer.
+    let opened = tokio::time::timeout(RPC_TIMEOUT, client.ask_mailbox(request)).await;
+    let mut stream = match opened {
+        Ok(Ok(response)) => response.into_inner(),
+        Ok(Err(status)) => {
+            let _ = out.send(Msg::Ask {
+                generation,
+                event: AskEvent::Failed(status.message().to_owned()),
+            });
+            return;
+        }
+        Err(_) => {
+            let _ = out.send(Msg::Ask {
+                generation,
+                event: AskEvent::Failed(format!(
+                    "the daemon did not start answering within {}s",
+                    RPC_TIMEOUT.as_secs()
+                )),
+            });
+            return;
+        }
+    };
+    let mut finished = false;
+    while let Some(next) = stream.next().await {
+        let event = match next {
+            Ok(chunk) => match chunk.body {
+                Some(ask_chunk::Body::Trace(trace)) => AskEvent::Trace(wire::ask_trace(&trace)),
+                Some(ask_chunk::Body::Token(token)) => AskEvent::Token(token),
+                Some(ask_chunk::Body::Citation(citation)) => {
+                    AskEvent::Cite(Box::new(wire::citation(citation)))
+                }
+                Some(ask_chunk::Body::Done(done)) => {
+                    finished = true;
+                    AskEvent::Done {
+                        grounded: done.grounded,
+                        refusal: done.refusal,
+                    }
+                }
+                // Live token accounting; the durable, billed copy is the
+                // audit ledger's, not this echo's.
+                Some(ask_chunk::Body::Usage(_)) | None => continue,
+            },
+            Err(status) => {
+                finished = true;
+                AskEvent::Failed(status.message().to_owned())
+            }
+        };
+        if out.send(Msg::Ask { generation, event }).is_err() {
+            return;
+        }
+        if finished {
+            return;
+        }
+    }
+    let _ = out.send(Msg::Ask {
+        generation,
+        event: AskEvent::Failed("the daemon ended the answer early".to_owned()),
+    });
+}
+
+async fn list_outbox(
+    client: &mut SendSchedulerServiceClient<Channel>,
+    account_id: i64,
+) -> Result<Vec<super::overlays::OutboxRow>, String> {
+    let response = call(client.list_outbox(ListOutboxRequest {
+        account_id: Some(account_id),
+        page_size: OUTBOX_PAGE,
+        ..ListOutboxRequest::default()
+    }))
+    .await?;
+    Ok(response
+        .into_inner()
+        .entries
+        .into_iter()
+        .map(wire::outbox_row)
+        .collect())
 }
 
 impl GrpcExec {

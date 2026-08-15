@@ -95,9 +95,11 @@ fn boot_loads_accounts_then_folders_then_messages() {
         cmds,
         vec![
             Cmd::LoadFolders { account_id: 7 },
-            Cmd::Watch { account_id: 7 }
+            Cmd::Watch { account_id: 7 },
+            Cmd::LoadOutbox { account_id: 7 },
         ],
-        "the event stream starts as soon as there is an account to watch"
+        "the event stream starts as soon as there is an account to watch, and the \
+         outbox is listed once so a live undo window is visible without asking"
     );
 
     let cmds = update(&mut model, Msg::Folders(Ok(folders())));
@@ -116,6 +118,16 @@ fn boot_loads_accounts_then_folders_then_messages() {
     );
     assert!(cmds.is_empty());
     assert_eq!(model.messages.len(), 2);
+
+    // The outbox listing startup asked for, so the counter can be checked
+    // against every request that actually went out.
+    update(
+        &mut model,
+        Msg::Outbox {
+            now: 1_000,
+            result: Ok(Vec::new()),
+        },
+    );
     assert_eq!(model.inflight, 0, "every request has been accounted for");
 }
 
@@ -186,7 +198,8 @@ fn account_flag_selects_that_account_rather_than_the_first() {
         cmds,
         vec![
             Cmd::LoadFolders { account_id: 9 },
-            Cmd::Watch { account_id: 9 }
+            Cmd::Watch { account_id: 9 },
+            Cmd::LoadOutbox { account_id: 9 },
         ]
     );
 }

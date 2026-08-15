@@ -33,6 +33,34 @@ fn degraded(text: &str) -> Term {
     }
 }
 
+/// [`OPERATORS`] is what a UI completes from; the `match` in
+/// [`parse_operator`] is what actually parses. Two lists in one file drift,
+/// so this walks every advertised name — with the example value it
+/// advertises — through the real parser.
+#[test]
+fn operator_table_matches_the_parser() {
+    for (name, example) in OPERATORS {
+        assert!(
+            parse_operator(name, example).is_some(),
+            "OPERATORS advertises {name}:{example}, which the parser rejects",
+        );
+    }
+    assert!(
+        parse_operator("nosuchoperator", "x").is_none(),
+        "the check would pass vacuously if unknown keys parsed",
+    );
+    // The other direction, which the loop above cannot see: a new arm in
+    // `parse_operator` that never reaches OPERATORS is an operator the search
+    // box will not offer. There is no way to enumerate a `match`, so this is
+    // a deliberate speed bump — bump the count *and* add the row.
+    assert_eq!(
+        OPERATORS.len(),
+        20,
+        "an operator was added to or removed from the grammar; keep OPERATORS level with \
+         `parse_operator`'s match arms so the search box still offers all of them",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Address / text operators
 // ---------------------------------------------------------------------------
