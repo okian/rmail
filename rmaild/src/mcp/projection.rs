@@ -49,7 +49,7 @@
 //!
 //! # Scope gating is advisory here and enforced there
 //!
-//! [`ToolSurface::visible_to`] and [`ToolSurface::authorize`] filter the
+//! [`ToolSurface::authorize`] and [`super::tools::Visibility`] filter the
 //! surface a caller sees and refuse a call the caller's scopes do not cover.
 //! Both are a *client-side* courtesy: the request still travels through
 //! [`crate::AuthLayer`], which fails closed against the same table. If the
@@ -57,16 +57,24 @@
 //! the reason this module never becomes the only thing standing between an
 //! agent and a mutation.
 //!
-//! # The seam for task 54
+//! # The seam task 54 was built on
 //!
-//! Task 54 ("MCP tool surface & scope-filtered listing") needs to filter the
+//! Task 54 ("MCP tool surface & scope-filtered listing") needed to filter the
 //! projected surface by a caller's granted scopes without re-deriving
-//! anything. That is [`ToolSurface::visible_to`], which takes `&[Scope]` and
-//! borrows out of a surface built once. [`Tool::requirement`] exposes the
+//! anything. [`Tool::granted_by`] is the per-tool predicate that does it,
+//! borrowing out of a surface built once; [`Tool::requirement`] exposes the
 //! underlying [`Requirement`] for a caller that needs to explain *why* a tool
 //! is absent, and [`Tool::command`] hands back the parity row so the PRD's
 //! named tool set can be checked against the registry rather than against a
 //! second list.
+//!
+//! Scope turned out not to be the only question — see
+//! [`super::tools::Visibility`], which pairs it with whether a given
+//! connection offers state-changing tools at all. **That type owns both the
+//! listing and the gate**, and this module deliberately no longer offers a
+//! scope-only listing for anything to build one out of by accident: a listing
+//! and a gate computed from different predicates is exactly how a surface
+//! comes to advertise what it will refuse.
 
 use rmail_core::auth::Scope;
 use rmail_core::parity::{Command, Effect};
@@ -290,15 +298,6 @@ impl ToolSurface {
         self.tools.iter().find(|tool| tool.name() == name)
     }
 
-    /// The tools a caller holding `granted` may actually call.
-    ///
-    /// The seam task 54 lists from: it filters an already-built surface and
-    /// re-derives nothing, so a per-connection tool list costs a scope check
-    /// per tool rather than a descriptor walk.
-    pub fn visible_to<'a>(&'a self, granted: &'a [Scope]) -> impl Iterator<Item = &'a Tool> + 'a {
-        self.tools.iter().filter(|tool| tool.granted_by(granted))
-    }
-
     /// Resolve a tool by name and check `granted` against it.
     ///
     /// # Errors
@@ -308,7 +307,14 @@ impl ToolSurface {
     /// it. The two are deliberately different: a client that mistyped a name
     /// and a client that is under-scoped need different fixes, and collapsing
     /// them into "unknown tool" would hide a mutation the caller was refused.
-    pub fn authorize(&self, name: &str, granted: &[Scope]) -> Result<&Tool, McpError> {
+    ///
+    /// `pub(crate)` rather than `pub`: this answers the **scope** question
+    /// only, and a connection's gate must also apply
+    /// [`super::tools::Visibility`]'s effect policy. Leaving it reachable
+    /// outside the crate — [`ToolSurface`] is handed out by
+    /// `McpServer::surface` — would make "go through `Visibility`" advice
+    /// rather than a property.
+    pub(crate) fn authorize(&self, name: &str, granted: &[Scope]) -> Result<&Tool, McpError> {
         let tool = self
             .get(name)
             .ok_or_else(|| McpError::UnknownTool(name.to_owned()))?;
@@ -323,5 +329,8 @@ impl ToolSurface {
     }
 }
 
+/// `pub(crate)` only so `super::tools`' tests can assert against this module's
+/// `MUTATIONS_A_READ_TOKEN_REACHES` rather than restating it. Test-only either
+/// way — `#[cfg(test)]` keeps it out of every real build.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

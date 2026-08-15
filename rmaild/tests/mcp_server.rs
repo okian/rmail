@@ -121,7 +121,11 @@ impl TestServer {
         let channel = rmail_core::connect_uds(&self.socket).await.unwrap();
         McpServer::new(
             channel,
-            Principal { scopes, bearer },
+            Principal {
+                scopes,
+                bearer,
+                ..Principal::default()
+            },
             limits,
             CancellationToken::new(),
         )
@@ -470,6 +474,7 @@ async fn a_cancelled_server_stops_answering_calls() {
         Principal {
             scopes: vec![Scope::Admin],
             bearer: None,
+            ..Principal::default()
         },
         CallLimits {
             max_frames: 4,

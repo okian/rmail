@@ -9,12 +9,25 @@
 //! file.
 
 use super::*;
+use crate::mcp::tools::Visibility;
 use rmail_core::parity::Command;
 
 /// The scope set `prd.md` describes handing an agent: "read and summarize
 /// freely but cannot send".
 fn read_only() -> Vec<Scope> {
     vec![Scope::MailRead]
+}
+
+/// The listing a connection holding `granted` gets, with no effect policy on
+/// top — which is the scope-only filter these tests are about.
+///
+/// Task 54 folded the scope-only listing into [`Visibility`] so that a listing
+/// and a gate cannot be computed from different predicates, which is why this
+/// goes through [`Visibility::scoped`] rather than a method on
+/// [`ToolSurface`]. [`Mutations::AsScoped`] is the default, so this is the
+/// same set as before, obtained through the path production actually uses.
+fn scoped(granted: Vec<Scope>) -> Visibility {
+    Visibility::scoped(granted)
 }
 
 #[test]
@@ -124,7 +137,11 @@ fn read_only_hint_is_exactly_effect_read() {
 /// by name, and a human then decides whether the scope row is too weak or the
 /// effect too strong — instead of an agent quietly gaining a mutation that a
 /// read-only token was supposed not to have.
-const MUTATIONS_A_READ_TOKEN_REACHES: &[&str] = &["log_search_feedback"];
+/// `pub(crate)` so `mcp::tools`' own tests can assert against the *same* set
+/// rather than restating it: task 54's default listing must contain exactly
+/// these, and its `--read-only` listing exactly none of them. A second copy of
+/// this list is how the two would drift.
+pub(crate) const MUTATIONS_A_READ_TOKEN_REACHES: &[&str] = &["log_search_feedback"];
 
 /// The acceptance's "mutating tools gated by capability-token scope".
 ///
@@ -162,8 +179,9 @@ fn no_undeclared_mutating_tool_is_reachable_with_a_read_only_token() {
 #[test]
 fn the_mutations_a_read_token_reaches_are_exactly_the_declared_ones() {
     let surface = ToolSurface::build().expect("surface");
-    let mut reachable: Vec<&str> = surface
-        .visible_to(&read_only())
+    let visibility = scoped(read_only());
+    let mut reachable: Vec<&str> = visibility
+        .list(&surface)
         .filter(|tool| tool.effect() == Effect::Mutate)
         .map(Tool::name)
         .collect();
@@ -179,7 +197,8 @@ fn the_mutations_a_read_token_reaches_are_exactly_the_declared_ones() {
 fn a_read_only_token_sees_only_tools_it_can_call() {
     let surface = ToolSurface::build().expect("surface");
     let granted = read_only();
-    let visible: Vec<&Tool> = surface.visible_to(&granted).collect();
+    let visibility = scoped(granted.clone());
+    let visible: Vec<&Tool> = visibility.list(&surface).collect();
 
     assert!(!visible.is_empty(), "a read token must see something");
     for tool in &visible {
@@ -207,7 +226,8 @@ fn a_read_only_token_sees_only_tools_it_can_call() {
 #[test]
 fn a_mutating_tool_is_never_advertised_as_read_only() {
     let surface = ToolSurface::build().expect("surface");
-    for tool in surface.visible_to(&read_only()) {
+    let visibility = scoped(read_only());
+    for tool in visibility.list(&surface) {
         if tool.effect() == Effect::Mutate {
             assert_eq!(
                 tool.to_json()["annotations"]["readOnlyHint"],
@@ -222,7 +242,8 @@ fn a_mutating_tool_is_never_advertised_as_read_only() {
 #[test]
 fn an_admin_token_sees_every_tool() {
     let surface = ToolSurface::build().expect("surface");
-    let visible = surface.visible_to(&[Scope::Admin]).count();
+    let visibility = scoped(vec![Scope::Admin]);
+    let visible = visibility.list(&surface).count();
     assert_eq!(
         visible,
         surface.tools().len(),

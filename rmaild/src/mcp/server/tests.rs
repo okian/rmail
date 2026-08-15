@@ -23,6 +23,7 @@ fn server(scopes: Vec<Scope>) -> McpServer {
         Principal {
             scopes,
             bearer: None,
+            ..Principal::default()
         },
         CallLimits {
             max_frames: 8,

@@ -535,7 +535,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmaild mcp::projection` (annotation→tool generation, scope gating, mutating-tool denial under read token)
 
 ## 54. MCP tool surface & scope-filtered listing
-- [ ] status
+- [x] status
 - **depends-on:** 53, 50, 52
 - **parallel-safe:** no
 - **acceptance:**

@@ -18,6 +18,7 @@
 //! | [`descriptor`] | the compiled `FileDescriptorSet`, indexed by name |
 //! | [`schema`] | a request message -> the tool's `inputSchema` (the "arg mapping") |
 //! | [`projection`] | the join, the tool list, and scope gating |
+//! | [`tools`] | which of those tools *this* connection lists and will send |
 //! | [`codec`] | JSON <-> protobuf wire, dynamically, from the descriptor |
 //! | [`invoke`] | one tool call -> one gRPC request on the daemon's channel |
 //! | [`server`] | MCP/JSON-RPC semantics: `initialize`, `tools/list`, `tools/call` |
@@ -46,11 +47,13 @@ mod invoke;
 pub mod projection;
 mod schema;
 mod server;
+pub mod tools;
 mod transport;
 
 pub use invoke::{CallLimits, CallOutcome, Truncation};
 pub use projection::{Tool, ToolSurface};
 pub use server::{McpServer, Principal};
+pub use tools::{Mutations, Visibility};
 pub use transport::{serve_sse, serve_stdio};
 
 /// Everything the MCP adapter can fail at.
@@ -84,6 +87,34 @@ pub enum McpError {
         tool: String,
         /// What the caller would need, in the words `mail token create` takes.
         requires: String,
+    },
+
+    /// The tool exists, but this MCP server is serving a read-only surface and
+    /// will not send anything that changes state.
+    ///
+    /// Distinct from [`McpError::Denied`] because the fix is different and
+    /// naming the wrong one wastes a turn: a denial is answered by minting a
+    /// wider token, this is answered by restarting the server without
+    /// `--read-only`. See [`tools::Mutations::Withheld`], and this module's
+    /// note on where enforcement lives — a withheld tool is refused here and
+    /// would still be accepted by the daemon, which is exactly why the listing
+    /// omits it rather than the surface pretending it does not exist.
+    #[error(
+        "{tool} changes state and this MCP server is serving a read-only surface, so it is \
+         neither listed nor sent.{scope_shortfall}"
+    )]
+    Withheld {
+        /// The tool that was withheld.
+        tool: String,
+        /// Empty when lifting the read-only surface would be enough.
+        ///
+        /// A caller can fail *both* halves of the policy — a `mail.read`
+        /// connection asking a read-only server for `delete_message` fails the
+        /// effect rule and the scope rule. Naming only one sends an operator
+        /// through two fixes one at a time, so when both bind this carries the
+        /// second, pre-composed as a sentence (`thiserror`'s `#[error]` has no
+        /// conditional form).
+        scope_shortfall: String,
     },
 
     /// The `arguments` object does not fit the RPC's request message.
@@ -159,10 +190,13 @@ impl McpError {
             McpError::Protocol(_) => -32600,
             McpError::UnknownTool(_) => -32601,
             McpError::InvalidArguments(_) => -32602,
-            // Application-defined range (-32000..=-32099). A denial is not a
+            // Application-defined range (-32000..=-32099). A refusal is not a
             // malformed request and not a server fault; a client that retried
-            // it identically would be refused identically.
-            McpError::Denied { .. } => -32003,
+            // it identically would be refused identically. The two refusals
+            // share a code because a client acts on them the same way — it
+            // stops — while the *message* carries the difference, which is
+            // what the model needs in order to say why.
+            McpError::Denied { .. } | McpError::Withheld { .. } => -32003,
             McpError::Cancelled => -32001,
             McpError::Timeout { .. } => -32002,
             McpError::Unavailable(_) => -32004,

@@ -451,8 +451,37 @@ async fn positions_are_omitted_unless_asked_for() {
             ..messages("acme")
         })
         .await;
-    let last = batches.last().unwrap();
-    assert_eq!(last.results.len(), 1);
+    // Diagnostics on the assertion rather than a bare count: this test failed
+    // exactly once under full-suite scheduling pressure with `left: 0`, and
+    // did not reproduce in four subsequent runs (three isolated, one binary,
+    // one full). `left: 0 right: 1` is not enough to tell a superseded stream
+    // from an empty scan from a batch-ordering surprise, so the next
+    // occurrence should say which. See the batch protocol in `finder.proto`:
+    // exactly one batch carries `complete`, and it is always the last.
+    let summary = || {
+        batches
+            .iter()
+            .map(|b| {
+                format!(
+                    "{{results:{}, complete:{}, scanned:{}, superseded:{}}}",
+                    b.results.len(),
+                    b.complete,
+                    b.scanned,
+                    b.superseded
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let last = batches
+        .last()
+        .unwrap_or_else(|| panic!("the Find stream produced no batches at all"));
+    assert_eq!(
+        last.results.len(),
+        1,
+        "the terminal batch carried no result. batches: [{}]",
+        summary()
+    );
     assert!(last.results[0].positions.is_empty());
 
     server.stop().await;

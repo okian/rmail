@@ -42,13 +42,27 @@
 //! makes this process — not the daemon — the component whose compromise would
 //! matter. `rmaild/tests/mcp_server.rs` pins the behaviour so it cannot change
 //! silently, and points at where to update these words if it ever does.
+//!
+//! # `--read-only` says something `--scope mail.read` does not
+//!
+//! Scope answers "what may this caller do"; effect answers "does calling it
+//! change anything". They are decided in different tables and one row makes
+//! them differ — `log_search_feedback` mutates at `mail.read`, on the argument
+//! that a read-only agent is exactly the one that should be able to improve
+//! its own future searches. `--scope mail.read` therefore lists it, honestly,
+//! because the daemon would run it. `--read-only` is the stricter statement,
+//! and it withholds that tool as well; because this process then also *refuses*
+//! it, the shorter listing is still an accurate description of the surface
+//! rather than an under-report. `rmaild::mcp::tools` carries the full argument,
+//! including what the flag deliberately does not promise (search still writes
+//! to the local learning log, which is `search.learning`'s job to turn off).
 
 use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use rmail_core::auth::Scope;
-use rmaild::mcp::{self, CallLimits, McpServer, Principal};
+use rmaild::mcp::{self, CallLimits, McpServer, Mutations, Principal};
 use tokio_util::sync::CancellationToken;
 
 /// `mail mcp ...`.
@@ -103,6 +117,23 @@ pub struct ServeArgs {
     #[arg(long, default_value = "60s")]
     timeout: String,
 
+    /// Withhold every tool that changes mail, spends at a model provider, or
+    /// produces something that can — whatever `--scope` allows.
+    ///
+    /// `--scope mail.read` already refuses the mutations that sit behind
+    /// `mail.write`, but it is *scope* filtering, and one capability
+    /// deliberately mutates at read scope: `log_search_feedback` writes the
+    /// click data that improves your own later searches. This flag is the
+    /// stricter, effect-based statement, and it withholds that one too. A
+    /// withheld tool is not merely hidden: this process refuses to send it, so
+    /// the listing still describes the surface exactly.
+    ///
+    /// Not the same as "writes nothing at all": search is read-only by this
+    /// measure and still appends to the local learning log — set
+    /// `search.learning = false` for that. See `rmaild::mcp::tools`.
+    #[arg(long)]
+    read_only: bool,
+
     /// Print the projected tool surface and exit, instead of serving. The
     /// listing is filtered exactly as an MCP client would see it.
     #[arg(long)]
@@ -153,10 +184,7 @@ async fn serve(socket: &Path, args: ServeArgs) -> Result<()> {
     let cancel = CancellationToken::new();
     let server = McpServer::new(
         channel,
-        Principal {
-            scopes,
-            bearer: args.token.clone(),
-        },
+        principal(&args, scopes),
         CallLimits {
             max_frames: args.max_frames,
             timeout,
@@ -188,6 +216,24 @@ async fn serve(socket: &Path, args: ServeArgs) -> Result<()> {
     cancel.cancel();
     signal.abort();
     result.map_err(anyhow::Error::from)
+}
+
+/// Who this connection claims to be, and what it will offer.
+///
+/// Split out of [`serve`] so the one line that turns `--read-only` into a
+/// policy is reachable from a test: it is the whole user-facing surface of
+/// "a read-only token's tool list contains only read tools", and inverting it
+/// would otherwise be invisible to every test in `rmaild::mcp`.
+fn principal(args: &ServeArgs, scopes: Vec<Scope>) -> Principal {
+    Principal {
+        scopes,
+        bearer: args.token.clone(),
+        mutations: if args.read_only {
+            Mutations::Withheld
+        } else {
+            Mutations::AsScoped
+        },
+    }
 }
 
 /// The scopes this connection claims — see this module's docs on why the
@@ -236,9 +282,10 @@ fn resolve_scopes(args: &ServeArgs) -> Result<Vec<Scope>> {
 fn print_surface(server: &McpServer) -> Result<()> {
     let visible = server.visible_tools();
     println!(
-        "{} of {} tools visible to this connection",
+        "{} of {} tools visible to this connection ({})",
         visible.len(),
-        server.surface().tools().len()
+        server.surface().tools().len(),
+        server.visibility().mutations().label()
     );
     for tool in visible {
         println!(
@@ -253,4 +300,79 @@ fn print_surface(server: &McpServer) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    /// Parse a `mail mcp serve` invocation the way clap will at runtime, so
+    /// the flag's *name* is under test alongside what it does.
+    #[derive(clap::Parser)]
+    struct Probe {
+        #[command(flatten)]
+        args: ServeArgs,
+    }
+
+    fn parse(argv: &[&str]) -> ServeArgs {
+        Probe::parse_from(std::iter::once("serve").chain(argv.iter().copied())).args
+    }
+
+    /// The one line that turns the flag into a policy, both ways round.
+    ///
+    /// Without this, inverting the condition passes every test in
+    /// `rmaild::mcp` — the whole projection can be correct while the only
+    /// route a user has to it is backwards.
+    #[test]
+    fn read_only_is_what_withholds_the_mutating_tools() {
+        let with = parse(&["--stdio", "--read-only"]);
+        assert_eq!(
+            principal(&with, vec![Scope::MailRead]).mutations,
+            Mutations::Withheld
+        );
+
+        let without = parse(&["--stdio"]);
+        assert_eq!(
+            principal(&without, vec![Scope::MailRead]).mutations,
+            Mutations::AsScoped,
+            "the default must stay the surface the daemon actually accepts"
+        );
+    }
+
+    /// The flag narrows the effect policy and nothing else: it must not
+    /// quietly change the scopes or drop the bearer token.
+    #[test]
+    fn read_only_changes_nothing_but_the_effect_policy() {
+        let args = parse(&["--stdio", "--read-only", "--scope", "mail.read,ai.invoke"]);
+        let principal = principal(&args, resolve_scopes(&args).expect("scopes parse"));
+        assert_eq!(principal.scopes, vec![Scope::MailRead, Scope::AiInvoke]);
+        assert!(principal.bearer.is_none());
+    }
+
+    /// The guardrails task 53's reviewer put in place, pinned from here too:
+    /// a TCP port and an opaque token both have to be told what they may do.
+    #[test]
+    fn read_only_does_not_excuse_an_explicit_scope() {
+        assert!(
+            resolve_scopes(&parse(&["--sse", "--read-only"])).is_err(),
+            "--sse must still demand an explicit --scope"
+        );
+        assert!(
+            resolve_scopes(&parse(&[
+                "--stdio",
+                "--read-only",
+                "--token",
+                "rmail_tok_x"
+            ]))
+            .is_err(),
+            "--token must still demand an explicit --scope"
+        );
+        // ...and `--stdio` alone still claims admin, rather than --read-only
+        // being mistaken for a scope.
+        assert_eq!(
+            resolve_scopes(&parse(&["--stdio", "--read-only"])).expect("scopes"),
+            vec![Scope::Admin]
+        );
+    }
 }

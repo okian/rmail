@@ -22,9 +22,11 @@
 //!   the model's context, where it can reason about it, instead of into a
 //!   client-side error path the model never sees.
 //!
-//! A scope denial is the second kind even though it is caught before the call
-//! leaves this process: "you do not have permission to send mail" is something
-//! the agent must know and work around, not a malformed request.
+//! A refusal — the caller's scopes do not cover the tool, or this server is
+//! serving a read-only surface — is the second kind even though it is caught
+//! before the call leaves this process: "you do not have permission to send
+//! mail" is something the agent must know and work around, not a malformed
+//! request.
 //!
 //! # Untrusted text
 //!
@@ -48,6 +50,7 @@ use tracing::Instrument as _;
 
 use super::invoke::{self, CallLimits};
 use super::projection::ToolSurface;
+use super::tools::{Mutations, Visibility};
 use super::McpError;
 
 /// MCP protocol revisions this server implements.
@@ -72,6 +75,13 @@ pub struct Principal {
     /// Bearer token presented on every RPC, if any. Absent means the daemon's
     /// Unix-peer-uid path decides (implicit admin for the owning user).
     pub bearer: Option<String>,
+    /// Whether this connection offers mutating tools at all.
+    ///
+    /// Orthogonal to `scopes`, and defaulting to
+    /// [`Mutations::AsScoped`] — the setting under which the listing and the
+    /// daemon agree exactly. See [`super::tools`] for why the alternative is a
+    /// deliberate opt-in rather than what "read-only scopes" implies.
+    pub mutations: Mutations,
 }
 
 /// An MCP server over one gRPC channel to the daemon.
@@ -80,6 +90,9 @@ pub struct McpServer {
     channel: Channel,
     surface: Arc<ToolSurface>,
     principal: Arc<Principal>,
+    /// Derived from `principal` once, at construction: every listing and every
+    /// call goes through it, so the two cannot describe different surfaces.
+    visibility: Arc<Visibility>,
     limits: CallLimits,
     cancel: CancellationToken,
 }
@@ -91,6 +104,7 @@ impl std::fmt::Debug for McpServer {
             .field("scopes", &self.principal.scopes)
             // Never the token itself: this type is `Debug`-printed in traces.
             .field("bearer", &self.principal.bearer.is_some())
+            .field("mutations", &self.principal.mutations)
             .field("limits", &self.limits)
             .finish()
     }
@@ -111,16 +125,19 @@ impl McpServer {
         cancel: CancellationToken,
     ) -> Result<Self, McpError> {
         let surface = ToolSurface::build()?;
+        let visibility = Visibility::new(principal.scopes.clone(), principal.mutations);
         tracing::info!(
             tools = surface.tools().len(),
-            visible = surface.visible_to(&principal.scopes).count(),
+            visible = visibility.list(&surface).count(),
             scopes = %Scope::join(&principal.scopes),
+            mutations = visibility.mutations().label(),
             "projected the gRPC surface as MCP tools"
         );
         Ok(Self {
             channel,
             surface: Arc::new(surface),
             principal: Arc::new(principal),
+            visibility: Arc::new(visibility),
             limits,
             cancel,
         })
@@ -136,11 +153,18 @@ impl McpServer {
         &self.surface
     }
 
-    /// Just the tools this connection's scopes reach — exactly what
-    /// `tools/list` returns, without going through JSON-RPC to get it.
+    /// What this connection lists and will call — exactly what `tools/list`
+    /// returns, without going through JSON-RPC to get it.
     #[must_use]
     pub fn visible_tools(&self) -> Vec<&super::projection::Tool> {
-        self.surface.visible_to(&self.principal.scopes).collect()
+        self.visibility.list(&self.surface).collect()
+    }
+
+    /// The policy behind [`McpServer::visible_tools`], for a caller that needs
+    /// to report *why* the listing is what it is (`mail mcp serve --list`).
+    #[must_use]
+    pub fn visibility(&self) -> &Visibility {
+        &self.visibility
     }
 
     /// Handle one JSON-RPC message. `None` means it was a notification and
@@ -253,11 +277,28 @@ impl McpServer {
                 "Every tool here is one rmail gRPC method, generated from the compiled service \
                  definitions. Tools marked readOnlyHint observe; the rest change mail, spend at \
                  a model provider, or produce something that can. This connection is scoped to: \
-                 {}.",
+                 {}.{}",
                 if self.principal.scopes.is_empty() {
                     "no declared scope".to_owned()
                 } else {
                     Scope::join(&self.principal.scopes)
+                },
+                // Stated rather than left to be inferred from a short list: an
+                // agent that knows the surface is read-only can say so to its
+                // human instead of planning around a tool it will be refused.
+                //
+                // Worded to what `Effect` actually draws the line at, because
+                // this string ends up in the model's context and the model
+                // will repeat it: search still appends to the local learning
+                // log (`search.learning`), so "changes nothing at all" would
+                // be a claim this server does not deliver.
+                match self.principal.mutations {
+                    Mutations::AsScoped => "",
+                    Mutations::Withheld =>
+                        " This server was started read-only: every tool that changes mail, spends \
+                         at a model provider, or produces something that can, is withheld, and \
+                         calling one is refused here rather than by the daemon. Searching still \
+                         records locally what it showed you.",
                 }
             ),
         })
@@ -266,8 +307,8 @@ impl McpServer {
     /// `tools/list`, filtered to what this caller may actually invoke.
     fn list_tools(&self) -> Value {
         let tools: Vec<Value> = self
-            .surface
-            .visible_to(&self.principal.scopes)
+            .visibility
+            .list(&self.surface)
             .map(super::projection::Tool::to_json)
             .collect();
         json!({ "tools": tools })
@@ -284,11 +325,30 @@ impl McpServer {
             Some(value) => value.clone(),
         };
 
-        let tool = match self.surface.authorize(name, &self.principal.scopes) {
+        let tool = match self.visibility.authorize(&self.surface, name) {
             Ok(tool) => tool,
-            // A denial is an execution outcome the agent has to work around,
-            // not a malformed request — see this module's own docs.
-            Err(error @ McpError::Denied { .. }) => return Ok(tool_error(&error.to_string())),
+            // A refusal — for want of a scope, or because this server is
+            // read-only — is an execution outcome the agent has to work
+            // around, not a malformed request. See this module's own docs; the
+            // text differs because the two have different fixes.
+            Err(error @ (McpError::Denied { .. } | McpError::Withheld { .. })) => {
+                // Traced here rather than by `dispatch`, which only sees the
+                // `Err` arm and never this one — without this line the single
+                // path an operator most wants to see (an agent repeatedly
+                // reaching for mutations it does not have) produces no
+                // structured output at all.
+                tracing::warn!(
+                    tool = name,
+                    reason = if matches!(error, McpError::Withheld { .. }) {
+                        "withheld"
+                    } else {
+                        "denied"
+                    },
+                    scopes = %Scope::join(self.visibility.granted()),
+                    "refused an MCP tool call before it left this process"
+                );
+                return Ok(tool_error(&error.to_string()));
+            }
             Err(error) => return Err(error),
         };
 
