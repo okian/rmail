@@ -25,6 +25,7 @@ mod hook_service;
 mod idempotency;
 mod index_service;
 mod mail_service;
+pub mod mcp;
 mod note_service;
 mod rule_service;
 mod saved_search_service;
@@ -41,6 +42,11 @@ pub use ai_safety_service::AiSafetyApi;
 pub use ai_service::AiApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
+/// The per-method capability requirement, re-exported because
+/// [`mcp::Tool::requirement`] hands it back: an MCP client that is refused a
+/// tool needs to be told which scope to mint, and re-deriving that from a
+/// second table is the drift `rmail_core::parity` exists to prevent.
+pub use auth::Requirement;
 pub use compose_service::ComposeApi;
 pub use config_service::ConfigApi;
 pub use finder_service::FinderApi;

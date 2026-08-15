@@ -3190,6 +3190,7 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3267,11 +3268,17 @@ name = "rmaild"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "async-trait",
+ "base64 0.22.1",
+ "bytes",
  "chrono",
  "chrono-tz",
  "futures",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "prost",
  "prost-types",
  "rmail-core",

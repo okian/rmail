@@ -70,6 +70,64 @@ pub enum Requirement {
     AllOf(&'static [Scope]),
 }
 
+impl Requirement {
+    /// Whether a caller holding `granted` satisfies this requirement.
+    ///
+    /// The one definition of "satisfied" in the daemon. `crate::auth`'s layer
+    /// applies it to decide whether a request proceeds, and
+    /// `crate::mcp::projection` applies it to decide which tools a caller is
+    /// even shown — two places that must agree, since a tool advertised to a
+    /// token that is then refused it is a worse experience than not listing
+    /// it, and a tool *withheld* from a token that would have been allowed is
+    /// a capability silently lost.
+    ///
+    /// [`Requirement::Public`] is `true` for any scope set including the
+    /// empty one: a public method needs no authentication at all.
+    #[must_use]
+    pub fn satisfied_by(&self, granted: &[Scope]) -> bool {
+        match self {
+            Requirement::Public => true,
+            Requirement::Scope(scope) => rmail_core::auth::satisfies(granted, scope),
+            Requirement::AnyOf(scopes) => scopes
+                .iter()
+                .any(|scope| rmail_core::auth::satisfies(granted, scope)),
+            // The emptiness guard is not belt-and-braces: an empty `all` is
+            // vacuously true, so an empty `AllOf` row would grant the method
+            // to every caller. `no_all_of_row_is_empty` keeps one from being
+            // written; this keeps one from being *honoured* if it were.
+            Requirement::AllOf(scopes) => {
+                !scopes.is_empty()
+                    && scopes
+                        .iter()
+                        .all(|scope| rmail_core::auth::satisfies(granted, scope))
+            }
+        }
+    }
+
+    /// This requirement in the words an operator would use to fix it
+    /// ("scope mail.read and ai.invoke").
+    ///
+    /// Shared by the `PERMISSION_DENIED` message the auth layer returns and
+    /// by the MCP tool description, so an agent reading why a tool exists and
+    /// an operator reading why a call failed are told the same thing.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        fn join(scopes: &[Scope], conjunction: &str) -> String {
+            scopes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(conjunction)
+        }
+        match self {
+            Requirement::Public => "no scope".to_owned(),
+            Requirement::Scope(scope) => format!("scope {scope}"),
+            Requirement::AnyOf(scopes) => format!("scope {}", join(scopes, " or ")),
+            Requirement::AllOf(scopes) => format!("scope {}", join(scopes, " and ")),
+        }
+    }
+}
+
 /// method path -> requirement. See the module docs for the fail-closed
 /// contract and the provisional-rows note.
 const TABLE: &[(&str, Requirement)] = &[

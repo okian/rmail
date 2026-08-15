@@ -407,6 +407,33 @@ commands! {
     }
 
     // -- SearchService (tasks 33, 37, 51, 64) ---------------------------------
+    // Every ranking RPC below is `Read`, and the reason is *not* "it only
+    // reads the local index" — it is the clamp, and the clamp has to cover two
+    // separate provider paths rather than the one that was written down first.
+    //
+    // The rerank path is the obvious one: `SearchApi::rerank_for` lets a
+    // request reduce the backend `search.rerank` configures and never escalate
+    // past it, so a caller cannot spend anything the operator had not already
+    // turned on (`rmaild::auth::methods` argues this at length).
+    //
+    // The *query embedder* is the one that is easy to miss. `QueryPlanner`
+    // embeds every query, and `index.semantic.provider = "voyage"` makes that
+    // a metered call to a third-party API (`crate::embed::voyage`) — so on
+    // such a deployment `search_mail` egresses the query text and spends, on
+    // every call. It stays `Read` on the same clamp: the embedder is one
+    // process-wide instance built from `[index.semantic]`, a request cannot
+    // name or change it, and a caller can therefore cause nothing the operator
+    // did not already configure. That is the identical argument, and it is
+    // written here rather than inferred because the two paths are separate
+    // code and only one of them had it.
+    //
+    // `Evaluate` is the sharpest case and still `Read`: it runs the pipeline
+    // once per golden query, so one call is N embeddings rather than one. The
+    // clamp holds (it cannot select a backend either), but the amplification
+    // is real, which is why `search.eval` work belongs to an operator rather
+    // than to an unattended agent loop. If the embedder ever becomes
+    // request-selectable, these rows become `Mutate` and want `ai.invoke`,
+    // exactly as `AiAskMailbox` does.
     SearchSearch {
         rpc: "/rmail.v1.SearchService/Search",
         tool: "search_mail",
@@ -1193,8 +1220,11 @@ fn split_rpc(rpc: &'static str) -> (&'static str, &'static str) {
 /// - `ping` is the standard `grpc.health.v1.Health/Check` probe, served by
 ///   `tonic-health`. It is an RPC — just not a `rmail.v1` one, so it is not in
 ///   this workspace's descriptor set and cannot be a [`Command`] row.
-/// - `tui` *is* a client. The terminal UI is an adapter over this table, not a
-///   capability in it.
+/// - `tui` *is* a client, and so is `mcp serve` (task 53). Both are adapters
+///   over this table rather than entries in it — and `mcp serve` is the
+///   sharpest case, because what it serves is precisely [`Command::tool`] for
+///   every row here. A `Command` variant for it would have to claim an RPC
+///   that projects the projection.
 /// - `keys …` and `hook add` edit the user's own files (`keys.toml`, the
 ///   master TOML). Both have module docs in `rmail-cli` explaining why a
 ///   daemon round-trip would end up editing the same file anyway, with a
@@ -1210,6 +1240,11 @@ pub const LOCAL_CLI: &[(&str, &str)] = &[
     (
         "tui",
         "the terminal UI itself — a client of this table, not an entry in it",
+    ),
+    (
+        "mcp serve",
+        "the MCP adapter itself — it serves `tool()` for every row in this table, so a row of \
+         its own would be a capability that projects the projection",
     ),
     (
         "keys list",

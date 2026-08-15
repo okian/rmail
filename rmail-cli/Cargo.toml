@@ -26,9 +26,19 @@ default = ["onnx"]
 # re-enables ONNX and the "no model" path is never compiled, let alone tested.
 onnx = ["rmail-core/onnx", "rmaild/onnx"]
 
+# `rmaild` is now a real dependency (for `mail mcp serve`), not only a
+# dev-dependency, so this crate's own default features must not silently
+# re-enable ONNX in it — the same reason the workspace declaration sets
+# `default-features = false`.
+
 [dependencies]
 rmail-core.workspace = true
 rmail-proto.workspace = true
+# `mail mcp serve` (task 53) launches `rmaild::mcp`'s projected tool surface.
+# The MCP adapter lives in the daemon crate because that is where the scope
+# table it joins against lives; this crate only chooses a transport, so it
+# names no RPC — see `mcp_cli`'s own module docs.
+rmaild.workspace = true
 tonic-health.workspace = true
 # `note_cli`'s `$EDITOR` flow launches the user's editor as a child process.
 tokio = { workspace = true, features = ["process"] }
@@ -59,6 +69,10 @@ toml.workspace = true
 # status line; the spans are here for `RUST_LOG` when something needs
 # debugging without a status line to read.
 tracing.workspace = true
+# `mail mcp serve` is the one verb that runs unattended for hours, so it
+# installs a **stderr** subscriber of its own — stdout is the JSON-RPC channel
+# under `--stdio` and must carry nothing else. No other verb installs one.
+tracing-subscriber.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

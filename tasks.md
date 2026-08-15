@@ -526,7 +526,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmaild ask_mailbox` (streamed tokens+citations, grounded-refusal path)
 
 ## 53. gRPC→MCP auto-projection
-- [ ] status
+- [x] status
 - **depends-on:** 41, 38
 - **parallel-safe:** no
 - **acceptance:**

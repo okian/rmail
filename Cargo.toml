@@ -121,6 +121,17 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
 futures = "0.3"
+# The MCP adapter's SSE transport (task 53) serves plain HTTP/1.1 on a
+# loopback port. Already in the tree under tonic, so naming it here promotes a
+# transitive dependency to a direct one rather than adding code to the build.
+# `server` + `http1` only: the gRPC side keeps using tonic's own hyper wiring,
+# and an MCP client speaks HTTP/1.1.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+http-body-util = "0.1"
+# `rmaild::mcp::invoke` implements `tonic::codec::Codec` over already-encoded
+# message bodies, which means using `Buf`/`BufMut` directly. Also already in
+# the tree via tonic and prost.
+bytes = "1"
 # `hooks::kill_process_group` (task 67): killing a whole POSIX process
 # group (`kill(-pid, SIGKILL)`) rather than only the one pid
 # `tokio::process::Child::start_kill` tracks — needed so a timed-out hook

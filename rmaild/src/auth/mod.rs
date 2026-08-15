@@ -50,7 +50,12 @@
 //!
 //! [`admin_uid`]: AuthLayer::new
 
-mod methods;
+/// Crate-visible so `crate::mcp::projection` can join the same table this
+/// layer enforces (task 53): the MCP tool surface reports the scope each
+/// projected tool needs, and re-deriving that from a second table is exactly
+/// the drift `rmail_core::parity` exists to prevent. Still not part of
+/// `rmaild`'s public API — `auth` itself is a private module.
+pub(crate) mod methods;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -151,51 +156,34 @@ async fn authorize(
     peer_admin: bool,
     bearer: Option<&str>,
 ) -> Result<(), Status> {
-    // `every` distinguishes the two quantifiers over the same slice: a
-    // conjunction and a disjunction are otherwise indistinguishable once the
-    // requirement has been flattened to `&[Scope]`, and getting it backwards
-    // would silently widen an `AllOf` row to whichever of its scopes a caller
-    // happened to hold.
-    let (required, every) = match methods::lookup(method) {
-        Some(Requirement::Public) => return Ok(()),
-        Some(Requirement::Scope(scope)) => (std::slice::from_ref(scope), false),
-        Some(Requirement::AnyOf(scopes)) => (*scopes, false),
-        Some(Requirement::AllOf(scopes)) => (*scopes, true),
-        None => {
-            tracing::warn!(
-                method,
-                "denying call to a gRPC method with no scope-table entry (fail-closed default)"
-            );
-            return Err(Status::from(RmailError::permission_denied(format!(
-                "method {method} is not registered in the capability-scope table"
-            ))));
-        }
+    let Some(requirement) = methods::lookup(method) else {
+        tracing::warn!(
+            method,
+            "denying call to a gRPC method with no scope-table entry (fail-closed default)"
+        );
+        return Err(Status::from(RmailError::permission_denied(format!(
+            "method {method} is not registered in the capability-scope table"
+        ))));
     };
 
+    // Short-circuited *before* resolving a principal: a public method (health,
+    // reflection) must answer a caller that presents nothing at all, and
+    // `principal_scopes` would reject one with `UNAUTHENTICATED`.
+    if matches!(requirement, Requirement::Public) {
+        return Ok(());
+    }
+
     let granted = principal_scopes(db, peer_admin, bearer).await?;
-    let satisfied = if every {
-        // An empty `AllOf` would vacuously pass here and grant the method to
-        // any authenticated caller; `methods::tests::no_all_of_row_is_empty`
-        // is what keeps one from ever being written.
-        !required.is_empty()
-            && required
-                .iter()
-                .all(|scope| rmail_core::auth::satisfies(&granted, scope))
-    } else {
-        required
-            .iter()
-            .any(|scope| rmail_core::auth::satisfies(&granted, scope))
-    };
-    if satisfied {
+    // The quantifier over the scope set (any/all) lives on `Requirement`
+    // itself, so that `crate::mcp`'s tool gating and this layer's enforcement
+    // are the same predicate rather than two implementations of it — see
+    // `Requirement::satisfied_by`.
+    if requirement.satisfied_by(&granted) {
         Ok(())
     } else {
-        let wanted = required
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(if every { " and " } else { " or " });
         Err(Status::from(RmailError::permission_denied(format!(
-            "method {method} requires scope {wanted}, which this token does not grant"
+            "method {method} requires {}, which this token does not grant",
+            requirement.describe()
         ))))
     }
 }

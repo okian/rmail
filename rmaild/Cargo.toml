@@ -69,12 +69,29 @@ serde_json.workspace = true
 # response, so `idempotency.rs` needs prost's `Message` at runtime and not only
 # in the descriptor-set test below.
 prost.workspace = true
+# `mcp::descriptor` decodes the compiled `FileDescriptorSet` at runtime to
+# derive the MCP tool surface (task 53) — the same set `auth::methods`' tests
+# decode, which is why this moved out of `[dev-dependencies]`.
+prost-types.workspace = true
+# `mcp::codec` renders proto `bytes` fields as base64, which is what proto3
+# JSON specifies and what an MCP client expects to receive.
+base64.workspace = true
+# `mcp::invoke`'s `tonic::codec::Codec` implementation reads and writes
+# message bodies through `Buf`/`BufMut`.
+bytes.workspace = true
+# `mcp::transport::session_id` needs the OS CSPRNG: an SSE session id is the
+# only thing between a POST and this server's whole authority, so it cannot be
+# a counter. `argon2` re-exports `rand_core`'s `OsRng`, which is the same
+# source `rmail_core::auth::mint` draws a bearer secret from — one RNG in the
+# workspace rather than a second crate for sixteen bytes.
+argon2.workspace = true
+# The MCP SSE transport (`mcp::transport`): an HTTP/1.1 server on loopback.
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 
 [dev-dependencies]
 tonic-types.workspace = true
-# Decoding the compiled descriptor set so the auth scope table can be checked
-# against the RPCs actually served (see `auth::methods` tests).
-prost-types.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 # Only used by the AuditService integration test, to verify a ledger entry's
 # `payload_sha256` against an independently computed hash.

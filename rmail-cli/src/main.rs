@@ -5,6 +5,7 @@ mod hook_cli;
 mod index_cli;
 mod keymap;
 mod keys_cli;
+mod mcp_cli;
 mod note_cli;
 mod outbox_cli;
 /// The CLI half of the feature-parity drift check (task 41). Test-only: it
@@ -185,6 +186,15 @@ enum Command {
     Followup {
         #[command(subcommand)]
         action: FollowupAction,
+    },
+    /// Serve the whole gRPC surface to an AI agent over the Model Context
+    /// Protocol. The tool list is generated from the compiled service
+    /// definitions, so it is never out of step with the API — see
+    /// `mcp_cli`'s own module docs, and read the note there on `--scope`
+    /// before pointing an agent at this.
+    Mcp {
+        #[command(subcommand)]
+        action: mcp_cli::McpAction,
     },
 }
 
@@ -434,6 +444,7 @@ async fn main() -> Result<()> {
         Command::Undo(args) => outbox_cli::undo(&socket, args).await,
         Command::Outbox(args) => outbox_cli::outbox(&socket, args).await,
         Command::Followup { action } => outbox_cli::followup(&socket, action).await,
+        Command::Mcp { action } => mcp_cli::run(&socket, action).await,
         Command::AcceptTags { message_tag_ids } => {
             tag_cli::resolve_suggestions(&socket, message_tag_ids, true).await
         }
