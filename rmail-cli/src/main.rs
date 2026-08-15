@@ -809,7 +809,7 @@ async fn ask(socket: &Path, args: AskArgs) -> Result<()> {
                 }
             }
             Some(ask_chunk::Body::Token(token)) => {
-                print!("{token}");
+                print!("{}", terminal_safe(&token));
                 printed_any_token = true;
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
@@ -837,23 +837,58 @@ async fn ask(socket: &Path, args: AskArgs) -> Result<()> {
     Ok(())
 }
 
+/// Make model- and mail-authored text safe to write to a terminal.
+///
+/// `mail ask` streams two kinds of attacker-influenced text straight to
+/// stdout: the model's prose (steerable by any message that reached the
+/// context) and each citation's subject, sender and quote (written by whoever
+/// sent the mail). Both need neutralizing, and they need *different*
+/// neutralizing than `search_cli`'s renderer does — that one folds newlines to
+/// spaces, which is right for a one-line hit and wrong for a prose answer
+/// where paragraph breaks carry meaning.
+///
+/// Two families, because they fail differently:
+///
+/// - **Bidi overrides and invisibles** reorder or hide what the user reads
+///   without corrupting anything. `injection::sanitize_model_text` already
+///   removes these and is what `rules::classify` applies to a `claude_is`
+///   explanation; reusing it keeps one definition of "safe to show".
+/// - **C0/C1 controls** are what actually drives a terminal — an `ESC [` run
+///   can repaint the screen, move the cursor, or hide subsequent output.
+///   Dropped here rather than escaped, matching `search_cli::push_sanitized`'s
+///   reasoning: a visible placeholder buys nothing when the text is prose.
+///
+/// `\n` survives; `\t` becomes a space so it cannot be used for alignment
+/// tricks in the citation block.
+fn terminal_safe(text: &str) -> String {
+    rmail_core::ai::injection::sanitize_model_text(text)
+        .chars()
+        .filter_map(|c| match c {
+            '\n' => Some('\n'),
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 fn print_citation(citation: &Citation) {
     let subject = if citation.subject.is_empty() {
-        "(no subject)"
+        "(no subject)".to_owned()
     } else {
-        &citation.subject
+        terminal_safe(&citation.subject)
     };
     println!(
         "  [{}] #{} {} — {} ({}, uid {})",
         citation.label,
         citation.message_id,
         subject,
-        citation.from_addr,
-        citation.mailbox,
+        terminal_safe(&citation.from_addr),
+        terminal_safe(&citation.mailbox),
         citation.message_uid
     );
     if !citation.quote.is_empty() {
-        println!("      {}", citation.quote);
+        println!("      {}", terminal_safe(&citation.quote));
     }
 }
 
@@ -1273,4 +1308,44 @@ fn summary_to_json(summary: &Summary) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "suggested_reply": summary.suggested_reply,
     })
+}
+
+#[cfg(test)]
+mod ask_render_tests {
+    use super::terminal_safe;
+
+    /// A model steered by a hostile message, or a subject line written by one,
+    /// must not be able to drive the terminal it is printed to.
+    #[test]
+    fn an_ansi_escape_in_model_or_mail_text_never_reaches_the_terminal() {
+        // A cursor-up-and-overwrite run: the classic way to make output claim
+        // something other than what was actually said.
+        let hostile = "Refund confirmed\u{1b}[1A\u{1b}[2K totally legitimate";
+        let safe = terminal_safe(hostile);
+        assert!(
+            !safe.contains('\u{1b}'),
+            "an ESC survived into terminal output: {safe:?}"
+        );
+        assert!(safe.contains("Refund confirmed"), "the text itself is kept");
+    }
+
+    /// Bidi overrides reorder what a reader sees without corrupting anything,
+    /// which is exactly why a control-character filter alone misses them.
+    #[test]
+    fn a_bidi_override_cannot_reorder_what_the_user_reads() {
+        let spoofed = "paid \u{202e}drac tiderc\u{202c} today";
+        let safe = terminal_safe(spoofed);
+        assert!(
+            !safe.contains('\u{202e}') && !safe.contains('\u{202c}'),
+            "a bidi control survived: {safe:?}"
+        );
+    }
+
+    /// Prose, not a one-line hit: newlines are paragraph breaks and must
+    /// survive, which is why this cannot just reuse `search_cli`'s renderer.
+    #[test]
+    fn newlines_survive_but_tabs_do_not() {
+        assert_eq!(terminal_safe("one\ntwo"), "one\ntwo");
+        assert_eq!(terminal_safe("a\tb"), "a b");
+    }
 }
