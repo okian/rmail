@@ -6,19 +6,42 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**73 of 86 done, 13 remaining.** `tasks.md` is authoritative — count with
+**75 of 86 done, 11 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **3473/3473** on the full
+after merge, never on the agent's own report: currently **3593/3593** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: 36, 42, 58, 62, 65, 68, 69, 72, 73, 75, 78. All ready; all but 42
-are `parallel-safe: yes`. In flight: **57** (AI auto-tagging) and **80**
-(unified inbox + autoconfig).
+Remaining: 36, 42, 58, 65, 68, 69, 72, 73, 78. All ready; all but 42 are
+`parallel-safe: yes`. In flight: **62** (AI reply drafting) and **75**
+(table/calendar/link extraction).
 
-Merged so far: 74, 71, 82, 79, 81, 70, 63. Every one verified on the
-*combined* tree, never on the agent's own count — the reports said 3106,
-3084, 3263, 3389 and 3409 against five different bases; the truth after
-merging all of them is 3473.
+Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80. Every one verified on the
+*combined* tree, never on the agent's own count — the reports quoted six
+different bases; the truth after merging all of them is 3593.
+
+**Three of the last five needed real work at merge, not just a cherry-pick:**
+
+- **79** shipped red (its agent reported before its suite finished):
+  `account::create` validated only `Keychain` while `set_credential`
+  validated `Keychain | OAuth`, so an OAuth account could be persisted with
+  no username and could never resolve its refresh token.
+- **57** shipped *inert*: the whole auto-apply mechanism existed and was
+  unit-tested, but `tag_rules` had no RPC/CLI surface, so nothing outside
+  `rmail-core` could write a rule and every suggestion pended forever. Same
+  shape as tasks 16-21's index pipeline. Closed at merge with
+  `TagService.SetTagRule`/`ListTagRules` + `mail tag-rules`, tested *through
+  the daemon* — a unit test proves a mechanism works, only a daemon-level
+  test proves it is reachable.
+- **80** had never been compiled: it called two `rmaild::*_for_tests`
+  helpers it never wrote, and added an `Injected` field without updating
+  every literal. Merging it then exposed three racy assertions in **81**'s
+  tests, which asserted they had won a race against the daemon's delivery
+  loop — `NotifyEngine::spawn` ticks *first* and sleeps afterwards, so a long
+  `tick_interval` never kept it out of the window.
+
+**Read every agent's honest caveats.** 57's agent volunteered that its
+feature was unreachable; that note is what made the gap fixable at merge
+rather than a year later.
 
 **79 shipped red and the post-merge suite caught it.** Its agent reported
 success while its suite was still building, then stopped. Its own test
@@ -75,7 +98,7 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V43.** (81 took V40, 70 took V41, 63 took V42;
+costs nothing. **Next free: V45.** V43 went to 57, V44 to 80. (81 took V40, 70 took V41, 63 took V42;
 71, 79 and 82 needed none.)
 
 **Tasks 70 and 63 both arrived numbered V41** — the first real collision
