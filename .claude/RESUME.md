@@ -6,10 +6,14 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**61 of 86 done, 25 remaining.** `tasks.md` is authoritative — count with
+**67 of 86 done, 19 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **2529/2529** on the full
-workspace suite, with clippy, `buf lint`, gitleaks and typos clean.
+after merge, never on the agent's own report: currently **3001/3001** on the full
+workspace suite, with clippy, gitleaks and typos clean.
+
+Remaining: 36, 42, 57, 58, 62, 63, 65, 68, 69, 70, 71, 72, 73, 75, 78, 79, 80,
+81, 82. All are ready — no unmet dependencies — and all but 42 are
+`parallel-safe: yes`.
 
 Defects in already-merged work keep being found by the post-merge full-suite
 run or by orchestrator review rather than by the task that introduced them: a
@@ -56,8 +60,11 @@ The rule now is: whatever number a branch used, rename it at merge to
 `max_merged + 1` and fix any `-- Vnn:` references inside the file. Never
 reference a migration version from Rust.
 
-Merged: V1–V14, V16, V18–V28, V32–V36. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V37.**
+Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
+costs nothing. **Next free: V40.**
+
+Task 74 arrived numbered V40 over a V38 tip and was renamed to V39 at merge,
+along with the `-- V40:` comment in the file and two doc references to it.
 
 The wave of 51/64/66 all hit this and all were renumbered at merge: V30→V34,
 V31→V35, and task 23's V15→V33. The V15 case is the one the collision test
@@ -292,26 +299,37 @@ and its swap. With it, `a_stale_load_cannot_clobber_a_newer_one` fails
 deterministically without the fix (verified by reverting only the `rebuild`
 lock) and passes with it.
 
-## Trap: the shared `/target` volume leaks generated protos between worktrees
+## Trap: the Bash cwd persists, and it silently redirects the whole gate
 
 A full-suite run failed with `SearchService's RPC list changed ... left:
-[..., "SearchAttachments", ...]` while `SearchAttachments` existed **nowhere in
-this checkout** — it is task 74's RPC, unmerged, in another worktree.
+[..., "SearchAttachments", ...]` while `SearchAttachments` existed nowhere in
+this checkout. It looked like the shared Docker cache leaking another
+worktree's generated protos. **It was not.** `VOL_TARGET` is keyed to
+`shasum(repo_root)`, so every checkout already gets its own target volume, and
+the two volumes present were exactly this checkout and that worktree.
 
-`docker-test.sh` mounts the caller's repo root at `/w` and the *same* named
-`/target` volume for every run. An agent running the script from its worktree
-therefore compiles `rmail-proto` from `/w/proto/...` — the identical path this
-checkout uses — and caches the generated code. Cargo then judges freshness by
-mtime, and a main-checkout proto older than that cached output reads as
-**fresh**, so `build.rs` never reruns and the suite builds against another
-worktree's protos.
+What actually happened: several calls earlier I had `cd`-ed into
+`.claude/worktrees/agent-*` to inspect that agent's state. The Bash tool's
+working directory **persists between calls**, so the later
+`scripts/docker-test.sh` resolved to the *worktree's* copy of the script,
+which sets `repo_root` from its own `BASH_SOURCE` and mounts the worktree at
+`/w`. The suite was correctly testing task 74's tree and correctly reported
+its extra RPC.
 
-This can turn a run green or red for reasons that have nothing to do with the
-code under test. Whenever a failure names a symbol that `grep` cannot find in
-the checkout, suspect this first, then:
+The test count was the tell and I missed it: that run reported **2882** tests
+against this checkout's **2942**. A worktree branched off an older base has
+*fewer* tests, not more.
 
-    find proto -name '*.proto' -exec touch {} +
-    scripts/docker-test.sh -- sh -c 'cargo clean -p rmail-proto && cargo nextest run ...'
+Rules that follow:
+
+- After inspecting a worktree, `cd` back to the repo root before running
+  anything, or prefix the command with an absolute `cd`. Assume nothing about
+  cwd at the start of a Bash call.
+- When a failure names a symbol `grep` cannot find in the checkout, check
+  `pwd` **before** reaching for `cargo clean`. Cleaning `rmail-proto` on a
+  false alarm forced a cold rebuild of the whole workspace, which is what
+  then OOM-killed the linker and cost several cycles.
+- A sudden change in total test count means you are testing a different tree.
 
 ## `docker-test.sh` does not forward host environment variables
 
