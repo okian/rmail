@@ -783,3 +783,65 @@ async fn the_stored_blob_is_folded() {
         .blob()
         .starts_with("Cafe meeting"));
 }
+
+/// A `load` must never apply a snapshot older than the store already holds.
+///
+/// # The bug this pins
+///
+/// [`FinderIndex::load`] is a database *read* followed by a store *write*,
+/// with nothing spanning the two. Two refreshes could therefore interleave,
+/// and the winner was whichever reached the store lock last rather than
+/// whichever read the fresher table. A load that read an empty index could
+/// land *after* a rebuild had correctly populated the store, `clear()` it,
+/// and repopulate it from a table state that no longer existed.
+///
+/// The daemon runs exactly that race on every boot: `run` calls
+/// `ensure_built` while an explicit `RebuildIndex` may be in flight. It
+/// surfaced as `rmaild/tests/finder_service.rs` failing with an *empty final
+/// batch* — the scan was correct and the store was simply missing the seeded
+/// message. Two different tests in that file hit it on different runs, which
+/// is what a lost update looks like from the outside.
+///
+/// # Why this needs the pause hook
+///
+/// The interleaving cannot be arranged from outside. Both halves of a
+/// refresh are fast, and a load started first also *finishes* first, so a
+/// plain pair of concurrent calls never reproduces it — an earlier draft of
+/// this test ran twenty-four concurrent `load`/`rebuild` pairs against the
+/// unfixed code and passed every time. Holding the store lock does not help
+/// either: it parks both swaps on one lock whose wake order cannot be
+/// chosen. So the load is held open between its read and its swap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_load_cannot_clobber_a_newer_one() {
+    let fx = Fixture::open();
+    fx.seed_message(1, "Acme invoice 338");
+
+    // Clones, not two `new`s: they must share the one `refresh` mutex, which
+    // is the production topology (`rmaild::serve` builds one and clones it).
+    let index = fx.index();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let stale = index.clone().pausing_after_read(Arc::clone(&gate));
+
+    // `stale` reads an index no rebuild has populated yet, then holds that
+    // snapshot open.
+    let loader = tokio::spawn(async move { stale.load().await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The rebuild that actually populates the table and the store.
+    let builder = index.clone();
+    let rebuild = tokio::spawn(async move { builder.rebuild().await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Release the stale snapshot last. Before the fix it applied on top of
+    // the rebuild and emptied the store.
+    gate.notify_one();
+    loader.await.expect("load task").expect("load");
+    rebuild.await.expect("rebuild task").expect("rebuild");
+
+    let guard = fx.store.read().expect("store lock");
+    assert!(
+        !guard.entries(ItemKind::Message).is_empty(),
+        "the store lost the seeded message: a snapshot taken before the \
+         rebuild was applied after it"
+    );
+}

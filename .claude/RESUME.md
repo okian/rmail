@@ -246,3 +246,109 @@ Practical rule: with the host under ~20 GiB, **do not dispatch a third
 agent**. A fresh worktree needs 2–7 GB of host `target/` plus a new Docker
 volume, and running out mid-build fails every agent at once, not just the new
 one. Two concurrent agents is the safe ceiling until the host has room.
+
+## The finder flake was a real data-loss race, now fixed
+
+The intermittent `rmaild/tests/finder_service.rs` failure (`left: 0, right: 1`,
+seen on `positions_are_omitted_unless_asked_for` and later on
+`find_returns_char_offset_positions`) was **not flaky infrastructure**. It was
+a lost update in `FinderIndex::load`.
+
+`load()` is a database *read* followed by a store *write* with nothing
+spanning them. Two refreshes could interleave, and the winner was whichever
+reached the store lock last rather than whichever read the fresher table. The
+daemon runs that race on every boot: `run()` calls `ensure_built()` while an
+explicit `RebuildIndex` may be in flight. A load that read the index before it
+was populated could land *after* the rebuild, `clear()` the correct store, and
+repopulate it from a table state that no longer existed — so the mail stayed
+unfindable until something else triggered a reload.
+
+Fix: an `Arc<tokio::sync::Mutex<()>>` on `FinderIndex`, held across the whole
+refresh — the read *and* the swap — by `load`, `rebuild` and `drain`.
+`load_locked()` exists because `tokio::sync::Mutex` is not reentrant and
+`rebuild` holds the lock across its table write and its reload.
+
+**Clone `FinderIndex`, never build a second one over the same store.** The
+mutex lives on the struct, so a second `FinderIndex::new` would mint a second
+mutex that serializes nothing. `rmaild::serve` builds exactly one and clones
+it into the service and the drain loop; `finder/index/tests.rs` does the same.
+
+### What it took to prove, and what did not work
+
+Two probes failed to bite before the real one did, and both failures were
+informative:
+
+- **Twenty-four concurrent `load`/`rebuild` pairs passed every time** on the
+  unfixed code. A load started first also *finishes* first — its read and swap
+  are both fast — so the stale snapshot never lands last on its own.
+- **A uniform sleep between read and swap also passed.** Delaying every
+  refresh equally preserves start order, so it makes the bug *less* likely,
+  not more. Holding the store lock does not help either: it parks both swaps
+  on one lock whose wake order cannot be chosen.
+
+The interleaving cannot be built from outside, so `FinderIndex` carries a
+`#[cfg(test)] pause_after_read` gate that holds one load open between its read
+and its swap. With it, `a_stale_load_cannot_clobber_a_newer_one` fails
+deterministically without the fix (verified by reverting only the `rebuild`
+lock) and passes with it.
+
+## Trap: the shared `/target` volume leaks generated protos between worktrees
+
+A full-suite run failed with `SearchService's RPC list changed ... left:
+[..., "SearchAttachments", ...]` while `SearchAttachments` existed **nowhere in
+this checkout** — it is task 74's RPC, unmerged, in another worktree.
+
+`docker-test.sh` mounts the caller's repo root at `/w` and the *same* named
+`/target` volume for every run. An agent running the script from its worktree
+therefore compiles `rmail-proto` from `/w/proto/...` — the identical path this
+checkout uses — and caches the generated code. Cargo then judges freshness by
+mtime, and a main-checkout proto older than that cached output reads as
+**fresh**, so `build.rs` never reruns and the suite builds against another
+worktree's protos.
+
+This can turn a run green or red for reasons that have nothing to do with the
+code under test. Whenever a failure names a symbol that `grep` cannot find in
+the checkout, suspect this first, then:
+
+    find proto -name '*.proto' -exec touch {} +
+    scripts/docker-test.sh -- sh -c 'cargo clean -p rmail-proto && cargo nextest run ...'
+
+## `docker-test.sh` does not forward host environment variables
+
+There is no `-e` in its `docker run` args, so `CARGO_BUILD_JOBS=1 scripts/docker-test.sh ...`
+sets nothing inside the container — a note in an earlier revision of this file
+implied otherwise and is wrong. Use raw mode, which runs an arbitrary command
+in the same container:
+
+    scripts/docker-test.sh -- env CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo nextest run --locked --all-features --workspace
+
+Note also that the script always appends `--workspace`, so a caller's `-p foo`
+narrows *what runs*, not what gets built.
+
+## The Docker VM has 12.5 GB and the linker is what runs out
+
+`ld terminated with signal 9` is the OOM killer. A *warm* cache survives it;
+a **cold** one does not, because `cargo clean -p rmail-proto` forces every
+downstream crate to be compiled from scratch and `rmail-core`'s lib test is
+the crate that does not fit.
+
+`CARGO_BUILD_JOBS=1` fixes it, and is the only thing that needs to change:
+
+    scripts/docker-test.sh -- env CARGO_BUILD_JOBS=1 cargo nextest run --locked --all-features --workspace --no-run
+
+That was never actually tried until now. Every earlier "serial build" in this
+project was written `CARGO_BUILD_JOBS=1 scripts/docker-test.sh …`, which sets
+the variable on the *host* — and the script has no `-e`, so it reached
+nothing. The setting works; the invocation did not.
+
+**Do not reach for `CARGO_PROFILE_TEST_DEBUG=0`.** It builds, but it
+fingerprints differently from the `Stop` hook's default profile, so the hook
+then rebuilds the whole workspace from scratch and OOMs — which is exactly
+how a green manual run turned into a red gate here. Build with the same
+profile the hook uses so the hook finds a warm cache.
+
+Two agents building at once also exhausts 12.5 GB. Wait for the other
+container (`docker wait <name>`) rather than retrying into the same wall —
+and note the `Stop` hook runs the gate itself, so **never leave a background
+build running when a turn ends**: the hook's build and yours will collide and
+both die.

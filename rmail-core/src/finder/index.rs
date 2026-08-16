@@ -106,12 +106,36 @@ pub struct IndexStatus {
 }
 
 /// Owns the durable index and the in-memory store it feeds.
+///
+/// # One index per store, and why `refresh` is on it
+///
+/// Clone this rather than building a second one over the same store: the
+/// `refresh` mutex is what keeps two refreshes from interleaving, and a
+/// second [`FinderIndex::new`] would mint a second mutex that serializes
+/// nothing. The daemon builds exactly one (`rmaild::serve`) and clones it
+/// into the service and the drain loop.
 #[derive(Clone)]
 pub struct FinderIndex {
     db: Database,
     store: Arc<RwLock<FinderStore>>,
     config: FinderConfig,
     limits: Limits,
+    /// Held across a whole refresh — the database read *and* the store swap.
+    ///
+    /// [`FinderIndex::load`] is a read followed by a write with no
+    /// transaction spanning them, so without this the two halves of two
+    /// refreshes could interleave and the *older* snapshot could land last,
+    /// `clear()`ing a correct store and repopulating it from a table state
+    /// that no longer existed. That is a silent loss of index entries, not a
+    /// stale read: the mail stays unfindable until something else triggers a
+    /// reload. See `a_stale_load_cannot_clobber_a_newer_one`.
+    refresh: Arc<tokio::sync::Mutex<()>>,
+    /// Test-only: released between a load's read and its store swap, so a
+    /// test can hold a snapshot open across another refresh. There is no
+    /// other way to construct that interleaving from outside — it is decided
+    /// by which blocking task happens to acquire the store lock first.
+    #[cfg(test)]
+    pause_after_read: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl FinderIndex {
@@ -123,7 +147,17 @@ impl FinderIndex {
             store,
             config: config.clone(),
             limits: Limits::from_config(config),
+            refresh: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            pause_after_read: None,
         }
+    }
+
+    /// Test-only: pause this handle's next load between its read and its swap.
+    #[cfg(test)]
+    fn pausing_after_read(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+        self.pause_after_read = Some(gate);
+        self
     }
 
     /// The store this index maintains.
@@ -203,6 +237,9 @@ impl FinderIndex {
     /// A mapped storage error.
     #[tracing::instrument(skip(self), fields(entries))]
     pub async fn rebuild(&self) -> Result<usize, Error> {
+        // Held across the table write *and* the reload, so a refresh that
+        // began earlier cannot apply its older snapshot on top of this one.
+        let _refresh = self.refresh.lock().await;
         self.seed_commands().await?;
         let snippet_max = self.config.snippet_max_bytes as usize;
         let written = self
@@ -219,7 +256,7 @@ impl FinderIndex {
                 Ok(written)
             })
             .await?;
-        let loaded = self.load().await?;
+        let loaded = self.load_locked().await?;
         tracing::Span::current().record("entries", loaded);
         tracing::info!(written, loaded, "rebuilt the finder index");
         Ok(loaded)
@@ -231,11 +268,25 @@ impl FinderIndex {
     ///
     /// A mapped storage error.
     pub async fn load(&self) -> Result<usize, Error> {
+        let _refresh = self.refresh.lock().await;
+        self.load_locked().await
+    }
+
+    /// [`FinderIndex::load`]'s body, for callers already holding `refresh`.
+    ///
+    /// `tokio::sync::Mutex` is not reentrant, so `rebuild` — which holds the
+    /// lock across its table write and its reload — must call this rather
+    /// than `load`.
+    async fn load_locked(&self) -> Result<usize, Error> {
         let limits = self.limits;
         let entries = self
             .db
             .read(move |conn| read_entries(conn, limits.max_entries))
             .await?;
+        #[cfg(test)]
+        if let Some(gate) = self.pause_after_read.clone() {
+            gate.notified().await;
+        }
         let store = Arc::clone(&self.store);
         let now = Utc::now().timestamp();
         let loaded = tokio::task::spawn_blocking(move || {
@@ -263,6 +314,10 @@ impl FinderIndex {
     ///
     /// A mapped storage error.
     pub async fn drain(&self, pass: u64) -> Result<DrainReport, Error> {
+        // A drain consumes feed rows and then applies them to the store. If a
+        // reload landed between those two steps it would either lose the
+        // batch or double-apply it, so a drain is one refresh like any other.
+        let _refresh = self.refresh.lock().await;
         let batch = self.config.max_drain_batch.max(1) as i64;
         let snippet_max = self.config.snippet_max_bytes as usize;
         let changed = self
@@ -304,7 +359,7 @@ impl FinderIndex {
         }
 
         if pass > 0 && pass % RECONCILE_EVERY_PASSES == 0 && self.reconcile_needed().await? {
-            self.load().await?;
+            self.load_locked().await?;
             report.reloaded = true;
         }
         Ok(report)
