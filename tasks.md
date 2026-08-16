@@ -679,7 +679,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmaild --test agent_service` (dry-run makes no mutations, allowlist enforcement, action log)
 
 ## 70. AI periodic digest
-- [ ] status
+- [x] status
 - **depends-on:** 49, 43
 - **parallel-safe:** yes
 - **acceptance:**

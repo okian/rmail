@@ -13,6 +13,7 @@ pub mod auth;
 pub mod compose;
 pub mod config;
 pub mod credential;
+pub mod digest;
 pub mod embed;
 pub mod error;
 pub mod eval;

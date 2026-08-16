@@ -674,6 +674,20 @@ commands! {
         actions: [],
         summary: "Per-contact or per-folder response-time percentiles, a rolling trend, and where you are the bottleneck.",
     }
+    // `Mutate`, unlike its neighbour above and for both of the reasons
+    // `AiAskMailbox`/`AttachmentAskAttachment` give: calling the provider *is*
+    // the RPC — a briefing with no model call is not a degraded briefing, it
+    // is no briefing — and it writes a durable `digests` row a later request
+    // reads back. A caller can therefore cause spend and leave state behind,
+    // which is an effect an observer outside this process sees.
+    AnalyticsGenerateDigest {
+        rpc: "/rmail.v1.AnalyticsService/GenerateDigest",
+        tool: "generate_digest",
+        effect: Mutate,
+        cli: ["digest"],
+        actions: [],
+        summary: "Brief one window of mail as ranked markdown, clustered by topic and sender, every line citing its message-ids.",
+    }
 
     // -- IndexService (task 24) -----------------------------------------------
     IndexStatus {

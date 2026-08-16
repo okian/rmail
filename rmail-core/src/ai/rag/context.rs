@@ -56,7 +56,39 @@ use crate::storage::Database;
 /// [`crate::rank::l2`]'s own cap. `ai.ask.top_k` is the real bound; this
 /// exists so a misconfiguration cannot turn one question into an unbounded
 /// `IN (...)` list.
-const MAX_FETCH: usize = 200;
+///
+/// `pub`, because it is not merely an internal safety net for callers that
+/// select their own candidate set: everything past it is *silently* absent
+/// from [`Packed`] — not withheld, not dropped for budget, just never fetched
+/// — so a caller that hands over more ids than this would misreport its own
+/// coverage. [`crate::digest`] clamps against it for exactly that reason.
+pub const MAX_FETCH: usize = 200;
+
+/// The two bounds [`pack`] enforces.
+///
+/// Named separately from [`AiAsk`] because packing is not an `AskMailbox`
+/// concern any more: [`crate::digest`] (task 70) builds a context the same way
+/// — same policy gate, same fencing, same budget discipline — from its own
+/// `[digest]` table, and threading an `AiAsk` through it would have meant
+/// either a second copy of this function or a digest configured out of the
+/// mailbox-RAG table. Neither is a real option, and both would have let the
+/// two paths' policy handling drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackLimits {
+    /// Ceiling on the assembled context, in estimated tokens.
+    pub max_context_tokens: usize,
+    /// Ceiling on how much of one message's body may enter it.
+    pub max_chars_per_message: usize,
+}
+
+impl From<&AiAsk> for PackLimits {
+    fn from(ask: &AiAsk) -> Self {
+        Self {
+            max_context_tokens: ask.max_context_tokens as usize,
+            max_chars_per_message: ask.max_chars_per_message as usize,
+        }
+    }
+}
 
 /// One message as the answering model will see it: an identity the citation
 /// layer maps back to, and the bounded text that entered the prompt.
@@ -185,7 +217,7 @@ pub async fn pack(
     db: &Database,
     ids: &[i64],
     policy: &Arc<PolicyEngine>,
-    config: &AiAsk,
+    limits: PackLimits,
     max_body_chars: usize,
     cancel: &CancellationToken,
 ) -> Result<Packed, Error> {
@@ -202,8 +234,8 @@ pub async fn pack(
     // and never more than `ai.privacy.max_body_chars` — the operator's own
     // ceiling on what any single message may hand a provider, which this path
     // must not silently exceed just because it packs many messages at once.
-    let per_message = (config.max_chars_per_message as usize).min(max_body_chars);
-    let budget = config.max_context_tokens as usize;
+    let per_message = limits.max_chars_per_message.min(max_body_chars);
+    let budget = limits.max_context_tokens;
 
     // `ids`' order, not the fetch's: retrieval ranked these, and the pack has
     // to be best-first for the budget cut below to mean "the best that fit".

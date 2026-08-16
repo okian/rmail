@@ -431,6 +431,25 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AnalyticsService/GetResponseTimes",
         Requirement::Scope(Scope::MailRead),
     ),
+    // `GenerateDigest` (task 70) is the opposite of its neighbour on every
+    // axis the row above turns on, so it needs both scopes — the same pairing,
+    // for the same two reasons, `AiService/AskMailbox` and
+    // `AttachmentService/AskAttachment` carry.
+    //
+    // `mail.read`, because a briefing is built from the bodies of a whole
+    // window of mail and restates them; anything that can read that much of a
+    // mailbox has to need what reading a mailbox needs.
+    //
+    // `ai.invoke`, because calling the provider is the entire RPC. There is no
+    // clamp-to-configured-backend argument available here of the kind that
+    // keeps `SearchService/Search` at `mail.read`: a caller names the window,
+    // and a wide enough window is an arbitrarily large Sonnet call charged to
+    // the operator. `AllOf`, not `AnyOf` — either scope alone under-gates it,
+    // and picking the stronger of the two would silently grant the other.
+    (
+        "/rmail.v1.AnalyticsService/GenerateDigest",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
+    ),
     // -- IndexService (task 24) -----------------------------------------------
     // The index is a derived artifact over mail the caller can already read, so
     // the read-only RPCs sit at `mail.read` for the same reason `SearchService`'s

@@ -1,10 +1,25 @@
-//! The `AnalyticsService` gRPC implementation (task 71, prd.md feature 58).
+//! The `AnalyticsService` gRPC implementation (tasks 71 and 70, prd.md
+//! features 58 and 57).
 //!
-//! A thin boundary over [`rmail_core::analytics::response_time`]: decode the
-//! request, apply the defaults a zero field stands for, run the report, and
-//! project it back. Every rule about what a pair *is* — direction, the
-//! bottleneck test, the percentile method — lives in the core module, because
-//! the CLI, MCP and any future surface must all get the same numbers.
+//! A thin boundary over [`rmail_core::analytics::response_time`] and
+//! [`rmail_core::digest`]: decode the request, apply the defaults a zero field
+//! stands for, run the report, and project it back. Every rule about what a
+//! pair *is* — direction, the bottleneck test, the percentile method — and
+//! every rule about what a briefing is — the window grid, clustering, the
+//! policy gate, the fence, the citation discipline — lives in the core
+//! modules, because the CLI, MCP and any future surface must all get the same
+//! answers.
+//!
+//! # Why the digest lives on this service and not on `AiService`
+//!
+//! It is prd.md's own placement (`AnalyticsService.GenerateDigest`), and the
+//! reason survives scrutiny: a digest answers a question *about* a window of
+//! mail rather than about a message, which is the line this service is drawn
+//! on. What it does *not* share with its neighbour is the risk profile —
+//! `GetResponseTimes` is arithmetic over headers, while `GenerateDigest` reads
+//! bodies, calls a provider, spends, and writes a row. That difference is
+//! carried entirely by the scope table (`mail.read` versus `mail.read` +
+//! `ai.invoke`), not by which service the RPC sits on.
 //!
 //! # Zero means "default", and the resolved values come back
 //!
@@ -28,12 +43,16 @@
 use rmail_core::analytics::response_time::{
     self, GroupBy, ResponseGroup, ResponseTimeQuery, ResponseTimes, Stats, TrendPoint,
 };
+use rmail_core::digest::{
+    schedule, DigestEngine, DigestReport, DigestRequest, Period, StoredSource,
+};
 use rmail_core::{Database, Error};
 use rmail_proto::v1::analytics_service_server::AnalyticsService;
 use rmail_proto::v1::{
-    GetResponseTimesRequest, GetResponseTimesResponse, ResponseStats,
-    ResponseTimeGroup as ProtoGroup, ResponseTimeGroupBy as ProtoGroupBy,
-    ResponseTrendPoint as ProtoTrendPoint,
+    DigestLine as ProtoLine, DigestSection as ProtoSection, DigestSource as ProtoSource,
+    GenerateDigestRequest, GenerateDigestResponse, GetResponseTimesRequest,
+    GetResponseTimesResponse, ResponseStats, ResponseTimeGroup as ProtoGroup,
+    ResponseTimeGroupBy as ProtoGroupBy, ResponseTrendPoint as ProtoTrendPoint,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -42,16 +61,37 @@ use tonic::{Request, Response, Status};
 #[derive(Clone)]
 pub struct AnalyticsApi {
     db: Database,
+    /// The digest engine, `None` on a daemon whose AI subsystem is off.
+    ///
+    /// `None` rather than an engine over a `NullProvider`: `GenerateDigest`
+    /// then declines with `FAILED_PRECONDITION` *before* selecting a window
+    /// and scanning it, instead of doing all the work and failing at the
+    /// provider. The RPC stays registered either way — reflection and the
+    /// fail-closed scope table must see every RPC regardless of runtime
+    /// config, the convention `AiService`/`HookService` established.
+    digest: Option<DigestEngine>,
     /// Cancelled when the daemon shuts down, so an in-flight report stops
     /// with it rather than holding shutdown open.
     shutdown: CancellationToken,
 }
 
 impl AnalyticsApi {
-    /// Create a handler over the given database.
+    /// Create a handler over the given database, with no digest engine —
+    /// `GenerateDigest` declines. Use [`Self::with_digest`] to wire one.
     #[must_use]
     pub fn new(db: Database, shutdown: CancellationToken) -> Self {
-        Self { db, shutdown }
+        Self {
+            db,
+            digest: None,
+            shutdown,
+        }
+    }
+
+    /// Serve `GenerateDigest` from `engine`.
+    #[must_use]
+    pub fn with_digest(mut self, engine: DigestEngine) -> Self {
+        self.digest = Some(engine);
+        self
     }
 }
 
@@ -69,6 +109,140 @@ impl AnalyticsService for AnalyticsApi {
         let cancel = self.shutdown.child_token();
         let report = response_time::response_times(&self.db, &cancel, query).await?;
         Ok(Response::new(to_proto(&report)))
+    }
+
+    async fn generate_digest(
+        &self,
+        request: Request<GenerateDigestRequest>,
+    ) -> Result<Response<GenerateDigestResponse>, Status> {
+        let req = request.into_inner();
+        if req.account_id != 0 {
+            tracing::Span::current().record(rmail_core::telemetry::FIELD_ACCOUNT, req.account_id);
+        }
+        let Some(engine) = self.digest.as_ref() else {
+            return Err(Status::from(Error::failed_precondition(
+                "the AI subsystem is not available on this daemon, so no digest can be \
+                 generated (check `ai.enabled` and the configured provider)",
+            )));
+        };
+        let period = window_from_proto(&req, engine.interval_seconds(), now()?)?;
+        let cancel = self.shutdown.child_token();
+        let digest = engine
+            .generate(
+                DigestRequest {
+                    account_id: req.account_id,
+                    period,
+                    // 0, not the configured cadence: an RPC-selected window is
+                    // ad hoc even when it happens to coincide with a period,
+                    // and `digests.interval_seconds` records which cadence
+                    // *produced* a row rather than which one it resembles.
+                    interval_seconds: 0,
+                    force: req.force,
+                    // A caller is on the other end of this RPC, so it is
+                    // charged as interactive rather than against the bulk
+                    // sub-budget the scheduled job uses.
+                    interactive: true,
+                },
+                &cancel,
+            )
+            .await?;
+        Ok(Response::new(digest_to_proto(&digest)))
+    }
+}
+
+/// Resolve the requested window, applying the "0 means the last completed
+/// period" default.
+///
+/// The three shapes are deliberate and each has a use: no bounds is "what the
+/// timer would have produced" (`mail digest`), a `since` alone is "since then,
+/// up to now" (`mail digest --since 7d`), and an `until` alone is one cadence
+/// ending there, which is how a caller re-asks for a specific past period.
+fn window_from_proto(
+    req: &GenerateDigestRequest,
+    interval: i64,
+    now: i64,
+) -> Result<Period, Status> {
+    for (name, value) in [
+        ("account_id", req.account_id),
+        ("since", req.since),
+        ("until", req.until),
+    ] {
+        if value < 0 {
+            return Err(Status::from(Error::invalid_argument(format!(
+                "{name} must not be negative"
+            ))));
+        }
+    }
+    let period = match (req.since, req.until) {
+        (0, 0) => schedule::last_completed(now, interval),
+        (since, 0) => Period {
+            start: since,
+            end: now,
+        },
+        (0, until) => Period {
+            start: until.saturating_sub(interval),
+            end: until,
+        },
+        (since, until) => Period {
+            start: since,
+            end: until,
+        },
+    };
+    if period.end <= period.start {
+        return Err(Status::from(Error::invalid_argument(
+            "a digest window must end after it starts",
+        )));
+    }
+    Ok(period)
+}
+
+/// Project a finished briefing onto the wire.
+fn digest_to_proto(report: &DigestReport) -> GenerateDigestResponse {
+    GenerateDigestResponse {
+        digest_id: report.id,
+        since: report.period.start,
+        until: report.period.end,
+        account_id: report.account_id,
+        generated_at: report.generated_at,
+        markdown: report.markdown.clone(),
+        sections: report
+            .briefing
+            .sections
+            .iter()
+            .map(|(section, lines)| ProtoSection {
+                id: section.id().to_owned(),
+                heading: section.heading().to_owned(),
+                lines: lines
+                    .iter()
+                    .map(|line| ProtoLine {
+                        text: line.text.clone(),
+                        message_ids: line.message_ids.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        sources: report.sources.iter().map(source_to_proto).collect(),
+        model: report.model.clone(),
+        considered: report.considered,
+        packed: report.packed,
+        withheld_by_policy: report.withheld,
+        clusters: report.clusters,
+        cached: report.cached,
+        empty: report.empty,
+    }
+}
+
+fn source_to_proto(source: &StoredSource) -> ProtoSource {
+    ProtoSource {
+        label: source.label,
+        message_id: source.message_id,
+        message_uid: source.message_uid,
+        account_id: source.account_id,
+        mailbox: source.mailbox.clone(),
+        subject: source.subject.clone(),
+        from_addr: source.from_addr.clone(),
+        date: source.date.unwrap_or(0),
+        cited: source.cited,
     }
 }
 

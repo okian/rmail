@@ -84,6 +84,7 @@ use rmail_core::ai::{
     Provider as AiProvider, QueueOptions as AiQueueOptions, RateLimiter, TriagePassHandler,
 };
 use rmail_core::compose::DraftStore;
+use rmail_core::digest::{DigestEngine, DigestScheduler};
 use rmail_core::embed::hash::HashEmbedder;
 use rmail_core::embed::Embedder;
 use rmail_core::events::{EventLog, Retention};
@@ -714,8 +715,10 @@ where
         AccountApi::new(db.clone(), stopping.clone()).map_err(ServeError::OAuthBroker)?,
     );
     let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
-    let analytics_service =
-        AnalyticsServiceServer::new(AnalyticsApi::new(db.clone(), stopping.clone()));
+    // Built further down, once the AI provider and policy engine exist:
+    // `AnalyticsService` is registered with the rest of the services below,
+    // and `GenerateDigest`'s engine is attached to it there.
+    let analytics_api = AnalyticsApi::new(db.clone(), stopping.clone());
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
     // `ExportService` needs nothing but the database and the shutdown token:
     // an export is a local read that never touches IMAP or a model provider
@@ -1160,6 +1163,11 @@ where
     // longer where they originate.
     let rules_ai_semaphore = Arc::clone(&ai_semaphore);
     let rules_ai_rate_limiter = Arc::clone(&ai_rate_limiter);
+    // The digest engine draws from the same pair, for the identical reason.
+    // Cloned here rather than at its construction site further down because
+    // `ai_semaphore`/`ai_rate_limiter` are moved into `AiApi::new` before it.
+    let digest_ai_semaphore = Arc::clone(&ai_semaphore);
+    let digest_ai_rate_limiter = Arc::clone(&ai_rate_limiter);
 
     // Always starts unpaused, regardless of `ai_active` — a disabled daemon
     // is reported via `GetUsage.enabled = false`, not by pretending it is
@@ -1400,6 +1408,61 @@ where
         None
     };
 
+    // The periodic AI digest (task 70). Two switches, and they gate different
+    // things — the same split `notify.enabled` already established:
+    //
+    // - `ai_active` gates the *engine*. With `NullProvider` behind it every
+    //   briefing would scan a window, cluster it, and then fail at the
+    //   provider, so the handler declines up front instead (see
+    //   `AnalyticsApi::with_digest`) and the scheduler is never spawned.
+    // - `digest.enabled` gates only the *timer*. `GenerateDigest` and `mail
+    //   digest` keep working on a daemon with the schedule off, because what
+    //   the switch exists to control is unattended, recurring spend, not the
+    //   operator's own explicit request.
+    //
+    // The engine draws on the same `ai.limits` semaphore and rate limiter as
+    // every other AI call site in this process: a digest is exactly the kind
+    // of wide, bursty work `ai.limits` exists to bound, and a second budget
+    // would let the two together exceed it.
+    let digest_engine = ai_active.then(|| {
+        DigestEngine::new(
+            db.clone(),
+            Arc::clone(&ai_provider),
+            Arc::clone(&ai_policy),
+            config.ai.privacy.clone(),
+            config.ai.limits.clone(),
+            config.digest.clone(),
+            Arc::clone(&digest_ai_semaphore),
+            Arc::clone(&digest_ai_rate_limiter),
+        )
+    });
+    let analytics_service = AnalyticsServiceServer::new(match digest_engine.clone() {
+        Some(engine) => analytics_api.with_digest(engine),
+        None => analytics_api,
+    });
+    let digest_handle = match (&digest_engine, config.digest.enabled) {
+        (Some(engine), true) => {
+            let scheduler = DigestScheduler::new(engine.clone(), db.clone());
+            tracing::info!(
+                interval_seconds = engine.interval_seconds(),
+                tick_interval = ?scheduler.tick_interval(),
+                "the periodic AI digest is running"
+            );
+            Some(scheduler.spawn(stopping.clone()))
+        }
+        (Some(_), false) => {
+            tracing::info!(
+                "digest.enabled = false; no periodic digest is produced (GenerateDigest and \
+                 `mail digest` still answer on demand)"
+            );
+            None
+        }
+        (None, _) => {
+            tracing::info!("the AI subsystem is off; no digest is produced on this daemon");
+            None
+        }
+    };
+
     let incoming = UnixListenerStream::new(listener);
     let serve_result = Server::builder()
         // Every RPC runs inside a request-tracing span; the auth layer sits
@@ -1448,6 +1511,9 @@ where
         let _ = handle.await;
     }
     if let Some(handle) = notify_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = digest_handle {
         let _ = handle.await;
     }
     let _ = index_handle.await;

@@ -130,7 +130,14 @@ const SCHEMA_VERSION: i64 = 1;
 /// deep pass, task 49) so this ceiling is rarely approached.
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
-const CATEGORIES: [&str; 8] = [
+/// `pub(crate)` for the same reason [`PRIORITIES`] is: [`crate::digest`]
+/// renders a cluster's triage category into the prompt *outside* the untrusted
+/// fence, which is only defensible while the value comes from a closed
+/// vocabulary this codebase controls. A second, hand-maintained copy of that
+/// vocabulary would silently drift the moment this one gains or renames a
+/// value, and the drift would show up as a category the digest quietly
+/// discards.
+pub(crate) const CATEGORIES: [&str; 8] = [
     "personal",
     "work",
     "newsletter",

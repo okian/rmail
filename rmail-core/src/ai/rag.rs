@@ -368,7 +368,7 @@ impl RagEngine {
             &self.db,
             &ids,
             &self.policy,
-            &self.config,
+            context::PackLimits::from(&self.config),
             self.privacy.max_body_chars as usize,
             cancel,
         )

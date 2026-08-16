@@ -1,5 +1,6 @@
 //! The `mail` CLI — a thin gRPC client for the rmail daemon.
 
+mod digest_cli;
 mod export_cli;
 mod find_cli;
 mod hook_cli;
@@ -218,6 +219,11 @@ enum Command {
         #[command(subcommand)]
         action: stats_cli::StatsAction,
     },
+    /// A ranked markdown briefing over one window of mail, every line citing
+    /// the messages it came from (`AnalyticsService.GenerateDigest`). Reads
+    /// back an existing briefing for the same window rather than paying for a
+    /// second one — see `digest_cli`'s own module docs.
+    Digest(digest_cli::DigestArgs),
     /// Serve the whole gRPC surface to an AI agent over the Model Context
     /// Protocol. The tool list is generated from the compiled service
     /// definitions, so it is never out of step with the API — see
@@ -540,6 +546,7 @@ async fn main() -> Result<()> {
         Command::Outbox(args) => outbox_cli::outbox(&socket, args).await,
         Command::Followup { action } => outbox_cli::followup(&socket, action).await,
         Command::Stats { action } => stats_cli::run(&socket, action).await,
+        Command::Digest(args) => digest_cli::run(&socket, args).await,
         Command::Mcp { action } => mcp_cli::run(&socket, action).await,
         Command::AcceptTags { message_tag_ids } => {
             tag_cli::resolve_suggestions(&socket, message_tag_ids, true).await

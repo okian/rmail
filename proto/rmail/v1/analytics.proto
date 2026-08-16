@@ -3,14 +3,13 @@ syntax = "proto3";
 package rmail.v1;
 
 // AnalyticsService answers questions *about* a mailbox rather than about the
-// mail in it: how fast you answer, who you keep waiting, and whether that is
-// getting better or worse.
+// mail in it: how fast you answer, who you keep waiting, what a week of mail
+// added up to, and whether any of that is getting better or worse.
 //
-// Everything here is derived from the local mirror by SQL. No model is
-// called, nothing is written, and no message body is read — the inputs are
-// headers (`From`, `Date`, `In-Reply-To`, `References`) and folder names.
-// That is why it sits behind `mail.read` and is projected to MCP as a safe
-// tool.
+// Most of it is derived from the local mirror by SQL — no model, no writes,
+// no message body — which is why `GetResponseTimes` sits behind `mail.read`.
+// `GenerateDigest` is the exception in every one of those respects and is
+// scoped accordingly; see its own comment.
 service AnalyticsService {
   // Per-contact or per-mailbox response-time percentiles, a rolling trend,
   // and a flag on the correspondences where *you* are the slow side
@@ -21,6 +20,38 @@ service AnalyticsService {
   // retry. INVALID_ARGUMENT for a window, bucket or ratio the fields below
   // say is out of range.
   rpc GetResponseTimes(GetResponseTimesRequest) returns (GetResponseTimesResponse);
+
+  // A ranked markdown briefing over one window of mail, clustered by
+  // thread/topic/sender, with every line linked to the message-ids it came
+  // from (prd.md feature 57).
+  //
+  // Unlike `GetResponseTimes` this reads message bodies, calls Claude, spends
+  // against `ai.limits`, and writes a durable row — so it needs both
+  // `mail.read` and `ai.invoke`.
+  //
+  // One window, one stored briefing. The window is resolved first (see the
+  // request's own fields) and a briefing already stored for exactly that
+  // window is returned as-is with `cached = true`, without a second model
+  // call. Only `force` replaces one.
+  //
+  // Reuse is keyed on the exact bounds, so it only helps a caller that asks
+  // for a *fixed* window. Leaving both bounds at 0 does (it resolves to the
+  // last completed period); naming `since` alone does not, since the window
+  // then ends at "now" and differs on every call. An explicit open-ended
+  // window is a fresh model call, by construction.
+  //
+  // A window ending in the future is accepted and stored, but is deliberately
+  // inert to the scheduled job: the timer's cursor ignores rows that have not
+  // elapsed, so one such request cannot stop the periodic digest.
+  //
+  // FAILED_PRECONDITION on a daemon whose AI subsystem is off, or when
+  // redaction leaves nothing to brief on. RESOURCE_EXHAUSTED when a spend cap
+  // or budget refuses the call. INVALID_ARGUMENT for a window that does not
+  // end after it starts. INTERNAL when the model answered but not one line of
+  // it cited a message that was actually retrieved — a briefing with no
+  // sourced line is not a thinner briefing, it is an unusable one, and it is
+  // not stored.
+  rpc GenerateDigest(GenerateDigestRequest) returns (GenerateDigestResponse);
 }
 
 // Which dimension a response-time report is grouped along.
@@ -200,4 +231,113 @@ message GetResponseTimesResponse {
   // answers. A negative latency is a clock or a forged `Date` header, not a
   // fast reply, and averaging it in would drag every percentile down.
   uint64 skipped_out_of_order = 11;
+}
+
+// ---------------------------------------------------------------------------
+// GenerateDigest (prd.md feature 57, task 70)
+// ---------------------------------------------------------------------------
+
+message GenerateDigestRequest {
+  // Restrict to one account. 0 covers every configured account, and is the
+  // scope the scheduled job itself uses — a briefing about "my mail" is not
+  // per-mailbox.
+  int64 account_id = 1;
+
+  // Window bounds in unix seconds, half-open: `since <= t < until`. A message
+  // is in the window when its own `Date` (falling back to the IMAP
+  // INTERNALDATE) is.
+  //
+  // Both 0 means "the most recently completed period on the configured
+  // cadence" (`digest.interval`, one day by default) — the same window the
+  // scheduled job would have produced, so `mail digest` with no flags asks
+  // for exactly what the timer would have. Naming `since` alone means "since
+  // then, up to now"; naming `until` alone means "one cadence ending there".
+  int64 since = 2;
+  int64 until = 3;
+
+  // Regenerate rather than returning a briefing already stored for this
+  // window. Costs a second model call and replaces the stored row; the
+  // scheduler never sets it.
+  bool force = 4;
+}
+
+// One source the briefing was built from. The label is what the model was
+// shown and what the citation layer resolved; `message_id` is what the
+// rendered markdown carries inline.
+message DigestSource {
+  uint32 label = 1;
+  int64 message_id = 2;
+  int64 message_uid = 3;
+  int64 account_id = 4;
+  string mailbox = 5;
+  string subject = 6;
+  string from_addr = 7;
+  // 0 when the message has no date.
+  int64 date = 8;
+  // Whether a surviving line of the briefing actually pointed at this source.
+  // A packed-but-uncited source is context the model was given and did not
+  // use, which is worth telling apart from one it did.
+  bool cited = 9;
+}
+
+// One line of the briefing, and the messages it is drawn from.
+message DigestLine {
+  // The line as rendered, citations included. Never empty, and never without
+  // at least one citation.
+  string text = 1;
+  // `messages.id` for every source this line cited, in the order it named
+  // them. Never empty — a line that cited nothing is not returned.
+  repeated int64 message_ids = 2;
+}
+
+// One section of the briefing. All five are always present, in the fixed
+// order below, whether or not they hold lines.
+message DigestSection {
+  // Stable identifier: `needs_reply`, `fyi`, `waiting_on`, `auto_handled` or
+  // `skipped`. Match on this, not on `heading`.
+  string id = 1;
+  // The heading as it appears in `markdown`.
+  string heading = 2;
+  repeated DigestLine lines = 3;
+}
+
+message GenerateDigestResponse {
+  // `digests.id` — the durable row this briefing is stored as.
+  int64 digest_id = 1;
+  // The resolved window, after defaults were applied.
+  int64 since = 2;
+  int64 until = 3;
+  int64 account_id = 4;
+  // When the stored briefing was written; for a cached one this is when it
+  // was *first* produced, not now.
+  int64 generated_at = 5;
+
+  // The briefing as markdown: five `## ` headings in a fixed order, bullets
+  // beneath them, `_none_` where a section is empty. Rendered by the daemon
+  // from `sections` — only the prose inside a bullet is the model's, and
+  // every citation in it is a `[msg:<id>]` the daemon resolved.
+  string markdown = 6;
+  repeated DigestSection sections = 7;
+  repeated DigestSource sources = 8;
+
+  // The model that actually wrote it, after any budget downgrade. Empty when
+  // no model was called — see `empty`.
+  string model = 9;
+
+  // Messages in the window that were considered, how many entered the prompt,
+  // how many the AI policy withheld, and how many clusters they were grouped
+  // into. Reported because a thin briefing and a quiet week look the same in
+  // `markdown` and are very different facts.
+  uint64 considered = 10;
+  uint64 packed = 11;
+  uint64 withheld_by_policy = 12;
+  uint64 clusters = 13;
+
+  // Whether this briefing was read back rather than generated. A cached
+  // response made no model call and cost nothing.
+  bool cached = 14;
+  // Whether the window held nothing to brief. An empty window produces the
+  // same five-section document with every section empty, and — deliberately —
+  // no model call at all.
+  bool empty = 15;
 }

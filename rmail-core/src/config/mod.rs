@@ -34,7 +34,7 @@ pub use duration::{parse_human_duration, HumanDuration};
 /// Top-level table names accepted from the environment overlay.
 const KNOWN_TABLES: &[&str] = &[
     "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc",
-    "hooks", "rules", "notify",
+    "hooks", "rules", "notify", "digest",
 ];
 
 /// Errors produced while loading or parsing configuration.
@@ -307,6 +307,8 @@ pub struct Config {
     pub rules: RulesConfig,
     /// Priority-notification engine settings.
     pub notify: NotifyConfig,
+    /// Periodic AI digest settings.
+    pub digest: DigestConfig,
 }
 
 impl Config {
@@ -2613,6 +2615,78 @@ impl Default for QuietHoursConfig {
             start: "22:00".to_owned(),
             end: "07:00".to_owned(),
             timezone: String::new(),
+        }
+    }
+}
+
+/// The periodic AI digest (`[digest]`, task 70, prd.md feature 57).
+///
+/// Deliberately a small table, for the reason [`AiAsk`]'s docs give: what
+/// decides *whether* a call may happen at all — spend caps, concurrency,
+/// redaction, per-folder eligibility — already lives in `[ai.limits]`,
+/// `[ai.privacy]` and `[ai.policy]`, and the digest draws on those rather than
+/// restating them. What is here is the cadence, the size of one briefing, and
+/// nothing else.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DigestConfig {
+    /// Whether the scheduled job runs.
+    ///
+    /// Off by default, like `notify.enabled` and for the same reason: a
+    /// digest is a recurring Sonnet call over a window of mail, and a feature
+    /// that spends money on a timer must be something an operator switched on
+    /// rather than something they discover on their first invoice.
+    /// `AnalyticsService.GenerateDigest` and `mail digest` still answer on a
+    /// daemon with this off — what `enabled` gates is the *automatic* spend,
+    /// not the operator's own explicit request, exactly as
+    /// `notify.enabled`/`NotificationService.ScoreMessage` already split it.
+    pub enabled: bool,
+    /// The model that writes the briefing. prd.md's `claude-sonnet-5` default
+    /// for RAG/drafting — a briefing is a synthesis task over many messages,
+    /// not the per-message classification `ai.models.triage` sizes for.
+    pub model: String,
+    /// The cadence. Periods are absolute, anchored at the unix epoch, so this
+    /// value determines the window boundaries — see
+    /// `rmail_core::digest::schedule`'s own docs on why that matters and what
+    /// it implies for anything other than a whole number of days.
+    pub interval: HumanDuration,
+    /// How often the scheduler checks whether a period has completed. Only an
+    /// upper bound on how late a briefing is, never on what it covers.
+    pub tick_interval: HumanDuration,
+    /// How many missed periods one tick will catch up on. A daemon that was
+    /// off for a month briefs the most recent `max_catchup_periods` and skips
+    /// the rest, rather than making thirty model calls in one tick.
+    pub max_catchup_periods: u32,
+    /// How many of the window's messages may enter one briefing, after
+    /// clustering has ranked them.
+    pub max_messages: u32,
+    /// How many clusters one briefing covers.
+    pub max_clusters: u32,
+    /// Ceiling on the assembled context, in estimated tokens.
+    pub max_context_tokens: u32,
+    /// How much of one message's body may enter the context. Bounded per
+    /// message as well as in aggregate so one enormous message cannot consume
+    /// the whole budget — and never more than `ai.privacy.max_body_chars`,
+    /// which this path must not silently exceed just because it packs many
+    /// messages at once.
+    pub max_chars_per_message: u32,
+    /// Output-token ceiling for the briefing itself.
+    pub max_tokens: u32,
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: "claude-sonnet-5".to_owned(),
+            interval: HumanDuration::new(days(1)),
+            tick_interval: HumanDuration::new(mins(15)),
+            max_catchup_periods: 7,
+            max_messages: 120,
+            max_clusters: 15,
+            max_context_tokens: 12_000,
+            max_chars_per_message: 800,
+            max_tokens: 2_048,
         }
     }
 }
