@@ -6,18 +6,18 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**75 of 86 done, 11 remaining.** `tasks.md` is authoritative — count with
+**77 of 86 done, 9 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **3593/3593** on the full
+after merge, never on the agent's own report: currently **3778/3778** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: 36, 42, 58, 65, 68, 69, 72, 73, 78. All ready; all but 42 are
-`parallel-safe: yes`. In flight: **62** (AI reply drafting) and **75**
-(table/calendar/link extraction).
+Remaining: 36, 42, 65, 69, 72, 73, 78. All ready; all but 42 are
+`parallel-safe: yes`. In flight: **58** (NL smart folders) and **68**
+(outbound webhooks).
 
-Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80. Every one verified on the
-*combined* tree, never on the agent's own count — the reports quoted six
-different bases; the truth after merging all of them is 3593.
+Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75. Every one verified on the
+*combined* tree, never on the agent's own count — the reports quoted eight
+different bases; the truth after merging all of them is 3778.
 
 **Three of the last five needed real work at merge, not just a cherry-pick:**
 
@@ -98,7 +98,9 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V45.** V43 went to 57, V44 to 80. (81 took V40, 70 took V41, 63 took V42;
+costs nothing. **Next free: V47.** V43 went to 57, V44 to 80, V45 to 62,
+V46 to 75 (renumbered from its own V45 — the second collision, again from two
+agents dispatched with different numbers). (81 took V40, 70 took V41, 63 took V42;
 71, 79 and 82 needed none.)
 
 **Tasks 70 and 63 both arrived numbered V41** — the first real collision
