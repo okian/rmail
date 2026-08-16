@@ -88,11 +88,17 @@ pub async fn create(db: &Database, new: NewAccount) -> Result<Account> {
     }
     // A Keychain credential is looked up by (service, username), so fail fast
     // rather than persisting an account that can never resolve its password.
-    if matches!(new.credential, CredentialSource::Keychain(_))
-        && new.username.as_deref().map_or(true, str::is_empty)
+    // An OAuth grant is Keychain-addressed too, so it carries the same
+    // precondition — `set_credential` enforces both, and a `create` that
+    // enforced only one let an OAuth account be persisted that could never
+    // resolve its refresh token.
+    if matches!(
+        new.credential,
+        CredentialSource::Keychain(_) | CredentialSource::OAuth(_)
+    ) && new.username.as_deref().map_or(true, str::is_empty)
     {
         return Err(Error::invalid_argument(
-            "keychain credentials require a username",
+            "keychain and oauth credentials require a username",
         ));
     }
 
@@ -136,6 +142,45 @@ pub async fn get(db: &Database, id: i64) -> Result<Account> {
         .await?
         .ok_or_else(|| Error::not_found(format!("account {id}")))?;
     Account::from_repo(row)
+}
+
+/// Repoint an account at a different credential source.
+///
+/// The one mutation `AccountService` exposes on an existing account, and it
+/// exists for exactly one caller: `CompleteOAuth`, which must switch an
+/// account onto its new grant *after* the grant is safely stored. Nothing here
+/// touches the secret itself — only the reference describing where it lives.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if no such account; [`Error::InvalidArgument`] if the
+/// source needs a username the account does not have; otherwise a mapped
+/// storage error.
+pub async fn set_credential(db: &Database, id: i64, credential: &CredentialSource) -> Result<()> {
+    // Same precondition `create` enforces: a Keychain-addressed secret (which
+    // an OAuth grant is) is looked up by (service, username), so an account
+    // without a username could never resolve it.
+    if matches!(
+        credential,
+        CredentialSource::Keychain(_) | CredentialSource::OAuth(_)
+    ) {
+        let account = get(db, id).await?;
+        if account.username.as_deref().map_or(true, str::is_empty) {
+            return Err(Error::invalid_argument(
+                "keychain and oauth credentials require a username",
+            ));
+        }
+    }
+    let kind = credential.kind().to_owned();
+    let reference = credential.reference().map(str::to_owned);
+    let changed = db
+        .write(move |c| repo::set_account_credential(c, id, &kind, reference.as_deref()))
+        .await?;
+    if changed {
+        Ok(())
+    } else {
+        Err(Error::not_found(format!("account {id}")))
+    }
 }
 
 /// Delete an account by id (cascades to its mailboxes/messages).

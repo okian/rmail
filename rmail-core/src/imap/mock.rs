@@ -17,6 +17,7 @@
 //! test can assert that an incremental sync issued *no* fetches — or that it
 //! issued exactly the CONDSTORE one — rather than merely producing no new rows.
 
+use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,6 +65,9 @@ pub(crate) struct MockConfig {
     /// Answer every `UID` command with a tagged `NO [TRYCREATE]` — the one
     /// refusal RFC 3501 defines as "the destination does not exist".
     refuse_uid_trycreate: bool,
+    /// The SASL XOAUTH2 bearer token accepted by `AUTHENTICATE XOAUTH2`, if
+    /// the mock speaks it at all.
+    xoauth2_token: Option<String>,
     /// How often to volunteer `* OK Still here` while idling.
     idle_keepalive: Duration,
 }
@@ -96,6 +100,7 @@ impl Default for MockConfig {
             empty_search: false,
             refuse_uid: false,
             refuse_uid_trycreate: false,
+            xoauth2_token: None,
             // Effectively never, unless a test asks for it.
             idle_keepalive: Duration::from_secs(86_400),
         }
@@ -106,6 +111,12 @@ impl MockConfig {
     /// Set the accepted password.
     pub(crate) fn password(mut self, password: &str) -> Self {
         self.password = password.to_owned();
+        self
+    }
+
+    /// Accept `AUTHENTICATE XOAUTH2` bearing exactly this access token.
+    pub(crate) fn xoauth2(mut self, access_token: &str) -> Self {
+        self.xoauth2_token = Some(access_token.to_owned());
         self
     }
 
@@ -569,6 +580,71 @@ async fn serve(
                         .write_all(
                             format!("{tag} NO [AUTHENTICATIONFAILED] invalid credentials\r\n")
                                 .as_bytes(),
+                        )
+                        .await?;
+                }
+            }
+            // `AUTHENTICATE XOAUTH2` as Google and Microsoft implement it: an
+            // empty continuation, then one base64 SASL line from the client.
+            // Modelled rather than stubbed because the failure mode worth
+            // testing is the *second* continuation a real server sends on a
+            // bad token — a client that answers it with the credential again
+            // instead of an empty line hangs forever against Gmail.
+            "AUTHENTICATE" => {
+                let mechanism = command
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+                let Some(expected) = config.xoauth2_token.clone() else {
+                    write
+                        .write_all(
+                            format!("{tag} NO [CANNOT] AUTHENTICATE not supported\r\n").as_bytes(),
+                        )
+                        .await?;
+                    continue;
+                };
+                if mechanism != "XOAUTH2" {
+                    write
+                        .write_all(
+                            format!("{tag} NO unsupported mechanism {mechanism}\r\n").as_bytes(),
+                        )
+                        .await?;
+                    continue;
+                }
+                write.write_all(b"+ \r\n").await?;
+                let response = tokio::select! {
+                    line = lines.recv() => line,
+                    () = shutdown.cancelled() => return Ok(()),
+                };
+                let Some(response) = response else { break };
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(response.trim_end_matches(['\r', '\n']))
+                    .unwrap_or_default();
+                let sasl = String::from_utf8_lossy(&decoded).into_owned();
+                if let Ok(mut log) = command_log.lock() {
+                    log.push(format!("SASL {sasl}"));
+                }
+                if sasl.contains(&format!("auth=Bearer {expected}\u{1}\u{1}")) {
+                    write
+                        .write_all(format!("{tag} OK AUTHENTICATE completed\r\n").as_bytes())
+                        .await?;
+                } else {
+                    // The real servers answer a bad token with a second
+                    // continuation carrying a base64 JSON status, and only
+                    // tag the command `NO` once the client sends an empty
+                    // line back.
+                    write.write_all(b"+ eyJzdGF0dXMiOiI0MDEifQ==\r\n").await?;
+                    let follow_up = tokio::select! {
+                        line = lines.recv() => line,
+                        () = shutdown.cancelled() => return Ok(()),
+                    };
+                    if follow_up.is_none() {
+                        break;
+                    }
+                    write
+                        .write_all(
+                            format!("{tag} NO [AUTHENTICATIONFAILED] invalid token\r\n").as_bytes(),
                         )
                         .await?;
                 }

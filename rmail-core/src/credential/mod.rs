@@ -50,6 +50,20 @@ impl fmt::Display for Secret {
     }
 }
 
+/// Deserialize straight into a [`Secret`], so a token arriving in a JSON body
+/// is redacted from the moment it is parsed rather than after somebody
+/// remembers to wrap it.
+///
+/// There is deliberately no `Serialize`: a `Secret` that can be serialized is
+/// a `Secret` that lands in the next structured log line or JSON response
+/// somebody derives. Writing one out is always explicit, via
+/// [`Secret::expose`], at the one boundary that needs it.
+impl<'de> serde::Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
 /// Where an account's password comes from. Holds only a reference (a command,
 /// env var name, or keychain service) — never the secret.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -64,6 +78,18 @@ pub enum CredentialSource {
     /// A macOS Keychain generic-password service name (looked up with the
     /// account username as the account field).
     Keychain(String),
+    /// OAuth2: the account authenticates with a short-lived bearer token
+    /// obtained by [`crate::oauth`], not with a password. The string is the
+    /// Keychain service holding the grant, addressed the same way
+    /// [`CredentialSource::Keychain`] is.
+    ///
+    /// This is a source with no password to resolve, which is why
+    /// [`CredentialSource::resolve`] refuses it rather than returning
+    /// something: an access token has to be *refreshed*, which is async and
+    /// needs the broker's per-account lock, and a caller that got a bare
+    /// string back here would send it as an IMAP `LOGIN` password — which
+    /// every OAuth provider rejects.
+    OAuth(String),
 }
 
 impl CredentialSource {
@@ -76,7 +102,7 @@ impl CredentialSource {
     pub fn from_stored(kind: &str, reference: Option<&str>) -> Result<Self, Error> {
         match kind {
             "none" => Ok(Self::None),
-            "command" | "env" | "keychain" => {
+            "command" | "env" | "keychain" | "oauth" => {
                 let reference = reference.ok_or_else(|| {
                     Error::invalid_argument(format!(
                         "credential kind {kind:?} requires a reference"
@@ -85,11 +111,12 @@ impl CredentialSource {
                 Ok(match kind {
                     "command" => Self::Command(reference.to_owned()),
                     "env" => Self::Env(reference.to_owned()),
-                    _ => Self::Keychain(reference.to_owned()),
+                    "keychain" => Self::Keychain(reference.to_owned()),
+                    _ => Self::OAuth(reference.to_owned()),
                 })
             }
             other => Err(Error::invalid_argument(format!(
-                "unknown credential kind {other:?} (use none, command, env, keychain)"
+                "unknown credential kind {other:?} (use none, command, env, keychain, oauth)"
             ))),
         }
     }
@@ -102,7 +129,15 @@ impl CredentialSource {
             Self::Command(_) => "command",
             Self::Env(_) => "env",
             Self::Keychain(_) => "keychain",
+            Self::OAuth(_) => "oauth",
         }
+    }
+
+    /// Whether this account authenticates with an OAuth2 bearer token
+    /// (XOAUTH2) rather than a password.
+    #[must_use]
+    pub const fn is_oauth(&self) -> bool {
+        matches!(self, Self::OAuth(_))
     }
 
     /// The persisted `secret_ref` (the command/env-name/keychain-service).
@@ -110,7 +145,7 @@ impl CredentialSource {
     pub fn reference(&self) -> Option<&str> {
         match self {
             Self::None => None,
-            Self::Command(r) | Self::Env(r) | Self::Keychain(r) => Some(r),
+            Self::Command(r) | Self::Env(r) | Self::Keychain(r) | Self::OAuth(r) => Some(r),
         }
     }
 
@@ -132,6 +167,12 @@ impl CredentialSource {
                 }),
             Self::Command(command) => resolve_command(command).map(Some),
             Self::Keychain(service) => resolve_keychain(service, username).map(Some),
+            // Refused rather than resolved: see the variant's own docs. The
+            // caller must go through `crate::oauth::OAuthBroker`, which is
+            // async (it may have to refresh) and serializes per account.
+            Self::OAuth(_) => Err(Error::failed_precondition(
+                "this account authenticates with OAuth2 (XOAUTH2); it has no password to resolve",
+            )),
         }
     }
 }

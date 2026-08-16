@@ -30,6 +30,8 @@ pub mod keymap;
 pub mod mail;
 pub mod message;
 pub mod notes;
+pub mod notify;
+pub mod oauth;
 pub mod outbox;
 pub mod page;
 pub mod parity;

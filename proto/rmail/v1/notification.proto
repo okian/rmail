@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// NotificationService exposes the priority notification engine (task 81,
+// prd.md #62): every newly synced message is scored by Haiku into an
+// importance tier plus a one-line reason, and a desktop notification fires
+// only at or above the account's threshold.
+//
+// The thresholds themselves are config-driven (`[notify]` and per-account
+// `[[accounts]] notify.threshold` in the master TOML) — there is no
+// SetThreshold RPC here, the same choice HookService made and for the same
+// reason: a setting that lives in the operator's config file must not also
+// live in a database this service would then have to keep in sync with it.
+// `ScoreMessage` reports the *effective* threshold so a caller can explain a
+// suppression without re-reading the file.
+service NotificationService {
+  // Report what this daemon has decided about one message, and queue a
+  // scoring pass if it has not decided yet.
+  //
+  // This does NOT block on a model call. Scoring runs through the shared AI
+  // queue (policy, redaction, budget, audit — see rmail_core::notify::score's
+  // module docs on why it must), which is a background pipeline, so an RPC
+  // that pretended to score synchronously would either bypass those gates or
+  // hold a connection open across a lease. Instead: an already-scored message
+  // answers immediately with its tier, reason and outcome; an unscored one is
+  // enqueued and answers QUEUED, and the caller learns the verdict from
+  // StreamAlerts or by asking again.
+  rpc ScoreMessage(ScoreMessageRequest) returns (ScoreMessageResponse);
+
+  // Stream notifications as they are delivered — what `mail notify watch`
+  // attaches to.
+  //
+  // Resumable: every alert carries a monotonic `id`, and a client that
+  // reconnects with `since_id` set to the last one it saw receives everything
+  // after it before the live tail resumes. `notifications.id` is an SQLite
+  // INTEGER PRIMARY KEY on a table nothing renumbers, so an id is never
+  // reused and a cursor can never land in a hole.
+  rpc StreamAlerts(StreamAlertsRequest) returns (stream Alert);
+}
+
+// How much a message deserves to interrupt its recipient.
+//
+// The same four-value ladder `ai.deep_pass.on_priority` and the triage pass
+// use (`rmail_core::ai::triage::PRIORITIES`), deliberately rather than a
+// second vocabulary: an operator reading `threshold = "high"` has every right
+// to expect it to mean what `high` means everywhere else in this config.
+enum NotificationTier {
+  NOTIFICATION_TIER_UNSPECIFIED = 0;
+  // Bulk: newsletters, marketing, receipts, automated notifications.
+  NOTIFICATION_TIER_LOW = 1;
+  // Ordinary correspondence that can wait.
+  NOTIFICATION_TIER_NORMAL = 2;
+  // Someone is waiting on the recipient specifically.
+  NOTIFICATION_TIER_HIGH = 3;
+  // Needs action now.
+  NOTIFICATION_TIER_CRITICAL = 4;
+}
+
+// What this daemon has done, or will do, about a message.
+enum NotificationState {
+  NOTIFICATION_STATE_UNSPECIFIED = 0;
+  // Scored, waiting to be acted on — including "held until quiet hours end".
+  NOTIFICATION_STATE_PENDING = 1;
+  // A notification fired.
+  NOTIFICATION_STATE_DELIVERED = 2;
+  // Deliberately not delivered; `suppressed_reason` says why.
+  NOTIFICATION_STATE_SUPPRESSED = 3;
+  // The delivery channel refused it until its attempts ran out. Distinct
+  // from SUPPRESSED on purpose: "we chose not to" and "we could not" are
+  // different operational facts.
+  NOTIFICATION_STATE_FAILED = 4;
+  // Not scored yet; a scoring pass has been queued by this call.
+  NOTIFICATION_STATE_QUEUED = 5;
+}
+
+message ScoreMessageRequest {
+  // The message to report on (`messages.id`).
+  int64 message_id = 1;
+}
+
+message ScoreMessageResponse {
+  NotificationState state = 1;
+  // Absent until the message has actually been scored.
+  optional NotificationTier tier = 2;
+  // The model's one-line justification. Absent until scored. Never a message
+  // body — see rmail_core::notify's module docs on what a notification is
+  // permitted to carry.
+  optional string reason = 3;
+  // Why a SUPPRESSED message was suppressed ("below_threshold",
+  // "notifications_disabled", ...). Empty in every other state.
+  string suppressed_reason = 4;
+  // The threshold that applies to this message's account, after the
+  // per-account override — the wire string of a NotificationTier, or
+  // "<unrecognized>" when the configured value names no tier (in which case
+  // nothing is delivered for that account; see rmail_core::notify::Threshold
+  // on why that fails closed).
+  string effective_threshold = 5;
+  // Whether notifications are enabled for this message's account at all.
+  bool account_enabled = 6;
+  // Whether the scored tier clears `effective_threshold`. False when
+  // unscored.
+  bool would_notify = 7;
+}
+
+message StreamAlertsRequest {
+  // Resume strictly after this alert id.
+  //
+  // Optional in the presence sense, and that is the whole point: ABSENT means
+  // "only what fires from now on" (what `mail notify watch` wants — a terminal
+  // should not fill with a week of history on every invocation), while a
+  // PRESENT value means "replay everything after this id first". Those are
+  // genuinely different requests, and a plain `int64` could not express both:
+  // its zero value would have to mean one of them, leaving a client with no
+  // way to ask for the other. `since_id = 0` therefore means "replay the whole
+  // retained history", since alert ids start at 1.
+  optional int64 since_id = 1;
+}
+
+// One delivered notification.
+message Alert {
+  // Monotonic, never reused. The cursor for `since_id`.
+  int64 id = 1;
+  int64 message_id = 2;
+  // The account name the message arrived in.
+  string account = 3;
+  NotificationTier tier = 4;
+  // The model's one-line justification.
+  string reason = 5;
+  // The message subject, if it has one.
+  optional string subject = 6;
+  // The sender, best-effort display form ("Ada Lovelace <ada@example.com>").
+  optional string from = 7;
+  // When the notification fired, unix seconds.
+  int64 delivered_at = 8;
+}

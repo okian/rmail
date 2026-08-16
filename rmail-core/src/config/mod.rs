@@ -34,7 +34,7 @@ pub use duration::{parse_human_duration, HumanDuration};
 /// Top-level table names accepted from the environment overlay.
 const KNOWN_TABLES: &[&str] = &[
     "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc",
-    "hooks", "rules",
+    "hooks", "rules", "notify",
 ];
 
 /// Errors produced while loading or parsing configuration.
@@ -305,6 +305,8 @@ pub struct Config {
     pub hooks: HooksConfig,
     /// Rules-engine settings.
     pub rules: RulesConfig,
+    /// Priority-notification engine settings.
+    pub notify: NotifyConfig,
 }
 
 impl Config {
@@ -421,6 +423,10 @@ pub struct AccountConfig {
     /// Per-account AI overrides.
     #[serde(default)]
     pub ai: AccountAiConfig,
+    /// Per-account notification overrides (prd.md #62's "per-account
+    /// threshold").
+    #[serde(default)]
+    pub notify: AccountNotifyConfig,
 }
 
 const fn default_imap_port() -> u16 {
@@ -447,6 +453,29 @@ impl Default for AccountAiConfig {
             residency: None,
         }
     }
+}
+
+/// Per-account notification overrides.
+///
+/// Both fields are `Option`, and that is load-bearing rather than stylistic:
+/// `None` means "this account did not say", so the `[notify]` table's own
+/// value applies. A plain `bool`/`String` with a `Default` impl could not
+/// express that — every account would silently claim a value, and an operator
+/// raising the global threshold would find the accounts they never touched
+/// still pinned to whatever the default happened to be.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AccountNotifyConfig {
+    /// Whether this account may notify at all. `None` inherits
+    /// `notify.enabled`; `Some(false)` silences one account without turning
+    /// the engine off for the others.
+    pub enabled: Option<bool>,
+    /// Minimum importance tier that fires a notification for this account.
+    /// `None` inherits `notify.threshold`. Validated against
+    /// `rmail_core::notify::Tier`'s vocabulary at engine construction, and
+    /// an unrecognized value fails *closed* (nothing notifies) rather than
+    /// open — see `notify::Threshold`'s own docs.
+    pub threshold: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1223,6 +1252,10 @@ pub struct AiModels {
     pub triage: String,
     /// Deep-pass model.
     pub deep: String,
+    /// Notification-scoring model (prd.md #62 names Haiku explicitly: this
+    /// runs on every newly synced message, so it has triage's cost profile,
+    /// not the deep pass's).
+    pub notify: String,
     /// Embedding backend.
     pub embedding: EmbeddingBackend,
 }
@@ -1232,6 +1265,7 @@ impl Default for AiModels {
         Self {
             triage: "claude-haiku-4-5".to_owned(),
             deep: "claude-opus-4-8".to_owned(),
+            notify: "claude-haiku-4-5".to_owned(),
             embedding: EmbeddingBackend::Local,
         }
     }
@@ -2409,6 +2443,176 @@ impl Default for GrpcIdempotency {
         Self {
             retention: HumanDuration::new(days(1)),
             in_flight: HumanDuration::new(mins(5)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+/// Where a fired notification is delivered.
+///
+/// `Auto` is the only value that ever reaches outside this process, and it is
+/// the default *because* the only thing it can reach is the local desktop —
+/// `osascript(1)` on the same machine, no network, no third party. There is
+/// deliberately no webhook/push variant here: prd.md's privacy posture is that
+/// mail never leaves the machine unless the operator has explicitly said so,
+/// and a "notify my phone" channel is a data-egress feature that needs its own
+/// opt-in surface rather than being smuggled in as an enum arm on a table that
+/// defaults to on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyChannel {
+    /// The local desktop notifier if this platform has one (macOS
+    /// Notification Center via `osascript`), otherwise nothing.
+    Auto,
+    /// Deliver nowhere. Scoring and the `StreamAlerts`/`ScoreMessage` RPCs
+    /// still work — this silences the *desktop*, which is what an operator
+    /// running `rmaild` headless on another machine wants.
+    None,
+}
+
+/// Priority-notification engine settings (prd.md #62 "AI Priority
+/// Notification Engine", task 81). See `rmail_core::notify`'s module docs for
+/// the engine itself.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NotifyConfig {
+    /// Whether new mail is scored for notification at all.
+    ///
+    /// Off by default. Scoring costs a model call per message on top of
+    /// triage's, and a feature that spends money must be something an
+    /// operator turned on rather than something they discover on their
+    /// first invoice. A disabled engine still registers
+    /// `NotificationService` (reflection and the fail-closed scope table see
+    /// every RPC regardless of runtime config, the same convention
+    /// `ai.enabled`/`hooks.enabled` already established) and `ScoreMessage`
+    /// still answers on demand — what `enabled` gates is the automatic
+    /// per-message spend, not the operator's own explicit request.
+    pub enabled: bool,
+    /// Minimum importance tier that fires a notification, unless an account
+    /// overrides it (`[[accounts]] notify.threshold`). One of `low`,
+    /// `normal`, `high`, `critical` — the same ladder
+    /// `ai.deep_pass.on_priority` uses. A value outside that vocabulary
+    /// delivers *nothing* (and warns at startup); to switch notifications off,
+    /// set `enabled = false` rather than inventing a tier for it.
+    pub threshold: String,
+    /// Where a fired notification goes.
+    pub channel: NotifyChannel,
+    /// Whether a delivered notification may carry the message's subject.
+    ///
+    /// On by default: a notification that will not say what it is about is
+    /// not a notification, it is a badge. It is still a switch, because a
+    /// desktop notification is rendered on a lock screen by default on
+    /// macOS, and an operator working in a shared space has a real reason to
+    /// want sender-only pings. The model's one-line reason is governed
+    /// separately by `include_reason` — the two leak different things (the
+    /// sender's own words versus a summary of them).
+    pub include_subject: bool,
+    /// Whether a delivered notification may carry the model's one-line
+    /// reason. Off by default: the reason is derived from the body, so it
+    /// can restate content the subject deliberately did not.
+    pub include_reason: bool,
+    /// Quiet hours: a daily window during which nothing is delivered.
+    pub quiet_hours: QuietHoursConfig,
+    /// How often the delivery loop looks for due notifications. This is the
+    /// upper bound on notification latency once a message has been scored.
+    pub tick_interval: HumanDuration,
+    /// How many delivery attempts a notification gets before it is recorded
+    /// `failed`. A desktop notifier that is missing (a headless machine, a
+    /// `osascript` that is not on PATH) fails identically every time, so
+    /// this is small on purpose — retrying it fifty times would only delay
+    /// the honest answer.
+    pub max_attempts: u32,
+    /// Backoff between delivery attempts.
+    pub retry_backoff: HumanDuration,
+    /// How long one delivery attempt may take before it is killed. A
+    /// notifier that hangs must not hold the delivery loop open.
+    pub delivery_timeout: HumanDuration,
+    /// Most notifications one tick will deliver, so a burst (an initial sync,
+    /// a long offline gap) cannot fire hundreds of desktop alerts in one go.
+    pub max_per_tick: u32,
+    /// How recently a message must have *arrived on this machine* to be
+    /// scored for notification at all.
+    ///
+    /// This is the switch that makes turning the feature on safe. The AI
+    /// dispatch loop keeps its cursor in memory and restarts it at zero, so
+    /// the first boot after `enabled = true` replays the whole event-log
+    /// retention window — a week by default. Triage shrugs that off (every
+    /// one of those messages already has a triage row, so the enqueue dedups
+    /// away); notification scoring would instead pay for a week of
+    /// already-read mail and then interrupt the user about all of it. Anything
+    /// older than this is declined before the model call — see
+    /// `rmail_core::notify::NotifyPassHandler::with_max_message_age`.
+    ///
+    /// Sized so that a daemon restarted after an ordinary outage still
+    /// notifies about what arrived while it was down, and a daemon that has
+    /// been off for a day does not open with a retrospective.
+    pub max_message_age: HumanDuration,
+}
+
+impl NotifyConfig {
+    /// The permissive defaults — enabled, no per-account overrides — for a
+    /// caller that wants the notification machinery without assembling a
+    /// config file. Used by `rmail_core::notify::NotifyPassHandler::new`'s
+    /// own default policy; the daemon always passes real config instead.
+    #[must_use]
+    pub fn always_on() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: "high".to_owned(),
+            channel: NotifyChannel::Auto,
+            include_subject: true,
+            include_reason: false,
+            quiet_hours: QuietHoursConfig::default(),
+            tick_interval: HumanDuration::new(secs(5)),
+            max_attempts: 3,
+            retry_backoff: HumanDuration::new(secs(30)),
+            delivery_timeout: HumanDuration::new(secs(10)),
+            max_per_tick: 20,
+            max_message_age: HumanDuration::new(mins(60)),
+        }
+    }
+}
+
+/// A daily do-not-disturb window.
+///
+/// `start`/`end` are `HH:MM` local wall-clock times in `timezone`, and the
+/// window is allowed to wrap midnight (`22:00`–`07:00`) because that is the
+/// shape almost every real one has.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct QuietHoursConfig {
+    /// Whether the window applies at all.
+    pub enabled: bool,
+    /// Window start, `HH:MM`.
+    pub start: String,
+    /// Window end, `HH:MM`. Equal to `start` means a zero-length window
+    /// (nothing is ever quiet), never a 24-hour one — see
+    /// `notify::quiet::QuietHours` for why that reading is the safe one.
+    pub end: String,
+    /// IANA timezone the window is expressed in (e.g. `Europe/Helsinki`).
+    /// Empty means the host's local timezone.
+    pub timezone: String,
+}
+
+impl Default for QuietHoursConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start: "22:00".to_owned(),
+            end: "07:00".to_owned(),
+            timezone: String::new(),
         }
     }
 }

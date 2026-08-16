@@ -219,3 +219,113 @@ async fn command_credential_source_persists() {
         CredentialSource::Command("security find-generic-password -w".to_owned())
     );
 }
+
+#[tokio::test]
+async fn set_credential_repoints_an_account_and_bumps_updated_at() {
+    let tmp = TempDb::open();
+    let created = create(
+        &tmp.db,
+        NewAccount {
+            name: "Gmail".to_owned(),
+            username: Some("me@gmail.com".to_owned()),
+            credential: CredentialSource::Command("printf pw".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    set_credential(
+        &tmp.db,
+        created.id,
+        &CredentialSource::OAuth("rmail-oauth-google-1".to_owned()),
+    )
+    .await
+    .unwrap();
+
+    let after = get(&tmp.db, created.id).await.unwrap();
+    assert_eq!(
+        after.credential,
+        CredentialSource::OAuth("rmail-oauth-google-1".to_owned())
+    );
+    assert!(after.credential.is_oauth());
+    assert!(
+        after.updated_at >= created.updated_at,
+        "the row was touched: {} -> {}",
+        created.updated_at,
+        after.updated_at
+    );
+
+    // Missing account.
+    let err = set_credential(&tmp.db, 9_999, &CredentialSource::None)
+        .await
+        .expect_err("no such account");
+    assert_eq!(err.reason(), ErrorReason::NotFound);
+}
+
+#[tokio::test]
+async fn set_credential_refuses_an_oauth_grant_with_no_username() {
+    // The username is the Keychain account field and the XOAUTH2 `user=`;
+    // pointing an account with neither at a grant makes an account that can
+    // never authenticate.
+    let tmp = TempDb::open();
+    let created = create(
+        &tmp.db,
+        NewAccount {
+            name: "Anonymous".to_owned(),
+            username: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let err = set_credential(
+        &tmp.db,
+        created.id,
+        &CredentialSource::OAuth("svc".to_owned()),
+    )
+    .await
+    .expect_err("no username");
+    assert_eq!(err.reason(), ErrorReason::InvalidArgument);
+    assert_eq!(
+        get(&tmp.db, created.id).await.unwrap().credential,
+        CredentialSource::None,
+        "a refused update must not have written anything"
+    );
+}
+
+#[tokio::test]
+async fn an_oauth_credential_round_trips_through_storage() {
+    let tmp = TempDb::open();
+    let created = create(
+        &tmp.db,
+        NewAccount {
+            name: "Outlook".to_owned(),
+            username: Some("me@outlook.com".to_owned()),
+            credential: CredentialSource::OAuth("rmail-oauth-microsoft-3".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.credential.kind(), "oauth");
+    assert_eq!(
+        get(&tmp.db, created.id).await.unwrap().credential,
+        CredentialSource::OAuth("rmail-oauth-microsoft-3".to_owned())
+    );
+
+    // And it needs a username, exactly as a keychain credential does.
+    let err = create(
+        &tmp.db,
+        NewAccount {
+            name: "NoUser".to_owned(),
+            username: None,
+            credential: CredentialSource::OAuth("svc".to_owned()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("oauth without a username must be rejected");
+    assert_eq!(err.reason(), ErrorReason::InvalidArgument);
+}

@@ -49,7 +49,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use lettre::address::{Address, Envelope};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::Tls;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
@@ -206,7 +206,18 @@ impl LettreSender {
         if let Some(cached) = self.lock().get(&account_id).cloned() {
             return Ok(cached);
         }
-        let built = self.build_transport(account_id).await?;
+        let (built, cacheable) = self.build_transport(account_id).await?;
+        if !cacheable {
+            // An OAuth transport carries a bearer token that expires within
+            // the hour. `lettre` captures credentials when the transport is
+            // built and never revisits them, so caching one turns "the token
+            // is refreshed before it expires" into "every send after the first
+            // hour is a 535" — with an eviction rule that only fires *after*
+            // a permanent failure has already bounced a message. Rebuilding
+            // per send costs one broker call, which is a cache hit whenever
+            // the token is still good.
+            return Ok(built);
+        }
         Ok(self.lock().entry(account_id).or_insert(built).clone())
     }
 
@@ -221,10 +232,13 @@ impl LettreSender {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Build a transport, and say whether it may be cached.
+    ///
+    /// It may not when its credential expires — see [`LettreSender::transport`].
     async fn build_transport(
         &self,
         account_id: i64,
-    ) -> Result<AsyncSmtpTransport<Tokio1Executor>, SendFailure> {
+    ) -> Result<(AsyncSmtpTransport<Tokio1Executor>, bool), SendFailure> {
         let account = crate::account::get(&self.db, account_id)
             .await
             .map_err(|error| classify_core_error(&error))?;
@@ -254,6 +268,29 @@ impl LettreSender {
         };
         builder = builder.port(port).timeout(Some(SMTP_DEADLINE));
 
+        // An OAuth account presents a bearer token over SASL XOAUTH2 rather
+        // than a password. `lettre` builds the same `user=..^Aauth=Bearer ..`
+        // string this crate's `oauth::xoauth2` does, from the same two fields,
+        // so the credential is the token and the mechanism is pinned.
+        if account.credential.is_oauth() {
+            let key = crate::oauth::key_for(&account).map_err(|e| classify_core_error(&e))?;
+            let token = crate::oauth::broker()
+                .map_err(|e| classify_core_error(&e))?
+                .access_token(&key)
+                .await
+                .map_err(|e| classify_core_error(&e))?;
+            builder = builder
+                .credentials(Credentials::new(
+                    key.account.clone(),
+                    token.expose().to_owned(),
+                ))
+                // Pinned rather than negotiated: lettre's default mechanism
+                // list prefers PLAIN, and a server advertising both would be
+                // handed the bearer token as a password.
+                .authentication(vec![Mechanism::Xoauth2]);
+            return Ok((builder.build(), false));
+        }
+
         // Resolved on a blocking thread — a `password_command` or a keychain
         // prompt can block for a long time — exactly as `imap::conn` does.
         let credential = account.credential.clone();
@@ -280,7 +317,7 @@ impl LettreSender {
                 "no SMTP credential configured; submitting unauthenticated"
             ),
         }
-        Ok(builder.build())
+        Ok((builder.build(), true))
     }
 }
 

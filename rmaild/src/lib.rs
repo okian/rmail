@@ -32,6 +32,7 @@ mod index_service;
 mod mail_service;
 pub mod mcp;
 mod note_service;
+mod notification_service;
 mod rule_service;
 mod saved_search_service;
 mod search_service;
@@ -62,6 +63,7 @@ pub use hook_service::HookApi;
 pub use index_service::IndexApi;
 pub use mail_service::MailApi;
 pub use note_service::NoteApi;
+pub use notification_service::NotificationApi;
 pub use rule_service::RuleApi;
 pub use saved_search_service::SavedSearchApi;
 pub use search_service::{AskSearch, SearchApi};
@@ -97,6 +99,7 @@ use rmail_core::index::{
 };
 use rmail_core::mail::MailStore;
 use rmail_core::notes::NoteStore;
+use rmail_core::notify::{NotifyEngine, NotifyPassHandler, NotifyPolicy};
 use rmail_core::outbox::{
     FollowupStore, ImapSentAppender, LettreSender, OutboxStore, SendPolicy, SendScheduler,
 };
@@ -126,6 +129,7 @@ use rmail_proto::v1::hook_service_server::HookServiceServer;
 use rmail_proto::v1::index_service_server::IndexServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::note_service_server::NoteServiceServer;
+use rmail_proto::v1::notification_service_server::NotificationServiceServer;
 use rmail_proto::v1::rule_service_server::RuleServiceServer;
 use rmail_proto::v1::saved_search_service_server::SavedSearchServiceServer;
 use rmail_proto::v1::search_service_server::SearchServiceServer;
@@ -190,6 +194,24 @@ pub enum ServeError {
     /// function as "invalid ai.policy," which is not what it would mean.
     #[error("invalid ai.policy: {0}")]
     InvalidAiPolicy(#[source] rmail_core::Error),
+
+    /// The OAuth broker could not be built (its HTTP client would not
+    /// construct). Fails at start-up for the same reason the two above do:
+    /// an account configured for OAuth would otherwise fail on its first
+    /// sync, long after anyone was watching.
+    ///
+    /// Not `#[from]`, for the reason [`ServeError::InvalidAiPolicy`] gives.
+    #[error("could not build the OAuth broker: {0}")]
+    OAuthBroker(#[source] rmail_core::Error),
+
+    /// `[notify.quiet_hours]` is enabled but its times or timezone do not
+    /// parse — caught here, before any socket is bound, for the same reason
+    /// `InvalidAiPolicy` is. Note that an unrecognized *threshold* is
+    /// deliberately not fatal (it resolves to "deliver nothing" and warns);
+    /// only an unparseable quiet-hours window fails the boot, because a
+    /// window that cannot be evaluated has no safe reading at all.
+    #[error("invalid notify.quiet_hours: {0}")]
+    InvalidNotify(#[source] rmail_core::Error),
 }
 
 /// Serve the rmail gRPC surface on a Unix domain socket until `shutdown`
@@ -688,7 +710,9 @@ where
         config.grpc.idempotency.in_flight.into(),
     );
     let admin_service = AdminServiceServer::new(AdminApi::new(db.clone()));
-    let account_service = AccountServiceServer::new(AccountApi::new(db.clone()));
+    let account_service = AccountServiceServer::new(
+        AccountApi::new(db.clone(), stopping.clone()).map_err(ServeError::OAuthBroker)?,
+    );
     let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
     let analytics_service =
         AnalyticsServiceServer::new(AnalyticsApi::new(db.clone(), stopping.clone()));
@@ -1088,9 +1112,31 @@ where
             .with_injection_config(config.ai.injection.clone())
             .with_deep_pass_gate(DeepPassGate::new(config.ai.deep_pass.clone())),
     );
+    // Registered unconditionally, like every other handler: `notify.enabled`
+    // gates whether a `NewMail` event *enqueues* a scoring job (see
+    // `AiDispatchLoop::with_notify_pass`), not whether the pool can run one
+    // that already exists. A job enqueued before the operator turned the
+    // feature off must still be able to complete rather than sit in the queue
+    // forever.
+    //
+    // The policy and the age bound are the two gates that keep this pass from
+    // spending money it should not: the first declines accounts whose
+    // notifications are off, the second declines mail that arrived too long
+    // ago to be worth interrupting anyone about — which is what makes the
+    // first boot after `notify.enabled = true` safe, since the AI dispatch
+    // loop replays a whole retention window of `NewMail` events on every
+    // restart. Both are checked before any request is built.
+    let notify_policy = NotifyPolicy::from_config(&config.notify, &config.accounts);
+    let notify_handler: Arc<dyn PassHandler> = Arc::new(
+        NotifyPassHandler::new(db.clone(), config.ai.models.notify.clone())
+            .with_injection_config(config.ai.injection.clone())
+            .with_policy(notify_policy.clone())
+            .with_max_message_age(config.notify.max_message_age.as_duration()),
+    );
     let ai_handlers: Vec<Arc<dyn PassHandler>> = vec![
         triage_handler,
         Arc::clone(&deep_handler) as Arc<dyn PassHandler>,
+        notify_handler,
     ];
 
     let ai_worker_pool = AiWorkerPool::new(
@@ -1201,7 +1247,8 @@ where
     // pointed at a provider that was just declared unusable.
     let ai_dispatch_handle = if ai_active {
         let mut dispatch = AiDispatchLoop::new(events.clone(), ai_queue.clone(), ai_worker_pool)
-            .with_pause_flag(ai_pause);
+            .with_pause_flag(ai_pause)
+            .with_notify_pass(config.notify.enabled);
         if config.ai.batching.enabled {
             match BatchClient::new() {
                 Ok(client) => match BatchCoordinator::new(
@@ -1319,6 +1366,40 @@ where
         None
     };
 
+    // The priority notification engine (task 81). `NotificationService` is
+    // always registered, for the same reason `HookService`/`RuleService` are:
+    // reflection and the fail-closed scope table must see every RPC
+    // regardless of runtime config. `notify.enabled` gates two things —
+    // whether a `NewMail` event enqueues a scoring job at all (wired into
+    // `AiDispatchLoop` above) and whether the delivery loop runs.
+    // `StreamAlerts` stays useful on a disabled daemon: it replays whatever
+    // was delivered before the feature was switched off.
+    let notify_engine = NotifyEngine::from_config(db.clone(), &config.notify, &config.accounts)
+        .map_err(ServeError::InvalidNotify)?;
+    let notification_service = NotificationServiceServer::new(NotificationApi::new(
+        db.clone(),
+        notify_engine.clone(),
+        ai_queue.clone(),
+        // Both switches, not just `notify.enabled`: the scoring pass runs on
+        // the AI worker pool, which is only driven when `ai_active`. A daemon
+        // with notifications on but AI off would otherwise answer `QUEUED` to
+        // `ScoreMessage` and then never run the job — a promise it structurally
+        // cannot keep, and a queue row that would sit there forever thanks to
+        // `AiQueue::enqueue`'s own `(message_id, pass)` dedup.
+        config.notify.enabled && ai_active,
+        stopping.clone(),
+    ));
+    let notify_handle = if config.notify.enabled {
+        tracing::info!(
+            channel = notify_engine.channel_name(),
+            "the priority notification engine is running"
+        );
+        Some(notify_engine.spawn(stopping.clone()))
+    } else {
+        tracing::info!("notify.enabled = false; new mail is not scored for notification");
+        None
+    };
+
     let incoming = UnixListenerStream::new(listener);
     let serve_result = Server::builder()
         // Every RPC runs inside a request-tracing span; the auth layer sits
@@ -1350,6 +1431,7 @@ where
         .add_service(ai_safety_service)
         .add_service(hook_service)
         .add_service(rule_service)
+        .add_service(notification_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
@@ -1363,6 +1445,9 @@ where
         let _ = handle.await;
     }
     if let Some(handle) = rule_evaluator_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = notify_handle {
         let _ = handle.await;
     }
     let _ = index_handle.await;

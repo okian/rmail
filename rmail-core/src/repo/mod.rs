@@ -111,6 +111,31 @@ pub fn insert_account(conn: &Connection, new: &NewAccount) -> rusqlite::Result<i
     Ok(conn.last_insert_rowid())
 }
 
+/// Repoint an account's credential reference. Returns whether a row changed.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn set_account_credential(
+    conn: &Connection,
+    id: i64,
+    secret_kind: &str,
+    secret_ref: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE accounts
+            SET secret_kind = :secret_kind,
+                secret_ref = :secret_ref,
+                updated_at = unixepoch()
+          WHERE id = :id",
+        named_params! {
+            ":id": id,
+            ":secret_kind": secret_kind,
+            ":secret_ref": secret_ref,
+        },
+    )?;
+    Ok(affected > 0)
+}
+
 /// Delete an account by id. Returns whether a row was removed.
 ///
 /// # Errors

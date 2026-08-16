@@ -15,6 +15,16 @@ service AccountService {
   rpc Delete(DeleteAccountRequest) returns (DeleteAccountResponse);
   // Verify the account can log in to its IMAP server (wired in task 8).
   rpc TestConnection(TestConnectionRequest) returns (TestConnectionResponse);
+
+  // Start a loopback-redirect OAuth2 + PKCE authorization for an account.
+  // Returns the URL the user must open; no token material is ever returned.
+  rpc BeginOAuth(BeginOAuthRequest) returns (BeginOAuthResponse);
+  // Wait for the browser redirect started by BeginOAuth, exchange the code,
+  // and store the refresh token in the Keychain. Blocks until the user
+  // consents, the deadline passes, or the RPC is cancelled.
+  rpc CompleteOAuth(CompleteOAuthRequest) returns (CompleteOAuthResponse);
+  // Refresh an account's OAuth access token, reporting the new expiry.
+  rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
 }
 
 // A configured account. Never includes the password — only how to resolve it.
@@ -43,6 +53,9 @@ message CredentialRef {
     string password_env = 2;
     // A macOS Keychain generic-password service name.
     string keychain = 3;
+    // The Keychain service holding an OAuth2 grant. The account authenticates
+    // with XOAUTH2 rather than a password; see AccountService.BeginOAuth.
+    string oauth = 4;
   }
 }
 
@@ -82,4 +95,61 @@ message TestConnectionRequest {
 message TestConnectionResponse {
   bool ok = 1;
   string detail = 2;
+}
+
+message BeginOAuthRequest {
+  // The account the grant will belong to.
+  int64 account_id = 1;
+  // "google"/"gmail" or "microsoft"/"outlook".
+  string provider = 2;
+  // The OAuth client id of a desktop/native application registered with the
+  // provider. Not a secret.
+  string client_id = 3;
+  // A shell command whose stdout is the client secret, for providers that
+  // require one from a native client (Google's "Desktop app" type). The secret
+  // itself is never carried over this API — only how to obtain it.
+  optional string client_secret_command = 4;
+  // Scopes to request; empty means the provider's defaults (mail access only).
+  repeated string scopes = 5;
+}
+
+message BeginOAuthResponse {
+  // Opaque handle identifying this in-flight authorization; pass it to
+  // CompleteOAuth.
+  string flow_id = 1;
+  // The URL the user must open in a browser.
+  string authorization_url = 2;
+  // The loopback URI the provider will redirect to.
+  string redirect_uri = 3;
+  // When this flow is abandoned and its port released (unix seconds).
+  int64 expires_at = 4;
+}
+
+message CompleteOAuthRequest {
+  // The handle from BeginOAuthResponse.
+  string flow_id = 1;
+}
+
+message CompleteOAuthResponse {
+  int64 account_id = 1;
+  string provider = 2;
+  // When the access token just obtained expires (unix seconds).
+  int64 expires_at = 3;
+  // The scopes the provider actually granted.
+  repeated string scopes = 4;
+}
+
+message RefreshTokenRequest {
+  int64 account_id = 1;
+  // Refresh even if the stored token has not expired yet.
+  bool force = 2;
+}
+
+message RefreshTokenResponse {
+  // When the access token expires (unix seconds).
+  int64 expires_at = 1;
+  // Whether this call went to the provider, or the stored token was still good.
+  bool refreshed = 2;
+  string provider = 3;
+  repeated string scopes = 4;
 }

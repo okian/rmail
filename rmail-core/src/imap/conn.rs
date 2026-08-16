@@ -83,24 +83,111 @@ pub async fn connect_account(
     let port = account.imap_port.unwrap_or(993);
     let username = account.username.clone().unwrap_or_default();
 
-    let credential = account.credential.clone();
-    let username_for_resolve = account.username.clone();
-    let secret =
+    // An OAuth account has no password to resolve; it presents a bearer token
+    // over SASL XOAUTH2 instead. The token is fetched *before* the deadline
+    // starts because obtaining it may involve a network refresh and a Keychain
+    // read, neither of which is part of the IMAP handshake this deadline
+    // bounds — and a refresh that pushed the handshake over the limit would
+    // surface as "IMAP connection timed out" rather than as the token error it
+    // is.
+    let oauth = account.credential.is_oauth();
+    let secret = if oauth {
+        let key = crate::oauth::key_for(&account)?;
+        crate::oauth::broker()?.access_token(&key).await?
+    } else {
+        let credential = account.credential.clone();
+        let username_for_resolve = account.username.clone();
         tokio::task::spawn_blocking(move || credential.resolve(username_for_resolve.as_deref()))
             .await
             .map_err(|e| Error::internal(format!("credential resolution task failed: {e}")))??
-            .ok_or_else(|| Error::failed_precondition("account has no credential configured"))?;
+            .ok_or_else(|| Error::failed_precondition("account has no credential configured"))?
+    };
 
     // Bound the handshake so a wedged server cannot hang a sync before it has
     // even started.
     tokio::time::timeout(super::IMAP_DEADLINE, async {
         let stream = connect_tls(&host, port).await?;
-        let mut session = login(stream, &username, secret.expose()).await?;
+        let mut session = if oauth {
+            authenticate_xoauth2(stream, &username, &secret).await?
+        } else {
+            login(stream, &username, secret.expose()).await?
+        };
         let capabilities = probe_capabilities(&mut session).await?;
         Ok((session, capabilities))
     })
     .await
     .map_err(|_| Error::deadline_exceeded("IMAP connection timed out"))?
+}
+
+/// Authenticate with SASL `XOAUTH2` (RFC 6749 bearer tokens over IMAP), the
+/// mechanism Google and Microsoft require for OAuth accounts.
+///
+/// `async-imap` base64-encodes whatever the authenticator returns, so the
+/// authenticator hands back the raw SASL string [`crate::oauth::xoauth2`]
+/// builds.
+///
+/// # Errors
+///
+/// [`Error::Unavailable`] if the greeting is missing/broken;
+/// [`Error::Unauthenticated`] if the server rejects the token.
+pub async fn authenticate_xoauth2<T: ImapStream>(
+    stream: T,
+    username: &str,
+    access_token: &crate::Secret,
+) -> Result<Session<T>, Error> {
+    let mut client = Client::new(stream);
+    read_greeting(&mut client).await?;
+    client
+        .authenticate(
+            "XOAUTH2",
+            Xoauth2 {
+                response: crate::oauth::xoauth2(username, access_token.expose()),
+            },
+        )
+        .await
+        .map_err(|(err, _client)| {
+            // A rejected bearer token is `Unauthenticated` by way of
+            // `map_imap_err`, which is the code that tells the caller to
+            // re-authorize rather than to retry — the same conclusion the
+            // broker reaches for a revoked refresh token.
+            map_imap_err(err)
+        })
+}
+
+/// The SASL exchange for XOAUTH2: one response, ignoring the (empty) server
+/// challenge.
+///
+/// On failure Google and Microsoft send a *second* continuation carrying a
+/// base64 JSON error rather than tagging the command `NO`; the client is
+/// expected to answer with an empty line, which is what the empty response
+/// after the first challenge produces. Returning the credential again there
+/// would replay the token into a channel the server has already declared
+/// failed.
+struct Xoauth2 {
+    response: crate::Secret,
+}
+
+impl async_imap::Authenticator for Xoauth2 {
+    type Response = Vec<u8>;
+
+    fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+        let out = self.response.expose().as_bytes().to_vec();
+        // One shot: any further challenge is the server's error report, and
+        // the protocol wants an empty line back to close the exchange.
+        self.response = crate::Secret::new(String::new());
+        out
+    }
+}
+
+/// Read and discard the untagged server greeting.
+async fn read_greeting<T: ImapStream>(client: &mut Client<T>) -> Result<(), Error> {
+    match client.read_response().await {
+        Some(Ok(_greeting)) => Ok(()),
+        Some(Err(e)) => Err(Error::unavailable(format!("IMAP greeting failed: {e}"))),
+        None => Err(Error::unavailable(
+            "IMAP server closed before sending a greeting",
+        )),
+    }
 }
 
 /// Read the server greeting and log in, returning an authenticated session.
@@ -118,15 +205,7 @@ pub async fn login<T: ImapStream>(
     password: &str,
 ) -> Result<Session<T>, Error> {
     let mut client = Client::new(stream);
-    match client.read_response().await {
-        Some(Ok(_greeting)) => {}
-        Some(Err(e)) => return Err(Error::unavailable(format!("IMAP greeting failed: {e}"))),
-        None => {
-            return Err(Error::unavailable(
-                "IMAP server closed before sending a greeting",
-            ))
-        }
-    }
+    read_greeting(&mut client).await?;
     client
         .login(username, password)
         .await
@@ -189,6 +268,59 @@ mod tests {
         assert!(caps.qresync);
         assert!(caps.move_);
         let _ = session.logout().await;
+    }
+
+    #[tokio::test]
+    async fn xoauth2_authenticates_with_the_bearer_token() {
+        let mock = MockImap::start(MockConfig::default().xoauth2("ya29.good-token")).await;
+        let stream = connect_mock(mock.addr).await;
+        let session = authenticate_xoauth2(
+            stream,
+            "user@example.com",
+            &crate::Secret::new("ya29.good-token"),
+        )
+        .await;
+        assert!(
+            session.is_ok(),
+            "XOAUTH2 should succeed: {:?}",
+            session.err()
+        );
+        // The server saw the exact SASL string, base64-decoded.
+        let sasl = mock
+            .commands()
+            .into_iter()
+            .find(|c| c.starts_with("SASL "))
+            .expect("the mock records the decoded SASL response");
+        assert_eq!(
+            sasl,
+            "SASL user=user@example.com\u{1}auth=Bearer ya29.good-token\u{1}\u{1}"
+        );
+    }
+
+    /// A rejected bearer token must come back as `Unauthenticated` — and must
+    /// not hang. Real servers answer a bad token with a *second* continuation
+    /// rather than a tagged `NO`, so a client that replies to it with the
+    /// credential again never terminates the exchange.
+    #[tokio::test]
+    async fn xoauth2_with_a_stale_token_is_unauthenticated() {
+        let mock = MockImap::start(MockConfig::default().xoauth2("ya29.good-token")).await;
+        let stream = connect_mock(mock.addr).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            authenticate_xoauth2(
+                stream,
+                "user@example.com",
+                &crate::Secret::new("ya29.stale"),
+            ),
+        )
+        .await
+        .expect("a rejected token must not hang the exchange");
+        let err = result.expect_err("a stale token must be rejected");
+        assert_eq!(err.reason(), ErrorReason::Unauthenticated);
+        assert!(
+            !err.to_string().contains("ya29.stale"),
+            "the token must not appear in the error: {err}"
+        );
     }
 
     #[tokio::test]

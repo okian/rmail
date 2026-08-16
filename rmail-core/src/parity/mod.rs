@@ -259,6 +259,39 @@ commands! {
         actions: [],
         summary: "Verify an account's IMAP login and report its server capabilities.",
     }
+    // The OAuth trio (task 79). All three are `Mutate`, including the two that
+    // sound like reads: `BeginOAuth` binds a loopback port and mints a PKCE
+    // grant, and `RefreshToken` spends one use of a refresh token at the
+    // provider — which on Microsoft *rotates* it, so calling it is not
+    // repeatable and is very much observable outside this process.
+    //
+    // `mail account login --oauth <provider>` reaches Begin and Complete in
+    // one verb; that is the second row in this table to claim two RPCs, and
+    // `the_two_verbs_that_reach_two_rpcs_still_do` is the check that pins it.
+    AccountBeginOAuth {
+        rpc: "/rmail.v1.AccountService/BeginOAuth",
+        tool: "begin_account_oauth",
+        effect: Mutate,
+        cli: ["account login"],
+        actions: [],
+        summary: "Start a loopback+PKCE OAuth2 authorization and return the URL to open.",
+    }
+    AccountCompleteOAuth {
+        rpc: "/rmail.v1.AccountService/CompleteOAuth",
+        tool: "complete_account_oauth",
+        effect: Mutate,
+        cli: ["account login"],
+        actions: [],
+        summary: "Wait for the OAuth redirect, exchange the code, and store the refresh token.",
+    }
+    AccountRefreshToken {
+        rpc: "/rmail.v1.AccountService/RefreshToken",
+        tool: "refresh_account_token",
+        effect: Mutate,
+        cli: ["account refresh"],
+        actions: [],
+        summary: "Refresh an account's OAuth access token and report its new expiry.",
+    }
 
     // -- AdminService (task 38) ----------------------------------------------
     AdminMintToken {
@@ -1178,6 +1211,27 @@ commands! {
         cli: ["hook test"],
         actions: [],
         summary: "Run one configured hook now against a sample or supplied event.",
+    }
+
+    // -- NotificationService (task 81) -----------------------------------------
+    NotificationScoreMessage {
+        rpc: "/rmail.v1.NotificationService/ScoreMessage",
+        tool: "score_message",
+        // Mutating, not read: an unscored message is *enqueued* for scoring by
+        // this call, which is spend at a provider — the same line
+        // `AiAskMailbox` is on, and for the same reason.
+        effect: Mutate,
+        cli: ["notify score"],
+        actions: [],
+        summary: "Report the notification decision for a message, queueing a scoring pass if there is none.",
+    }
+    NotificationStreamAlerts {
+        rpc: "/rmail.v1.NotificationService/StreamAlerts",
+        tool: "stream_alerts",
+        effect: Read,
+        cli: ["notify watch"],
+        actions: [],
+        summary: "Stream priority notifications as they fire, resumable from a cursor.",
     }
 
     // -- ConfigService (task 84) -----------------------------------------------

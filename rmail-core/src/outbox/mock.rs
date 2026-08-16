@@ -29,6 +29,10 @@ pub struct MockSmtpConfig {
     /// Close the connection abruptly instead of replying to `DATA`'s
     /// terminator — the shape "the network went away mid-send" takes.
     pub drop_after_data: bool,
+    /// Advertise `AUTH XOAUTH2` and accept exactly this base64 SASL initial
+    /// response. `None` advertises no AUTH at all, which is what the
+    /// plaintext classification tests want.
+    pub xoauth2: Option<String>,
 }
 
 impl Default for MockSmtpConfig {
@@ -37,6 +41,7 @@ impl Default for MockSmtpConfig {
             rcpt_reply: "250 2.1.5 Ok".to_owned(),
             data_reply: "250 2.0.0 Ok: queued".to_owned(),
             drop_after_data: false,
+            xoauth2: None,
         }
     }
 }
@@ -45,6 +50,8 @@ impl Default for MockSmtpConfig {
 pub struct MockSmtp {
     addr: SocketAddr,
     accepted: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Every `AUTH ...` command line the server was sent, verbatim.
+    auth_commands: Arc<Mutex<Vec<String>>>,
     cancel: CancellationToken,
 }
 
@@ -54,10 +61,12 @@ impl MockSmtp {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let accepted: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let auth_commands: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let cancel = CancellationToken::new();
 
         tokio::spawn({
             let accepted = Arc::clone(&accepted);
+            let auth_commands = Arc::clone(&auth_commands);
             let cancel = cancel.clone();
             async move {
                 loop {
@@ -69,12 +78,13 @@ impl MockSmtp {
                         },
                     };
                     let accepted = Arc::clone(&accepted);
+                    let auth_commands = Arc::clone(&auth_commands);
                     let config = config.clone();
                     // One task per connection: lettre's pool keeps a
                     // connection open across sends, so a serial accept loop
                     // would deadlock the second concurrent worker.
                     tokio::spawn(async move {
-                        let _ = serve(stream, config, accepted).await;
+                        let _ = serve(stream, config, accepted, auth_commands).await;
                     });
                 }
             }
@@ -83,6 +93,7 @@ impl MockSmtp {
         Ok(Self {
             addr,
             accepted,
+            auth_commands,
             cancel,
         })
     }
@@ -95,6 +106,14 @@ impl MockSmtp {
     /// Every message body this server accepted, in order.
     pub fn accepted(&self) -> Vec<Vec<u8>> {
         self.accepted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every `AUTH` command line the server saw.
+    pub fn auth_commands(&self) -> Vec<String> {
+        self.auth_commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -119,6 +138,7 @@ async fn serve(
     stream: TcpStream,
     config: MockSmtpConfig,
     accepted: Arc<Mutex<Vec<Vec<u8>>>>,
+    auth_commands: Arc<Mutex<Vec<String>>>,
 ) -> std::io::Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
@@ -134,11 +154,33 @@ async fn serve(
         let upper = command.to_ascii_uppercase();
 
         if upper.starts_with("EHLO") || upper.starts_with("HELO") {
-            // No STARTTLS and no AUTH advertised: the tests run plaintext,
-            // and an advertised AUTH would make lettre negotiate one.
-            write
-                .write_all(b"250-mock.rmail.test\r\n250 8BITMIME\r\n")
-                .await?;
+            // No STARTTLS, and AUTH only when a test asked for it: the
+            // plaintext classification tests advertise none, because an
+            // advertised AUTH would make lettre negotiate one.
+            if config.xoauth2.is_some() {
+                write
+                    .write_all(
+                        b"250-mock.rmail.test\r\n250-AUTH XOAUTH2 PLAIN LOGIN\r\n250 8BITMIME\r\n",
+                    )
+                    .await?;
+            } else {
+                write
+                    .write_all(b"250-mock.rmail.test\r\n250 8BITMIME\r\n")
+                    .await?;
+            }
+        } else if upper.starts_with("AUTH") {
+            if let Ok(mut log) = auth_commands.lock() {
+                log.push(command.to_owned());
+            }
+            let expected = config.xoauth2.as_deref().unwrap_or("");
+            let presented = command.split_whitespace().nth(2).unwrap_or("");
+            if !expected.is_empty() && presented == expected {
+                write.write_all(b"235 2.7.0 Accepted\r\n").await?;
+            } else {
+                write
+                    .write_all(b"535 5.7.8 Authentication credentials invalid\r\n")
+                    .await?;
+            }
         } else if upper.starts_with("MAIL FROM") {
             write.write_all(b"250 2.1.0 Ok\r\n").await?;
         } else if upper.starts_with("RCPT TO") {

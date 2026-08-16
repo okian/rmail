@@ -78,6 +78,20 @@ impl Fixture {
         OutboxStore::new(self.db.clone())
     }
 
+    /// Switch the account to an OAuth credential naming `service`.
+    pub(super) fn set_oauth_credential(&self, service: &str) {
+        let account_id = self.account_id;
+        let service = service.to_owned();
+        self.db
+            .with_write(move |c| {
+                c.execute(
+                    "UPDATE accounts SET secret_kind = 'oauth', secret_ref = ?2 WHERE id = ?1",
+                    rusqlite::params![account_id, service],
+                )
+            })
+            .unwrap();
+    }
+
     /// Point the account's SMTP config at a mock server's ephemeral port.
     pub(super) fn set_smtp_port(&self, port: u16) {
         let account_id = self.account_id;

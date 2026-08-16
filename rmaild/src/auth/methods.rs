@@ -165,6 +165,27 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AccountService/TestConnection",
         Requirement::Scope(Scope::Admin),
     ),
+    // -- AccountService OAuth (task 79) -------------------------------------
+    // `admin`, and not a softer scope, because these three *are* credential
+    // management: `BeginOAuth`/`CompleteOAuth` mint a grant that is a
+    // non-expiring bearer credential for the whole mailbox and file it in the
+    // Keychain, and `RefreshToken` spends a use of that grant at the provider
+    // (which on Microsoft rotates it, invalidating the stored one). A
+    // `mail.read` token that could re-point an account's credential at a
+    // client id the caller controls would be a privilege escalation out of
+    // this daemon entirely.
+    (
+        "/rmail.v1.AccountService/BeginOAuth",
+        Requirement::Scope(Scope::Admin),
+    ),
+    (
+        "/rmail.v1.AccountService/CompleteOAuth",
+        Requirement::Scope(Scope::Admin),
+    ),
+    (
+        "/rmail.v1.AccountService/RefreshToken",
+        Requirement::Scope(Scope::Admin),
+    ),
     // -- SyncService (task 15) -----------------------------------------------
     // Triggering/pausing/resuming a sync mutates local state (and drives IMAP
     // traffic), so it needs `mail.write`; observing status/events is `mail.read`.
@@ -846,6 +867,29 @@ const TABLE: &[(&str, Requirement)] = &[
     (
         "/rmail.v1.HookService/TestHook",
         Requirement::Scope(Scope::Automation),
+    ),
+    // -- NotificationService (task 81) ----------------------------------------
+    // `ScoreMessage` can enqueue a provider call for a message that has not
+    // been scored yet, which is spend — so it sits behind `ai.invoke`, exactly
+    // where every other RPC that can reach a model sits, rather than behind
+    // `mail.read` on the grounds that it mostly reads a table. The read-only
+    // half of its answer is not separable: a caller that only wanted to look
+    // would be indistinguishable at this layer from one that wanted the call
+    // made.
+    //
+    // `StreamAlerts` is `mail.read`. What an alert carries is a subject line,
+    // a sender and a one-line summary of a message — mail content by any
+    // honest reading, and the same privilege `MailService`'s reads and
+    // `SyncService/WatchEvents` sit behind. It is deliberately *not*
+    // `automation` despite being a notification surface: nothing about
+    // reading this stream runs anything.
+    (
+        "/rmail.v1.NotificationService/ScoreMessage",
+        Requirement::Scope(Scope::AiInvoke),
+    ),
+    (
+        "/rmail.v1.NotificationService/StreamAlerts",
+        Requirement::Scope(Scope::MailRead),
     ),
     // -- TagService (task 55) -------------------------------------------------
     // `ListTags`/`SuggestTags` are pure reads over the local mirror (no IMAP

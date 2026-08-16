@@ -754,7 +754,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core ai::local` (no outbound network under local provider, same verb surface)
 
 ## 79. OAuth2 broker (Gmail/Outlook)
-- [ ] status
+- [x] status
 - **depends-on:** 7, 8
 - **parallel-safe:** yes
 - **acceptance:**
@@ -771,12 +771,12 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmaild --test unified_inbox` · `cargo nextest run -p rmail-core autoconfig::` (dedup/order, probe→settings, login validation)
 
 ## 81. Priority notification engine
-- [ ] status
+- [x] status
 - **depends-on:** 48, 14
 - **parallel-safe:** yes
 - **acceptance:**
   - On each new-mail event Claude Haiku scores an importance tier + one-line reason; a macOS notification fires only at/above a per-account threshold so newsletters never ping; `NotificationService.ScoreMessage/StreamAlerts`; `mail notify watch`.
-- **verify:** `cargo nextest run -p rmail-core notify::` (threshold gating, below-threshold suppressed)
+- **verify:** `cargo nextest run -p rmail-core notify::` (threshold gating, below-threshold suppressed) · `cargo nextest run --test notification_service` (RPC surface + `Status` paths)
 
 ## 82. Multi-format export
 - [x] status

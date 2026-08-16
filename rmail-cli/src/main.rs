@@ -8,6 +8,7 @@ mod keymap;
 mod keys_cli;
 mod mcp_cli;
 mod note_cli;
+mod notify_cli;
 mod outbox_cli;
 /// The CLI half of the feature-parity drift check (task 41). Test-only: it
 /// asserts about `Cli`'s own `clap` tree rather than contributing to it.
@@ -28,15 +29,17 @@ use find_cli::FindArgs;
 use note_cli::{NoteAction, NotesArgs};
 use outbox_cli::{FollowupAction, OutboxArgs, SendArgs, UndoArgs};
 use rmail_core::socket_path_from_env;
+use rmail_proto::v1::account_service_client::AccountServiceClient;
 use rmail_proto::v1::admin_service_client::AdminServiceClient;
 use rmail_proto::v1::ai_policy_service_client::AiPolicyServiceClient;
 use rmail_proto::v1::ai_safety_service_client::AiSafetyServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
-    analyze_event, ask_chunk, AnalyzeMessageRequest, AskRequest, BudgetCaps, BudgetClass,
-    BudgetWindowCaps, Citation, ClassSpend, ConfirmInjectionRequest, EventKind, GetSpendRequest,
-    GetSummaryRequest, GetUsageRequest, InjectionSeverity, ListTokensRequest, MintTokenRequest,
+    analyze_event, ask_chunk, AnalyzeMessageRequest, AskRequest, BeginOAuthRequest, BudgetCaps,
+    BudgetClass, BudgetWindowCaps, Citation, ClassSpend, CompleteOAuthRequest,
+    ConfirmInjectionRequest, EventKind, GetSpendRequest, GetSummaryRequest, GetUsageRequest,
+    InjectionSeverity, ListTokensRequest, MintTokenRequest, RefreshTokenRequest,
     RetryFailedRequest, RevokeTokenRequest, ScanInjectionRequest, ScanInjectionResponse,
     SetBudgetRequest, SetPausedRequest, SuggestReplyRequest, Summary, SyncFolderRequest, SyncMode,
     WatchEventsRequest,
@@ -78,6 +81,11 @@ enum Command {
         /// After syncing, follow the event stream until interrupted.
         #[arg(long)]
         watch: bool,
+    },
+    /// Account credentials (`AccountService.BeginOAuth/CompleteOAuth/RefreshToken`).
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
     },
     /// Manage capability tokens (`AdminService.MintToken/RevokeToken/ListTokens`).
     Token {
@@ -196,6 +204,13 @@ enum Command {
     Followup {
         #[command(subcommand)]
         action: FollowupAction,
+    },
+    /// Priority notifications: follow what fired, or ask why a message did
+    /// not (`NotificationService`; thresholds live in the config file — see
+    /// `notify_cli`'s own module docs).
+    Notify {
+        #[command(subcommand)]
+        action: notify_cli::NotifyAction,
     },
     /// Mailbox analytics: response-time percentiles, trend and bottlenecks
     /// (`AnalyticsService`).
@@ -369,6 +384,46 @@ enum BudgetAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum AccountAction {
+    /// Authorize an account with OAuth2, opening a browser for consent.
+    ///
+    /// Runs the whole loopback+PKCE flow: the daemon binds a redirect port,
+    /// prints the authorization URL, and waits for the browser to come back.
+    /// The refresh token is written to the macOS Keychain by the daemon and
+    /// never crosses this process.
+    Login {
+        /// Account id (as returned by `AccountService.List`).
+        id: i64,
+        /// Provider: google/gmail or microsoft/outlook.
+        #[arg(long = "oauth", value_name = "PROVIDER")]
+        oauth: String,
+        /// OAuth client id of a desktop/native application you registered
+        /// with the provider. Not a secret.
+        #[arg(long)]
+        client_id: String,
+        /// A command whose stdout is the client secret, for providers that
+        /// require one from a native client (Google's "Desktop app" type).
+        /// The secret is never passed on the command line.
+        #[arg(long, value_name = "COMMAND")]
+        client_secret_command: Option<String>,
+        /// Scope(s) to request. Omit for the provider's mail-only defaults.
+        #[arg(long = "scope", value_delimiter = ',')]
+        scopes: Vec<String>,
+        /// Print the URL instead of trying to open a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Refresh an account's OAuth access token.
+    Refresh {
+        /// Account id.
+        id: i64,
+        /// Refresh even if the stored token has not expired yet.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum TokenAction {
     /// Mint a new capability token. The bearer secret is printed exactly
     /// once — it cannot be recovered later, only revoked.
@@ -413,6 +468,28 @@ async fn main() -> Result<()> {
             full,
             watch,
         } => sync(&socket, account, mailbox, full, watch).await,
+        Command::Account { action } => match action {
+            AccountAction::Login {
+                id,
+                oauth,
+                client_id,
+                client_secret_command,
+                scopes,
+                no_browser,
+            } => {
+                account_login(
+                    &socket,
+                    id,
+                    oauth,
+                    client_id,
+                    client_secret_command,
+                    scopes,
+                    no_browser,
+                )
+                .await
+            }
+            AccountAction::Refresh { id, force } => account_refresh(&socket, id, force).await,
+        },
         Command::Token { action } => match action {
             TokenAction::Create { name, scopes, ttl } => {
                 token_create(&socket, name, scopes, ttl).await
@@ -446,6 +523,7 @@ async fn main() -> Result<()> {
         Command::Notes(args) => note_cli::list(&socket, args).await,
         Command::Export(args) => export_cli::export(&socket, args).await,
         Command::Hook { action } => hook_cli::run(&socket, action).await,
+        Command::Notify { action } => notify_cli::run(&socket, action).await,
         Command::Index { action } => index_cli::run(&socket, action).await,
         Command::Entities(args) => index_cli::entities(&socket, args).await,
         Command::Tag(args) => tag_cli::tag(&socket, args).await,
@@ -615,6 +693,124 @@ async fn ping(socket: &Path) -> Result<()> {
 
 /// Mint a capability token and print its bearer secret. This is the only
 /// moment the secret is ever visible — `ListTokens` returns metadata only.
+/// `mail account login --oauth <provider>`: the whole authorization, driven
+/// from one verb.
+///
+/// Two RPCs rather than one, because the middle of this flow is a human in a
+/// browser: `BeginOAuth` returns the URL and binds the port, and
+/// `CompleteOAuth` blocks until the redirect lands. Splitting them is what
+/// lets the URL be printed *before* the wait starts — a single RPC would have
+/// to stream, and would still leave the caller with no way to see the URL if
+/// opening a browser failed.
+async fn account_login(
+    socket: &Path,
+    id: i64,
+    provider: String,
+    client_id: String,
+    client_secret_command: Option<String>,
+    scopes: Vec<String>,
+    no_browser: bool,
+) -> Result<()> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let mut client = AccountServiceClient::new(channel);
+
+    let begun = client
+        .begin_o_auth(BeginOAuthRequest {
+            account_id: id,
+            provider: provider.clone(),
+            client_id,
+            client_secret_command,
+            scopes,
+        })
+        .await
+        .context("BeginOAuth RPC failed")?
+        .into_inner();
+
+    println!("Open this URL to authorize rmail for account {id}:");
+    println!();
+    println!("  {}", begun.authorization_url);
+    println!();
+    if !no_browser {
+        open_in_browser(&begun.authorization_url).await;
+    }
+    println!("Waiting for the redirect to {} …", begun.redirect_uri);
+
+    // No client-side deadline: the daemon already bounds this flow, and a
+    // shorter one here would abandon a user who is still typing a password.
+    let done = client
+        .complete_o_auth(CompleteOAuthRequest {
+            flow_id: begun.flow_id,
+        })
+        .await
+        .context("CompleteOAuth RPC failed")?
+        .into_inner();
+
+    println!();
+    println!("Authorized with {}.", done.provider);
+    println!("scopes:  {}", done.scopes.join(" "));
+    println!("expires: {} (unix seconds)", done.expires_at);
+    println!("The refresh token is in your Keychain; it never passed through this command.");
+    Ok(())
+}
+
+async fn account_refresh(socket: &Path, id: i64, force: bool) -> Result<()> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let response = AccountServiceClient::new(channel)
+        .refresh_token(RefreshTokenRequest {
+            account_id: id,
+            force,
+        })
+        .await
+        .context("RefreshToken RPC failed")?
+        .into_inner();
+
+    println!(
+        "{} ({}): expires {} (unix seconds)",
+        if response.refreshed {
+            "refreshed"
+        } else {
+            "still valid"
+        },
+        response.provider,
+        response.expires_at
+    );
+    Ok(())
+}
+
+/// Best-effort browser launch. A failure is not an error: the URL has already
+/// been printed, and the flow works perfectly well with a copy and paste.
+///
+/// Reaped rather than detached. `open`/`xdg-open` hand off and exit at once,
+/// but the very next thing this command does is block for up to five minutes
+/// waiting for the redirect — long enough for an unreaped child to sit there
+/// as a zombie for the whole flow.
+async fn open_in_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    // `arg`, not a shell: the URL is provider-controlled data and must never
+    // be word-split or interpreted by `sh`.
+    let spawned = tokio::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    // Bounded: a wedged opener must not hold up the flow whose URL is already
+    // on screen.
+    match tokio::time::timeout(Duration::from_secs(10), spawned).await {
+        Ok(Ok(_)) => println!("(opening it in your browser…)"),
+        _ => println!("(could not launch a browser; open the URL above by hand)"),
+    }
+}
+
 async fn token_create(
     socket: &Path,
     name: String,

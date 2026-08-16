@@ -212,6 +212,116 @@ async fn a_transport_is_built_once_per_account_and_reused() {
     assert_eq!(sender.lock().len(), 1);
 }
 
+/// An OAuth account authenticates with the bearer token over SASL XOAUTH2 —
+/// and its transport is deliberately *not* cached, because the credential it
+/// captured expires within the hour.
+#[tokio::test]
+async fn an_oauth_account_authenticates_with_xoauth2_and_is_never_cached() {
+    let fixture = Fixture::open_named("smtp-xoauth2");
+    let key = crate::oauth::StoreKey::new("rmail-oauth-smtp", "alice@example.com");
+    let token = install_oauth_grant(&key, "ya29.smtp-token");
+    fixture.set_oauth_credential(&key.service);
+
+    let expected = crate::oauth::xoauth2_b64(&key.account, &token);
+    let (mock, sender) = sender_against(
+        &fixture,
+        MockSmtpConfig {
+            xoauth2: Some(expected.expose().to_owned()),
+            ..MockSmtpConfig::default()
+        },
+    )
+    .await;
+
+    for _ in 0..2 {
+        sender
+            .send(fixture.account_id, &envelope(), MESSAGE)
+            .await
+            .unwrap();
+    }
+    assert_eq!(mock.accepted_count(), 2);
+
+    let auth = mock.auth_commands();
+    assert!(!auth.is_empty(), "the server saw no AUTH command");
+    for command in &auth {
+        assert!(
+            command.starts_with("AUTH XOAUTH2 "),
+            "a bearer token must not be offered as a password: {command}"
+        );
+    }
+    assert!(
+        sender.lock().is_empty(),
+        "an expiring credential must not be captured in a cached transport"
+    );
+}
+
+#[tokio::test]
+async fn an_oauth_account_with_no_grant_fails_permanently() {
+    // Nothing stored means the user never authorized: retrying cannot fix it,
+    // and burning the message's attempt budget on it would hide the reason.
+    let fixture = Fixture::open_named("smtp-xoauth2-missing");
+    // Install the process broker before asserting on its answer: without this
+    // the outcome depends on which test happened to run first, and off macOS
+    // the default Keychain store gives a different (also permanent) error.
+    let _ = oauth_store();
+    fixture.set_oauth_credential("rmail-oauth-smtp-never-authorized");
+    let (_mock, sender) = sender_against(&fixture, MockSmtpConfig::default()).await;
+
+    let failure = sender
+        .send(fixture.account_id, &envelope(), MESSAGE)
+        .await
+        .unwrap_err();
+    assert!(!failure.is_transient(), "{failure:?}");
+    assert!(
+        failure.message().contains("mail account login --oauth"),
+        "the operator needs to be told what to do: {failure:?}"
+    );
+}
+
+/// The process broker's store, installing a memory-backed broker on first use.
+///
+/// The Keychain does not exist off macOS, so every test that reaches the
+/// broker must go through this — including the ones expecting a *failure*,
+/// since otherwise the failure they observe depends on which test ran first.
+/// Installing is idempotent and each test addresses a distinct
+/// [`crate::oauth::StoreKey`], so they do not interfere.
+pub(crate) fn oauth_store() -> std::sync::Arc<crate::oauth::MemoryTokenStore> {
+    use crate::oauth::{MemoryTokenStore, OAuthBroker, TokenStore};
+    static STORE: std::sync::OnceLock<std::sync::Arc<MemoryTokenStore>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(STORE.get_or_init(|| {
+        let store = std::sync::Arc::new(MemoryTokenStore::new());
+        let broker =
+            OAuthBroker::new(std::sync::Arc::clone(&store) as std::sync::Arc<dyn TokenStore>)
+                .expect("a broker over a memory store");
+        crate::oauth::install_broker(std::sync::Arc::new(broker));
+        store
+    }))
+}
+
+/// Seed the process broker's store with a usable grant, returning the access
+/// token.
+fn install_oauth_grant(key: &crate::oauth::StoreKey, access_token: &str) -> String {
+    use crate::oauth::{Provider, StoredTokens, TokenStore};
+    let store = oauth_store();
+    store
+        .save(
+            key,
+            &StoredTokens {
+                provider: Provider::Google,
+                client_id: "client-abc".to_owned(),
+                client_secret: None,
+                refresh_token: crate::Secret::new("refresh"),
+                access_token: Some(crate::Secret::new(access_token)),
+                // Comfortably outside the refresh window, so this test never
+                // reaches a token endpoint.
+                expires_at: crate::oauth::unix_now() + 3600,
+                scopes: Vec::new(),
+            },
+        )
+        .expect("seeding a memory store cannot fail");
+    access_token.to_owned()
+}
+
 #[test]
 fn auto_security_never_resolves_to_plaintext() {
     // Silently downgrading a submission on a heuristic is how credentials

@@ -67,6 +67,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, ErrorReason};
 use crate::events::{EventKind, EventLog};
+use crate::notify;
 
 use super::queue::{AiWorkerPool, BatchCoordinator, BatchPollOutcome, DispatchSummary};
 use super::triage;
@@ -183,6 +184,11 @@ pub struct AiDispatchLoop {
     /// not yet been resolved by [`BatchCoordinator::poll`] — see the module
     /// docs' "Batch bookkeeping lives here."
     active_batches: Arc<Mutex<Vec<String>>>,
+    /// Whether a `NewMail` event also enqueues a
+    /// [`crate::notify::PASS`] job alongside triage's — `notify.enabled`.
+    /// See [`Self::drain_new_mail`] for why the switch lives at the enqueue
+    /// site rather than in the handler.
+    notify_pass: bool,
 }
 
 impl fmt::Debug for AiDispatchLoop {
@@ -212,7 +218,16 @@ impl AiDispatchLoop {
             lease_limit: DEFAULT_LEASE_LIMIT,
             cursor: Arc::new(AtomicI64::new(0)),
             active_batches: Arc::new(Mutex::new(Vec::new())),
+            notify_pass: false,
         }
+    }
+
+    /// Also enqueue a [`crate::notify`] scoring job for every `NewMail`
+    /// event — what `notify.enabled` turns on.
+    #[must_use]
+    pub fn with_notify_pass(mut self, enabled: bool) -> Self {
+        self.notify_pass = enabled;
+        self
     }
 
     /// Also drive the batch path: [`BatchCoordinator::maybe_submit`] for each
@@ -334,7 +349,24 @@ impl AiDispatchLoop {
                         // codebase writes.
                         return None;
                     };
-                    Some(NewAiJob::new(message_id, account_id, triage::PASS))
+                    Some((message_id, account_id))
+                })
+                .flat_map(|(message_id, account_id)| {
+                    // Triage always; notification scoring only when the
+                    // operator turned it on. `notify.enabled` is off by
+                    // default (see `config::NotifyConfig::enabled`) precisely
+                    // because this is where its cost is incurred — one extra
+                    // Haiku call per newly synced message, on top of triage's.
+                    // Gating it here rather than inside the handler is what
+                    // keeps a disabled engine from queueing work it will
+                    // never run: a job enqueued and then declined would still
+                    // occupy `ai_queue`, and `AiQueue::enqueue`'s
+                    // `(message_id, pass)` dedup would make it permanent.
+                    let mut jobs = vec![NewAiJob::new(message_id, account_id, triage::PASS)];
+                    if self.notify_pass {
+                        jobs.push(NewAiJob::new(message_id, account_id, notify::PASS));
+                    }
+                    jobs
                 })
                 .collect();
             if !jobs.is_empty() {
