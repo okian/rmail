@@ -687,6 +687,60 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AttachmentService/AskAttachment",
         Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
     ),
+    // `ExtractTables` (task 75) is `mail.read` alone, and the difference from
+    // its neighbour is the one this table draws everywhere: whether a caller
+    // can *force* spend. A workbook, a CSV and an HTML table are parsed with
+    // no provider involved; only a PDF or an image needs a model, and only
+    // when the request sets `allow_model`. A caller that has not been trusted
+    // with `ai.invoke` can simply leave it unset and still get every native
+    // table — which is why requiring `ai.invoke` here would deny a read-only
+    // token a capability that costs nothing.
+    //
+    // A caller that *does* set `allow_model` is asking for spend, and
+    // `AttachmentApi::extract_tables` therefore hands that request to
+    // `rmail_core::ai::gate`, which resolves `ai.policy` and both spend caps
+    // before any request is assembled. The scope table is not the only gate on
+    // that path, and it is deliberately the looser of the two: the tighter one
+    // is per-account and per-folder, which a scope cannot be.
+    (
+        "/rmail.v1.AttachmentService/ExtractTables",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // -- ExtractService / LinkService (task 75) -------------------------------
+    // `ExtractEvents`/`ExtractTasks` need `automation` on top of `mail.read`,
+    // and the reason is the sink rather than the extraction. With
+    // `EXTRACTION_SINK_COMMAND` the daemon spawns the operator's configured
+    // process with the extracted `.ics` on its stdin, and with
+    // `EXTRACTION_SINK_WEBHOOK` it POSTs outside the machine. That is exactly
+    // the authority `HookService/TestHook` sits behind — "cause a process to
+    // be spawned from an operator-authored command" — and the argument its row
+    // gives applies verbatim. `mail.read` as well, because the response quotes
+    // the message: an invite's summary, description, location and attendee
+    // list are message content.
+    //
+    // Deliberately *not* `ai.invoke`: `use_model` is optional and the `.ics`
+    // route answers fully without it, the same split `ExtractTables` above
+    // documents. And deliberately not `mail.write`, because nothing here
+    // touches the mailbox — the `extraction_deliveries` row it writes is a
+    // record of what left the machine, not a change to any message.
+    (
+        "/rmail.v1.ExtractService/ExtractEvents",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
+    (
+        "/rmail.v1.ExtractService/ExtractTasks",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
+    // `ExtractLinks` is `mail.read` and nothing else. It reads one message the
+    // caller already named, resolves nothing, fetches nothing, spawns nothing
+    // and writes nothing; `use_model` only refines a ranking the daemon
+    // produces deterministically either way, so — exactly as for
+    // `SearchService/Search` — a caller obtains nothing by spending that it
+    // could not obtain without.
+    (
+        "/rmail.v1.LinkService/ExtractLinks",
+        Requirement::Scope(Scope::MailRead),
+    ),
     // -- SendSchedulerService (task 61) ----------------------------------------------
     // Replaces the provisional `OutboxService/Send` row this table carried
     // until task 61 landed the real `proto/rmail/v1/send_scheduler.proto` —

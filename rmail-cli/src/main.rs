@@ -2,6 +2,7 @@
 
 mod digest_cli;
 mod export_cli;
+mod extract_cli;
 mod find_cli;
 mod hook_cli;
 mod index_cli;
@@ -252,6 +253,24 @@ enum Command {
     /// back an existing briefing for the same window rather than paying for a
     /// second one — see `digest_cli`'s own module docs.
     Digest(digest_cli::DigestArgs),
+    /// Attachment verbs (`AttachmentService`).
+    Attach {
+        #[command(subcommand)]
+        action: extract_cli::AttachAction,
+    },
+    /// Calendar events and tasks out of a message and any .ics it carries
+    /// (`ExtractService`). Delivery is idempotent per message: running this
+    /// twice does not create the reminder twice.
+    Extract {
+        #[command(subcommand)]
+        action: extract_cli::ExtractAction,
+    },
+    /// A message's links, deduplicated and ranked, with the ones whose text
+    /// misrepresents their target flagged (`LinkService.ExtractLinks`).
+    ///
+    /// Nothing here opens or resolves a link — see `extract_cli`'s own module
+    /// docs on why there is no `--open`.
+    Links(extract_cli::LinksArgs),
     /// Serve the whole gRPC surface to an AI agent over the Model Context
     /// Protocol. The tool list is generated from the compiled service
     /// definitions, so it is never out of step with the API — see
@@ -646,6 +665,14 @@ async fn main() -> Result<()> {
         Command::Note { action } => note_cli::dispatch(&socket, action).await,
         Command::Notes(args) => note_cli::list(&socket, args).await,
         Command::Export(args) => export_cli::export(&socket, args).await,
+        Command::Attach {
+            action: extract_cli::AttachAction::Tables(args),
+        } => extract_cli::tables(&socket, args).await,
+        Command::Extract { action } => match action {
+            extract_cli::ExtractAction::Events(args) => extract_cli::events(&socket, args).await,
+            extract_cli::ExtractAction::Tasks(args) => extract_cli::tasks(&socket, args).await,
+        },
+        Command::Links(args) => extract_cli::links(&socket, args).await,
         Command::Hook { action } => hook_cli::run(&socket, action).await,
         Command::Notify { action } => notify_cli::run(&socket, action).await,
         Command::Index { action } => index_cli::run(&socket, action).await,

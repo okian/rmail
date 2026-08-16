@@ -25,6 +25,7 @@ mod auth;
 mod compose_service;
 mod config_service;
 mod export_service;
+mod extract_service;
 mod finder_service;
 mod hook_service;
 mod idempotency;
@@ -58,6 +59,7 @@ pub use auth::Requirement;
 pub use compose_service::ComposeApi;
 pub use config_service::ConfigApi;
 pub use export_service::ExportApi;
+pub use extract_service::{ExtractApi, LinkApi};
 pub use finder_service::FinderApi;
 pub use hook_service::HookApi;
 pub use index_service::IndexApi;
@@ -89,6 +91,7 @@ use rmail_core::digest::{DigestEngine, DigestScheduler};
 use rmail_core::embed::hash::HashEmbedder;
 use rmail_core::embed::Embedder;
 use rmail_core::events::{EventLog, Retention};
+use rmail_core::extract::{ExtractEngine, ExtractModel};
 use rmail_core::finder::index::FinderIndex;
 use rmail_core::finder::store::FinderStore;
 use rmail_core::finder::Finder;
@@ -129,9 +132,11 @@ use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::compose_service_server::ComposeServiceServer;
 use rmail_proto::v1::config_service_server::ConfigServiceServer;
 use rmail_proto::v1::export_service_server::ExportServiceServer;
+use rmail_proto::v1::extract_service_server::ExtractServiceServer;
 use rmail_proto::v1::finder_service_server::FinderServiceServer;
 use rmail_proto::v1::hook_service_server::HookServiceServer;
 use rmail_proto::v1::index_service_server::IndexServiceServer;
+use rmail_proto::v1::link_service_server::LinkServiceServer;
 use rmail_proto::v1::mail_service_server::MailServiceServer;
 use rmail_proto::v1::note_service_server::NoteServiceServer;
 use rmail_proto::v1::notification_service_server::NotificationServiceServer;
@@ -1256,19 +1261,49 @@ where
     // declines with FAILED_PRECONDITION on a daemon whose AI subsystem is off
     // rather than disappearing from the reflection set and the fail-closed
     // scope table.
-    let attachment_service = AttachmentServiceServer::new(AttachmentApi::new(
-        db.clone(),
-        Arc::clone(&ai_provider),
-        Arc::clone(&ai_policy),
-        search_api.attachments().clone(),
-        config.ai.privacy.clone(),
-        config.ai.limits.clone(),
-        config.ai.ask.clone(),
-        Arc::clone(&ai_semaphore),
-        Arc::clone(&ai_rate_limiter),
-        ai_active,
-        stopping.clone(),
-    ));
+    // Structured extraction (task 75). The model half is `Some` only when the
+    // AI subsystem is actually active, and it shares the *same* semaphore and
+    // rate limiter as every other call site in this process — minting fresh
+    // ones would double the operator's configured `ai.limits` ceiling, which
+    // `rmail_core::ai::gate` documents at length.
+    //
+    // The engine itself is built either way, because its native routes need no
+    // provider at all: a workbook's tables, an `.ics`'s events and a message's
+    // links are all available on a daemon with `ai.enabled = false`.
+    let extract_model = ai_active.then(|| {
+        Arc::new(ExtractModel::new(
+            db.clone(),
+            Arc::clone(&ai_provider),
+            Arc::clone(&ai_policy),
+            config.ai.privacy.clone(),
+            config.ai.limits.clone(),
+            config.extract.model.clone(),
+            Arc::clone(&ai_semaphore),
+            Arc::clone(&ai_rate_limiter),
+        ))
+    });
+    let extract_engine = ExtractEngine::new(db.clone(), extract_model, config.extract.clone());
+
+    let attachment_service = AttachmentServiceServer::new(
+        AttachmentApi::new(
+            db.clone(),
+            Arc::clone(&ai_provider),
+            Arc::clone(&ai_policy),
+            search_api.attachments().clone(),
+            config.ai.privacy.clone(),
+            config.ai.limits.clone(),
+            config.ai.ask.clone(),
+            Arc::clone(&ai_semaphore),
+            Arc::clone(&ai_rate_limiter),
+            ai_active,
+            stopping.clone(),
+        )
+        .with_extract(extract_engine.clone()),
+    );
+
+    let extract_service =
+        ExtractServiceServer::new(ExtractApi::new(extract_engine.clone(), stopping.clone()));
+    let link_service = LinkServiceServer::new(LinkApi::new(extract_engine, stopping.clone()));
 
     let ai_service = AiServiceServer::new(
         AiApi::new(
@@ -1693,6 +1728,8 @@ where
         .add_service(finder_service)
         .add_service(ai_service)
         .add_service(attachment_service)
+        .add_service(extract_service)
+        .add_service(link_service)
         .add_service(ai_policy_service)
         .add_service(ai_safety_service)
         .add_service(hook_service)

@@ -565,6 +565,19 @@ commands! {
         actions: [],
         summary: "Answer a question from one attachment (or the best matches for it), citing page and span.",
     }
+    // `Read`, unlike its neighbour above, because spend is optional here
+    // rather than the whole RPC: a workbook, a CSV and an HTML table are
+    // parsed with no provider at all, and only a request that sets
+    // `allow_model` on a PDF or an image reaches one. A caller cannot force
+    // spend, which is the line this enum's own docs draw.
+    AttachmentExtractTables {
+        rpc: "/rmail.v1.AttachmentService/ExtractTables",
+        tool: "extract_tables",
+        effect: Read,
+        cli: ["attach tables"],
+        actions: [],
+        summary: "Read one attachment's tables as typed rows with per-cell provenance, saying which were inferred.",
+    }
 
     // -- SavedSearchService (task 35) -----------------------------------------
     SavedSearchCreateSavedSearch {
@@ -1244,6 +1257,43 @@ commands! {
         cli: ["ai scan-injection"],
         actions: [],
         summary: "Release (or re-withhold) rule actions on a message flagged for prompt injection.",
+    }
+
+    // -- ExtractService / LinkService (task 75) --------------------------------
+    ExtractExtractEvents {
+        rpc: "/rmail.v1.ExtractService/ExtractEvents",
+        tool: "extract_events",
+        // Mutating even with the default `ics` sink, on two counts a caller
+        // holds authority over: `use_model` spends at a provider, and every
+        // call *claims* the items it returns in `extraction_deliveries`, which
+        // is what makes the pipe and webhook sinks idempotent. A read that
+        // consumed an idempotency claim would be a read that changed what the
+        // next call does.
+        effect: Mutate,
+        cli: ["extract events"],
+        actions: [],
+        summary: "Extract calendar events from a message and any .ics, and deliver them once.",
+    }
+    ExtractExtractTasks {
+        rpc: "/rmail.v1.ExtractService/ExtractTasks",
+        tool: "extract_tasks",
+        effect: Mutate,
+        cli: ["extract tasks"],
+        actions: [],
+        summary: "Extract actionable tasks from a message and any .ics, and deliver them once.",
+    }
+    LinkExtractLinks {
+        rpc: "/rmail.v1.LinkService/ExtractLinks",
+        tool: "extract_links",
+        // A read despite `use_model`: unlike `AiService/AskMailbox`, a model
+        // call here is a *refinement* of an answer the daemon produces
+        // deterministically either way, so a caller cannot obtain anything by
+        // spending that it could not obtain without — the same line
+        // `SearchService/Search` is on.
+        effect: Read,
+        cli: ["links"],
+        actions: [],
+        summary: "Extract, deduplicate and rank a message's links, flagging targets that misrepresent themselves.",
     }
 
     // -- AuditService (task 45) ------------------------------------------------

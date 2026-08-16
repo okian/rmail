@@ -77,3 +77,7 @@ blokc = "blokc"
 # checker's splitter cuts into fragments. The word being matched is
 # "attachment" — the pre-send guardian's "you said attached" rule.
 ment = "ment"
+
+# A spreadsheet column, not a word: `extract::tables` maps column index 52 to
+# the A1 reference "BA1", and the test pins the Z -> AA -> BA carry.
+BA = "BA"

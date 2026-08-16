@@ -20,6 +20,7 @@ pub mod error;
 pub mod eval;
 pub mod events;
 pub mod export;
+pub mod extract;
 pub mod features;
 pub mod feedback;
 pub mod finder;

@@ -36,12 +36,15 @@ use rmail_core::attach::ask::{
 };
 use rmail_core::attach::search::AttachmentSearch;
 use rmail_core::config::{AiAsk, AiLimits, AiPrivacy};
+use rmail_core::extract::{tables, ExtractEngine, Table, TableReport};
 use rmail_core::{Database, Error};
 use rmail_proto::v1::attachment_service_server::AttachmentService;
 use rmail_proto::v1::{
     ask_attachment_chunk, AskAttachmentChunk, AskAttachmentDone, AskAttachmentRequest,
     AttachmentCitation as ProtoCitation, AttachmentRetrievalTrace as ProtoTrace,
-    AttachmentUsage as ProtoUsage,
+    AttachmentUsage as ProtoUsage, CellSource as ProtoCellSource, CellType as ProtoCellType,
+    ExtractTablesRequest, ExtractTablesResponse, Table as ProtoTable, TableCell as ProtoCell,
+    TableColumn as ProtoColumn, TableOrigin as ProtoOrigin, TableRow as ProtoRow,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -58,6 +61,13 @@ pub struct AttachmentApi {
     /// retrieval runs, so a disabled daemon declines in microseconds rather
     /// than after ranking a corpus for a call it was never going to make.
     enabled: bool,
+    /// The structured-extraction engine behind `ExtractTables`. `None` leaves
+    /// that RPC declining with `FAILED_PRECONDITION`, the convention this
+    /// service already follows for `AskAttachment` on an AI-less daemon — but
+    /// note the two are wired independently: table extraction's *native*
+    /// routes need no provider at all, so the engine is built even when
+    /// `enabled` is false.
+    extract: Option<ExtractEngine>,
     /// Cancelled when the daemon shuts down, so open answers stop with it
     /// rather than holding shutdown open.
     shutdown: CancellationToken,
@@ -98,8 +108,20 @@ impl AttachmentApi {
                 rate_limiter,
             )),
             enabled,
+            extract: None,
             shutdown,
         }
+    }
+
+    /// Serve `ExtractTables` from `engine`.
+    ///
+    /// Separate from [`Self::new`] because the two capabilities have different
+    /// preconditions: `AskAttachment` needs a provider, and table extraction's
+    /// native routes do not.
+    #[must_use]
+    pub fn with_extract(mut self, engine: ExtractEngine) -> Self {
+        self.extract = Some(engine);
+        self
     }
 }
 
@@ -155,6 +177,109 @@ impl AttachmentService for AttachmentApi {
             event.map(to_proto_chunk).map_err(Status::from)
         });
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(message_id, tables))]
+    async fn extract_tables(
+        &self,
+        request: Request<ExtractTablesRequest>,
+    ) -> Result<Response<ExtractTablesResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("message_id", req.message_id);
+        if req.message_id <= 0 {
+            return Err(Status::from(Error::invalid_argument(
+                "message_id must be a positive message id",
+            )));
+        }
+        let Some(engine) = self.extract.as_ref() else {
+            return Err(Status::from(Error::failed_precondition(
+                "structured extraction is not wired on this daemon".to_owned(),
+            )));
+        };
+        let cancel = self.shutdown.child_token();
+        let report = engine
+            .tables(req.message_id, &req.part_id, req.allow_model, &cancel)
+            .await
+            .map_err(Status::from)?;
+        tracing::Span::current().record("tables", report.tables.len());
+        Ok(Response::new(to_proto_tables(&report)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExtractTables conversions
+// ---------------------------------------------------------------------------
+
+fn to_proto_tables(report: &TableReport) -> ExtractTablesResponse {
+    ExtractTablesResponse {
+        tables: report.tables.iter().map(to_proto_table).collect(),
+        dropped_tables: clamp_u32(report.dropped_tables),
+        cell_budget_exhausted: report.cell_budget_exhausted,
+    }
+}
+
+fn to_proto_table(table: &Table) -> ProtoTable {
+    ProtoTable {
+        name: table.name.clone(),
+        columns: table
+            .columns
+            .iter()
+            .map(|column| ProtoColumn {
+                header: column.header.clone(),
+                r#type: to_proto_cell_type(column.kind) as i32,
+            })
+            .collect(),
+        rows: table
+            .rows
+            .iter()
+            .map(|row| ProtoRow {
+                cells: row.iter().map(to_proto_cell).collect(),
+            })
+            .collect(),
+        origin: match table.origin {
+            tables::TableOrigin::Spreadsheet => ProtoOrigin::Spreadsheet,
+            tables::TableOrigin::Csv => ProtoOrigin::Csv,
+            tables::TableOrigin::Html => ProtoOrigin::Html,
+            tables::TableOrigin::Model => ProtoOrigin::Model,
+        } as i32,
+        // Sent explicitly rather than left for a client to derive from
+        // `origin`: a client that forgot would treat a transcription as a
+        // parse, which is the one mistake this field exists to prevent.
+        inferred: table.inferred(),
+        truncated: table.truncated,
+    }
+}
+
+fn to_proto_cell(cell: &tables::Cell) -> ProtoCell {
+    let (number, boolean, date) = match &cell.value {
+        tables::CellValue::Number(value) => (*value, false, 0),
+        tables::CellValue::Bool(value) => (0.0, *value, 0),
+        tables::CellValue::Date(value) => (0.0, false, *value),
+        tables::CellValue::Text(_) | tables::CellValue::Empty => (0.0, false, 0),
+    };
+    ProtoCell {
+        text: cell.text.clone(),
+        r#type: to_proto_cell_type(cell.value.kind()) as i32,
+        number,
+        boolean,
+        date,
+        source: Some(ProtoCellSource {
+            sheet: cell.source.sheet.clone(),
+            page: cell.source.page.unwrap_or(0),
+            row: clamp_u32(cell.source.row),
+            col: clamp_u32(cell.source.col),
+            reference: cell.source.reference.clone(),
+        }),
+    }
+}
+
+fn to_proto_cell_type(kind: tables::CellType) -> ProtoCellType {
+    match kind {
+        tables::CellType::Empty => ProtoCellType::Empty,
+        tables::CellType::Text => ProtoCellType::Text,
+        tables::CellType::Number => ProtoCellType::Number,
+        tables::CellType::Bool => ProtoCellType::Bool,
+        tables::CellType::Date => ProtoCellType::Date,
     }
 }
 

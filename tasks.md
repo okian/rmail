@@ -722,13 +722,14 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmaild --test attach_search --test ask_attachment` (page-cited answer, unsupported refusal)
 
 ## 75. Table, calendar/task & link extraction
-- [ ] status
+- [x] status
 - **depends-on:** 22, 43
 - **parallel-safe:** yes
 - **acceptance:**
   - Table extraction (native from spreadsheets, Claude vision for PDF/image tables) into typed rows with headers + source-cell provenance; calendar/task extraction (message + .ics → normalized events/tasks → .ics / pipe / task webhook, idempotent per message); URL/link extraction + Claude classification (unsubscribe/tracking/meeting/document/CTA) with relevance score + picker.
   - `AttachmentService.ExtractTables`, `ExtractService.ExtractEvents/ExtractTasks`, `LinkService.ExtractLinks`.
-- **verify:** `cargo nextest run -p rmail-core extract::tables extract::events extract::links`
+- **verify:** `cargo nextest run -p rmail-core extract::tables extract::events extract::links` (108 tests) · `cargo nextest run -p rmaild --test extract_service` (the RPCs end-to-end: idempotent delivery, the spoofed-link flag, per-cell provenance)
+- **note:** PDF/image tables read the document's *extracted text* (page-marked) and an image's OCR output, not pixels — this crate has no PDF renderer and `ai::provider` carries no image content block, the same constraint `attach::ocr` documents. Such tables arrive with `origin = MODEL` and `inferred = true`.
 
 ## 76. Budget enforcer
 - [x] status

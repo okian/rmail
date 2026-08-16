@@ -1,0 +1,158 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// ExtractService turns a message into calendar events and tasks, and hands
+// them to whatever keeps them (prd.md "Attachments & Extraction", feature 65).
+//
+// Two inputs, one normalized shape. A `text/calendar` part is *parsed* —
+// exact, deterministic, and the sender's own statement of what they mean. A
+// body that says "let's do Thursday at 3" is *inferred* by a model. Both
+// arrive as the same Event/Task and every item carries `source`, because a
+// DTSTART and a model's reading of a sentence are not the same quality of
+// fact and a calendar that merged them would be lying by omission.
+//
+// # Delivery is idempotent per message
+//
+// Every item has a UID: the .ics's own, or one derived deterministically from
+// the message and the item's own content. Before a sink fires, the daemon
+// claims `(message_id, kind, uid, sink)` behind a UNIQUE index. A redelivered
+// sync, a retried RPC and a user pressing the button twice therefore collapse
+// to one webhook POST and one pipe execution — `delivered` counts what this
+// call actually pushed and `skipped` counts what a previous one already had.
+//
+// The claim is taken *before* the side effect on purpose: firing first would
+// leave a window in which a crash duplicates a task in somebody's tracker. A
+// sink that then fails releases its own claim and the call answers
+// UNAVAILABLE, so the item can be delivered again.
+//
+// # Sinks are configured, never supplied by the caller
+//
+// `sink` names one of three shapes; where it points comes from `[extract]` in
+// the daemon's configuration. A pipe whose argv a caller could choose would be
+// remote code execution, and a webhook whose URL a caller could choose would
+// be an outbound request generator. Asking for a sink the operator has not
+// configured is INVALID_ARGUMENT rather than a silent degrade to returning a
+// file, because a user must not believe their task tracker was updated when
+// it was not.
+service ExtractService {
+  // Extract calendar events from a message and any .ics it carries, and
+  // optionally deliver them.
+  //
+  // INVALID_ARGUMENT if `use_model` is set on a daemon with no AI provider —
+  // the .ics route still works there and is what a caller should ask for.
+  // NOT_FOUND for a message that does not exist; FAILED_PRECONDITION for one
+  // whose body has not been fetched.
+  rpc ExtractEvents(ExtractEventsRequest) returns (ExtractEventsResponse);
+
+  // ExtractEvents for tasks (VTODOs, and actionable items a model finds in a
+  // body). Same routes, same sinks, same idempotency — under its own `kind`,
+  // so extracting the events of a message does not suppress its tasks.
+  rpc ExtractTasks(ExtractTasksRequest) returns (ExtractTasksResponse);
+}
+
+// Which route produced an item.
+enum ExtractionSource {
+  EXTRACTION_SOURCE_UNSPECIFIED = 0;
+  // Parsed from a text/calendar part.
+  EXTRACTION_SOURCE_ICS = 1;
+  // Inferred by a model from the message body.
+  EXTRACTION_SOURCE_MODEL = 2;
+}
+
+// Where extracted items go.
+enum ExtractionSink {
+  // Return the .ics and push nothing. The default, and the only shape with
+  // no side effect outside this process.
+  EXTRACTION_SINK_UNSPECIFIED = 0;
+  EXTRACTION_SINK_ICS = 1;
+  // Pipe the .ics to the command in `extract.command`.
+  EXTRACTION_SINK_COMMAND = 2;
+  // POST the items to `extract.webhook_url`.
+  EXTRACTION_SINK_WEBHOOK = 3;
+}
+
+message ExtractEventsRequest {
+  int64 message_id = 1;
+  // Whether a model may read the body for events the .ics does not state.
+  bool use_model = 2;
+  // Where to deliver. Unspecified returns the .ics and pushes nothing.
+  ExtractionSink sink = 3;
+}
+
+message ExtractTasksRequest {
+  int64 message_id = 1;
+  bool use_model = 2;
+  ExtractionSink sink = 3;
+}
+
+message ExtractedEvent {
+  // The item's identity, and the key delivery is idempotent on.
+  string uid = 1;
+  string summary = 2;
+  string description = 3;
+  string location = 4;
+  // Unix seconds, UTC.
+  int64 starts_at = 5;
+  // 0 when the invite gave no end.
+  int64 ends_at = 6;
+  // Whether the start was a whole day with no time.
+  bool all_day = 7;
+  string organizer = 8;
+  repeated string attendees = 9;
+  // The RRULE verbatim, unexpanded: expanding a recurrence is a calendar
+  // application's job, and getting it subtly wrong puts phantom meetings in
+  // somebody's week.
+  string rrule = 10;
+  ExtractionSource source = 11;
+  // 1.0 for an .ics; the model's own number, clamped, otherwise.
+  double confidence = 12;
+  // Whether the source said this event is off: STATUS:CANCELLED, or a
+  // calendar whose METHOD is CANCEL. Per event rather than only in
+  // ExtractEventsResponse.method, because a client handling events one at a
+  // time has lost the calendar-level field by then — and a cancellation
+  // written into somebody's calendar as a new appointment is the failure this
+  // exists to prevent.
+  bool cancelled = 13;
+}
+
+message ExtractedTask {
+  string uid = 1;
+  string summary = 2;
+  string description = 3;
+  // Unix seconds, UTC. 0 when there is no due date.
+  int64 due_at = 4;
+  // RFC 5545 priority, 0 (unset) through 9.
+  uint32 priority = 5;
+  bool completed = 6;
+  ExtractionSource source = 7;
+  double confidence = 8;
+}
+
+message ExtractEventsResponse {
+  repeated ExtractedEvent events = 1;
+  // The calendar's METHOD (REQUEST, CANCEL, REPLY), uppercased, empty when
+  // the file declared none. Surfaced rather than dropped: a client must not
+  // read a CANCEL as an invitation.
+  string method = 2;
+  // Components skipped because they were malformed or a bound was reached.
+  uint32 skipped = 3;
+  // The rendered .ics, always returned whatever the sink — asking for the
+  // file a second time gets the file, not an empty string.
+  string ics = 4;
+  // Items this call actually pushed to the sink.
+  uint32 delivered = 5;
+  // Items a previous call had already pushed to this sink.
+  uint32 already_delivered = 6;
+  // A piped command's stdout, bounded. Empty for the other sinks.
+  string sink_output = 7;
+}
+
+message ExtractTasksResponse {
+  repeated ExtractedTask tasks = 1;
+  uint32 skipped = 2;
+  string ics = 3;
+  uint32 delivered = 4;
+  uint32 already_delivered = 5;
+  string sink_output = 6;
+}

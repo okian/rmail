@@ -53,6 +53,138 @@ service AttachmentService {
   // yielding would be indistinguishable from one that had finished, so a
   // partial result would read as a whole one.
   rpc AskAttachment(AskAttachmentRequest) returns (stream AskAttachmentChunk);
+
+  // Read the tables out of one attachment as typed rows with per-cell
+  // provenance (prd.md feature 54).
+  //
+  // Two routes, chosen from the attachment's own bytes rather than from its
+  // declared type, and the caller is always told which one ran:
+  //
+  //   * A workbook, a delimited file or an HTML table is *parsed*. The rows,
+  //     the columns and the types are in the file. Every cell carries the
+  //     sheet it came from and, for those routes, the A1 reference an
+  //     operator can type into the original.
+  //   * A PDF or an image is *inferred* — a model reads the document's
+  //     extracted text (or its OCR output) and transcribes what it finds.
+  //     Table.origin is MODEL and Table.inferred is true, because a total
+  //     read off a rendered page is not the same fact as a total read out of
+  //     a cell, and a client that could not tell them apart would treat both
+  //     as ground truth.
+  //
+  // `allow_model` false confines the call to the parsing routes, which is
+  // what a caller that must not spend anything asks for; a PDF or an image
+  // then answers INVALID_ARGUMENT rather than silently returning nothing.
+  //
+  // FAILED_PRECONDITION when the attachment yielded no text at all (a scan
+  // with no OCR backend available, an encrypted document) — deliberately
+  // distinct from an empty table list, which means the document was read and
+  // holds no tables.
+  //
+  // Every bound is enforced by the daemon, never asked of the model: cells,
+  // rows, columns, characters per cell, tables per document, and `<table>`
+  // nesting depth. A table cut short by one of them arrives with
+  // `truncated` set rather than silently short.
+  rpc ExtractTables(ExtractTablesRequest) returns (ExtractTablesResponse);
+}
+
+message ExtractTablesRequest {
+  // The message carrying the attachment.
+  int64 message_id = 1;
+  // Its MIME part id, as SearchAttachments and `attachment_extractions`
+  // report it.
+  string part_id = 2;
+  // Whether the model route may run for a format that has no parseable
+  // structure. False confines this to the native routes.
+  bool allow_model = 3;
+}
+
+// What kind of value a cell holds. TYPE_TEXT is the fallback for a column
+// whose cells disagree — a column of numbers with one "n/a" in it is not a
+// numeric column, and a client that summed it would be wrong.
+enum CellType {
+  CELL_TYPE_UNSPECIFIED = 0;
+  CELL_TYPE_EMPTY = 1;
+  CELL_TYPE_TEXT = 2;
+  CELL_TYPE_NUMBER = 3;
+  CELL_TYPE_BOOL = 4;
+  CELL_TYPE_DATE = 5;
+}
+
+// Which route read a table.
+enum TableOrigin {
+  TABLE_ORIGIN_UNSPECIFIED = 0;
+  // Read out of a workbook's own cells.
+  TABLE_ORIGIN_SPREADSHEET = 1;
+  // Read out of delimited text.
+  TABLE_ORIGIN_CSV = 2;
+  // Read out of HTML `<table>` markup.
+  TABLE_ORIGIN_HTML = 3;
+  // Transcribed by a model from a rendered document.
+  TABLE_ORIGIN_MODEL = 4;
+}
+
+// Where one cell came from. The whole point of this message: a structured
+// extraction nobody can check against the source is a claim, not data.
+message CellSource {
+  // The worksheet name, for a workbook. Empty otherwise.
+  string sheet = 1;
+  // The one-based page, for a paginated document. 0 when there is none.
+  int64 page = 2;
+  // Zero-based row within the table.
+  uint32 row = 3;
+  // Zero-based column within the table.
+  uint32 col = 4;
+  // The A1-style reference in the source file (`B7`), for a route where that
+  // is meaningful. Empty otherwise — an invented reference would be worse
+  // than none, because somebody would type it in.
+  string reference = 5;
+}
+
+message TableCell {
+  // The cell as written.
+  string text = 1;
+  // Its parsed value, when it has one beyond the text.
+  CellType type = 2;
+  // Set for CELL_TYPE_NUMBER.
+  double number = 3;
+  // Set for CELL_TYPE_BOOL.
+  bool boolean = 4;
+  // Unix seconds, UTC. Set for CELL_TYPE_DATE.
+  int64 date = 5;
+  CellSource source = 6;
+}
+
+message TableColumn {
+  // The detected header, empty when the table has none.
+  string header = 1;
+  // The type every non-empty cell in the column shares.
+  CellType type = 2;
+}
+
+message TableRow {
+  repeated TableCell cells = 1;
+}
+
+message Table {
+  // The sheet name, the caption, or a synthesized `Table 3`.
+  string name = 1;
+  repeated TableColumn columns = 2;
+  // Data rows only; the header is in `columns`.
+  repeated TableRow rows = 3;
+  TableOrigin origin = 4;
+  // Whether this table was inferred rather than read. Derived from `origin`
+  // by the daemon and sent explicitly so a client cannot forget to check it.
+  bool inferred = 5;
+  // Whether a bound cut this table short.
+  bool truncated = 6;
+}
+
+message ExtractTablesResponse {
+  repeated Table tables = 1;
+  // Tables dropped because the per-document table cap was reached.
+  uint32 dropped_tables = 2;
+  // Whether the document-wide cell budget was exhausted.
+  bool cell_budget_exhausted = 3;
 }
 
 message AskAttachmentRequest {

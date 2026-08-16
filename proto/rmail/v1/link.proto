@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// LinkService turns a message's links into a short ranked picker
+// (prd.md "Attachments & Extraction", feature 66).
+//
+// A marketing mail has forty links, of which one is the thing the reader came
+// for, one is the unsubscribe, and thirty-eight are the sender's plumbing.
+// ExtractLinks extracts every link once, deduplicates by identity rather than
+// by spelling, classifies each, and returns them ordered so a client can float
+// the head of the list.
+//
+// # No link is ever resolved
+//
+// The daemon does not fetch, HEAD, follow, expand or DNS-resolve anything it
+// finds in a message. A shortener is reported as a shortener; a redirector's
+// claimed destination is reported as *claimed*. Resolving a link found in
+// hostile mail is a request the message's author chose, sent from the
+// reader's machine: it confirms the address is live, it leaks the reader's IP,
+// and for a one-time link it burns it.
+//
+// # Display text and target stay separate, all the way to the wire
+//
+// `url` is where the link goes and `display_text` is what the reader sees.
+// They are different fields because collapsing them is the bug. When the text
+// names a host and the href goes somewhere else, `deceptive` is set and
+// `display_host` says what the text claimed — the mismatch is *reported*, not
+// repaired. A client that quietly showed the real host would rob the reader of
+// the fact that the message tried. The same flag covers the two other ways a
+// target lies about itself: a punycode host and a non-ASCII one.
+//
+// `deceptive` is computed from the bytes and is not something the model
+// classifier can clear; the ranking penalty it carries is re-applied after
+// any model answer, so a model talked into scoring a spoofed link 1.0 still
+// does not out-rank an honest one.
+//
+// # AI is a refinement, never a dependency
+//
+// The deterministic classifier always runs. `use_model` asks a model to
+// refine the kinds and the scores; a daemon with no provider, or a model call
+// that fails, still returns a ranked picker — less well, which is this
+// project's standing rule for what "AI off" means. The model may not add a
+// link, remove one, or invent a kind outside the enum below.
+service LinkService {
+  // Extract, deduplicate, classify and rank every link in a message.
+  //
+  // NOT_FOUND for a message that does not exist; FAILED_PRECONDITION for one
+  // whose body has not been fetched.
+  rpc ExtractLinks(ExtractLinksRequest) returns (ExtractLinksResponse);
+}
+
+// What a link is for. LINK_KIND_OTHER is not a failure — most links in most
+// mail are ordinary references, and inventing a category for them would make
+// the high-value classes meaningless.
+enum LinkKind {
+  LINK_KIND_UNSPECIFIED = 0;
+  // A list-unsubscribe or preference-centre link.
+  LINK_KIND_UNSUBSCRIBE = 1;
+  // Open/click telemetry: a redirector or a beacon.
+  LINK_KIND_TRACKING = 2;
+  // A video-call or calendar join link.
+  LINK_KIND_MEETING = 3;
+  // A document, sheet, deck or file.
+  LINK_KIND_DOCUMENT = 4;
+  // The message's call to action.
+  LINK_KIND_CTA = 5;
+  LINK_KIND_OTHER = 6;
+}
+
+// Who decided a link's kind.
+enum LinkClassifier {
+  LINK_CLASSIFIER_UNSPECIFIED = 0;
+  // The daemon's deterministic rules.
+  LINK_CLASSIFIER_RULES = 1;
+  // A model pass over the rules' output.
+  LINK_CLASSIFIER_MODEL = 2;
+}
+
+message ExtractLinksRequest {
+  int64 message_id = 1;
+  // Whether a model may refine the classification and the ranking.
+  bool use_model = 2;
+}
+
+// Where in the message a link was found.
+message LinkSource {
+  // The part key (`html:0`, `text:1`).
+  string part = 1;
+  // Byte offsets of the link within that part.
+  int64 span_start = 2;
+  int64 span_end = 3;
+}
+
+message ExtractedLink {
+  // The target exactly as the message wrote it.
+  string url = 1;
+  // The host, lowercased.
+  string host = 2;
+  // The scheme, lowercased. Only http and https ever reach a client: a
+  // `javascript:` or `data:` target is not something a picker may offer.
+  string scheme = 3;
+  // The text a human sees, for an anchor; empty for a bare URL in a body.
+  // Never merged with `url` — see the service comment.
+  string display_text = 4;
+  // The host the display text claims, when the text is itself a URL or a bare
+  // domain. Empty when the text names no host, which is the ordinary case and
+  // is not suspicious.
+  string display_host = 5;
+  // Whether the target lies about itself. Reported, never used to hide.
+  bool deceptive = 6;
+  LinkKind kind = 7;
+  LinkClassifier classifier = 8;
+  // Relevance, 0.0..=1.0. The list is ordered by this.
+  double score = 9;
+  // One short phrase naming the evidence.
+  string reason = 10;
+  // How many times this link occurs in the message.
+  uint32 occurrences = 11;
+  // Where it was first found.
+  LinkSource source = 12;
+}
+
+message ExtractLinksResponse {
+  // Ordered by score descending and, on a tie, by first appearance. The head
+  // is what a picker floats.
+  repeated ExtractedLink links = 1;
+  // Distinct links dropped because the per-message cap was reached.
+  uint32 truncated = 2;
+  // Parts skipped for being empty, oversized, or past the message budget.
+  uint32 skipped_parts = 3;
+  // Tracking pixels seen. Counted rather than listed: a beacon is not a link
+  // a human can pick, and offering one would be offering a button that only
+  // fires the beacon.
+  uint32 tracking_pixels = 4;
+}

@@ -309,6 +309,8 @@ pub struct Config {
     pub notify: NotifyConfig,
     /// Periodic AI digest settings.
     pub digest: DigestConfig,
+    /// Table/calendar/link extraction settings.
+    pub extract: ExtractConfig,
 }
 
 impl Config {
@@ -2832,6 +2834,57 @@ impl Default for DigestConfig {
             max_context_tokens: 12_000,
             max_chars_per_message: 800,
             max_tokens: 2_048,
+        }
+    }
+}
+
+/// Table, calendar/task and link extraction (`[extract]`, task 75, prd.md
+/// features 54, 65 and 66).
+///
+/// Small, for the reason [`DigestConfig`] gives: whether a model call may
+/// happen at all is `[ai.limits]`/`[ai.privacy]`/`[ai.policy]`'s business and
+/// is not restated here. What is here is the model to use, the ceiling on one
+/// answer, and the two sinks an operator has to name before extracted items can
+/// be pushed anywhere — because a sink is the one part of this that leaves the
+/// machine, and it must be something they configured rather than something a
+/// default chose for them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExtractConfig {
+    /// The model that reads a rendered table, infers events from a body, and
+    /// ranks links. Haiku by default: all three are structured classification
+    /// over text that is already in front of it, which is what the cheap tier
+    /// is for, and this runs per message the user asks about.
+    pub model: String,
+    /// Output-token ceiling for one extraction answer.
+    pub max_tokens: u32,
+    /// OCR languages for the image-table route, matching
+    /// `index.extract.ocr_langs`.
+    pub ocr_langs: Vec<String>,
+    /// The command extracted items are piped to when the `command` sink is
+    /// chosen — an `osascript` that adds to Reminders, typically. Empty means
+    /// the sink is unavailable, and asking for it is an error rather than a
+    /// silent no-op.
+    ///
+    /// The `.ics` arrives on the command's stdin and nothing from the message
+    /// reaches its argv: see [`crate::extract::Sink::Command`].
+    pub command: String,
+    /// Fixed arguments for `command`.
+    pub command_args: Vec<String>,
+    /// The endpoint extracted items are POSTed to when the `webhook` sink is
+    /// chosen. Empty means the sink is unavailable.
+    pub webhook_url: String,
+}
+
+impl Default for ExtractConfig {
+    fn default() -> Self {
+        Self {
+            model: "claude-haiku-4-5".to_owned(),
+            max_tokens: 4_096,
+            ocr_langs: vec!["en-US".to_owned()],
+            command: String::new(),
+            command_args: Vec::new(),
+            webhook_url: String::new(),
         }
     }
 }
