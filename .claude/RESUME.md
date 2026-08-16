@@ -6,14 +6,20 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**67 of 86 done, 19 remaining.** `tasks.md` is authoritative — count with
+**69 of 86 done, 17 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **3001/3001** on the full
+after merge, never on the agent's own report: currently **3189/3189** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: 36, 42, 57, 58, 62, 63, 65, 68, 69, 70, 71, 72, 73, 75, 78, 79, 80,
-81, 82. All are ready — no unmet dependencies — and all but 42 are
-`parallel-safe: yes`.
+Remaining: 36, 42, 57, 58, 62, 63, 65, 68, 69, 70, 72, 73, 75, 78, 79, 80, 81.
+All are ready — no unmet dependencies — and all but 42 are
+`parallel-safe: yes`. In flight: **79** (OAuth2 broker) and **81** (priority
+notifications), each in its own worktree.
+
+Merged this round: 74 (attachment search), 71 (SLA analytics), 82 (export).
+Each was verified on the *combined* tree, never on the agent's own count —
+71 reported 3106 and 82 reported 3084 against their own bases, and the truth
+after merging both was 3189.
 
 Defects in already-merged work keep being found by the post-merge full-suite
 run or by orchestrator review rather than by the task that introduced them: a
@@ -61,7 +67,7 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V40.**
+costs nothing. **Next free: V40.** (71 and 82 needed no migration.)
 
 Task 74 arrived numbered V40 over a V38 tip and was renamed to V39 at merge,
 along with the `-- V40:` comment in the file and two doc references to it.
