@@ -142,6 +142,7 @@ impl TestServer {
 
     fn request(&self) -> ScheduleSendRequest {
         ScheduleSendRequest {
+            skip_preflight: false,
             account_id: self.account_id,
             draft_id: None,
             to: vec!["bob@example.net".to_owned()],

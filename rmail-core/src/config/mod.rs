@@ -2079,6 +2079,8 @@ pub struct SendConfig {
     pub optimal: SendOptimal,
     /// Follow-up tracker settings.
     pub followup: SendFollowup,
+    /// Pre-send guardian settings.
+    pub preflight: SendPreflight,
 }
 
 impl Default for SendConfig {
@@ -2097,6 +2099,7 @@ impl Default for SendConfig {
             smtp_security: SmtpSecurity::Auto,
             optimal: SendOptimal::default(),
             followup: SendFollowup::default(),
+            preflight: SendPreflight::default(),
         }
     }
 }
@@ -2137,6 +2140,11 @@ pub struct SendFollowup {
     pub default_delay: HumanDuration,
     /// Cancel the follow-up when a reply is detected.
     pub cancel_on_reply: bool,
+    /// Model for the tracker's judge and its nudge drafts.
+    pub model: String,
+    /// Upper clamp on a model-proposed deadline. A judge that answers "300
+    /// days" must not be able to arm a reminder nobody will ever see.
+    pub max_delay: HumanDuration,
 }
 
 impl Default for SendFollowup {
@@ -2144,6 +2152,86 @@ impl Default for SendFollowup {
         Self {
             default_delay: HumanDuration::new(days(3)),
             cancel_on_reply: true,
+            model: "claude-haiku-4-5".to_owned(),
+            max_delay: HumanDuration::new(days(30)),
+        }
+    }
+}
+
+/// Pre-send guardian settings — see [`crate::send::preflight`]'s module docs,
+/// which is where the fail-open/fail-closed reasoning behind these knobs
+/// lives.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SendPreflight {
+    /// Whether the guardian runs at all.
+    ///
+    /// `false` disables the automatic check on `ScheduleSend`. `PreflightCheck`
+    /// keeps answering — it is an explicitly invoked review, and refusing to
+    /// perform one on request would be a strange reading of "off".
+    pub enabled: bool,
+    /// Whether the *model* layer runs on top of the deterministic checks.
+    ///
+    /// Turning it off costs the tone-clash pass and nothing else: a model
+    /// finding can never block a send (see the module docs), so the set of
+    /// messages this daemon refuses is identical either way.
+    pub ai: bool,
+    /// Model for the guardian's review pass.
+    pub model: String,
+    /// How long the model layer may take before the guardian gives up on it
+    /// and reports itself degraded.
+    ///
+    /// This is the bound that keeps a wedged provider from holding a send
+    /// open forever. It is deliberately short: a review that has not come
+    /// back in this long is not going to change anyone's mind about a
+    /// message they have already pressed send on.
+    pub timeout: HumanDuration,
+    /// The lowest [`crate::send::preflight::Severity`] that *refuses* a send:
+    /// `block`, `warn`, `notice`, or `never`.
+    ///
+    /// Anything else is treated as `never` and warned about at startup — see
+    /// [`Self::warn_if_unrecognized`]. Mail must not stop because of a typo
+    /// in a config file, which is the opposite of the fail-closed choice
+    /// `ai.injection.block_actions_at` makes and for the symmetric reason:
+    /// there, an unreadable policy must not *grant* authority; here, it must
+    /// not *seize* it.
+    pub block_at: String,
+    /// How many envelope recipients a message may name before the guardian
+    /// says something.
+    pub max_recipients: u32,
+}
+
+impl Default for SendPreflight {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ai: true,
+            model: "claude-haiku-4-5".to_owned(),
+            timeout: HumanDuration::new(secs(15)),
+            block_at: "block".to_owned(),
+            max_recipients: 15,
+        }
+    }
+}
+
+impl SendPreflight {
+    /// The parsed [`Self::block_at`], or `None` for "never refuse a send".
+    #[must_use]
+    pub fn block_severity(&self) -> Option<crate::send::preflight::Severity> {
+        crate::send::preflight::Severity::parse(self.block_at.trim())
+    }
+
+    /// Warn, once, if [`Self::block_at`] names neither a severity nor the
+    /// literal `never` — the startup-time counterpart to the deliberate
+    /// fail-open in [`Self::block_severity`].
+    pub fn warn_if_unrecognized(&self) {
+        if self.block_severity().is_none() && self.block_at.trim() != "never" {
+            tracing::warn!(
+                block_at = %self.block_at,
+                recognized = ?["block", "warn", "notice", "never"],
+                "send.preflight.block_at is not a recognized value; the pre-send guardian will \
+                 warn but never refuse a send until this is fixed"
+            );
         }
     }
 }

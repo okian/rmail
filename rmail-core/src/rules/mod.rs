@@ -99,7 +99,6 @@ pub mod actions;
 pub mod classify;
 pub mod eval;
 pub mod facts;
-pub mod gate;
 pub mod model;
 pub mod repo;
 pub mod synth;
@@ -273,7 +272,7 @@ pub struct RuleEngine {
     /// Resolves `ai.policy` for [`RuleEngine::record_correction`].
     ///
     /// The classifier resolves policy for the message it is about to send
-    /// (see [`gate::admit`]), which covers the evaluation path — but a
+    /// (see [`crate::ai::gate::admit`]), which covers the evaluation path — but a
     /// *correction* freezes a rendered copy of its message into
     /// `rule_examples`, and every later classification of that predicate
     /// replays it to the provider as a prior turn. Without this check, a

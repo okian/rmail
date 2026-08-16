@@ -12,13 +12,8 @@ fn now() -> i64 {
 
 fn new(fixture: &Fixture, message_id: &str, remind_at: i64) -> NewFollowup {
     NewFollowup {
-        account_id: fixture.account_id,
-        thread_id: None,
-        message_id: message_id.to_owned(),
-        remind_at,
-        tz: "UTC".to_owned(),
-        cancel_on_reply: true,
         note: Some("chase the quote".to_owned()),
+        ..NewFollowup::manual(fixture.account_id, message_id, remind_at, "UTC", true)
     }
 }
 

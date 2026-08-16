@@ -76,6 +76,14 @@ pub struct SendArgs {
     /// Lengthen the undo window for this send, in seconds.
     #[arg(long)]
     undo_window: Option<i64>,
+    /// Send even if the pre-send guardian refuses the message.
+    ///
+    /// The guardian blocks on things that are irreversible once delivered — a
+    /// credential in the body, an unfilled template hole — so this is the
+    /// documented way through after reading what it found, not a way to turn
+    /// the check off. The daemon logs every use.
+    #[arg(long)]
+    force: bool,
 }
 
 /// `mail undo [<id>]`
@@ -236,6 +244,7 @@ pub async fn send(socket: &Path, args: SendArgs) -> Result<()> {
             tz: args.tz.unwrap_or_default(),
             undo_window_secs: args.undo_window,
             origin: SendOrigin::User as i32,
+            skip_preflight: args.force,
             // Empty: this command issues the RPC exactly once and never
             // retries it, so there is nothing for the fence to protect
             // against. Minting keys is a client policy task 42 owns.

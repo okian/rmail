@@ -1,16 +1,25 @@
-//! The gates every rules-engine provider call passes through, in the one
-//! order `crate::ai::queue`'s module docs establish: policy first, then the
-//! daily cost gate, then the per-account budget, then concurrency and rate
-//! pacing — and only then the network.
+//! The gates every *ad-hoc* provider call passes through, in the one order
+//! [`crate::ai::queue`]'s module docs establish: policy first, then the daily
+//! cost gate, then the per-account budget, then concurrency and rate pacing —
+//! and only then the network.
 //!
-//! Both callers that can reach a provider from this subsystem
-//! ([`super::classify::ClaudeClassifier`] and [`super::synth::RuleSynthesizer`])
-//! go through here rather than each re-deriving the sequence. That is not
-//! only deduplication: the ordering is the security property. Resolving
-//! policy *after* assembling a request would mean a forbidden folder's
-//! content had already been built into a payload; consulting the budget
-//! *after* acquiring a permit would hold capacity for a call that is about to
-//! be refused.
+//! [`crate::ai::queue`] applies the same sequence to everything that goes
+//! through the AI worker pool. This module is that sequence for the calls that
+//! cannot: a request-scoped call answering a human who is waiting, with no
+//! queue row and no lease. Four callers use it —
+//! [`crate::rules::classify::ClaudeClassifier`],
+//! [`crate::rules::synth::RuleSynthesizer`],
+//! [`crate::send::preflight::PreflightGuardian`] and
+//! [`crate::outbox::followup::track::FollowupTracker`] — and each one of them
+//! going through here rather than re-deriving the sequence is not only
+//! deduplication: the ordering is the security property. Resolving policy
+//! *after* assembling a request would mean a forbidden folder's content had
+//! already been built into a payload; consulting the budget *after* acquiring
+//! a permit would hold capacity for a call that is about to be refused.
+//!
+//! It lives under `ai` rather than under `rules`, where it was first written,
+//! because the second and third subsystem to need it made "the rules engine's
+//! gate" a name that no longer described what it gates.
 
 use std::sync::Arc;
 
@@ -22,7 +31,6 @@ use crate::ai::policy::{PolicyEngine, PolicyTarget};
 use crate::ai::queue::{CapDecision, CostGate, RateLimiter};
 use crate::config::AiLimits;
 use crate::error::Error;
-use crate::rules::repo;
 use crate::storage::Database;
 
 /// Resolve policy, the daily cost gate, and the per-account budget for one
@@ -31,7 +39,8 @@ use crate::storage::Database;
 ///
 /// `mailbox` is the folder the call concerns, when there is one — policy is
 /// resolved per account *and* folder, and a synthesis call (which reads no
-/// message) legitimately has none.
+/// message), or a check on a message that has not been filed anywhere yet,
+/// legitimately has none.
 ///
 /// # Errors
 /// [`Error::NotFound`] if `account_id` names no account;
@@ -46,7 +55,7 @@ pub async fn admit(
     mailbox: Option<&str>,
     model: &str,
 ) -> Result<String, Error> {
-    let account = repo::account_name(db, account_id)
+    let account = crate::rules::repo::account_name(db, account_id)
         .await?
         .ok_or_else(|| Error::not_found(format!("account {account_id}")))?;
     let mut target = PolicyTarget::account(account);
@@ -75,9 +84,10 @@ pub async fn admit(
             account_id,
             model,
             // Interactive, never Bulk: the `bulk` sub-budget exists to keep
-            // backlog walks from starving user-facing work, and rule
-            // evaluation *is* the user-facing work — a message arriving and
-            // being filed, or a human waiting on a backtest.
+            // backlog walks from starving user-facing work, and every caller
+            // here *is* the user-facing work — a message arriving and being
+            // filed, a human waiting on a backtest, a send waiting on a
+            // review.
             work_class: WorkClass::Interactive,
             now: chrono::Utc::now().timestamp(),
         })
@@ -93,7 +103,7 @@ pub async fn admit(
                 from = model,
                 to = %downgraded,
                 reason = %reason,
-                "ai budget soft cap: downgrading this rules call"
+                "ai budget soft cap: downgrading this request-scoped call"
             );
             Ok(downgraded)
         }
@@ -101,9 +111,13 @@ pub async fn admit(
             // The detailed reason names aggregate spend figures, which the
             // scope table deliberately keeps behind `admin` (see
             // `AiService/GetUsage`'s row); it goes to the log, not the caller.
-            tracing::info!(account_id, reason = %reason, "ai budget hard cap: refusing a rules call");
+            tracing::info!(
+                account_id,
+                reason = %reason,
+                "ai budget hard cap: refusing a request-scoped call"
+            );
             Err(Error::resource_exhausted(
-                "an AI spend budget has been reached; rules cannot call the model until the \
+                "an AI spend budget has been reached; no model call can be made until the \
                  window resets or an operator raises the budget"
                     .to_owned(),
             ))

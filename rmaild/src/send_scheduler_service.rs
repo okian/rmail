@@ -38,23 +38,35 @@ use std::pin::Pin;
 use rmail_core::compose::{Draft, Mailbox};
 use rmail_core::config::SendConfig;
 use rmail_core::idempotency::IdempotencyStore;
+use rmail_core::outbox::followup::track::{FollowupTracker, SentMessage};
 use rmail_core::outbox::followup::{
-    Followup as CoreFollowup, FollowupState as CoreFollowupState, FollowupStore, NewFollowup,
+    Followup as CoreFollowup, FollowupKind as CoreFollowupKind, FollowupState as CoreFollowupState,
+    FollowupStore, NewFollowup,
 };
 use rmail_core::outbox::schedule::{parse_timezone, suggest_send_time};
 use rmail_core::outbox::{
     inline_draft, resolve_send_at, InlineMessage, NewSend, Origin, OutboxEntry as CoreEntry,
     OutboxState as CoreState, OutboxStore, SendPolicy,
 };
+use rmail_core::send::preflight::{
+    Degradation, Finding, FindingKind as CoreFindingKind, PreflightGuardian, PreflightMessage,
+    PreflightReport, Severity as CoreSeverity,
+};
 use rmail_core::{Database, Error};
 use rmail_proto::v1::send_scheduler_service_server::SendSchedulerService;
 use rmail_proto::v1::{
-    CancelRequest, CreateFollowupRequest, Followup as ProtoFollowup,
+    CancelRequest, CreateFollowupRequest, DraftNudgeRequest, DraftNudgeResponse,
+    Followup as ProtoFollowup, FollowupKind as ProtoFollowupKind,
     FollowupState as ProtoFollowupState, IdRequest, ListFollowupsRequest, ListFollowupsResponse,
-    ListOutboxRequest, ListOutboxResponse, OutboxEntry as ProtoEntry, OutboxEvent,
-    OutboxState as ProtoState, RescheduleRequest, ScheduleSendRequest, SendOrigin,
-    SuggestSendTimeRequest, SuggestSendTimeResponse, UpdateBodyRequest, WatchOutboxRequest,
+    ListOutboxRequest, ListOutboxResponse, ListWaitingOnRequest, ListWaitingOnResponse,
+    OutboxEntry as ProtoEntry, OutboxEvent, OutboxState as ProtoState, PreflightCheckRequest,
+    PreflightCheckResponse, PreflightDegradation, PreflightFinding,
+    PreflightFindingKind as ProtoFindingKind, PreflightSeverity as ProtoSeverity,
+    RescheduleRequest, ScheduleSendRequest, SendOrigin, SuggestSendTimeRequest,
+    SuggestSendTimeResponse, TrackFollowupRequest, TrackFollowupResponse, UpdateBodyRequest,
+    WatchOutboxRequest,
 };
+use rusqlite::OptionalExtension;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -80,6 +92,21 @@ pub struct SendSchedulerApi {
     policy: SendPolicy,
     /// The replay fence behind `ScheduleSend.idempotency_key`.
     idempotency: IdempotencyStore,
+    /// The pre-send guardian (task 63), when the daemon has a provider to
+    /// give it. `None` — a daemon with AI switched off, or a test that did
+    /// not wire one — makes `PreflightCheck` answer `FAILED_PRECONDITION`
+    /// and makes the automatic check on `ScheduleSend` a no-op.
+    ///
+    /// A no-op, and deliberately not a refusal: the guardian is a review, and
+    /// a daemon that could not perform one must still send mail. That is the
+    /// same fail-open choice `rmail_core::send::preflight` makes for a
+    /// provider outage, one level up.
+    guardian: Option<PreflightGuardian>,
+    /// The waiting-on tracker's model-backed half (task 63), when there is a
+    /// provider. `None` makes `TrackFollowup`/`DraftNudge` answer
+    /// `FAILED_PRECONDITION`; both are explicitly-invoked judgements, so
+    /// refusing is the honest answer rather than a silent no-op.
+    tracker: Option<FollowupTracker>,
     /// Cancelled when the daemon shuts down, so an open `WatchOutbox` stream
     /// stops with it rather than holding shutdown open.
     shutdown: CancellationToken,
@@ -104,8 +131,181 @@ impl SendSchedulerApi {
             config,
             policy,
             idempotency,
+            guardian: None,
+            tracker: None,
             shutdown,
         }
+    }
+
+    /// Give this handler a pre-send guardian.
+    #[must_use]
+    pub fn with_guardian(mut self, guardian: PreflightGuardian) -> Self {
+        self.guardian = Some(guardian);
+        self
+    }
+
+    /// Give this handler the waiting-on tracker.
+    #[must_use]
+    pub fn with_tracker(mut self, tracker: FollowupTracker) -> Self {
+        self.tracker = Some(tracker);
+        self
+    }
+
+    /// Refuse a send the guardian blocks.
+    ///
+    /// Three ways this is a no-op, and each one is a decision:
+    ///
+    /// * **No guardian wired** — a daemon with AI off still sends mail. See
+    ///   [`Self::guardian`].
+    /// * **`send.preflight.enabled = false`** — the operator switched the
+    ///   automatic check off.
+    /// * **`skip_preflight`** — the user read the findings and decided
+    ///   anyway. Logged at `info`, because "who overrode the guardian and
+    ///   when" is exactly the question asked after a message goes out wrong.
+    ///
+    /// What it is never: silent. A blocked send returns
+    /// `FAILED_PRECONDITION` naming every finding at or above the threshold,
+    /// and a degraded check (the model was unreachable) is logged with its
+    /// reason by `PreflightGuardian::check` itself.
+    ///
+    /// # Errors
+    /// `FAILED_PRECONDITION` when the report blocks.
+    async fn guard_send(
+        &self,
+        req: &ScheduleSendRequest,
+        rendered: &Rendered,
+    ) -> Result<(), Status> {
+        let Some(guardian) = &self.guardian else {
+            return Ok(());
+        };
+        if !guardian.config().enabled {
+            return Ok(());
+        }
+        if req.skip_preflight {
+            tracing::info!(
+                account_id = req.account_id,
+                "the pre-send guardian was skipped by explicit request"
+            );
+            return Ok(());
+        }
+
+        let message = self.preflight_message(req.account_id, rendered).await?;
+        let report = guardian.check(&message, &self.shutdown.child_token()).await;
+        if !report.blocks(guardian.config()) {
+            return Ok(());
+        }
+        // `block_severity()` is `Some` whenever `blocks` is true, but the
+        // threshold is defaulted rather than unwrapped: an unreachable branch
+        // that panics is still a panic.
+        let threshold = guardian
+            .config()
+            .block_severity()
+            .unwrap_or(CoreSeverity::Block);
+        tracing::warn!(
+            account_id = req.account_id,
+            findings = report.findings.len(),
+            "the pre-send guardian refused this message"
+        );
+        Err(Status::from(Error::failed_precondition(format!(
+            "the pre-send guardian refused this message: {}. Fix it, or resend with \
+             skip_preflight to send it anyway.",
+            report.summary(threshold)
+        ))))
+    }
+
+    /// Assemble the message the guardian inspects from a rendered send.
+    async fn preflight_message(
+        &self,
+        account_id: i64,
+        rendered: &Rendered,
+    ) -> Result<PreflightMessage, Status> {
+        let thread_participants = match rendered.in_reply_to.as_deref() {
+            Some(parent) => self.thread_participants(account_id, parent).await?,
+            None => Vec::new(),
+        };
+        Ok(PreflightMessage {
+            account_id,
+            from: rendered.from_addr.clone(),
+            to: rendered.to.clone(),
+            cc: rendered.cc.clone(),
+            bcc: rendered.bcc.clone(),
+            subject: rendered.subject.clone(),
+            body: rendered.body_preview.clone(),
+            attachments: rendered.attachment_names.clone(),
+            thread_participants,
+            mailbox: None,
+        })
+    }
+
+    /// Every address already on the thread `parent` belongs to.
+    ///
+    /// Read from the parent message's own headers rather than from a
+    /// `threads` join: a reply composed inline names its parent by
+    /// `Message-ID` and may have no local thread row at all, and the question
+    /// being asked — "was this person already in this conversation" — is
+    /// answered by the message being replied to more directly than by
+    /// whatever else the threader has grouped with it.
+    ///
+    /// An unknown parent yields an empty list, which *disables* the recipient
+    /// check rather than flagging every recipient — see
+    /// `PreflightMessage::thread_participants`.
+    async fn thread_participants(
+        &self,
+        account_id: i64,
+        parent: &str,
+    ) -> Result<Vec<String>, Status> {
+        let parent = parent.trim().trim_matches(['<', '>']).to_owned();
+        if parent.is_empty() {
+            return Ok(Vec::new());
+        }
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT from_addr, to_addrs, cc_addrs FROM messages
+                     WHERE account_id = ?1 AND message_id = ?2
+                     ORDER BY id LIMIT 1",
+                    rusqlite::params![account_id, parent],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+            })
+            .await
+            .map_err(Error::from)?;
+        let Some((from, to, cc)) = row else {
+            return Ok(Vec::new());
+        };
+        let mut out: Vec<String> = Vec::new();
+        for field in [from, to, cc] {
+            for address in field.unwrap_or_default().split(',') {
+                let address = address.trim();
+                if !address.is_empty() && !out.iter().any(|seen| seen == address) {
+                    out.push(address.to_owned());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The guardian, or the `FAILED_PRECONDITION` an unconfigured daemon owes
+    /// a caller that asked for a review explicitly.
+    fn require_guardian(&self) -> Result<&PreflightGuardian, Status> {
+        self.guardian.as_ref().ok_or_else(|| {
+            Status::from(Error::failed_precondition(
+                "the pre-send guardian is not available on this daemon; it needs an AI provider \
+                 (ai.enabled) to run its review",
+            ))
+        })
+    }
+
+    /// The tracker, or the `FAILED_PRECONDITION` an unconfigured daemon owes.
+    fn require_tracker(&self) -> Result<&FollowupTracker, Status> {
+        self.tracker.as_ref().ok_or_else(|| {
+            Status::from(Error::failed_precondition(
+                "the follow-up tracker is not available on this daemon; it needs an AI provider \
+                 (ai.enabled) to judge a message",
+            ))
+        })
     }
 
     /// The zone a request's bare wall-clock expressions are read in.
@@ -177,6 +377,11 @@ impl SendSchedulerApi {
             let rendered = self.store.drafts().render(draft_id).await?;
             return Ok(Rendered {
                 raw_mime: rendered.mime,
+                attachment_names: draft
+                    .attachments
+                    .iter()
+                    .map(|a| a.filename.clone())
+                    .collect(),
                 draft_id: Some(draft_id),
                 from_addr: draft.from.address().to_owned(),
                 to: addresses(&draft.to),
@@ -194,16 +399,7 @@ impl SendSchedulerApi {
         let bcc = mailboxes(&req.bcc)?;
         let subject = req.subject.clone().unwrap_or_default();
         let body = req.body.clone().unwrap_or_default();
-        let in_reply_to = req
-            .in_reply_to
-            .clone()
-            .map(|id| {
-                id.trim()
-                    .trim_start_matches('<')
-                    .trim_end_matches('>')
-                    .to_owned()
-            })
-            .filter(|id| !id.is_empty());
+        let in_reply_to = bare_message_id(req.in_reply_to.as_deref());
 
         let draft = inline_draft(InlineMessage {
             account_id: req.account_id,
@@ -236,6 +432,10 @@ impl SendSchedulerApi {
 
         Ok(Rendered {
             raw_mime,
+            // An inline send carries none by construction: `InlineMessage`
+            // has no attachment field, so a caller with a file to send goes
+            // through `ComposeService`.
+            attachment_names: Vec::new(),
             draft_id: None,
             from_addr: from.address().to_owned(),
             to: addresses(&to),
@@ -263,6 +463,9 @@ impl SendSchedulerApi {
 /// Everything the outbox needs about a message, whichever path produced it.
 struct Rendered {
     raw_mime: Vec<u8>,
+    /// Attachment filenames, for the guardian's "see attached" check. The
+    /// bytes are already inside `raw_mime`; only the names are carried.
+    attachment_names: Vec<String>,
     draft_id: Option<i64>,
     from_addr: String,
     to: Vec<String>,
@@ -312,6 +515,7 @@ impl SendSchedulerService for SendSchedulerApi {
                 );
 
                 let rendered = self.render(&req).await?;
+                self.guard_send(&req, &rendered).await?;
                 let entry = self
                     .store
                     .schedule(NewSend {
@@ -547,15 +751,16 @@ impl SendSchedulerService for SendSchedulerApi {
         let followup = self
             .followups
             .create(NewFollowup {
-                account_id: req.account_id,
                 thread_id: req.thread_id,
-                message_id: req.message_id,
-                remind_at,
-                tz: tz.name().to_owned(),
-                cancel_on_reply: req
-                    .cancel_on_reply
-                    .unwrap_or(self.config.followup.cancel_on_reply),
                 note: req.note.filter(|n| !n.trim().is_empty()),
+                ..NewFollowup::manual(
+                    req.account_id,
+                    req.message_id,
+                    remind_at,
+                    tz.name(),
+                    req.cancel_on_reply
+                        .unwrap_or(self.config.followup.cancel_on_reply),
+                )
             })
             .await?;
         tracing::Span::current().record("followup_id", followup.id);
@@ -593,11 +798,227 @@ impl SendSchedulerService for SendSchedulerApi {
         let followup = self.followups.dismiss(request.into_inner().id).await?;
         Ok(Response::new(followup_to_proto(&followup)))
     }
+
+    #[tracing::instrument(
+        skip(self, request),
+        fields(account_id, findings, severity, blocks, degraded)
+    )]
+    async fn preflight_check(
+        &self,
+        request: Request<PreflightCheckRequest>,
+    ) -> Result<Response<PreflightCheckResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record(rmail_core::telemetry::FIELD_ACCOUNT, req.account_id);
+        let guardian = self.require_guardian()?;
+
+        // A draft is read through the same `DraftStore` the send path renders
+        // from, so the check is over the message that would actually go out.
+        // What it deliberately does *not* do is render it: `render` base64s
+        // every attachment, hashes the result, and copies it several times
+        // (see `compose::mime::build`), and not one of those bytes reaches
+        // `PreflightMessage`. This RPC is interactive and `mail.read`-scoped;
+        // paying a multi-megabyte MIME build per keystroke-adjacent call to
+        // then discard it would be the wrong trade in the one place a user is
+        // waiting.
+        let message = match req.draft_id {
+            Some(draft_id) => {
+                let draft = self.store.drafts().get(draft_id).await?;
+                if draft.account_id != req.account_id {
+                    // Scoped exactly as `render` scopes it: reading one
+                    // account's draft under another would cross two mailboxes
+                    // that were meant to stay separate.
+                    return Err(Status::from(Error::not_found(format!(
+                        "draft {draft_id} not found in account {}",
+                        req.account_id
+                    ))));
+                }
+                let rendered = Rendered {
+                    raw_mime: Vec::new(),
+                    attachment_names: draft
+                        .attachments
+                        .iter()
+                        .map(|a| a.filename.clone())
+                        .collect(),
+                    draft_id: Some(draft_id),
+                    from_addr: draft.from.address().to_owned(),
+                    to: addresses(&draft.to),
+                    cc: addresses(&draft.cc),
+                    bcc: addresses(&draft.bcc),
+                    subject: draft.subject.clone(),
+                    body_preview: draft.body_text.clone(),
+                    in_reply_to: draft.in_reply_to.clone(),
+                };
+                self.preflight_message(req.account_id, &rendered).await?
+            }
+            None => {
+                let from = self.account_identity(req.account_id).await?;
+                let in_reply_to = bare_message_id(req.in_reply_to.as_deref());
+                let rendered = Rendered {
+                    raw_mime: Vec::new(),
+                    // Inline: the caller's stated filenames are the only
+                    // evidence about attachments there is.
+                    attachment_names: req.attachment_names.clone(),
+                    draft_id: None,
+                    from_addr: from.address().to_owned(),
+                    // Validated through the same parser the send path uses, so
+                    // a malformed address is INVALID_ARGUMENT here rather than
+                    // a surprise at send time.
+                    to: addresses(&mailboxes(&req.to)?),
+                    cc: addresses(&mailboxes(&req.cc)?),
+                    bcc: addresses(&mailboxes(&req.bcc)?),
+                    subject: req.subject.clone().unwrap_or_default(),
+                    body_preview: req.body.clone().unwrap_or_default(),
+                    in_reply_to,
+                };
+                self.preflight_message(req.account_id, &rendered).await?
+            }
+        };
+
+        let report = guardian.check(&message, &self.shutdown.child_token()).await;
+        let span = tracing::Span::current();
+        span.record("findings", report.findings.len());
+        if let Some(severity) = report.severity() {
+            span.record("severity", severity.as_str());
+        }
+        // The `enabled` gate too, because the proto promises this field
+        // answers "would ScheduleSend refuse this message" — and on a daemon
+        // with `send.preflight.enabled = false` the answer is no, whatever
+        // the findings say. `severity` still reports what was found, so
+        // switching the automatic check off does not blind the explicit one.
+        let blocks = guardian.config().enabled && report.blocks(guardian.config());
+        span.record("blocks", blocks);
+        if let Some(degraded) = &report.degraded {
+            span.record("degraded", degraded.as_str());
+        }
+        Ok(Response::new(report_to_proto(&report, blocks)))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(account_id, expects_reply, followup_id))]
+    async fn track_followup(
+        &self,
+        request: Request<TrackFollowupRequest>,
+    ) -> Result<Response<TrackFollowupResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record(rmail_core::telemetry::FIELD_ACCOUNT, req.account_id);
+        let tracker = self.require_tracker()?;
+        let tz = self.zone(&req.tz)?;
+        if req.message_id.trim().is_empty() {
+            return Err(Status::from(Error::invalid_argument(
+                "tracking needs the Message-ID of the message that was sent",
+            )));
+        }
+
+        let sent = SentMessage {
+            account_id: req.account_id,
+            message_id: req.message_id,
+            thread_id: req.thread_id,
+            subject: req.subject,
+            body: req.body,
+            recipients: req.recipients,
+            sent_at: req
+                .sent_at
+                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+            tz: tz.name().to_owned(),
+            mailbox: None,
+        };
+        let followup = tracker.track(&sent, &self.shutdown.child_token()).await?;
+        let span = tracing::Span::current();
+        span.record("expects_reply", followup.is_some());
+        if let Some(followup) = &followup {
+            span.record("followup_id", followup.id);
+        }
+        Ok(Response::new(TrackFollowupResponse {
+            expects_reply: followup.is_some(),
+            ask: followup
+                .as_ref()
+                .and_then(|f| f.ask.clone())
+                .unwrap_or_default(),
+            followup: followup.as_ref().map(followup_to_proto),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(account_id, returned))]
+    async fn list_waiting_on(
+        &self,
+        request: Request<ListWaitingOnRequest>,
+    ) -> Result<Response<ListWaitingOnResponse>, Status> {
+        let req = request.into_inner();
+        let page_size = usize::try_from(req.page_size)
+            .map_err(|_| Status::from(Error::invalid_argument("page_size must not be negative")))?;
+        // One `now` for the whole response, so `age_secs` and `overdue` on
+        // page one describe the same instant as the filter that chose it.
+        let now = chrono::Utc::now().timestamp();
+        let page = self
+            .followups
+            .waiting_on(
+                req.account_id,
+                req.overdue_only,
+                now,
+                page_size,
+                &req.page_token,
+            )
+            .await?;
+        let span = tracing::Span::current();
+        if let Some(account_id) = req.account_id {
+            span.record(rmail_core::telemetry::FIELD_ACCOUNT, account_id);
+        }
+        span.record("returned", page.followups.len());
+        Ok(Response::new(ListWaitingOnResponse {
+            followups: page
+                .followups
+                .iter()
+                .map(|f| waiting_on_to_proto(f, now))
+                .collect(),
+            next_page_token: page.next_page_token.unwrap_or_default(),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(account_id, followup_id))]
+    async fn draft_nudge(
+        &self,
+        request: Request<DraftNudgeRequest>,
+    ) -> Result<Response<DraftNudgeResponse>, Status> {
+        let tracker = self.require_tracker()?;
+        let id = request.into_inner().id;
+        tracing::Span::current().record("followup_id", id);
+        let followup = self.followups.get(id).await?;
+        tracing::Span::current().record(rmail_core::telemetry::FIELD_ACCOUNT, followup.account_id);
+        let nudge = tracker
+            .draft_nudge(
+                &followup,
+                chrono::Utc::now().timestamp(),
+                &self.shutdown.child_token(),
+            )
+            .await?;
+        Ok(Response::new(DraftNudgeResponse {
+            subject: nudge.subject,
+            body: nudge.body,
+            model: nudge.model,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+/// Strip the angle brackets a caller may have copied out of a header, and
+/// treat an empty result as absent.
+///
+/// Shared by `render` and `preflight_check` so the two agree about what
+/// "the parent's Message-ID" means — the guardian looks the parent up by this
+/// exact string, and a version that kept its brackets would find nothing and
+/// silently disable the recipient check.
+fn bare_message_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(|id| {
+            id.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_owned()
+        })
+        .filter(|id| !id.is_empty())
+}
 
 /// Render an in-memory draft on a blocking thread.
 ///
@@ -731,6 +1152,13 @@ fn entry_to_proto(entry: &CoreEntry) -> ProtoEntry {
 }
 
 fn followup_to_proto(followup: &CoreFollowup) -> ProtoFollowup {
+    // `now` at conversion time. A reminder returned from `CreateFollowup` or
+    // `ListFollowups` still carries an honest age; the waiting-on listing
+    // pins one instant for a whole page instead — see `waiting_on_to_proto`.
+    waiting_on_to_proto(followup, chrono::Utc::now().timestamp())
+}
+
+fn waiting_on_to_proto(followup: &CoreFollowup, now: i64) -> ProtoFollowup {
     ProtoFollowup {
         id: followup.id,
         account_id: followup.account_id,
@@ -742,6 +1170,82 @@ fn followup_to_proto(followup: &CoreFollowup) -> ProtoFollowup {
         state: followup_state_to_proto(followup.state) as i32,
         note: followup.note.clone(),
         created_at: followup.created_at,
+        kind: followup_kind_to_proto(followup.kind) as i32,
+        ask: followup.ask.clone(),
+        waiting_on: followup.waiting_on.clone(),
+        subject: Some(followup.subject.clone()).filter(|s| !s.is_empty()),
+        sent_at: followup.sent_at,
+        age_secs: followup.age_secs(now),
+        overdue: followup.is_overdue(now),
+    }
+}
+
+const fn followup_kind_to_proto(kind: CoreFollowupKind) -> ProtoFollowupKind {
+    match kind {
+        CoreFollowupKind::Manual => ProtoFollowupKind::Manual,
+        CoreFollowupKind::Auto => ProtoFollowupKind::Auto,
+    }
+}
+
+fn report_to_proto(report: &PreflightReport, blocks: bool) -> PreflightCheckResponse {
+    PreflightCheckResponse {
+        findings: report.findings.iter().map(finding_to_proto).collect(),
+        severity: report
+            .severity()
+            .map_or(ProtoSeverity::Unspecified, severity_to_proto) as i32,
+        blocks,
+        degradation: report
+            .degraded
+            .as_ref()
+            .map_or(PreflightDegradation::Unspecified, degradation_to_proto)
+            as i32,
+        // Carried as prose alongside the enum, not instead of it: the enum is
+        // what a client branches on, and this is the sentence a human reads.
+        // Losing either one would leave a caller unable to say *why* a
+        // message was only half-reviewed.
+        degradation_detail: report.degraded.as_ref().map(Degradation::describe),
+        model: report.model.clone(),
+    }
+}
+
+fn finding_to_proto(finding: &Finding) -> PreflightFinding {
+    PreflightFinding {
+        kind: finding_kind_to_proto(finding.kind) as i32,
+        severity: severity_to_proto(finding.severity) as i32,
+        detail: finding.detail.clone(),
+        from_model: finding.from_model,
+    }
+}
+
+const fn severity_to_proto(severity: CoreSeverity) -> ProtoSeverity {
+    match severity {
+        CoreSeverity::Notice => ProtoSeverity::Notice,
+        CoreSeverity::Warn => ProtoSeverity::Warn,
+        CoreSeverity::Block => ProtoSeverity::Block,
+    }
+}
+
+const fn finding_kind_to_proto(kind: CoreFindingKind) -> ProtoFindingKind {
+    match kind {
+        CoreFindingKind::MissingAttachment => ProtoFindingKind::MissingAttachment,
+        CoreFindingKind::UnfilledPlaceholder => ProtoFindingKind::UnfilledPlaceholder,
+        CoreFindingKind::ApparentSecret => ProtoFindingKind::ApparentSecret,
+        CoreFindingKind::RecipientNotOnThread => ProtoFindingKind::RecipientNotOnThread,
+        CoreFindingKind::DuplicateRecipient => ProtoFindingKind::DuplicateRecipient,
+        CoreFindingKind::LargeRecipientList => ProtoFindingKind::LargeRecipientList,
+        CoreFindingKind::ToneClash => ProtoFindingKind::ToneClash,
+    }
+}
+
+const fn degradation_to_proto(degradation: &Degradation) -> PreflightDegradation {
+    match degradation {
+        Degradation::Disabled => PreflightDegradation::Disabled,
+        Degradation::Refused(_) => PreflightDegradation::Refused,
+        Degradation::Unavailable(_) => PreflightDegradation::Unavailable,
+        Degradation::TimedOut => PreflightDegradation::TimedOut,
+        Degradation::Cancelled => PreflightDegradation::Cancelled,
+        Degradation::Unreadable(_) => PreflightDegradation::Unreadable,
+        Degradation::NothingToReview => PreflightDegradation::NothingToReview,
     }
 }
 

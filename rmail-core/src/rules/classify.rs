@@ -39,7 +39,7 @@
 //!
 //! A `claude_is` call is a real AI call and goes through every stage the rest
 //! of `crate::ai` insists on, in the same order and for the same reasons (see
-//! [`super::gate`]): policy, cost gate, per-account budget, the AI pool's own
+//! [`crate::ai::gate`]): policy, cost gate, per-account budget, the AI pool's own
 //! semaphore and rate limiter, the redaction firewall, the provider, then the
 //! audit ledger with the redacted payload.
 //!
@@ -92,6 +92,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::ai::gate;
 use crate::ai::injection;
 use crate::ai::policy::PolicyEngine;
 use crate::ai::provider::{ChatRequest, OutputFormat, Provider};
@@ -102,7 +103,7 @@ use crate::config::{AiLimits, AiPrivacy};
 use crate::error::Error;
 use crate::rules::eval::{Classification, Classifier};
 use crate::rules::facts::MessageFacts;
-use crate::rules::{gate, repo};
+use crate::rules::repo;
 use crate::storage::Database;
 
 /// The `ai_ledger.pass` value every `claude_is` call is recorded under, so an
@@ -200,7 +201,7 @@ impl ClaudeClassifier {
     /// Build a classifier.
     ///
     /// `semaphore`/`rate_limiter` should be the running
-    /// `crate::ai::AiWorkerPool`'s own handles — see [`super::gate`] on why
+    /// `crate::ai::AiWorkerPool`'s own handles — see [`crate::ai::gate`] on why
     /// minting fresh ones doubles the operator's configured ceiling.
     #[must_use]
     #[allow(clippy::too_many_arguments)]

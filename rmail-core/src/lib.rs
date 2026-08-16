@@ -43,6 +43,7 @@ pub mod repo;
 pub mod retrieve;
 pub mod rules;
 pub mod saved_search;
+pub mod send;
 pub mod smart_folder;
 pub mod storage;
 pub mod sync;

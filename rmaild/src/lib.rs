@@ -101,6 +101,7 @@ use rmail_core::index::{
 use rmail_core::mail::MailStore;
 use rmail_core::notes::NoteStore;
 use rmail_core::notify::{NotifyEngine, NotifyPassHandler, NotifyPolicy};
+use rmail_core::outbox::followup::track::FollowupTracker;
 use rmail_core::outbox::{
     FollowupStore, ImapSentAppender, LettreSender, OutboxStore, SendPolicy, SendScheduler,
 };
@@ -110,6 +111,7 @@ use rmail_core::rules::{
     ActionRunner, Classifier, ClaudeClassifier, RuleEngine, RuleEvaluator, RuleSynthesizer,
 };
 use rmail_core::saved_search::SavedSearchStore;
+use rmail_core::send::preflight::PreflightGuardian;
 use rmail_core::smart_folder::{SmartFolderEvaluator, SmartFolderStore};
 use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::tags::TagStore;
@@ -763,16 +765,16 @@ where
     // outbox row scheduled by a previous run is mail the user has already
     // pressed send on, and a daemon that declines to drain it is a daemon that
     // silently swallows outgoing mail.
+    //
+    // The *handler* is assembled further down, after the AI provider exists:
+    // task 63's pre-send guardian and waiting-on tracker both call a model,
+    // and both must draw on the one provider and the one `ai.limits` budget
+    // this process has rather than minting a second of either. The stores and
+    // the scheduler loop are built here, where they always were, because
+    // neither needs a provider and the loop must not wait on one.
     let outbox_store = OutboxStore::new(db.clone());
     let followup_store = FollowupStore::new(db.clone());
-    let send_scheduler_service = SendSchedulerServiceServer::new(SendSchedulerApi::new(
-        outbox_store.clone(),
-        followup_store.clone(),
-        db.clone(),
-        config.send.clone(),
-        idempotency.clone(),
-        stopping.clone(),
-    ));
+    let send_api_stores = (outbox_store.clone(), followup_store.clone());
     let send_handle = SendScheduler::new(
         outbox_store,
         followup_store,
@@ -1212,8 +1214,8 @@ where
             config.ai.limits.clone(),
             ai_pause.clone(),
             ai_active,
-            ai_semaphore,
-            ai_rate_limiter,
+            Arc::clone(&ai_semaphore),
+            Arc::clone(&ai_rate_limiter),
             stopping.clone(),
         )
         // Mailbox RAG (task 52), over the *same* `SearchApi` `SearchService` and
@@ -1295,6 +1297,64 @@ where
     } else {
         None
     };
+
+    // The `SendScheduler` handler, assembled here rather than next to its
+    // stores because task 63's two model-backed additions need the provider.
+    //
+    // Both are wired only when the AI subsystem is genuinely active: with
+    // `NullProvider` behind them, every `PreflightCheck` would spend a policy
+    // resolution and a redaction pass to reach a provider that always
+    // refuses, and the automatic check on `ScheduleSend` would log a
+    // degradation on every single message this daemon sends. `None` says the
+    // same thing once, structurally — see `SendSchedulerApi::guardian`.
+    //
+    // Both share `ai_semaphore`/`ai_rate_limiter` with the worker pool and
+    // the rules engine, for the reason `rmail_core::ai::gate` documents: a
+    // second pair would let the paths together exceed `ai.limits`.
+    //
+    // `send.preflight.warn_if_unrecognized` runs here, once, at the only
+    // point in the process where a misconfigured `block_at` can still be
+    // reported before it silently stops refusing anything.
+    config.send.preflight.warn_if_unrecognized();
+    let (outbox_store_for_api, followup_store_for_api) = send_api_stores;
+    let mut send_scheduler_api = SendSchedulerApi::new(
+        outbox_store_for_api,
+        followup_store_for_api.clone(),
+        db.clone(),
+        config.send.clone(),
+        idempotency.clone(),
+        stopping.clone(),
+    );
+    if ai_active {
+        send_scheduler_api = send_scheduler_api
+            .with_guardian(PreflightGuardian::new(
+                db.clone(),
+                Arc::clone(&ai_provider),
+                Arc::clone(&ai_policy),
+                config.ai.privacy.clone(),
+                config.ai.limits.clone(),
+                config.send.preflight.clone(),
+                Arc::clone(&ai_semaphore),
+                Arc::clone(&ai_rate_limiter),
+            ))
+            .with_tracker(FollowupTracker::new(
+                db.clone(),
+                followup_store_for_api,
+                Arc::clone(&ai_provider),
+                Arc::clone(&ai_policy),
+                config.ai.privacy.clone(),
+                config.ai.limits.clone(),
+                config.send.followup.clone(),
+                Arc::clone(&ai_semaphore),
+                Arc::clone(&ai_rate_limiter),
+            ));
+    } else {
+        tracing::info!(
+            "the AI subsystem is inactive; the pre-send guardian does not run and \
+             PreflightCheck/TrackFollowup/DraftNudge answer FAILED_PRECONDITION"
+        );
+    }
+    let send_scheduler_service = SendSchedulerServiceServer::new(send_scheduler_api);
 
     // The rules engine (task 66). Registered unconditionally — the reflection
     // set and the auth scope table must see every RPC regardless of runtime

@@ -64,6 +64,7 @@ pub mod audit;
 pub mod budget;
 pub mod deep;
 pub mod dispatch;
+pub mod gate;
 pub mod injection;
 pub mod policy;
 pub mod provider;

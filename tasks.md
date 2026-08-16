@@ -618,7 +618,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmaild --test draft_reply` (streamed draft, headers correct, never auto-sends)
 
 ## 63. Pre-send guardian + follow-up/waiting-on tracker
-- [ ] status
+- [x] status
 - **depends-on:** 61, 43
 - **parallel-safe:** yes
 - **acceptance:**

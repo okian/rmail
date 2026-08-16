@@ -67,3 +67,13 @@ fre = "fre"
 # French-language contract fixture ("et le reste du contrat") to prove the
 # citation offsets survive multi-byte text. The word is the fixture.
 reste = "reste"
+
+# Deliberately misspelled. `send::preflight`'s tests feed "blokc" as an
+# unrecognized `send.preflight.block_at` value and assert it resolves safely
+# rather than being read as a real severity; correcting it deletes the case.
+blokc = "blokc"
+
+# Not "meant": the alternation in `attach(?:ed|ment|ments)`, which the
+# checker's splitter cuts into fragments. The word being matched is
+# "attachment" — the pre-send guardian's "you said attached" rule.
+ment = "ment"

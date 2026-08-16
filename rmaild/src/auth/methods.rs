@@ -713,6 +713,37 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SendSchedulerService/ListFollowups",
         Requirement::Scope(Scope::MailRead),
     ),
+    (
+        "/rmail.v1.SendSchedulerService/ListWaitingOn",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // The pre-send guardian and the tracker's judge (task 63) both read a
+    // message *and* call a model, so both scopes, the same `AllOf` shape
+    // `AttachmentService/AskAttachment` uses. `mail.read` alone would let a
+    // token that is deliberately kept away from the model provider spend
+    // against `ai.limits`; `ai.invoke` alone would let a token with no
+    // mailbox access have a draft's contents summarized back to it.
+    //
+    // Deliberately *not* `mail.send`, even though `PreflightCheck` sits on
+    // the send path: it reviews and reports, and cannot put a byte on the
+    // wire. Requiring the send scope to ask "is this message safe to send"
+    // would mean the only tokens that could check a message are the ones that
+    // could already send it unchecked.
+    (
+        "/rmail.v1.SendSchedulerService/PreflightCheck",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
+    ),
+    (
+        "/rmail.v1.SendSchedulerService/DraftNudge",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
+    ),
+    // `TrackFollowup` writes a reminder as well as calling a model, so it
+    // takes the write scope rather than the read one — the same split the
+    // three `Followup` rows above make.
+    (
+        "/rmail.v1.SendSchedulerService/TrackFollowup",
+        Requirement::AllOf(&[Scope::MailWrite, Scope::AiInvoke]),
+    ),
     // -- AiService (task 50) --------------------------------------------------
     // The provisional `Summarize`/`AskMailbox` rows this table carried before
     // task 50 landed the real `proto/rmail/v1/ai.proto` did not survive

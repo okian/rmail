@@ -1009,6 +1009,50 @@ commands! {
         summary: "Dismiss a follow-up reminder.",
     }
 
+    // -- The pre-send guardian and the waiting-on tracker (task 63) -----------
+    SendSchedulerPreflightCheck {
+        rpc: "/rmail.v1.SendSchedulerService/PreflightCheck",
+        tool: "preflight_check",
+        // `Mutate`, by this enum's own rule rather than by intuition: spend at
+        // a model provider is an effect an observer outside this process can
+        // see, which is what puts `AttachmentService/AskAttachment` on this
+        // side of the line too. Nothing in the mailbox changes; a bill does.
+        effect: Mutate,
+        // No CLI verb yet. `mail send --force` is the *override*, which
+        // belongs to `ScheduleSend`; a `mail draft check` is a later task.
+        cli: [],
+        actions: [],
+        summary: "Review a message before it is sent and report what a human should fix.",
+    }
+    SendSchedulerTrackFollowup {
+        rpc: "/rmail.v1.SendSchedulerService/TrackFollowup",
+        tool: "track_followup",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Judge whether a sent message expects a reply and arm a waiting-on entry.",
+    }
+    SendSchedulerListWaitingOn {
+        rpc: "/rmail.v1.SendSchedulerService/ListWaitingOn",
+        tool: "list_waiting_on",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "List what is still unanswered, longest wait first.",
+    }
+    SendSchedulerDraftNudge {
+        rpc: "/rmail.v1.SendSchedulerService/DraftNudge",
+        tool: "draft_followup",
+        // `Mutate` for the reason `PreflightCheck` is, and more plainly:
+        // generating text *is* the RPC, so there is no version of it that
+        // does not spend. It still has no path to the outbox — see
+        // `rmail_core::outbox::followup::track`'s module docs.
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Draft a follow-up nudge for a waiting-on entry. Sends nothing.",
+    }
+
     // -- AiService (tasks 50, 52) ----------------------------------------------
     AiGetSummary {
         rpc: "/rmail.v1.AiService/GetSummary",

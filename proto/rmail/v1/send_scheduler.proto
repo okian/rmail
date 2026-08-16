@@ -99,6 +99,105 @@ service SendSchedulerService {
 
   // Dismiss a reminder. Idempotent.
   rpc DismissFollowup(IdRequest) returns (Followup);
+
+  // Review a message before it goes out: "see attached" with nothing
+  // attached, unfilled placeholders, apparent secrets, wrong or extra
+  // recipients, tone clashes (prd.md #20, task 63).
+  //
+  // Side-effect free: it reports, and the caller decides. ScheduleSend runs
+  // the same check automatically unless `skip_preflight` is set.
+  //
+  // Two properties are contract rather than implementation detail, and a
+  // client may rely on both:
+  //
+  //   * The check always answers. There is no state in which a caller is left
+  //     unable to tell whether a message was reviewed: when the model layer
+  //     cannot run, `degraded` says so and the deterministic findings still
+  //     stand.
+  //   * A finding with `from_model = true` is never SEVERITY_BLOCK. Only the
+  //     offline checks can refuse a send, so what this daemon blocks is
+  //     reproducible and does not depend on whether a provider was reachable.
+  rpc PreflightCheck(PreflightCheckRequest) returns (PreflightCheckResponse);
+
+  // Judge whether a sent message is waiting on a reply and, if it is, arm a
+  // waiting-on entry with the extracted ask and a deadline (prd.md #21).
+  //
+  // Returns `followup` unset when no reply is expected — that is a successful
+  // judgement, not a failure. A judgement that cannot be made at all is an
+  // error and arms nothing: this RPC never guesses.
+  rpc TrackFollowup(TrackFollowupRequest) returns (TrackFollowupResponse);
+
+  // The aging waiting-on list, longest wait first. Threads that have since
+  // been answered are excluded.
+  rpc ListWaitingOn(ListWaitingOnRequest) returns (ListWaitingOnResponse);
+
+  // Draft a nudge for a waiting-on entry.
+  //
+  // Returns text. It writes no draft, queues nothing, and cannot send: a
+  // model that has just read a thread must not be one call away from mailing
+  // its conclusions to whoever wrote it.
+  rpc DraftNudge(DraftNudgeRequest) returns (DraftNudgeResponse);
+}
+
+// How much a preflight finding matters.
+enum PreflightSeverity {
+  PREFLIGHT_SEVERITY_UNSPECIFIED = 0;
+  // Worth mentioning; never on its own a reason to stop.
+  PREFLIGHT_SEVERITY_NOTICE = 1;
+  // The author should look before sending.
+  PREFLIGHT_SEVERITY_WARN = 2;
+  // Refuses the send under the default `send.preflight.block_at`. Only the
+  // deterministic checks ever produce this.
+  PREFLIGHT_SEVERITY_BLOCK = 3;
+}
+
+// What kind of problem a preflight finding names.
+enum PreflightFindingKind {
+  PREFLIGHT_FINDING_KIND_UNSPECIFIED = 0;
+  // The body promises an enclosure the message does not carry.
+  PREFLIGHT_FINDING_KIND_MISSING_ATTACHMENT = 1;
+  // A template hole or stand-in nobody filled in.
+  PREFLIGHT_FINDING_KIND_UNFILLED_PLACEHOLDER = 2;
+  // Something shaped like a credential, card number, or national id. The
+  // value itself is deliberately never quoted in `detail`.
+  PREFLIGHT_FINDING_KIND_APPARENT_SECRET = 3;
+  // A recipient the thread being replied to has not involved.
+  PREFLIGHT_FINDING_KIND_RECIPIENT_NOT_ON_THREAD = 4;
+  // The same address appears in more than one of To/Cc/Bcc.
+  PREFLIGHT_FINDING_KIND_DUPLICATE_RECIPIENT = 5;
+  // More recipients than `send.preflight.max_recipients`.
+  PREFLIGHT_FINDING_KIND_LARGE_RECIPIENT_LIST = 6;
+  // The register is wrong for the thread or the recipients.
+  PREFLIGHT_FINDING_KIND_TONE_CLASH = 7;
+}
+
+// Why the model half of a preflight check did not contribute.
+enum PreflightDegradation {
+  // The full check ran.
+  PREFLIGHT_DEGRADATION_UNSPECIFIED = 0;
+  // `send.preflight.ai = false`.
+  PREFLIGHT_DEGRADATION_DISABLED = 1;
+  // AI policy, the daily cost gate, or a spend budget refused the call.
+  PREFLIGHT_DEGRADATION_REFUSED = 2;
+  // The provider returned an error, or could not be reached.
+  PREFLIGHT_DEGRADATION_UNAVAILABLE = 3;
+  // The call did not answer within `send.preflight.timeout`.
+  PREFLIGHT_DEGRADATION_TIMED_OUT = 4;
+  // The caller went away, or the daemon is shutting down.
+  PREFLIGHT_DEGRADATION_CANCELLED = 5;
+  // The model answered something this build cannot read.
+  PREFLIGHT_DEGRADATION_UNREADABLE = 6;
+  // The redaction firewall left nothing to review.
+  PREFLIGHT_DEGRADATION_NOTHING_TO_REVIEW = 7;
+}
+
+// Who armed a follow-up.
+enum FollowupKind {
+  FOLLOWUP_KIND_UNSPECIFIED = 0;
+  // A human asked for it.
+  FOLLOWUP_KIND_MANUAL = 1;
+  // The tracker's judge decided the message expected a reply.
+  FOLLOWUP_KIND_AUTO = 2;
 }
 
 // Where an outbox entry stands.
@@ -234,6 +333,13 @@ message ScheduleSendRequest {
   // Who is asking. Defaults to the user. MCP passes SEND_ORIGIN_AI, which is
   // what earns the mandatory interception window.
   SendOrigin origin = 14;
+  // Send without running the pre-send guardian.
+  //
+  // The override exists because the guardian can refuse, and a user who has
+  // read the findings and decided anyway must have a way through — a check
+  // with no override is a check that eventually gets switched off entirely.
+  // It is logged when used.
+  bool skip_preflight = 16;
   // Optional replay fence, as MailService's DeleteRequest.idempotency_key —
   // and the one this matters most for: without it, a client that retries
   // after a lost response has queued the message twice, and the outbox's own
@@ -336,6 +442,125 @@ message Followup {
   FollowupState state = 8;
   optional string note = 9;
   int64 created_at = 10;
+
+  // Whether a human or the tracker's judge armed this.
+  FollowupKind kind = 11;
+  // The one thing being waited on, when the judge extracted one.
+  optional string ask = 12;
+  // Who is being waited on, as bare addr-specs.
+  repeated string waiting_on = 13;
+  // The subject of the message being waited on, frozen when the reminder was
+  // armed. Denormalized because a message this machine just sent has no local
+  // row until it syncs back from IMAP.
+  optional string subject = 14;
+  // When the tracked message went out, unix seconds. This, not created_at, is
+  // what `age_secs` is measured from.
+  optional int64 sent_at = 15;
+  // How long this has been waiting at the time of the response, seconds.
+  int64 age_secs = 16;
+  // Whether `remind_at` has passed.
+  bool overdue = 17;
+}
+
+// One thing the guardian noticed.
+message PreflightFinding {
+  PreflightFindingKind kind = 1;
+  PreflightSeverity severity = 2;
+  // One sentence naming the problem. Never quotes a suspected secret.
+  string detail = 3;
+  // Whether a model produced this finding rather than a deterministic check.
+  // A model finding is a judgement that may differ next time; a deterministic
+  // one is reproducible from the message.
+  bool from_model = 4;
+}
+
+message PreflightCheckRequest {
+  int64 account_id = 1;
+  // Check a stored draft. When set, the inline fields below are ignored.
+  optional int64 draft_id = 2;
+  // Or describe the message inline, for a caller that has not stored one.
+  repeated string to = 3;
+  repeated string cc = 4;
+  repeated string bcc = 5;
+  optional string subject = 6;
+  optional string body = 7;
+  // Attachment filenames, for the inline form. A draft brings its own.
+  repeated string attachment_names = 8;
+  // The parent's Message-ID, bare, when this is a reply. Used to look up who
+  // is already on the thread, which is what makes "extra recipient" a
+  // question this daemon can answer.
+  optional string in_reply_to = 9;
+}
+
+message PreflightCheckResponse {
+  repeated PreflightFinding findings = 1;
+  // The highest severity found. UNSPECIFIED means nothing was found.
+  PreflightSeverity severity = 2;
+  // Whether ScheduleSend would refuse this message under the current
+  // `send.preflight.block_at`.
+  bool blocks = 3;
+  // Why the model layer did not contribute, when it did not.
+  PreflightDegradation degradation = 4;
+  // The same, in one line a human can read.
+  optional string degradation_detail = 5;
+  // The model that reviewed it, when one did. May differ from
+  // `send.preflight.model`: a spend budget can downgrade it.
+  optional string model = 6;
+}
+
+message TrackFollowupRequest {
+  int64 account_id = 1;
+  // The Message-ID that was sent, bare.
+  string message_id = 2;
+  string subject = 3;
+  // The message body as sent, plain text.
+  string body = 4;
+  // Who it went to, bare addr-specs.
+  repeated string recipients = 5;
+  // When it went out, unix seconds. Absent means now.
+  optional int64 sent_at = 6;
+  optional int64 thread_id = 7;
+  // IANA zone the reminder is armed in. Empty uses `send.default_timezone`.
+  string tz = 8;
+}
+
+message TrackFollowupResponse {
+  // Unset when the judge concluded no reply is expected — a successful
+  // judgement, not a failure.
+  optional Followup followup = 1;
+  // What was concluded, whether or not anything was armed.
+  bool expects_reply = 2;
+  // The extracted ask, empty when nothing is expected.
+  string ask = 3;
+}
+
+message ListWaitingOnRequest {
+  optional int64 account_id = 1;
+  // Only entries already past their remind_at.
+  bool overdue_only = 2;
+  int32 page_size = 3;
+  // `next_page_token` from the previous page. Opaque, and bound to both
+  // filters. A token minted by ListFollowups is INVALID_ARGUMENT here: the
+  // two orderings differ, so resuming one in the other would skip rows.
+  string page_token = 4;
+}
+
+message ListWaitingOnResponse {
+  repeated Followup followups = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
+
+message DraftNudgeRequest {
+  // The waiting-on entry to chase.
+  int64 id = 1;
+}
+
+message DraftNudgeResponse {
+  string subject = 1;
+  string body = 2;
+  // The model that wrote it.
+  string model = 3;
 }
 
 message CreateFollowupRequest {

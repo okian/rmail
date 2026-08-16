@@ -51,6 +51,7 @@ use serde::Deserialize;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::ai::gate;
 use crate::ai::policy::PolicyEngine;
 use crate::ai::provider::{ChatRequest, OutputFormat, Provider};
 use crate::ai::queue::{payload_bytes, RateLimiter};
@@ -59,7 +60,7 @@ use crate::ai::{self, CallOutcome, CallRecord};
 use crate::config::{AiLimits, AiPrivacy};
 use crate::error::Error;
 use crate::rules::model::{self, Actions, MatchMode, Predicates, RuleSpec};
-use crate::rules::{gate, EvaluationReport, RuleEngine, RuleSelector};
+use crate::rules::{EvaluationReport, RuleEngine, RuleSelector};
 
 /// The `ai_ledger.pass` value a synthesis call is recorded under.
 pub const PASS: &str = "rule_synth";
@@ -164,7 +165,7 @@ impl RuleSynthesizer {
     /// # Errors
     /// [`Error::InvalidArgument`] for an empty or over-long instruction, or a
     /// proposal that does not validate as a rule; whatever
-    /// [`super::gate::admit`] returns when a policy/budget refuses the call;
+    /// [`crate::ai::gate::admit`] returns when a policy/budget refuses the call;
     /// the provider's error; [`Error::Internal`] if the response does not
     /// match the requested schema.
     #[tracing::instrument(
