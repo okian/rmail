@@ -34,9 +34,20 @@
 //! `extractor`/`status` columns everything else uses — a search hit on OCR'd
 //! text is real, but it is a guess about pixels rather than a fact read out
 //! of a format, and callers that care about the difference can ask.
+//!
+//! # Finding an attachment, and asking it a question
+//!
+//! [`search`] ranks *attachments* rather than the messages that carried them,
+//! fusing a per-attachment BM25 arm with the chunk-level dense arm and
+//! resolving each winner to a page. [`ask`] is retrieval-augmented generation
+//! over what [`search`] found, built to the same order of operations
+//! [`crate::ai::rag`] documents — policy gate before any text is rendered,
+//! every excerpt fenced, every citation looked up rather than believed.
 
+pub mod ask;
 pub mod extract;
 pub mod ocr;
+pub mod search;
 
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
@@ -892,6 +903,13 @@ async fn persist(
                         Sha256::digest(outcome.text.text.as_bytes()).to_vec(),
                         outcome.extractor,
                     ])?;
+                    // The attachment-granular lexical index (V39), written in
+                    // the same transaction as the text it indexes. Anywhere
+                    // else and a crash between the two leaves an attachment
+                    // whose text exists and is unfindable — which no later
+                    // pass repairs, because the skip above sees an unchanged
+                    // content hash and does nothing.
+                    search::index_part(&tx, message_id, &outcome.part_id, &outcome.text.text)?;
                 } else {
                     // No text is not the same as stale text. An attachment that
                     // used to extract and now does not — replaced by an
@@ -901,6 +919,7 @@ async fn persist(
                         "DELETE FROM index_content WHERE message_id = ?1 AND part = ?2",
                         rusqlite::params![message_id, &key],
                     )?;
+                    search::forget_part(&tx, message_id, &outcome.part_id)?;
                 }
 
                 tx.execute(
@@ -1012,6 +1031,7 @@ async fn persist(
                     "DELETE FROM index_content WHERE message_id = ?1 AND part = ?2",
                     rusqlite::params![message_id, &key],
                 )?;
+                search::forget_part(&tx, message_id, part_id)?;
                 tx.execute(
                     "DELETE FROM attachment_pages WHERE message_id = ?1 AND part_id = ?2",
                     rusqlite::params![message_id, part_id],

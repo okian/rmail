@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// AttachmentService answers questions from the text extracted out of mail
+// attachments (prd.md "Attachments & Extraction", feature 56).
+//
+// Finding an attachment is SearchService.SearchAttachments; this is what you
+// do once you have one, or once you have a query that names a few.
+service AttachmentService {
+  // Ask a question answered strictly from extracted attachment text,
+  // streaming a cited answer. No `mail` verb reaches it yet — the parity
+  // registry's row carries an empty `cli` list, which is the readable
+  // statement that a capability has no human surface so far.
+  //
+  // Two scopes, chosen by whether the request names an attachment:
+  //
+  //   * `message_id` + `part_id` set — one named attachment. No search runs;
+  //     the passages come from that document alone.
+  //   * both unset — the attachments SearchAttachments ranks best for the
+  //     question itself, over the same fused lexical+dense retrieval that RPC
+  //     serves, so the two surfaces cannot disagree about relevance.
+  //
+  // Setting exactly one of the pair is INVALID_ARGUMENT: a part id names an
+  // attachment *of a message*, and a message id alone would silently mean
+  // "every attachment of it", which is a third scope nothing asked for.
+  //
+  // Four properties are structural rather than best-effort, and clients may
+  // rely on them:
+  //
+  //   * Every AttachmentCitation names a passage this daemon actually packed.
+  //     The model cites positional labels, never ids, and a label with no
+  //     passage behind it produces no citation — so a fabricated or dangling
+  //     citation is not something the wire can carry.
+  //   * A citation carries both `page` and the byte span the passage came
+  //     from. The page is what a reader wants; the span is what makes the
+  //     citation checkable, and it is the half that exists for the formats
+  //     with no pages at all (plain text, HTML, OCR output).
+  //   * `quote` is extracted locally from the exact text that was in the
+  //     prompt, never taken from the model.
+  //   * `AskAttachmentDone.grounded` is the daemon's verdict, not the
+  //     model's: true only when the answer cited at least one real passage.
+  //     An answer that cites nothing still streams (it is usually the model
+  //     correctly saying the document does not say) but arrives ungrounded.
+  //
+  // Attachments in folders `ai.policy` marks `local_only` or `forbidden` are
+  // never packed and never reach the provider; a question whose every
+  // candidate is withheld refuses without a model call at all.
+  //
+  // Cancellation contract: if the daemon ends this stream before it is
+  // complete — a shutdown, or work cancelled underneath it — the call
+  // terminates with CANCELLED, never a clean OK. A stream that simply stopped
+  // yielding would be indistinguishable from one that had finished, so a
+  // partial result would read as a whole one.
+  rpc AskAttachment(AskAttachmentRequest) returns (stream AskAttachmentChunk);
+}
+
+message AskAttachmentRequest {
+  // The natural-language question.
+  string question = 1;
+  // Scope to one attachment: the message carrying it. 0 asks over search
+  // results instead.
+  int64 message_id = 2;
+  // That attachment's MIME part id, as SearchAttachments and
+  // `attachment_extractions` report it. Must be set exactly when message_id
+  // is.
+  string part_id = 3;
+  // Restrict a searched scope to one account; 0 means every configured
+  // account. Ignored when message_id names one attachment.
+  int64 account_id = 4;
+  // How many attachments a searched scope retrieves; 0 means ai.ask.top_k.
+  uint32 top_k = 5;
+}
+
+// One passage the answer cited.
+message AttachmentCitation {
+  // The 1-based label the answer used, so a client can align this with the
+  // [n] marker in the prose it already streamed.
+  uint32 label = 1;
+  int64 message_id = 2;
+  int64 message_uid = 3;
+  int64 account_id = 4;
+  string mailbox = 5;
+  // The MIME part id of the cited attachment.
+  string part_id = 6;
+  // Its filename, empty when the part declared none.
+  string filename = 7;
+  // The page the passage came from, one-based. Unset for a format with no
+  // pages — see the service comment on why the span travels alongside.
+  optional int64 page = 8;
+  // Byte offsets of the passage within the attachment's extracted text.
+  int64 span_start = 9;
+  int64 span_end = 10;
+  // A verbatim excerpt of the passage that was in the prompt, chosen for
+  // relevance to the question and extracted locally.
+  string quote = 11;
+}
+
+// What the scope found, sent before any token so a client can render "asked
+// over N attachments" while the answer is still arriving.
+message AttachmentRetrievalTrace {
+  // Attachments the scope produced.
+  uint32 retrieved = 1;
+  // How many of those contributed at least one passage.
+  uint32 attachments = 2;
+  // How many passages were packed into the prompt.
+  uint32 passages = 3;
+  // How many attachments were withheld because `ai.policy` does not let their
+  // folder reach a network provider.
+  uint32 withheld_by_policy = 4;
+  // How many were dropped because the context token budget was full.
+  uint32 dropped_for_budget = 5;
+  uint32 context_tokens = 6;
+  // The model actually called, which a soft budget cap may have downgraded
+  // from ai.ask.model. Empty when no call was made (the refusal path).
+  string model = 7;
+}
+
+// The terminal frame of an AskAttachment stream.
+message AskAttachmentDone {
+  // Whether the answer cited at least one passage this daemon packed. Set by
+  // the daemon from the resolved citations, never by the model.
+  bool grounded = 1;
+  // Why not, when grounded is false. Empty when grounded.
+  string refusal = 2;
+  // end_turn | max_tokens | stop_sequence | tool_use | pause_turn, when a
+  // model call was made at all.
+  string stop_reason = 3;
+}
+
+// Token usage for the call. Deliberately its own message rather than a reuse
+// of ai.proto's Usage: importing that file to share five integers would make
+// every AttachmentService client compile the whole AiService surface.
+message AttachmentUsage {
+  uint32 input_tokens = 1;
+  uint32 output_tokens = 2;
+  uint32 cache_creation_input_tokens = 3;
+  uint32 cache_read_input_tokens = 4;
+}
+
+// One frame of an AskAttachment stream.
+//
+// The order is fixed and total: exactly one trace, then zero or more tokens,
+// then zero or more citations, then at most one usage, then exactly one done
+// — unless the stream fails, in which case the error is terminal and no done
+// follows it. Citations come after the prose because a citation is only
+// resolvable once the whole answer has been seen.
+message AskAttachmentChunk {
+  oneof body {
+    AttachmentRetrievalTrace trace = 1;
+    string token = 2;
+    AttachmentCitation citation = 3;
+    AttachmentUsage usage = 4;
+    AskAttachmentDone done = 5;
+  }
+}

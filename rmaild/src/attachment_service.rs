@@ -1,0 +1,256 @@
+//! The `AttachmentService` gRPC implementation: one RPC, `AskAttachment`,
+//! which is a thin adapter over [`rmail_core::attach::ask`].
+//!
+//! # Why there is nothing here
+//!
+//! The same split `ai_service`'s `AskMailbox` documents, for the same reason.
+//! Every property this feature has to guarantee — that a `forbidden`/
+//! `local_only` folder's document never reaches a provider, that a citation
+//! names a passage this daemon actually packed, that grounding is the
+//! daemon's verdict rather than the model's — is provable in `rmail-core`
+//! without a gRPC server. A transport layer that could weaken one of them by
+//! accident is a transport layer that would have to be re-audited every time
+//! it changed, so this file converts
+//! [`AskEvent`](rmail_core::attach::ask::AskEvent)s to wire
+//! [`AskAttachmentChunk`](rmail_proto::v1::AskAttachmentChunk)s and does
+//! nothing else.
+//!
+//! # Why the service is registered even when it cannot answer
+//!
+//! `AttachmentService` is added to the server unconditionally — the
+//! reflection set and the fail-closed scope table must see every RPC
+//! regardless of runtime wiring — and declines with `FAILED_PRECONDITION`
+//! when AI is off on this daemon. The convention `AiService`/`IndexService`
+//! already follow.
+#![allow(clippy::result_large_err)] // see mail_service.rs's note on `Result<_, Status>`
+
+use std::pin::Pin;
+use std::sync::Arc;
+
+use futures::StreamExt;
+use rmail_core::ai::provider::{StopReason, Usage};
+use rmail_core::ai::{PolicyEngine, Provider, RateLimiter};
+use rmail_core::attach::ask::{
+    AskAttachmentRequest as CoreAskRequest, AskEvent, AskOutcome, AttachAskEngine,
+    AttachmentCitation, RetrievalTrace,
+};
+use rmail_core::attach::search::AttachmentSearch;
+use rmail_core::config::{AiAsk, AiLimits, AiPrivacy};
+use rmail_core::{Database, Error};
+use rmail_proto::v1::attachment_service_server::AttachmentService;
+use rmail_proto::v1::{
+    ask_attachment_chunk, AskAttachmentChunk, AskAttachmentDone, AskAttachmentRequest,
+    AttachmentCitation as ProtoCitation, AttachmentRetrievalTrace as ProtoTrace,
+    AttachmentUsage as ProtoUsage,
+};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+use tonic::{Request, Response, Status};
+
+/// The `AttachmentService` handler.
+///
+/// Cheap to clone: a `Database` handle plus `Arc`s.
+#[derive(Clone)]
+pub struct AttachmentApi {
+    engine: Arc<AttachAskEngine>,
+    /// Whether the AI subsystem is actually active on this daemon
+    /// (`ai.enabled = true` and a provider was built). Checked before any
+    /// retrieval runs, so a disabled daemon declines in microseconds rather
+    /// than after ranking a corpus for a call it was never going to make.
+    enabled: bool,
+    /// Cancelled when the daemon shuts down, so open answers stop with it
+    /// rather than holding shutdown open.
+    shutdown: CancellationToken,
+}
+
+impl AttachmentApi {
+    /// Build the handler from the daemon's own provider, policy engine,
+    /// privacy settings, limits and shared AI concurrency budget.
+    ///
+    /// `semaphore`/`rate_limiter` must be the daemon's `AiWorkerPool`'s own,
+    /// for the reason `AiApi::new` gives: one process must not exceed one
+    /// configured `ai.limits` ceiling because it has several call sites.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        db: Database,
+        provider: Arc<dyn Provider>,
+        policy: Arc<PolicyEngine>,
+        search: AttachmentSearch,
+        privacy: AiPrivacy,
+        limits: AiLimits,
+        config: AiAsk,
+        semaphore: Arc<Semaphore>,
+        rate_limiter: Arc<RateLimiter>,
+        enabled: bool,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            engine: Arc::new(AttachAskEngine::new(
+                db,
+                provider,
+                policy,
+                search,
+                privacy,
+                limits,
+                config,
+                semaphore,
+                rate_limiter,
+            )),
+            enabled,
+            shutdown,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl AttachmentService for AttachmentApi {
+    type AskAttachmentStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<AskAttachmentChunk, Status>> + Send>>;
+
+    #[tracing::instrument(skip(self, request), fields(message_id, top_k))]
+    async fn ask_attachment(
+        &self,
+        request: Request<AskAttachmentRequest>,
+    ) -> Result<Response<Self::AskAttachmentStream>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current()
+            .record("message_id", req.message_id)
+            .record("top_k", req.top_k);
+
+        if !self.enabled {
+            return Err(Status::from(Error::failed_precondition(
+                "AI is disabled on this daemon (ai.enabled = false, or no provider could be \
+                 built), so ask-attachment cannot answer"
+                    .to_owned(),
+            )));
+        }
+
+        // A child of the shutdown token, so daemon shutdown ends an open
+        // answer — and so dropping the response stream propagates to the
+        // provider rather than merely to the relay.
+        let cancel = self.shutdown.child_token();
+        let stream = self
+            .engine
+            .ask(
+                &CoreAskRequest {
+                    question: req.question,
+                    message_id: req.message_id,
+                    part_id: req.part_id,
+                    account_id: req.account_id,
+                    top_k: req.top_k,
+                },
+                &cancel,
+            )
+            .await
+            .map_err(Status::from)?;
+
+        // The token is cancelled when the mapped stream is dropped, which is
+        // what tonic does the instant a client disconnects. Without this the
+        // engine's own `tx.closed()` race would still fire, but the upstream
+        // HTTP request would only be dropped once the engine noticed.
+        let guard = CancelOnDrop(cancel);
+        let stream = stream.map(move |event| {
+            let _ = &guard;
+            event.map(to_proto_chunk).map_err(Status::from)
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+/// Cancels its token when dropped — see the call site.
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// One core [`AskEvent`] as a wire [`AskAttachmentChunk`].
+fn to_proto_chunk(event: AskEvent) -> AskAttachmentChunk {
+    let body = match event {
+        AskEvent::Trace(trace) => ask_attachment_chunk::Body::Trace(to_proto_trace(trace)),
+        AskEvent::Token(token) => ask_attachment_chunk::Body::Token(token),
+        AskEvent::Citation(citation) => {
+            ask_attachment_chunk::Body::Citation(to_proto_citation(citation))
+        }
+        AskEvent::Usage(usage) => ask_attachment_chunk::Body::Usage(to_proto_usage(usage)),
+        AskEvent::Done(outcome) => ask_attachment_chunk::Body::Done(to_proto_done(outcome)),
+    };
+    AskAttachmentChunk { body: Some(body) }
+}
+
+fn to_proto_trace(trace: RetrievalTrace) -> ProtoTrace {
+    ProtoTrace {
+        retrieved: clamp_u32(trace.retrieved),
+        attachments: clamp_u32(trace.attachments),
+        passages: clamp_u32(trace.passages),
+        withheld_by_policy: clamp_u32(trace.withheld_by_policy),
+        dropped_for_budget: clamp_u32(trace.dropped_for_budget),
+        context_tokens: clamp_u32(trace.context_tokens),
+        model: trace.model,
+    }
+}
+
+fn to_proto_citation(citation: AttachmentCitation) -> ProtoCitation {
+    ProtoCitation {
+        label: citation.label,
+        message_id: citation.message_id,
+        message_uid: citation.message_uid,
+        account_id: citation.account_id,
+        mailbox: citation.mailbox,
+        part_id: citation.part_id,
+        filename: citation.filename,
+        page: citation.page,
+        span_start: citation.span_start,
+        span_end: citation.span_end,
+        quote: citation.quote,
+    }
+}
+
+fn to_proto_usage(usage: Usage) -> ProtoUsage {
+    ProtoUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+    }
+}
+
+fn to_proto_done(outcome: AskOutcome) -> AskAttachmentDone {
+    AskAttachmentDone {
+        grounded: outcome.grounded,
+        // Empty exactly when grounded, per the proto's own contract — the
+        // refusal text is the engine's, so a client never has to compose one.
+        refusal: outcome
+            .refusal
+            .map(|refusal| refusal.message().to_owned())
+            .unwrap_or_default(),
+        stop_reason: outcome
+            .stop_reason
+            .map(|reason| stop_reason_str(reason).to_owned())
+            .unwrap_or_default(),
+    }
+}
+
+/// The wire spelling of a stop reason. Duplicated from `ai_service`'s own
+/// rather than exported from it: it is five string literals, and the two
+/// services' wire vocabularies are independent contracts that happen to
+/// agree today.
+fn stop_reason_str(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::StopSequence => "stop_sequence",
+        StopReason::ToolUse => "tool_use",
+        StopReason::PauseTurn => "pause_turn",
+    }
+}
+
+/// A count as a wire `uint32`. Saturating rather than wrapping: these are
+/// display counters, and a wrapped one would be a lie rather than a large
+/// number.
+fn clamp_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}

@@ -93,6 +93,93 @@ service SearchService {
   // should not have to special-case a setting it does not own. Nothing is
   // written either way.
   rpc LogFeedback (FeedbackRequest) returns (google.protobuf.Empty);
+
+  // Rank *attachments* rather than the messages that carried them (prd.md
+  // feature 55): "the contract clause about termination for convenience"
+  // returns the exact attachment and page.
+  //
+  // A different key, which is why it is a different RPC rather than a flag on
+  // `Search`. A message with a signed contract and a signature-block logo is
+  // one row in the message index covering both, and nothing about that row
+  // can say which of the two the clause came from. This one fuses a BM25 arm
+  // over per-attachment extracted text with the chunk-level embedding kNN,
+  // via the same RRF and the same `search.rrf_k` the message pipeline uses,
+  // and resolves each winner's byte offset to a page.
+  //
+  // Read-only over the local index, like every other RPC here, and scoped
+  // like `Search` for the same reason `Search` is: the embedding arm uses
+  // whichever backend `index.semantic` already indexes the mailbox with — a
+  // caller can neither select nor escalate it — so calling this grants no
+  // spend authority the operator's own configuration had not already granted.
+  //
+  // Unary rather than streamed, unlike `Search`. The whole page's order is
+  // only known once both arms have been fused, and every hit is then
+  // hydrated in a single batched read — there is no prefix of the answer that
+  // becomes correct earlier, so streaming would buy a cancellation contract
+  // and a generation slot for no latency at all.
+  rpc SearchAttachments (SearchAttachmentsRequest) returns (SearchAttachmentsResponse);
+}
+
+message SearchAttachmentsRequest {
+  // The query. Free text and quoted phrases; a phrase is matched as a phrase
+  // in the lexical arm and used to place the excerpt.
+  string query = 1;
+  // Restrict to one account; 0 means every configured account.
+  int64 account_id = 2;
+  // Restrict to one message's attachments; 0 means every message — what a
+  // client uses to search inside the message already on screen.
+  int64 message_id = 3;
+  // How many attachments to return; 0 means the daemon's default. Clamped to
+  // the daemon's own ceiling.
+  uint32 limit = 4;
+}
+
+// One attachment that matched.
+message AttachmentHit {
+  int64 message_id = 1;
+  int64 message_uid = 2;
+  int64 account_id = 3;
+  string mailbox = 4;
+  // The carrying message's subject and From address, so a hit is placeable
+  // without a second round trip.
+  string subject = 5;
+  string from_addr = 6;
+  optional int64 date = 7;
+  // The MIME part id, which addresses the attachment for
+  // MailService.GetAttachment and AttachmentService.AskAttachment.
+  string part_id = 8;
+  string filename = 9;
+  string content_type = 10;
+  // Decoded size in bytes, when recorded.
+  optional int64 bytes = 11;
+  // How many pages extraction found, when the format has them.
+  optional int64 pages = 12;
+  // The page the evidence falls on, one-based. Unset for a format with no
+  // pages, or an offset no page span covers.
+  optional int64 page = 13;
+  // Byte offsets of the evidence within the attachment's extracted text.
+  // `span_end` equals `span_start` when the offset came from a term match
+  // rather than an embedded chunk.
+  int64 span_start = 14;
+  int64 span_end = 15;
+  // A verbatim excerpt of the attachment's own text around the evidence,
+  // drawn from the local index.
+  string excerpt = 16;
+  // native | ocr — whether the text was read out of the format or recognized
+  // from pixels. A hit on OCR'd text is real, but it is a guess about pixels
+  // rather than a fact read out of a format.
+  string provenance = 17;
+  // Fused reciprocal-rank score, higher is better.
+  double score = 18;
+  // This attachment's 1-based rank in each arm, unset when that arm did not
+  // return it. Present so a client (and an operator reading a trace) can see
+  // which retrieval actually found a result.
+  optional uint32 lexical_rank = 19;
+  optional uint32 dense_rank = 20;
+}
+
+message SearchAttachmentsResponse {
+  repeated AttachmentHit hits = 1;
 }
 
 // Execution mode: which candidate sources contribute. `MODE_UNSPECIFIED`

@@ -474,6 +474,38 @@ commands! {
         actions: [],
         summary: "Record which results a searcher opened, as training signal for ranking.",
     }
+    // `Read` on the same grounds `SearchSearch` is, and on those grounds
+    // only. Its dense arm embeds the query with `index.semantic`'s configured
+    // embedder, which can be a hosted one — so this is not the stronger
+    // "nothing observable outside this process" case, it is the clamp case:
+    // the backend is the one the operator already indexes with, a caller
+    // cannot select or escalate it, and so calling this grants no spend
+    // authority `Search` did not already grant. `rmaild::auth::methods` puts
+    // the same argument on the same row at more length.
+    SearchSearchAttachments {
+        rpc: "/rmail.v1.SearchService/SearchAttachments",
+        tool: "search_attachments",
+        effect: Read,
+        cli: [],
+        actions: [],
+        summary: "Rank extracted attachment text, returning the exact attachment and page that matched.",
+    }
+
+    // -- AttachmentService (task 74) -------------------------------------------
+    // `Mutate` for the reason `AiAskMailbox` is, and it is the same reason
+    // spelled out on `Effect` itself: calling the provider *is* the RPC.
+    // There is no clamp-to-configured-backend escape hatch here the way
+    // `SearchSearchAttachments` above has by construction — an answer with no
+    // model call is not a degraded answer, it is no answer — so a caller can
+    // cause spend, which is an effect an observer outside this process sees.
+    AttachmentAskAttachment {
+        rpc: "/rmail.v1.AttachmentService/AskAttachment",
+        tool: "ask_attachment",
+        effect: Mutate,
+        cli: [],
+        actions: [],
+        summary: "Answer a question from one attachment (or the best matches for it), citing page and span.",
+    }
 
     // -- SavedSearchService (task 35) -----------------------------------------
     SavedSearchCreateSavedSearch {

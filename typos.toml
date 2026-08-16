@@ -62,3 +62,8 @@ Multiligual = "Multiligual"
 # and therefore what `attach::ocr::vision` has to map to a BCP 47 tag. Its
 # 639-2/T sibling `fra` is right there on the same line; both are real.
 fre = "fre"
+
+# French, not a misspelling of "reset": `attach::ask`'s tests build a
+# French-language contract fixture ("et le reste du contrat") to prove the
+# citation offsets survive multi-byte text. The word is the fixture.
+reste = "reste"

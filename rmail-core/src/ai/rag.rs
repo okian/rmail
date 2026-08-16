@@ -905,7 +905,12 @@ fn prompt(question: &str, sources: &[Source]) -> String {
 /// releases it the moment the closing bracket arrives — or the moment the
 /// candidate grows past the longest a real token could be, at which point it
 /// was never a token and holding it back would stall the stream forever.
-struct Rehydrator<'a> {
+///
+/// `pub(crate)` because [`crate::attach::ask`] streams a redacted answer for
+/// the identical reason and must not carry a second implementation of this:
+/// two copies of "how much of a partial token is safe to emit" is two places
+/// for a stream to start cutting `⟦CARD_1⟧` in half.
+pub(crate) struct Rehydrator<'a> {
     tokens: &'a TokenMap,
     pending: String,
 }
@@ -918,7 +923,7 @@ struct Rehydrator<'a> {
 const MAX_TOKEN_BYTES: usize = 64;
 
 impl<'a> Rehydrator<'a> {
-    const fn new(tokens: &'a TokenMap) -> Self {
+    pub(crate) const fn new(tokens: &'a TokenMap) -> Self {
         Self {
             tokens,
             pending: String::new(),
@@ -926,7 +931,7 @@ impl<'a> Rehydrator<'a> {
     }
 
     /// Absorb `chunk` and return whatever is now safe to emit.
-    fn push(&mut self, chunk: &str) -> String {
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
         if self.tokens.is_empty() {
             // No tokens were minted, so nothing in the stream can be one and
             // there is nothing to hold back.
@@ -941,7 +946,7 @@ impl<'a> Rehydrator<'a> {
 
     /// Emit whatever is still held back — the stream is over, so a partial
     /// token is just text.
-    fn flush(&mut self) -> String {
+    pub(crate) fn flush(&mut self) -> String {
         let tail = std::mem::take(&mut self.pending);
         rehydrate(&tail, self.tokens)
     }

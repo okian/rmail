@@ -140,6 +140,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::Utc;
 use rmail_core::ai::AskRetriever;
+use rmail_core::attach::search::{AttachmentQuery, AttachmentSearch};
 use rmail_core::config::{IndexSemanticConfig, Rerank, RetrieversConfig, SearchConfig, SearchMode};
 use rmail_core::embed::Embedder;
 use rmail_core::eval::{
@@ -167,8 +168,8 @@ use rmail_proto::v1::{
     FeedbackAction as ProtoFeedbackAction, FeedbackRequest, Intent as ProtoIntent,
     Message as ProtoMessage, Mode as ProtoMode, QueryEval as ProtoQueryEval,
     RankExplanation as ProtoRankExplanation, Rerank as ProtoRerank,
-    ResultAction as ProtoResultAction, SearchHit as ProtoSearchHit, SearchRequest,
-    Snippet as ProtoSnippet,
+    ResultAction as ProtoResultAction, SearchAttachmentsRequest, SearchAttachmentsResponse,
+    SearchHit as ProtoSearchHit, SearchRequest, Snippet as ProtoSnippet,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -443,6 +444,34 @@ pub(crate) fn to_proto_message(message: &repo::Message, flags: Vec<String>) -> P
     }
 }
 
+/// One core [`rmail_core::attach::search::AttachmentHit`] on the wire.
+fn to_proto_attachment_hit(
+    hit: rmail_core::attach::search::AttachmentHit,
+) -> rmail_proto::v1::AttachmentHit {
+    rmail_proto::v1::AttachmentHit {
+        message_id: hit.message_id,
+        message_uid: hit.message_uid,
+        account_id: hit.account_id,
+        mailbox: hit.mailbox,
+        subject: hit.subject,
+        from_addr: hit.from_addr,
+        date: hit.date,
+        part_id: hit.part_id,
+        filename: hit.filename,
+        content_type: hit.content_type,
+        bytes: hit.bytes,
+        pages: hit.pages,
+        page: hit.page,
+        span_start: hit.span_start,
+        span_end: hit.span_end,
+        excerpt: hit.excerpt,
+        provenance: hit.provenance.as_str().to_owned(),
+        score: hit.score,
+        lexical_rank: hit.lexical_rank,
+        dense_rank: hit.dense_rank,
+    }
+}
+
 /// The `SearchService` handler.
 ///
 /// Cheap to clone: every field either shares a `Database`/connection pool
@@ -459,6 +488,11 @@ pub struct SearchApi {
     /// degrades to zero candidates rather than erroring, the same graceful
     /// degradation `retrieve::fanout::Fanout` gives a disabled source.
     dense: Option<DenseRetriever>,
+    /// Attachment-granular retrieval (task 74), over the *same* embedder this
+    /// handler plans queries with. A second embedder here would embed the
+    /// query with one model and the corpus with another, which produces
+    /// cosines that mean nothing and still sort.
+    attachments: AttachmentSearch,
     planner: QueryPlanner,
     fuser: Fuser,
     feature_extractor: FeatureExtractor,
@@ -538,6 +572,7 @@ impl SearchApi {
             .retrievers
             .dense
             .then(|| DenseRetriever::new(db.clone(), &semantic_index));
+        let attachments = AttachmentSearch::new(db.clone(), Arc::clone(&embedder), &search);
         let planner = QueryPlanner::new(db.clone(), embedder, search.expansion.clone());
         let fuser = Fuser::new(db.clone());
         let feature_extractor = FeatureExtractor::new(
@@ -554,6 +589,7 @@ impl SearchApi {
             fts,
             semantic_index,
             dense,
+            attachments,
             planner,
             fuser,
             feature_extractor,
@@ -575,6 +611,19 @@ impl SearchApi {
     #[must_use]
     pub fn feedback(&self) -> &FeedbackStore {
         &self.feedback
+    }
+
+    /// The attachment-search surface this handler serves `SearchAttachments`
+    /// from, so `AttachmentService.AskAttachment` retrieves through the same
+    /// object rather than a second one of its own.
+    ///
+    /// The point is not to save an allocation. A second `AttachmentSearch`
+    /// could be built with a different embedder or a different `[search]`
+    /// table, and then "ask draws on what search found" would be a claim
+    /// about two independently-configured rankers rather than a fact.
+    #[must_use]
+    pub fn attachments(&self) -> &AttachmentSearch {
+        &self.attachments
     }
 
     /// Kick off a `Search`/`Semantic` stream: register it as the current
@@ -1584,6 +1633,51 @@ impl SearchService for SearchApi {
         self.start_stream(request.into_inner(), true, cancel).await
     }
 
+    #[tracing::instrument(skip(self, request), fields(account_id, message_id, hits))]
+    async fn search_attachments(
+        &self,
+        request: Request<SearchAttachmentsRequest>,
+    ) -> Result<Response<SearchAttachmentsResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current()
+            .record("account_id", req.account_id)
+            .record("message_id", req.message_id);
+
+        // A plain shutdown child, not `self.generation.begin(...)`. Attachment
+        // search does not share the interactive `Search`/`Semantic` slot: a
+        // client that searches attachments while a message search is still
+        // streaming would otherwise cancel it, and the two are answers to
+        // different questions that a UI legitimately shows side by side.
+        let cancel = self.shutdown.child_token();
+        let hits = self
+            .attachments
+            .search(
+                &AttachmentQuery {
+                    query: req.query,
+                    account_id: req.account_id,
+                    message_id: req.message_id,
+                    limit: req.limit,
+                },
+                &cancel,
+            )
+            .await
+            .map_err(Status::from)?;
+        if cancel.is_cancelled() {
+            // `AttachmentSearch` reports a cancelled scan as an empty page,
+            // which is right for a *superseded* search — but nothing
+            // supersedes this one: the only thing that cancels this token is
+            // daemon shutdown, so an empty page here would present a
+            // truncated result as a complete one.
+            return Err(Status::from(RmailError::unavailable(
+                "the daemon is shutting down; the attachment search did not complete",
+            )));
+        }
+        tracing::Span::current().record("hits", hits.len());
+        Ok(Response::new(SearchAttachmentsResponse {
+            hits: hits.into_iter().map(to_proto_attachment_hit).collect(),
+        }))
+    }
+
     async fn explain(
         &self,
         request: Request<ExplainRequest>,
@@ -2008,6 +2102,11 @@ mod tests {
             "Semantic",
             "Explain",
             "Evaluate",
+            // Read-only over the attachment index. Its handler never reaches
+            // `self.feedback`, and `attach::search` reads only
+            // fts_attachments / vec_chunks / attachment_* / index_content /
+            // mailboxes — no feedback table is in any of its queries.
+            "SearchAttachments",
             // Write-only, into the log. Returns `google.protobuf.Empty` —
             // it reports nothing back about what is stored.
             "LogFeedback",

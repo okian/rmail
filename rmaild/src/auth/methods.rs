@@ -519,6 +519,49 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SearchService/LogFeedback",
         Requirement::Scope(Scope::MailRead),
     ),
+    // `SearchAttachments` (task 74) discloses text extracted from attachments
+    // of messages a `mail.read` token can already fetch whole via
+    // `MailService/GetAttachment` — strictly less than that RPC hands over,
+    // since this one returns a bounded excerpt rather than the bytes.
+    //
+    // It needs no `ai.invoke` for exactly the reason `SearchService/Search`
+    // above does not, and the argument has to be the clamp one rather than a
+    // stronger-sounding claim about egress. Its dense arm embeds the query
+    // with `index.semantic`'s configured embedder, which under
+    // `provider = "voyage"` is a metered third-party API — so "nothing here
+    // leaves the host" would be false. What *is* true is that the embedder is
+    // whatever the operator already indexes the mailbox with: a read-scoped
+    // token can spend nothing the configuration had not already sanctioned,
+    // and cannot select a backend. That is the same bound `Search`'s row
+    // rests on. If this surface ever grows a reranker a request can *choose*,
+    // it needs `ai.invoke` the way `AskAttachment` below has it.
+    (
+        "/rmail.v1.SearchService/SearchAttachments",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // -- AttachmentService (task 74) ------------------------------------------
+    // `AskAttachment` needs both scopes for the reasons `AiService/AskMailbox`
+    // gives at length below, and the second half is if anything stronger here.
+    //
+    // `ai.invoke`, because calling the provider is the entire RPC: unlike
+    // `Search`, whose row stays at `mail.read` only because
+    // `SearchApi::rerank_for` clamps a request to the backend the operator
+    // already sanctioned, an answer with no model call is not a degraded
+    // answer but no answer. A `mail.read` token that could force provider
+    // spend is the hole task 51's own review caught.
+    //
+    // `mail.read`, because `ai.invoke` alone would be a content escalation.
+    // `AnalyzeMessage`/`SuggestReply` sit at `ai.invoke` and disclose one
+    // message the caller already named. In its searched form this RPC takes a
+    // free-text question, ranks attachments across every configured account,
+    // and streams back verbatim quotes from documents — contracts, invoices,
+    // scans — plus each source's mailbox, filename and UID. That is a
+    // mailbox-wide read of exactly the material a mailbox's owner is least
+    // willing to have gone fishing through.
+    (
+        "/rmail.v1.AttachmentService/AskAttachment",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
+    ),
     // -- SendSchedulerService (task 61) ----------------------------------------------
     // Replaces the provisional `OutboxService/Send` row this table carried
     // until task 61 landed the real `proto/rmail/v1/send_scheduler.proto` —
@@ -1311,6 +1354,58 @@ mod tests {
                 .iter()
                 .all(|want| rmail_core::auth::satisfies(&both, want)),
             "mail.read + ai.invoke must be enough to ask the mailbox a question"
+        );
+    }
+
+    /// Asking an attachment a question is two authorities at once, and
+    /// searching attachments is neither of them.
+    ///
+    /// The pair is checked together because the *gap* between the two rows is
+    /// the design: `SearchAttachments` reads the local index and must stay
+    /// reachable by a routine read-only token, while `AskAttachment` spends
+    /// at a provider and must not be. Collapsing them — by raising the search
+    /// or lowering the ask — would either make attachment search unusable for
+    /// the tokens it exists for or hand every read-only token a way to spend
+    /// money, and only one of those two mistakes is loud.
+    #[test]
+    fn asking_an_attachment_needs_both_mail_read_and_ai_invoke() {
+        let Some(Requirement::Scope(searching)) =
+            lookup("/rmail.v1.SearchService/SearchAttachments")
+        else {
+            unreachable!("SearchAttachments should require a single scope");
+        };
+        assert!(
+            rmail_core::auth::satisfies(std::slice::from_ref(&Scope::MailRead), searching),
+            "a read-only token must still be able to search attachments"
+        );
+
+        let method = "/rmail.v1.AttachmentService/AskAttachment";
+        let Some(Requirement::AllOf(required)) = lookup(method) else {
+            unreachable!("{method} should require every one of a scope set");
+        };
+        assert!(required.contains(&Scope::MailRead));
+        assert!(required.contains(&Scope::AiInvoke));
+        for granted in [Scope::MailRead, Scope::AiInvoke, Scope::MailWrite] {
+            assert!(
+                !required
+                    .iter()
+                    .all(|want| rmail_core::auth::satisfies(std::slice::from_ref(&granted), want)),
+                "{granted:?} alone must not be enough to ask an attachment a question"
+            );
+        }
+        // ...and whatever buys the search must not also buy the ask.
+        assert!(
+            !required
+                .iter()
+                .all(|want| rmail_core::auth::satisfies(std::slice::from_ref(searching), want)),
+            "{searching:?} buys an attachment search and must not also buy provider spend"
+        );
+        let both = [Scope::MailRead, Scope::AiInvoke];
+        assert!(
+            required
+                .iter()
+                .all(|want| rmail_core::auth::satisfies(&both, want)),
+            "mail.read + ai.invoke must be enough to ask an attachment a question"
         );
     }
 

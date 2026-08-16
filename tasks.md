@@ -713,7 +713,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core extract::invoice extract::structured` (schema-valid rows, CSV export)
 
 ## 74. Attachment semantic search & ask-your-attachment
-- [ ] status
+- [x] status
 - **depends-on:** 21, 22, 52
 - **parallel-safe:** yes
 - **acceptance:**

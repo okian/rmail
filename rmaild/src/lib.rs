@@ -16,6 +16,7 @@ mod admin_service;
 mod ai_policy_service;
 mod ai_safety_service;
 mod ai_service;
+mod attachment_service;
 mod audit_service;
 mod auth;
 mod compose_service;
@@ -40,6 +41,7 @@ pub use account_service::AccountApi;
 pub use admin_service::AdminApi;
 pub use ai_safety_service::AiSafetyApi;
 pub use ai_service::AiApi;
+pub use attachment_service::AttachmentApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
 /// The per-method capability requirement, re-exported because
@@ -107,6 +109,7 @@ use rmail_proto::v1::admin_service_server::AdminServiceServer;
 use rmail_proto::v1::ai_policy_service_server::AiPolicyServiceServer;
 use rmail_proto::v1::ai_safety_service_server::AiSafetyServiceServer;
 use rmail_proto::v1::ai_service_server::AiServiceServer;
+use rmail_proto::v1::attachment_service_server::AttachmentServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::compose_service_server::ComposeServiceServer;
 use rmail_proto::v1::config_service_server::ConfigServiceServer;
@@ -1102,6 +1105,32 @@ where
     // "paused" (which would misleadingly imply `mail ai resume` could make
     // it start running).
     let ai_pause = AiPauseFlag::new(false);
+
+    // Ask-your-attachment (task 74). Built before `AiService` only because
+    // `search_api` is moved into the mailbox-RAG retriever below; it takes a
+    // clone of the *same* `AttachmentSearch` `SearchService.SearchAttachments`
+    // answers from, so a question and an attachment search rank the same
+    // documents the same way, and the *same* `ai.limits` semaphore and rate
+    // limiter every other AI call site in this process shares.
+    //
+    // Registered unconditionally, like every other service: `AskAttachment`
+    // declines with FAILED_PRECONDITION on a daemon whose AI subsystem is off
+    // rather than disappearing from the reflection set and the fail-closed
+    // scope table.
+    let attachment_service = AttachmentServiceServer::new(AttachmentApi::new(
+        db.clone(),
+        Arc::clone(&ai_provider),
+        Arc::clone(&ai_policy),
+        search_api.attachments().clone(),
+        config.ai.privacy.clone(),
+        config.ai.limits.clone(),
+        config.ai.ask.clone(),
+        Arc::clone(&ai_semaphore),
+        Arc::clone(&ai_rate_limiter),
+        ai_active,
+        stopping.clone(),
+    ));
+
     let ai_service = AiServiceServer::new(
         AiApi::new(
             db.clone(),
@@ -1299,6 +1328,7 @@ where
         .add_service(saved_search_service)
         .add_service(finder_service)
         .add_service(ai_service)
+        .add_service(attachment_service)
         .add_service(ai_policy_service)
         .add_service(ai_safety_service)
         .add_service(hook_service)
