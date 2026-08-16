@@ -6,20 +6,27 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**69 of 86 done, 17 remaining.** `tasks.md` is authoritative — count with
+**71 of 86 done, 15 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **3189/3189** on the full
+after merge, never on the agent's own report: currently **3325/3325** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: 36, 42, 57, 58, 62, 63, 65, 68, 69, 70, 72, 73, 75, 78, 79, 80, 81.
-All are ready — no unmet dependencies — and all but 42 are
-`parallel-safe: yes`. In flight: **79** (OAuth2 broker) and **81** (priority
-notifications), each in its own worktree.
+Remaining: 36, 42, 57, 58, 62, 65, 68, 69, 72, 73, 75, 78, 80. All ready; all
+but 42 are `parallel-safe: yes`. In flight: **63** (pre-send guardian) and
+**70** (AI digest).
 
-Merged this round: 74 (attachment search), 71 (SLA analytics), 82 (export).
-Each was verified on the *combined* tree, never on the agent's own count —
-71 reported 3106 and 82 reported 3084 against their own bases, and the truth
-after merging both was 3189.
+Merged this round: 74, 71, 82, 79, 81. Every one verified on the *combined*
+tree, never on the agent's own count — 71 said 3106, 82 said 3084, 81 said
+3263, all against their own bases; the truth after merging is 3325.
+
+**79 shipped red and the post-merge suite caught it.** Its agent reported
+success while its suite was still building, then stopped. Its own test
+`an_oauth_credential_round_trips_through_storage` failed: `account::create`
+validated only `Keychain` while `set_credential` validated
+`Keychain | OAuth`, so an OAuth account could be persisted with no username
+and could never resolve its refresh token. `set_credential`'s comment even
+claimed "Same precondition `create` enforces". Agent briefs now say
+explicitly: do not report done until the suite has actually finished.
 
 Defects in already-merged work keep being found by the post-merge full-suite
 run or by orchestrator review rather than by the task that introduced them: a
@@ -67,7 +74,7 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V40.** (71 and 82 needed no migration.)
+costs nothing. **Next free: V41.** (71, 79 and 82 needed no migration; 81 took V40.)
 
 Task 74 arrived numbered V40 over a V38 tip and was renamed to V39 at merge,
 along with the `-- V40:` comment in the file and two doc references to it.
