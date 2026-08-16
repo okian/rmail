@@ -6,18 +6,19 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**71 of 86 done, 15 remaining.** `tasks.md` is authoritative — count with
+**73 of 86 done, 13 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **3325/3325** on the full
+after merge, never on the agent's own report: currently **3473/3473** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: 36, 42, 57, 58, 62, 65, 68, 69, 72, 73, 75, 78, 80. All ready; all
-but 42 are `parallel-safe: yes`. In flight: **63** (pre-send guardian) and
-**70** (AI digest).
+Remaining: 36, 42, 58, 62, 65, 68, 69, 72, 73, 75, 78. All ready; all but 42
+are `parallel-safe: yes`. In flight: **57** (AI auto-tagging) and **80**
+(unified inbox + autoconfig).
 
-Merged this round: 74, 71, 82, 79, 81. Every one verified on the *combined*
-tree, never on the agent's own count — 71 said 3106, 82 said 3084, 81 said
-3263, all against their own bases; the truth after merging is 3325.
+Merged so far: 74, 71, 82, 79, 81, 70, 63. Every one verified on the
+*combined* tree, never on the agent's own count — the reports said 3106,
+3084, 3263, 3389 and 3409 against five different bases; the truth after
+merging all of them is 3473.
 
 **79 shipped red and the post-merge suite caught it.** Its agent reported
 success while its suite was still building, then stopped. Its own test
@@ -74,7 +75,15 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V41.** (71, 79 and 82 needed no migration; 81 took V40.)
+costs nothing. **Next free: V43.** (81 took V40, 70 took V41, 63 took V42;
+71, 79 and 82 needed none.)
+
+**Tasks 70 and 63 both arrived numbered V41** — the first real collision
+since the rule was written, and the reason it exists. 70 merged first and
+kept V41; 63 was renamed to V42 along with its `-- V41:` comment and three
+doc references. Dispatching two agents with different numbers does not
+prevent this, because a task that needs no migration leaves its number
+unused and the next pair collides anyway. Assign at merge, always.
 
 Task 74 arrived numbered V40 over a V38 tip and was renamed to V39 at merge,
 along with the `-- V40:` comment in the file and two doc references to it.
