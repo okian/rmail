@@ -1086,6 +1086,21 @@ commands! {
         summary: "Stream the whole AI audit ledger for export.",
     }
 
+    // -- ExportService (task 82) -----------------------------------------------
+    ExportExport {
+        rpc: "/rmail.v1.ExportService/Export",
+        tool: "export_messages",
+        // A read despite writing a file: the file is written by the *client*
+        // from the stream this RPC returns. Calling it changes nothing an
+        // observer outside the caller's own process could see, and it cannot
+        // spend at a provider — `with_ai` attaches artifacts the AI passes
+        // already stored (see `crate::export`'s module docs).
+        effect: Read,
+        cli: ["export"],
+        actions: [],
+        summary: "Export a query or thread to mbox, Maildir, .eml, or JSON, preserving raw RFC822.",
+    }
+
     // -- RuleService (task 66) -------------------------------------------------
     RuleCreateRule {
         rpc: "/rmail.v1.RuleService/CreateRule",

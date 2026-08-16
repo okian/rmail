@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// ExportService turns a search query or a thread into an archive: mbox,
+// Maildir, one .eml per message, or a JSON document.
+//
+// The bytes an export carries are the message's own raw RFC822, exactly as
+// the server delivered them and exactly as `messages.raw` stored them. No
+// format re-renders a message from parsed fields, and none rewrites headers
+// or line endings; mbox's `From_` line and its `>From ` quoting are the only
+// bytes added, and both are reversible (see ExportChunk).
+service ExportService {
+  // Stream a selection as one of the supported formats.
+  //
+  // Everything that can be refused — an unset selection, an unknown format,
+  // `with_ai` on a byte format, a thread that does not exist — is refused as
+  // this call's own status, before the first frame. A client that gets a
+  // stream at all knows its request was accepted.
+  //
+  // Completion contract: the last frame of a complete export carries
+  // ExportDone. If the daemon ends the stream early — a shutdown, or work
+  // cancelled underneath it — it tries to terminate with CANCELLED, but that
+  // is best-effort and a client that was momentarily behind may simply see
+  // the stream end. The sentinel is what makes truncation detectable
+  // regardless: no ExportDone means the archive is incomplete, whatever the
+  // status said.
+  rpc Export(ExportRequest) returns (stream ExportChunk);
+}
+
+// The archive formats an export can produce.
+enum ExportFormat {
+  EXPORT_FORMAT_UNSPECIFIED = 0;
+  // One file, messages concatenated behind `From_` separator lines, with
+  // mboxrd (`>From `) quoting so the original bytes are recoverable.
+  EXPORT_FORMAT_MBOX = 1;
+  // A Maildir tree: `tmp/`, `new/`, `cur/`, one file per message under
+  // `cur/` with its IMAP flags encoded in the `:2,` info suffix.
+  EXPORT_FORMAT_MAILDIR = 2;
+  // A directory of `.eml` files, one per message, byte-identical to the
+  // stored raw RFC822.
+  EXPORT_FORMAT_EML = 3;
+  // One JSON document: parsed metadata, flags, attachment metadata, the raw
+  // RFC822 as base64, and — with `with_ai` — the AI summaries and tags
+  // already stored for each message.
+  EXPORT_FORMAT_JSON = 4;
+}
+
+message ExportRequest {
+  // What to export. Exactly one must be set; an unset selection is
+  // INVALID_ARGUMENT rather than "everything", because an export that
+  // silently widened to the whole mailbox is the one mistake here that
+  // cannot be taken back.
+  oneof selection {
+    // A search query in the ordinary operator grammar (`from:alice
+    // has:attachment "office move"`). Every message the query's operators
+    // and free text select is exported — this is a set, not a ranked page,
+    // so nothing is dropped for scoring below a cutoff.
+    string query = 1;
+    // Every message in one thread, oldest first.
+    int64 thread_id = 2;
+  }
+
+  // Required; EXPORT_FORMAT_UNSPECIFIED is INVALID_ARGUMENT.
+  ExportFormat format = 3;
+
+  // Attach the AI summaries and tags already stored for each message. Only
+  // EXPORT_FORMAT_JSON has anywhere to put them — the byte formats carry
+  // verbatim RFC822 and nothing else — so setting this with any other format
+  // is INVALID_ARGUMENT rather than silently ignored.
+  //
+  // This attaches what the AI passes have already produced. It never calls a
+  // model, so an export costs nothing and returns the same bytes twice.
+  bool with_ai = 4;
+
+  // Stop after this many messages. 0 (or absent) means no limit — the whole
+  // selection. Negative is INVALID_ARGUMENT.
+  int32 limit = 5;
+}
+
+// The terminal frame of a complete export.
+//
+// Its presence is the *only* proof a client has that the archive it just
+// wrote is whole. A gRPC stream that stops yielding ends OK, which is
+// indistinguishable on the wire from one the daemon cut short — and the
+// daemon's cancellation frame is best-effort (it is dropped if the client is
+// more than a moment behind when shutdown lands). So the rule for every
+// consumer is: no ExportDone, no complete archive, regardless of the call's
+// status.
+message ExportDone {
+  // Messages written to the archive.
+  int64 messages = 1;
+  // Total bytes across every frame.
+  int64 bytes = 2;
+  // Messages the selection matched that carried no stored raw RFC822 and are
+  // therefore absent from a byte-format archive. Non-zero means the archive
+  // is complete with respect to what this machine had, and short with respect
+  // to what the selection named — a distinction worth surfacing rather than
+  // burying in a server log.
+  int64 skipped_without_raw = 3;
+}
+
+// One frame of an export stream.
+//
+// Frames arrive in order, and every frame belonging to one message arrives
+// contiguously. A consumer that appends each frame's `data` to the output
+// named by `path` reproduces the archive exactly.
+message ExportChunk {
+  // Relative path within the destination, for the formats that produce one
+  // file per message (Maildir, .eml). Empty for mbox and JSON, whose whole
+  // output is a single document.
+  //
+  // Always a relative path with no `..` component. A client must still check
+  // that before touching its filesystem: this string decides where bytes
+  // land, and "the server said so" is not a reason to write outside the
+  // directory the user named.
+  string path = 1;
+
+  // True on the first frame of a message's bytes. A per-file consumer
+  // creates (or truncates) `path` on this frame and appends on every later
+  // frame carrying the same path; a single-stream consumer uses it to count
+  // messages.
+  bool start_of_message = 2;
+
+  // The message these bytes came from, or 0 for framing bytes belonging to
+  // no single message (the JSON document's opening and closing braces).
+  int64 message_id = 3;
+
+  bytes data = 4;
+
+  // Set on the last frame of a complete export, and only there. That frame
+  // carries no `data` and no `path`. See ExportDone.
+  optional ExportDone done = 5;
+}

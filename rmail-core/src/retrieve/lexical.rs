@@ -361,10 +361,17 @@ fn clamp_limit(limit: i64) -> i64 {
 }
 
 /// The `MATCH` expression built from a [`ParsedQuery`]'s terms and phrases.
-struct MatchExpr {
+///
+/// `pub(crate)` because [`crate::export`] compiles the same free text into
+/// the same expression: an export that disagreed with search about what
+/// `"office move" -draft` matches would be a second, silently divergent
+/// parser for the operator grammar. Export ignores [`MatchExpr::proximity`] —
+/// a relevance boost has no meaning for a set — and runs [`MatchExpr::full`]
+/// as a membership test.
+pub(crate) struct MatchExpr {
     /// Required terms/phrases ANDed together, with negated ones excluded via
     /// `NOT (...)`. The expression the ranked search actually runs.
-    full: String,
+    pub(crate) full: String,
     /// `NEAR(...)` over the bare (unquoted) non-negated terms, present only
     /// when there are at least two of them — with fewer than two there is
     /// nothing to be "near". Phrases are excluded: a quoted phrase already
@@ -384,7 +391,7 @@ impl MatchExpr {
     /// `unicode61` tokenizer would ever produce (see
     /// [`has_indexable_content`]) all land here, and the module docs cover
     /// why that means "nothing to rank" and not an error.
-    fn build(query: &ParsedQuery) -> Option<Self> {
+    pub(crate) fn build(query: &ParsedQuery) -> Option<Self> {
         let mut required = Vec::new();
         let mut excluded = Vec::new();
         let mut bare = Vec::new();

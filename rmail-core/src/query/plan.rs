@@ -1103,7 +1103,7 @@ fn dedup_entities(entities: Vec<EntityRef>) -> Vec<EntityRef> {
 /// than a single day (`after:last-week`), the same rule reads as "from the
 /// start of last week onward", which composes the same way for any
 /// precision the grammar accepts.
-fn resolve_filters(filters: &[Filter], now: DateTime<Utc>) -> Vec<HardFilter> {
+pub(crate) fn resolve_filters(filters: &[Filter], now: DateTime<Utc>) -> Vec<HardFilter> {
     filters
         .iter()
         .map(|filter| match &filter.op {

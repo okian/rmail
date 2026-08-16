@@ -1,5 +1,6 @@
 //! The `mail` CLI — a thin gRPC client for the rmail daemon.
 
+mod export_cli;
 mod find_cli;
 mod hook_cli;
 mod index_cli;
@@ -22,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use export_cli::ExportArgs;
 use find_cli::FindArgs;
 use note_cli::{NoteAction, NotesArgs};
 use outbox_cli::{FollowupAction, OutboxArgs, SendArgs, UndoArgs};
@@ -116,6 +118,13 @@ enum Command {
     },
     /// List notes on a message or thread (`NoteService.ListNotes`).
     Notes(NotesArgs),
+    /// Export a query or thread to mbox / Maildir / .eml / JSON
+    /// (`ExportService.Export`).
+    ///
+    /// An archive, not a search result: every message the selection matches
+    /// is written, in a deterministic order, with its raw RFC822 preserved
+    /// byte for byte.
+    Export(ExportArgs),
     /// Event hooks: config-driven shell commands on mail events
     /// (`HookService`; `add` edits the local config file directly — see
     /// `hook_cli`'s own module docs).
@@ -435,6 +444,7 @@ async fn main() -> Result<()> {
         Command::Ask(args) => ask(&socket, args).await,
         Command::Note { action } => note_cli::dispatch(&socket, action).await,
         Command::Notes(args) => note_cli::list(&socket, args).await,
+        Command::Export(args) => export_cli::export(&socket, args).await,
         Command::Hook { action } => hook_cli::run(&socket, action).await,
         Command::Index { action } => index_cli::run(&socket, action).await,
         Command::Entities(args) => index_cli::entities(&socket, args).await,

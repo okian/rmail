@@ -148,6 +148,38 @@ pub(crate) fn compile(filters: &[HardFilter]) -> FilterMask {
     }
 }
 
+/// The filters [`compile`] would silently drop as unresolvable, in order.
+///
+/// # Why this exists separately from `compile`
+///
+/// `compile` is deliberately **fail-open**: an operator it cannot resolve
+/// contributes no constraint, so a query with a typo'd `after:lasst-week`
+/// still returns *something* ranked rather than an error. That is the right
+/// call for search, where the result is a scored page a human is looking at.
+///
+/// It is the wrong call for [`crate::export`], where dropping a gate widens
+/// the selection to the whole mailbox and writes it to disk. Rather than have
+/// export re-derive the classification (a second copy that would drift the
+/// first time an operator is added), this returns exactly the set `compile`
+/// dropped, from the same `classify`/`date_effect` calls, so export can
+/// refuse the query instead of over-collecting.
+///
+/// A *negated* operator with no backing data is not included: dropping it is
+/// vacuously correct (`-tag:x` when no tags exist admits every message), not a
+/// loss of constraint.
+pub(crate) fn unenforceable(filters: &[HardFilter]) -> Vec<&'static str> {
+    filters
+        .iter()
+        .filter_map(|hard| {
+            let effect = match hard {
+                HardFilter::Date { range, .. } => date_effect(range),
+                HardFilter::Other(filter) => classify(&filter.op),
+            };
+            matches!(effect, RawEffect::Unknown).then(|| operator_kind(hard.filter()))
+        })
+        .collect()
+}
+
 /// A resolved date range's effect — always [`RawEffect::Sql`], since
 /// [`HardFilter::Date`] only exists once task 26 has already produced an
 /// absolute range.

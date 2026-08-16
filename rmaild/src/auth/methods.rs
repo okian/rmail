@@ -219,6 +219,22 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AuditService/ExportLedger",
         Requirement::Scope(Scope::Admin),
     ),
+    // -- ExportService (task 82) ---------------------------------------------
+    // An export is a bulk local read: raw RFC822, parsed metadata, flags, and
+    // — under `with_ai` — the stored AI artifacts. `mail.read` is exactly the
+    // authority that already covers reading a message, and an export is that
+    // in volume, not in kind. Deliberately *not* `admin` (the bar
+    // `AuditService` sits behind): the audit ledger is the record of what was
+    // sent to a provider and exists to hold the operator to account, while an
+    // export returns mail the caller could already fetch one `MailService/Get`
+    // at a time. Deliberately *not* `ai.invoke` under `with_ai` either — that
+    // flag attaches artifacts the AI passes already produced and cannot cause
+    // a model call (see `rmail_core::export`'s module docs), so gating it
+    // behind spend authority would misdescribe what it does.
+    (
+        "/rmail.v1.ExportService/Export",
+        Requirement::Scope(Scope::MailRead),
+    ),
     // -- MailService (task 39) -----------------------------------------------
     // Reads (list/get/thread/attachment/watch) are local-mirror lookups, so
     // `mail.read` suffices; every mutation reflects to the live IMAP server

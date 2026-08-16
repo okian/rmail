@@ -6,7 +6,8 @@
 //! `MailService`/`NoteService`/`TagService`/`SearchService`/
 //! `SavedSearchService`/`FinderService`/`ComposeService`/`SendSchedulerService`/`AiService`/
 //! `AnalyticsService`/
-//! `AiPolicyService`/`AiSafetyService`/`IndexService`/`HookService`/`RuleService` handlers — all wrapped in a
+//! `AiPolicyService`/`AiSafetyService`/`IndexService`/`HookService`/`RuleService`/
+//! `ExportService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
 //! exposed as a library function so both the `rmaild` binary and integration
@@ -23,6 +24,7 @@ mod audit_service;
 mod auth;
 mod compose_service;
 mod config_service;
+mod export_service;
 mod finder_service;
 mod hook_service;
 mod idempotency;
@@ -54,6 +56,7 @@ pub use auth::AuthLayer;
 pub use auth::Requirement;
 pub use compose_service::ComposeApi;
 pub use config_service::ConfigApi;
+pub use export_service::ExportApi;
 pub use finder_service::FinderApi;
 pub use hook_service::HookApi;
 pub use index_service::IndexApi;
@@ -117,6 +120,7 @@ use rmail_proto::v1::attachment_service_server::AttachmentServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::compose_service_server::ComposeServiceServer;
 use rmail_proto::v1::config_service_server::ConfigServiceServer;
+use rmail_proto::v1::export_service_server::ExportServiceServer;
 use rmail_proto::v1::finder_service_server::FinderServiceServer;
 use rmail_proto::v1::hook_service_server::HookServiceServer;
 use rmail_proto::v1::index_service_server::IndexServiceServer;
@@ -689,6 +693,11 @@ where
     let analytics_service =
         AnalyticsServiceServer::new(AnalyticsApi::new(db.clone(), stopping.clone()));
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
+    // `ExportService` needs nothing but the database and the shutdown token:
+    // an export is a local read that never touches IMAP or a model provider
+    // (see `rmail_core::export`'s module docs on why `--with-ai` attaches
+    // stored artifacts rather than producing new ones).
+    let export_service = ExportServiceServer::new(ExportApi::new(db.clone(), stopping.clone()));
     // Cloned before the store moves into its own service: the rules engine's
     // action runner mutates mail and tags through the *same* stores the
     // services do, so a rule-applied flag honours the same IMAP reflection and
@@ -1325,6 +1334,7 @@ where
         .add_service(account_service)
         .add_service(sync_service)
         .add_service(mail_service)
+        .add_service(export_service)
         .add_service(note_service)
         .add_service(tag_service)
         .add_service(compose_service)
