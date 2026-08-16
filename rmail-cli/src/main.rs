@@ -15,6 +15,7 @@ mod outbox_cli;
 /// asserts about `Cli`'s own `clap` tree rather than contributing to it.
 #[cfg(test)]
 mod parity;
+mod reply_cli;
 mod search_cli;
 mod stats_cli;
 mod tag_cli;
@@ -206,6 +207,19 @@ enum Command {
     TagRules {
         #[command(subcommand)]
         action: TagRuleAction,
+    },
+    /// Draft an on-voice reply to a message with Claude
+    /// (`ComposeService.DraftReply`).
+    ///
+    /// Reads the whole local thread plus samples of how you have written to
+    /// this correspondent before, streams the reply as it is written, and
+    /// stages it as an ordinary editable draft. It never sends: putting it on
+    /// the wire is `mail send`, past the pre-send guardian.
+    Reply(reply_cli::ReplyArgs),
+    /// Rewrite, list and revert draft revisions (`ComposeService`).
+    Draft {
+        #[command(subcommand)]
+        action: reply_cli::DraftAction,
     },
     /// Send a message now (undoable) or schedule it for later
     /// (`SendSchedulerService.ScheduleSend`).
@@ -645,6 +659,8 @@ async fn main() -> Result<()> {
         Command::Untag(args) => tag_cli::untag(&socket, args).await,
         Command::Tags(args) => tag_cli::tags(&socket, args).await,
         Command::SuggestTags { message_id } => tag_cli::suggest_tags(&socket, message_id).await,
+        Command::Reply(args) => reply_cli::reply(&socket, args).await,
+        Command::Draft { action } => reply_cli::dispatch(&socket, action).await,
         Command::Send(args) => outbox_cli::send(&socket, args).await,
         Command::Undo(args) => outbox_cli::undo(&socket, args).await,
         Command::Outbox(args) => outbox_cli::outbox(&socket, args).await,

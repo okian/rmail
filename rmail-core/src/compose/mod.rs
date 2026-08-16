@@ -49,6 +49,7 @@
 
 pub mod address;
 pub mod mime;
+pub mod reply;
 
 use rusqlite::{OptionalExtension, Row, Transaction};
 

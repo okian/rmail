@@ -48,6 +48,44 @@ service ComposeService {
   // path's serializer — a token that can only read mail should not be able
   // to mint a sendable message, however it is later carried.
   rpc RenderDraft(RenderDraftRequest) returns (RenderedDraft);
+
+  // Draft a reply to a local message with Claude (prd.md #18, task 62), from
+  // the full local thread, samples of how this user has written to this
+  // correspondent before, and a short intent.
+  //
+  // Streams the reply body as it is written, then stages it as an ordinary
+  // editable draft and emits it. **It never sends.** The draft it produces
+  // goes out the same way a hand-typed one does — through
+  // `SendSchedulerService`, past the pre-send guardian, with the configured
+  // undo window — or not at all. Nothing on this path can reach the outbox.
+  //
+  // Headers are derived from the parent, not generated: To is its author, Cc
+  // (with `reply_all`) its other recipients minus this user, Subject its
+  // subject with one `Re:`, and In-Reply-To/References are frozen by
+  // CreateDraft's own resolution. A model that could name recipients would be
+  // a model a hostile message could talk into naming its own.
+  rpc DraftReply(DraftReplyRequest) returns (stream DraftReplyEvent);
+
+  // Rewrite a draft to a target register and length (prd.md #19), storing the
+  // result as a new revision rather than editing in place.
+  //
+  // The first rewrite also captures the pre-rewrite text as revision 0, so
+  // `ListDraftRevisions` + `SelectDraftRevision` can cycle through every
+  // version and revert to what the user originally typed.
+  rpc RewriteDraft(RewriteDraftRequest) returns (DraftRevision);
+
+  // Every stored revision of a draft, oldest first. A draft nobody has
+  // rewritten has none, which is an empty list rather than an error.
+  rpc ListDraftRevisions(ListDraftRevisionsRequest) returns (ListDraftRevisionsResponse);
+
+  // Point a draft at one of its revisions: the cycle and the revert, which
+  // are one operation.
+  //
+  // The draft's current text is written back into whichever revision is
+  // active before the switch, so an edit made by hand after a rewrite
+  // survives a round trip through the cycle rather than being discarded by
+  // it.
+  rpc SelectDraftRevision(SelectDraftRevisionRequest) returns (Draft);
 }
 
 // One mailbox: an addr-spec plus an optional display name, both decoded.
@@ -203,4 +241,139 @@ message RenderedDraft {
   string message_id = 2;
   // Every RCPT TO the submission must issue: To, Cc, and Bcc, deduplicated.
   repeated string envelope_recipients = 3;
+}
+
+// -- AI reply drafting and rewrite (task 62) ---------------------------------
+
+message DraftReplyRequest {
+  // The local message being replied to. Its account, folder, thread and
+  // author are all read from here — a reply names no recipients of its own.
+  int64 message_id = 1;
+  // A short statement of what the reply should say ("yes, but push to
+  // Tuesday"). May be empty, in which case the shortest reply that moves the
+  // thread forward is written.
+  //
+  // Treated as untrusted data, not as instruction: the caller of this RPC is
+  // frequently an agent that has just read a hostile message, and that
+  // message's words must not become instructions merely by arriving here.
+  string intent = 2;
+  // Address everyone the parent addressed, not only its author. This user's
+  // own addresses are always dropped from the result, and the author stays in
+  // To rather than appearing twice.
+  bool reply_all = 3;
+}
+
+// What the drafter read before it called the model — the first frame of a
+// DraftReply stream, so a client can say "reading 7 messages, 3 past replies"
+// while tokens are still arriving.
+message DraftReplyContext {
+  // Thread messages that reached the prompt.
+  int32 thread_messages = 1;
+  // Thread messages `ai.policy` withheld from it (a local_only or forbidden
+  // folder's copy is never built into a payload at all).
+  int32 withheld_by_policy = 2;
+  // Past replies of this user's own that were sampled for voice.
+  int32 voice_samples = 3;
+  // The model actually used, after any budget-driven downgrade.
+  string model = 4;
+}
+
+// One frame of a DraftReply stream, mirroring AnalyzeEvent's vocabulary.
+//
+// Concatenating every `token` in arrival order reproduces the reply the model
+// wrote. The staged draft's `body_text` is that text after two further,
+// server-side steps a client cannot reproduce and should not try to: it is
+// trimmed and its line endings normalized, and (unless
+// `send.reply.quote_original = false`) the quoted original is appended. Show
+// the tokens as they arrive; read the draft for what will actually be sent.
+//
+// Order: context, then tokens, then the staged draft, then usage, then done.
+// `draft` precedes `done` on purpose — a client that has seen `done` knows
+// the draft is durable.
+message DraftReplyEvent {
+  oneof event {
+    DraftReplyContext context = 1;
+    string token = 2;
+    Draft draft = 3;
+    AiUsage usage = 4;
+    DraftReplyDone done = 5;
+  }
+}
+
+// Final token accounting for one DraftReply stream. The in-flight echo of
+// what AuditService.QueryAiCalls records durably for the same call.
+message AiUsage {
+  int64 input_tokens = 1;
+  int64 output_tokens = 2;
+  int64 cache_creation_input_tokens = 3;
+  int64 cache_read_input_tokens = 4;
+}
+
+message DraftReplyDone {
+  // end_turn | max_tokens | stop_sequence | tool_use | pause_turn.
+  string stop_reason = 1;
+}
+
+// The register a rewrite aims for.
+enum RewriteTone {
+  REWRITE_TONE_UNSPECIFIED = 0;
+  // Leave the register alone — a length-only rewrite.
+  REWRITE_TONE_AS_IS = 1;
+  REWRITE_TONE_FORMAL = 2;
+  REWRITE_TONE_CASUAL = 3;
+  REWRITE_TONE_WARMER = 4;
+  REWRITE_TONE_FIRMER = 5;
+  // Mirror the register the correspondent themselves writes in.
+  REWRITE_TONE_MIRROR = 6;
+}
+
+// The length a rewrite aims for.
+enum RewriteLength {
+  REWRITE_LENGTH_UNSPECIFIED = 0;
+  REWRITE_LENGTH_AS_IS = 1;
+  REWRITE_LENGTH_SHORTER = 2;
+  REWRITE_LENGTH_LONGER = 3;
+}
+
+message RewriteDraftRequest {
+  int64 draft_id = 1;
+  RewriteTone tone = 2;
+  RewriteLength length = 3;
+  // Extra free-form instruction ("drop the apology"). Fenced as untrusted
+  // data for the reason DraftReplyRequest.intent is.
+  string instruction = 4;
+}
+
+// One stored version of a draft.
+message DraftRevision {
+  int64 id = 1;
+  int64 draft_id = 2;
+  // Position in the cycle. 0 is always the pre-rewrite original.
+  int64 seq = 3;
+  // How this revision came to be: "original", or the instruction that
+  // produced it ("formal, shorter").
+  string label = 4;
+  string subject = 5;
+  string body_text = 6;
+  // The model that wrote it. Absent on revision 0, which no model wrote.
+  optional string model = 7;
+  // Whether the draft currently holds this revision's text. Exactly one
+  // revision of a draft is active.
+  bool active = 8;
+  // Unix seconds.
+  int64 created_at = 9;
+}
+
+message ListDraftRevisionsRequest {
+  int64 draft_id = 1;
+}
+
+message ListDraftRevisionsResponse {
+  repeated DraftRevision revisions = 1;
+}
+
+message SelectDraftRevisionRequest {
+  int64 draft_id = 1;
+  // The revision to make active. 0 reverts to what the user originally typed.
+  int64 seq = 2;
 }

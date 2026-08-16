@@ -295,6 +295,8 @@ impl TestServer {
                 Duration::from_secs(3600),
                 Duration::from_secs(60),
             ),
+            self.db.clone(),
+            CancellationToken::new(),
         );
         use rmail_proto::v1::compose_service_server::ComposeService as _;
         api.create_draft(tonic::Request::new(CreateDraftRequest {

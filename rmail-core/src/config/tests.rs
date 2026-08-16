@@ -853,6 +853,57 @@ fn inline_password_is_rejected() {
 }
 
 #[test]
+fn reply_drafting_is_settable_by_file_and_env() {
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        let cfg = Config::from_toml_str("[send.reply]\nvoice_samples = 0\n").map_err(fe)?;
+        assert_eq!(cfg.send.reply.voice_samples, 0);
+        assert_eq!(
+            cfg.send.reply.model, "claude-sonnet-5",
+            "prd.md's drafting tier, not ai.models.deep"
+        );
+        assert!(
+            cfg.send.reply.quote_original,
+            "the other keys still default"
+        );
+        Ok(())
+    });
+
+    // The env overlay is what `.env.example` documents; a typo'd key or a
+    // nesting mistake would otherwise ship as a setting that simply never
+    // takes.
+    Jail::expect_with(|jail| {
+        jail.clear_env();
+        jail.set_env("RMAIL_SEND__REPLY__MODEL", "claude-haiku-4-5");
+        jail.set_env("RMAIL_SEND__REPLY__MAX_TOKENS", "512");
+        jail.set_env("RMAIL_SEND__REPLY__TIMEOUT", "5s");
+        jail.set_env("RMAIL_SEND__REPLY__THREAD_MESSAGES", "3");
+        jail.set_env("RMAIL_SEND__REPLY__VOICE_SAMPLES", "1");
+        jail.set_env("RMAIL_SEND__REPLY__SAMPLE_CHARS", "200");
+        jail.set_env("RMAIL_SEND__REPLY__QUOTE_ORIGINAL", "false");
+        jail.set_env("RMAIL_SEND__REPLY__QUOTE_CHARS", "100");
+
+        let cfg = Config::from_toml_str("").map_err(fe)?;
+        assert_eq!(cfg.send.reply.model, "claude-haiku-4-5");
+        assert_eq!(cfg.send.reply.max_tokens, 512);
+        assert_eq!(
+            cfg.send.reply.timeout.as_duration(),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(cfg.send.reply.thread_messages, 3);
+        assert_eq!(cfg.send.reply.voice_samples, 1);
+        assert_eq!(cfg.send.reply.sample_chars, 200);
+        assert!(!cfg.send.reply.quote_original);
+        assert_eq!(cfg.send.reply.quote_chars, 100);
+        assert_eq!(
+            cfg.send.preflight.max_recipients, 15,
+            "a sibling send setting is unaffected"
+        );
+        Ok(())
+    });
+}
+
+#[test]
 fn socket_path_tilde_expansion() {
     Jail::expect_with(|jail| {
         jail.clear_env();

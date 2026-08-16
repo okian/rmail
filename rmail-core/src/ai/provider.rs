@@ -242,6 +242,26 @@ pub enum StopReason {
     PauseTurn,
 }
 
+impl StopReason {
+    /// The wire spelling every streaming RPC reports this as.
+    ///
+    /// Here rather than beside one service's frame builder because two of
+    /// them now report it (`AiService.AnalyzeMessage` and
+    /// `ComposeService.DraftReply`), and a second `match` would be a second
+    /// vocabulary for clients to reconcile the moment either one gained a
+    /// variant the other did not.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::MaxTokens => "max_tokens",
+            Self::StopSequence => "stop_sequence",
+            Self::ToolUse => "tool_use",
+            Self::PauseTurn => "pause_turn",
+        }
+    }
+}
+
 /// Token accounting for one request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {

@@ -415,6 +415,44 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.ComposeService/RenderDraft",
         Requirement::Scope(Scope::MailSend),
     ),
+    // -- ComposeService, AI half (task 62) ------------------------------------
+    // `AllOf`, for the reason `RuleService`'s own model-calling rows give:
+    // either scope alone under-gates these.
+    //
+    // `ai.invoke` because they reach a provider, which is the scope every
+    // provider-calling RPC in this table sits behind — a `mail.write` token
+    // minted deliberately *without* it (a composer or automation token) must
+    // not be able to force unbounded provider spend, which is the same failure
+    // `AiService/AnalyzeMessage`'s row exists to prevent from the other side.
+    //
+    // `mail.write` because they do something no `AiService` RPC does: they
+    // leave a *draft* behind. A draft is a document a human later opens, reads
+    // as their own words, and sends, so planting one is a mail mutation and
+    // must require the mutation scope — an `ai.invoke`-only token ("let Claude
+    // summarize my mail") must not be able to put text in someone's composer.
+    //
+    // Neither is `mail.send`, and that line is the whole point of the task: a
+    // drafted reply terminates at `DraftStore` and leaves this machine only
+    // through `SendSchedulerService/ScheduleSend`, which is separately scoped
+    // and separately guarded.
+    (
+        "/rmail.v1.ComposeService/DraftReply",
+        Requirement::AllOf(&[Scope::MailWrite, Scope::AiInvoke]),
+    ),
+    (
+        "/rmail.v1.ComposeService/RewriteDraft",
+        Requirement::AllOf(&[Scope::MailWrite, Scope::AiInvoke]),
+    ),
+    // Revisions call no model at all — they are draft history, scoped exactly
+    // like the draft CRUD they belong to.
+    (
+        "/rmail.v1.ComposeService/ListDraftRevisions",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    (
+        "/rmail.v1.ComposeService/SelectDraftRevision",
+        Requirement::Scope(Scope::MailWrite),
+    ),
     // -- SearchService (tasks 33, 37, 51) -------------------------------------
     // Every RPC here is a read-only query over the local index (no IMAP round
     // trip, no mutation — see `search_service`'s own module docs), so
@@ -1613,6 +1651,60 @@ mod tests {
                 "{method} is a dry run and must not demand a mutation scope it never uses"
             );
         }
+    }
+
+    /// Neither half of AI reply drafting's scope pair is enough on its own.
+    ///
+    /// The two failures this pins are symmetric and both were live in an
+    /// earlier draft of this table: an `ai.invoke`-only token planting a draft
+    /// in a mailbox it may only read, and a `mail.write`-only token forcing
+    /// provider spend an operator never granted.
+    #[test]
+    fn drafting_a_reply_needs_both_mail_write_and_ai_invoke() {
+        for method in [
+            "/rmail.v1.ComposeService/DraftReply",
+            "/rmail.v1.ComposeService/RewriteDraft",
+        ] {
+            let Some(Requirement::AllOf(required)) = lookup(method) else {
+                unreachable!("{method} should require every one of a scope set");
+            };
+            assert!(
+                required.contains(&Scope::AiInvoke),
+                "{method} can spend at a model provider and must require ai.invoke"
+            );
+            assert!(
+                required.contains(&Scope::MailWrite),
+                "{method} leaves a draft behind and must require mail.write"
+            );
+            assert!(
+                !required.contains(&Scope::MailSend),
+                "{method} must not demand a send scope: it stages a draft and stops"
+            );
+            for alone in [Scope::MailWrite, Scope::AiInvoke, Scope::MailRead] {
+                let held = [alone.clone()];
+                assert!(
+                    !required
+                        .iter()
+                        .all(|want| rmail_core::auth::satisfies(&held, want)),
+                    "{method} must not be satisfied by {alone:?} alone"
+                );
+            }
+        }
+    }
+
+    /// Cycling a draft's revisions calls no model, so it must not be gated
+    /// behind one — a user who turns AI off after a rewrite has to be able to
+    /// revert it.
+    #[test]
+    fn draft_revisions_are_scoped_like_the_draft_crud_they_belong_to() {
+        assert_eq!(
+            lookup("/rmail.v1.ComposeService/ListDraftRevisions"),
+            Some(&Requirement::Scope(Scope::MailRead))
+        );
+        assert_eq!(
+            lookup("/rmail.v1.ComposeService/SelectDraftRevision"),
+            Some(&Requirement::Scope(Scope::MailWrite))
+        );
     }
 
     #[test]

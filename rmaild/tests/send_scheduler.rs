@@ -170,6 +170,8 @@ impl TestServer {
                 std::time::Duration::from_secs(3600),
                 std::time::Duration::from_secs(60),
             ),
+            self.db.clone(),
+            tokio_util::sync::CancellationToken::new(),
         );
         use rmail_proto::v1::compose_service_server::ComposeService as _;
         api.create_draft(tonic::Request::new(CreateDraftRequest {

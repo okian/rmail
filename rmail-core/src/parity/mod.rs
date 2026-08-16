@@ -959,6 +959,44 @@ commands! {
         summary: "Render a draft to final RFC 5322 octets without sending it.",
     }
 
+    // -- ComposeService, AI half (task 62) ------------------------------------
+    ComposeDraftReply {
+        rpc: "/rmail.v1.ComposeService/DraftReply",
+        tool: "draft_reply",
+        // Spend at a provider is an observable effect (see `Effect`), and it
+        // writes a draft row. It is still nowhere near `send`: the draft it
+        // produces has to go through `SendSchedulerService` like any other.
+        effect: Mutate,
+        cli: ["reply"],
+        actions: [],
+        summary: "Draft an on-voice reply to a message with Claude, staged as an editable draft \
+                  that is never sent.",
+    }
+    ComposeRewriteDraft {
+        rpc: "/rmail.v1.ComposeService/RewriteDraft",
+        tool: "rewrite_draft",
+        effect: Mutate,
+        cli: ["draft rewrite"],
+        actions: [],
+        summary: "Rewrite a draft to a target tone and length, stored as a revertible revision.",
+    }
+    ComposeListDraftRevisions {
+        rpc: "/rmail.v1.ComposeService/ListDraftRevisions",
+        tool: "list_draft_revisions",
+        effect: Read,
+        cli: ["draft revisions"],
+        actions: [],
+        summary: "List a draft's stored revisions, oldest first.",
+    }
+    ComposeSelectDraftRevision {
+        rpc: "/rmail.v1.ComposeService/SelectDraftRevision",
+        tool: "select_draft_revision",
+        effect: Mutate,
+        cli: ["draft revert"],
+        actions: [],
+        summary: "Point a draft at one of its revisions — the cycle and the revert.",
+    }
+
     // -- SendSchedulerService (task 61) ----------------------------------------
     SendSchedulerScheduleSend {
         rpc: "/rmail.v1.SendSchedulerService/ScheduleSend",

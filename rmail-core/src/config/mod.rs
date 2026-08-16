@@ -2081,6 +2081,8 @@ pub struct SendConfig {
     pub followup: SendFollowup,
     /// Pre-send guardian settings.
     pub preflight: SendPreflight,
+    /// AI reply-drafting and rewrite settings.
+    pub reply: SendReply,
 }
 
 impl Default for SendConfig {
@@ -2100,6 +2102,61 @@ impl Default for SendConfig {
             optimal: SendOptimal::default(),
             followup: SendFollowup::default(),
             preflight: SendPreflight::default(),
+            reply: SendReply::default(),
+        }
+    }
+}
+
+/// AI reply drafting (`ComposeService.DraftReply`, `mail reply --ai`) and the
+/// tone/length rewrite (`ComposeService.RewriteDraft`).
+///
+/// Deliberately a small table, the same way `[ai.ask]` is: everything that
+/// decides *whether* a call may happen — spend caps, concurrency, redaction,
+/// per-folder eligibility — already lives in `[ai.limits]`, `[ai.privacy]` and
+/// `[ai.policy]`, and this path draws on those rather than restating them.
+/// What is here is only what shapes the prompt this feature builds.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SendReply {
+    /// The model that writes the reply. prd.md's "`claude-sonnet-5` default
+    /// for RAG/drafting" — not `ai.models.deep`, which is the opus tier a
+    /// per-message deep pass uses.
+    pub model: String,
+    /// Output-token ceiling for one reply or rewrite.
+    pub max_tokens: u32,
+    /// How long a rewrite may take — the *whole* call, including the wait for
+    /// concurrency, not only the network hop.
+    ///
+    /// `DraftReply` has no equivalent because it streams: its client is
+    /// watching tokens arrive and holds the deadline itself, and a server-side
+    /// timer that cut a stream mid-sentence would destroy a draft the user
+    /// could already read.
+    pub timeout: HumanDuration,
+    /// How many of a thread's most recent messages reach the prompt.
+    pub thread_messages: u32,
+    /// How many of the user's own past replies to the same correspondent are
+    /// sampled for voice. `0` disables voice sampling.
+    pub voice_samples: u32,
+    /// How much of one voice sample's body is used.
+    pub sample_chars: u32,
+    /// Whether a drafted reply quotes the message it answers below the new
+    /// text, the way a hand-written reply does.
+    pub quote_original: bool,
+    /// How much of the quoted original is kept.
+    pub quote_chars: u32,
+}
+
+impl Default for SendReply {
+    fn default() -> Self {
+        Self {
+            model: "claude-sonnet-5".to_owned(),
+            max_tokens: 2_048,
+            timeout: HumanDuration::new(secs(60)),
+            thread_messages: 12,
+            voice_samples: 3,
+            sample_chars: 1_500,
+            quote_original: true,
+            quote_chars: 4_000,
         }
     }
 }

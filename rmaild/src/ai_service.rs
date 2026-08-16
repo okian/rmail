@@ -1122,14 +1122,11 @@ fn to_proto_usage(usage: ai::provider::Usage) -> ProtoUsage {
     }
 }
 
+/// Delegates to [`ai::provider::StopReason::as_str`], which is where the
+/// vocabulary lives now that `ComposeService.DraftReply` reports it too. Kept
+/// as a named function only because this file's call sites read better for it.
 fn stop_reason_str(reason: ai::provider::StopReason) -> &'static str {
-    match reason {
-        ai::provider::StopReason::EndTurn => "end_turn",
-        ai::provider::StopReason::MaxTokens => "max_tokens",
-        ai::provider::StopReason::StopSequence => "stop_sequence",
-        ai::provider::StopReason::ToolUse => "tool_use",
-        ai::provider::StopReason::PauseTurn => "pause_turn",
-    }
+    reason.as_str()
 }
 
 /// A synthetic lease for a forced (queue-bypassing) call —

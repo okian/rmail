@@ -83,6 +83,7 @@ use rmail_core::ai::{
     BatchCoordinator, DeepPassGate, DeepPassHandler, PassHandler, PolicyEngine,
     Provider as AiProvider, QueueOptions as AiQueueOptions, RateLimiter, TriagePassHandler,
 };
+use rmail_core::compose::reply::ReplyDrafter;
 use rmail_core::compose::DraftStore;
 use rmail_core::digest::{DigestEngine, DigestScheduler};
 use rmail_core::embed::hash::HashEmbedder;
@@ -760,13 +761,21 @@ where
     // draw on the *same* semaphore and rate limiter every other AI call site
     // in this process shares.
     //
-    // `ComposeService` needs nothing but the database: drafts are local, and
-    // this task deliberately stops short of SMTP (task 61 owns submission),
-    // so there is no client, pool, or background loop to wire up here.
-    let compose_service = ComposeServiceServer::new(ComposeApi::new(
+    // `ComposeService`'s draft CRUD needs nothing but the database: drafts are
+    // local, and it deliberately stops short of SMTP (task 61 owns
+    // submission), so there is no client, pool, or background loop here.
+    //
+    // Task 62's `DraftReply`/`RewriteDraft` do need the provider, so the
+    // handler is *built* here and the drafter is attached further down, where
+    // the provider exists — the same two-step `SendSchedulerApi` uses. The
+    // revision RPCs are on the always-available half on purpose: a user who
+    // turns AI off after a rewrite must still be able to revert it.
+    let compose_api = ComposeApi::new(
         DraftStore::new(db.clone()),
         idempotency.clone(),
-    ));
+        db.clone(),
+        stopping.clone(),
+    );
     // The keymap the TUI reads directly; served for palette/MCP clients that
     // have no other way to discover the action-id registry. See
     // `config_service`'s own docs for why the daemon serves a client-side file.
@@ -1415,6 +1424,37 @@ where
         );
     }
     let send_scheduler_service = SendSchedulerServiceServer::new(send_scheduler_api);
+
+    // AI reply drafting (task 62), attached to the already-built
+    // `ComposeService` handler now that the provider exists. Wired only when
+    // the AI subsystem is genuinely active, for the reason the guardian above
+    // is: with `NullProvider` behind it every `DraftReply` would spend a
+    // policy resolution, a thread read and a redaction pass to reach a
+    // provider that always refuses. `None` says so once, structurally — see
+    // `ComposeApi::drafter`.
+    //
+    // Shares `ai_semaphore`/`ai_rate_limiter` with the worker pool and every
+    // other call site, for the reason `rmail_core::ai::gate` documents: a
+    // second pair would let the paths together exceed `ai.limits`.
+    let compose_api = if ai_active {
+        compose_api.with_drafter(ReplyDrafter::new(
+            db.clone(),
+            Arc::clone(&ai_provider),
+            Arc::clone(&ai_policy),
+            config.ai.privacy.clone(),
+            config.ai.limits.clone(),
+            config.send.reply.clone(),
+            Arc::clone(&ai_semaphore),
+            Arc::clone(&ai_rate_limiter),
+        ))
+    } else {
+        tracing::info!(
+            "the AI subsystem is inactive; DraftReply/RewriteDraft answer FAILED_PRECONDITION \
+             (draft CRUD and revision cycling are unaffected)"
+        );
+        compose_api
+    };
+    let compose_service = ComposeServiceServer::new(compose_api);
 
     // The rules engine (task 66). Registered unconditionally — the reflection
     // set and the auth scope table must see every RPC regardless of runtime

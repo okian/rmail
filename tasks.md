@@ -610,7 +610,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core outbox::` (lifecycle, idempotent retry, offline/late tolerance) · `cargo nextest run -p rmaild --test send_scheduler`
 
 ## 62. AI reply drafting
-- [ ] status
+- [x] status
 - **depends-on:** 60, 43, 49
 - **parallel-safe:** yes
 - **acceptance:**

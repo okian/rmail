@@ -21,21 +21,59 @@
 //! It serializes and returns; SMTP submission is task 61. It nonetheless
 //! sits behind `mail.send` in `auth::methods` — see that table's row for the
 //! reasoning.
+//!
+//! # The AI half (task 62) is an adapter and nothing else
+//!
+//! `DraftReply`/`RewriteDraft`/`ListDraftRevisions`/`SelectDraftRevision` have
+//! none of their logic here. [`rmail_core::compose::reply`] owns context
+//! gathering, the AI policy/budget gate, the fences, the redaction firewall,
+//! the model call, header derivation and the revision history; this file
+//! converts its [`ReplyEvent`](rmail_core::compose::reply::ReplyEvent)s to
+//! wire frames and its enums to proto enums. That split is deliberate for the
+//! same reason `ai_service`'s `AskMailbox` adapter documents: every property
+//! task 62 has to guarantee — above all that a drafted reply can never send
+//! itself — is provable without a gRPC server, and a transport layer that
+//! could weaken one by accident is one that would need re-auditing on every
+//! change.
+//!
+//! [`ComposeApi::drafter`] is `Option`, and absent on a daemon whose AI
+//! subsystem never came up. The four RPCs then answer `FAILED_PRECONDITION`
+//! rather than reaching a `NullProvider` that would refuse anyway after
+//! spending a policy resolution and a redaction pass — the same shape
+//! `SendSchedulerApi::guardian` uses.
 #![allow(clippy::result_large_err)]
 
+use std::pin::Pin;
+use std::sync::Arc;
+
+use futures::{Stream, StreamExt};
+use rmail_core::compose::reply::{
+    self, Length, ReplyDrafter, ReplyEvent, ReplyRequest, Revision, RewriteRequest, Tone,
+};
 use rmail_core::compose::{
     Draft as CoreDraft, DraftAttachment as CoreAttachment, DraftPatch, DraftStore, Mailbox,
     NewAttachment, NewDraft,
 };
 use rmail_core::idempotency::IdempotencyStore;
-use rmail_core::Error;
+use rmail_core::{Database, Error};
 use rmail_proto::v1::compose_service_server::ComposeService;
 use rmail_proto::v1::{
-    CreateDraftRequest, DeleteDraftRequest, Draft as ProtoDraft, DraftAddress as ProtoAddress,
-    DraftAttachment as ProtoAttachment, GetDraftRequest, ListDraftsRequest, ListDraftsResponse,
-    NewDraftAttachment, RenderDraftRequest, RenderedDraft, UpdateDraftRequest,
+    draft_reply_event, AiUsage, CreateDraftRequest, DeleteDraftRequest, Draft as ProtoDraft,
+    DraftAddress as ProtoAddress, DraftAttachment as ProtoAttachment, DraftReplyContext,
+    DraftReplyDone, DraftReplyEvent, DraftReplyRequest, DraftRevision as ProtoRevision,
+    GetDraftRequest, ListDraftRevisionsRequest, ListDraftRevisionsResponse, ListDraftsRequest,
+    ListDraftsResponse, NewDraftAttachment, RenderDraftRequest, RenderedDraft, RewriteDraftRequest,
+    RewriteLength, RewriteTone, SelectDraftRevisionRequest, UpdateDraftRequest,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
+
+/// Backpressure between a stream's producer task and its consumer — see
+/// `sync_service::STREAM_BUFFER`'s identical reasoning.
+const STREAM_BUFFER: usize = 64;
 
 /// The `ComposeService` handler.
 #[derive(Clone)]
@@ -45,13 +83,56 @@ pub struct ComposeApi {
     /// carries no uniqueness of its own, so without this a retried create
     /// leaves two identical drafts and no way to tell which id is live.
     idempotency: IdempotencyStore,
+    /// Read directly by the revision RPCs, which call no model and must keep
+    /// working on a daemon whose AI subsystem is off: a user who turned AI off
+    /// after a rewrite must still be able to revert it.
+    db: Database,
+    /// `None` on a daemon whose AI subsystem never came up — see the module
+    /// docs.
+    drafter: Option<Arc<ReplyDrafter>>,
+    /// Cancelled when the daemon starts shutting down, so a `DraftReply`
+    /// stream ends (and aborts its upstream request) instead of holding the
+    /// connection open through graceful shutdown.
+    shutdown: CancellationToken,
 }
 
 impl ComposeApi {
     /// Build a handler over a draft store.
+    ///
+    /// The AI half is attached separately with [`Self::with_drafter`]: a
+    /// daemon can serve drafts long before (or entirely without) a provider.
     #[must_use]
-    pub fn new(store: DraftStore, idempotency: IdempotencyStore) -> Self {
-        Self { store, idempotency }
+    pub fn new(
+        store: DraftStore,
+        idempotency: IdempotencyStore,
+        db: Database,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            store,
+            idempotency,
+            db,
+            drafter: None,
+            shutdown,
+        }
+    }
+
+    /// Attach the reply drafter, enabling `DraftReply`/`RewriteDraft`.
+    #[must_use]
+    pub fn with_drafter(mut self, drafter: ReplyDrafter) -> Self {
+        self.drafter = Some(Arc::new(drafter));
+        self
+    }
+
+    /// The drafter, or the refusal a daemon with no AI subsystem owes.
+    fn drafter(&self) -> Result<&Arc<ReplyDrafter>, Status> {
+        self.drafter.as_ref().ok_or_else(|| {
+            Status::from(Error::failed_precondition(
+                "AI reply drafting is not available on this daemon: the AI subsystem is \
+                 disabled or its provider could not be built"
+                    .to_owned(),
+            ))
+        })
     }
 }
 
@@ -179,6 +260,192 @@ impl ComposeService for ComposeApi {
             message_id: rendered.message_id,
             envelope_recipients: rendered.envelope_recipients,
         }))
+    }
+
+    type DraftReplyStream = Pin<Box<dyn Stream<Item = Result<DraftReplyEvent, Status>> + Send>>;
+
+    #[tracing::instrument(skip(self, request), fields(message_id, reply_all))]
+    async fn draft_reply(
+        &self,
+        request: Request<DraftReplyRequest>,
+    ) -> Result<Response<Self::DraftReplyStream>, Status> {
+        let drafter = Arc::clone(self.drafter()?);
+        let req = request.into_inner();
+        let span = tracing::Span::current();
+        span.record("message_id", req.message_id);
+        span.record("reply_all", req.reply_all);
+
+        // A child of the daemon's shutdown token: when the client disconnects
+        // this is cancelled by the send loop below, which drops the core
+        // stream, which aborts the upstream HTTP request rather than merely
+        // abandoning the local relay.
+        let cancel = self.shutdown.child_token();
+        // Awaited here, not in the producer task, so everything decidable
+        // without the network — a missing message, an over-long intent, a
+        // policy refusal, a spent budget — reaches the client as the RPC's own
+        // status instead of as an error frame it has to unwrap.
+        let mut events = drafter
+            .draft_reply(
+                &ReplyRequest {
+                    message_id: req.message_id,
+                    intent: req.intent,
+                    reply_all: req.reply_all,
+                },
+                &cancel,
+            )
+            .await
+            .map_err(Status::from)?;
+
+        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        tokio::spawn(
+            async move {
+                // Cancelled when this task ends for any reason. Dropping
+                // `events` alone would eventually stop the core drafter, but
+                // only once it tried to send again; the token is what aborts
+                // the upstream HTTP request immediately.
+                let _guard = cancel.clone().drop_guard();
+                loop {
+                    let event = tokio::select! {
+                        // Watched alongside the stream, not only discovered by
+                        // a failing `send`: `DraftReply` has no server-side
+                        // deadline by design, and `ClaudeProvider::stream`
+                        // applies no per-request timeout, so a stalled upstream
+                        // plus a client that has gone away would otherwise hold
+                        // a shared `ai.limits` permit until daemon shutdown.
+                        () = tx.closed() => return,
+                        next = events.next() => next,
+                    };
+                    let Some(event) = event else { return };
+                    let frame = match event {
+                        Ok(event) => Ok(event_to_proto(event)),
+                        Err(error) => Err(Status::from(error)),
+                    };
+                    let terminal = frame.is_err();
+                    if tx.send(frame).await.is_err() || terminal {
+                        return;
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(draft_id))]
+    async fn rewrite_draft(
+        &self,
+        request: Request<RewriteDraftRequest>,
+    ) -> Result<Response<ProtoRevision>, Status> {
+        let drafter = self.drafter()?;
+        let req = request.into_inner();
+        tracing::Span::current().record("draft_id", req.draft_id);
+        let revision = drafter
+            .rewrite(
+                &RewriteRequest {
+                    draft_id: req.draft_id,
+                    tone: tone_from_proto(req.tone)?,
+                    length: length_from_proto(req.length)?,
+                    instruction: req.instruction,
+                },
+                &self.shutdown.child_token(),
+            )
+            .await?;
+        Ok(Response::new(revision_to_proto(&revision)))
+    }
+
+    async fn list_draft_revisions(
+        &self,
+        request: Request<ListDraftRevisionsRequest>,
+    ) -> Result<Response<ListDraftRevisionsResponse>, Status> {
+        let revisions = reply::list_revisions(&self.db, request.into_inner().draft_id).await?;
+        Ok(Response::new(ListDraftRevisionsResponse {
+            revisions: revisions.iter().map(revision_to_proto).collect(),
+        }))
+    }
+
+    async fn select_draft_revision(
+        &self,
+        request: Request<SelectDraftRevisionRequest>,
+    ) -> Result<Response<ProtoDraft>, Status> {
+        let req = request.into_inner();
+        if req.seq < 0 {
+            return Err(Status::from(Error::invalid_argument(
+                "a revision sequence must not be negative",
+            )));
+        }
+        let draft = reply::select_revision(&self.db, req.draft_id, req.seq).await?;
+        Ok(Response::new(draft_to_proto(&draft)))
+    }
+}
+
+/// One core event as its wire frame.
+fn event_to_proto(event: ReplyEvent) -> DraftReplyEvent {
+    let event = match event {
+        ReplyEvent::Context(context) => draft_reply_event::Event::Context(DraftReplyContext {
+            thread_messages: i32::try_from(context.thread_messages).unwrap_or(i32::MAX),
+            withheld_by_policy: i32::try_from(context.withheld_by_policy).unwrap_or(i32::MAX),
+            voice_samples: i32::try_from(context.voice_samples).unwrap_or(i32::MAX),
+            model: context.model,
+        }),
+        ReplyEvent::Token(token) => draft_reply_event::Event::Token(token),
+        ReplyEvent::Drafted(draft) => draft_reply_event::Event::Draft(draft_to_proto(&draft)),
+        ReplyEvent::Usage(usage) => draft_reply_event::Event::Usage(AiUsage {
+            input_tokens: i64::from(usage.input_tokens),
+            output_tokens: i64::from(usage.output_tokens),
+            cache_creation_input_tokens: i64::from(usage.cache_creation_input_tokens),
+            cache_read_input_tokens: i64::from(usage.cache_read_input_tokens),
+        }),
+        ReplyEvent::Done(stop_reason) => draft_reply_event::Event::Done(DraftReplyDone {
+            stop_reason: stop_reason.as_str().to_owned(),
+        }),
+    };
+    DraftReplyEvent { event: Some(event) }
+}
+
+/// The wire tone as a domain tone.
+///
+/// `UNSPECIFIED` maps to [`Tone::AsIs`] rather than being rejected: proto3
+/// cannot tell "unset" from "zero", so a client that only wants a length
+/// change sends no tone at all, and refusing that would make the two knobs
+/// mandatory together. Asking for *nothing* is still refused — by
+/// `RewriteRequest`'s own check, which is where it belongs, since a CLI can
+/// reach the same state without going through this function.
+fn tone_from_proto(value: i32) -> Result<Tone, Status> {
+    match RewriteTone::try_from(value) {
+        Ok(RewriteTone::Unspecified | RewriteTone::AsIs) => Ok(Tone::AsIs),
+        Ok(RewriteTone::Formal) => Ok(Tone::Formal),
+        Ok(RewriteTone::Casual) => Ok(Tone::Casual),
+        Ok(RewriteTone::Warmer) => Ok(Tone::Warmer),
+        Ok(RewriteTone::Firmer) => Ok(Tone::Firmer),
+        Ok(RewriteTone::Mirror) => Ok(Tone::MirrorRecipient),
+        Err(_) => Err(Status::from(Error::invalid_argument(format!(
+            "unknown rewrite tone {value}"
+        )))),
+    }
+}
+
+fn length_from_proto(value: i32) -> Result<Length, Status> {
+    match RewriteLength::try_from(value) {
+        Ok(RewriteLength::Unspecified | RewriteLength::AsIs) => Ok(Length::AsIs),
+        Ok(RewriteLength::Shorter) => Ok(Length::Shorter),
+        Ok(RewriteLength::Longer) => Ok(Length::Longer),
+        Err(_) => Err(Status::from(Error::invalid_argument(format!(
+            "unknown rewrite length {value}"
+        )))),
+    }
+}
+
+fn revision_to_proto(revision: &Revision) -> ProtoRevision {
+    ProtoRevision {
+        id: revision.id,
+        draft_id: revision.draft_id,
+        seq: revision.seq,
+        label: revision.label.clone(),
+        subject: revision.subject.clone(),
+        body_text: revision.body_text.clone(),
+        model: revision.model.clone(),
+        active: revision.active,
+        created_at: revision.created_at,
     }
 }
 

@@ -87,6 +87,8 @@ impl TestServer {
                 std::time::Duration::from_secs(3600),
                 std::time::Duration::from_secs(60),
             ),
+            db.clone(),
+            tokio_util::sync::CancellationToken::new(),
         );
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let incoming = UnixListenerStream::new(listener);
