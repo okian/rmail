@@ -254,6 +254,7 @@ impl TestServer {
                 rmaild::Injected {
                     ai_provider: Some(server_provider),
                     reranker: None,
+                    ..Default::default()
                 },
                 async move {
                     let _ = shutdown_rx.await;

@@ -255,6 +255,7 @@ impl TestServer {
             let injected = rmaild::Injected {
                 ai_provider: provider.map(|p| p as Arc<dyn Provider>),
                 reranker: None,
+                ..Default::default()
             };
             rmaild::serve_uds_injected(
                 &server_socket,

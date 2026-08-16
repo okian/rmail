@@ -79,6 +79,26 @@
 //! command — see that module's docs. Without it, a `UIDVALIDITY` bump between
 //! this message's last sync and this call would let a stale UID silently
 //! address a different message on the server.
+//!
+//! # The unified inbox is a read, not a mailbox
+//!
+//! [`MailStore::list_unified`] merges every account's `INBOX` into one
+//! newest-first, `Message-ID`-deduplicated view (task 80). It is a *view*:
+//! there is no synthetic mailbox row, nothing is copied, and every message it
+//! returns keeps the real `account_id`/`mailbox_id` it has always had. That is
+//! precisely what routes an action back to the right place — [`MailStore`]'s
+//! mutations resolve their [`MutationTarget`] from the message row itself, so
+//! a message reached through the unified view is moved, flagged or deleted on
+//! its own account and folder with no unified-specific code path at all, and
+//! no opportunity for one to route it somewhere else.
+//!
+//! Paging across N accounts is the part that is easy to get wrong, and the
+//! answer is that it is not really an N-way problem: `messages.id` is unique
+//! across accounts, so `(sort_key, id)` is a total order over all of them and
+//! one keyset cursor walks the merge. See
+//! [`crate::repo::list_unified_inbox`] for why deduplication is a row-local
+//! predicate rather than a pass over the returned page — the short version is
+//! that a page has no memory of the page before it.
 
 use std::sync::Arc;
 
@@ -142,6 +162,20 @@ pub struct MessagePage {
 #[must_use]
 pub fn list_scope(mailbox_id: i64) -> page::PageScope {
     page::PageScope::new("rmail.v1.MailService/List").field("mailbox_id", mailbox_id)
+}
+
+/// The page-token scope for the unified-inbox listing.
+///
+/// It binds the method and nothing else, because nothing else selects rows:
+/// the unified inbox is by definition every account's inbox, and a caller who
+/// wants one account's inbox is asking for `MailService/List`. That single
+/// field is not decoration — it is what makes a `List` token
+/// `INVALID_ARGUMENT` here instead of a cursor into an unrelated ordering,
+/// and it will make every future filter opt in explicitly (see
+/// [`crate::page`]).
+#[must_use]
+pub fn unified_scope() -> page::PageScope {
+    page::PageScope::new("rmail.v1.MailService/ListUnified")
 }
 
 /// A message with its body and attachment metadata — the `Get` view.
@@ -269,6 +303,72 @@ impl MailStore {
         let last = messages
             .last()
             .map(|m| page::Cursor::new(m.message.sort_key(), m.message.id));
+        Ok(MessagePage {
+            next_page_token: page::next_token(&scope, last, overflow),
+            messages,
+        })
+    }
+
+    /// List one page of the unified inbox — every account's `INBOX`, merged
+    /// newest-first and deduplicated by `Message-ID` — capped at
+    /// [`MAX_LIST_LIMIT`]. `requested <= 0` uses [`DEFAULT_LIST_LIMIT`].
+    ///
+    /// `page_token` is validated against [`unified_scope`], so a token minted
+    /// by [`MailStore::list`] cannot be replayed here (or the reverse).
+    ///
+    /// The set of inbox mailboxes is resolved on every call, inside the same
+    /// read as the page itself: an account added between two pages simply
+    /// contributes whatever it has *below* the cursor, and an account deleted
+    /// between two pages takes its rows with it. Neither disturbs the
+    /// remaining order, because the cursor is a position in a value ordering
+    /// and not a reference to a row — the row it names may be gone by the
+    /// time the next page is asked for, and nothing here needs it to exist.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] if `page_token` is malformed or belongs to a
+    /// different query; otherwise a mapped storage error.
+    #[tracing::instrument(
+        skip(self, page_token),
+        fields(limit, inboxes, rows, resumed = !page_token.is_empty()),
+        err
+    )]
+    pub async fn list_unified(
+        &self,
+        requested: i64,
+        page_token: &str,
+    ) -> Result<MessagePage, Error> {
+        let scope = unified_scope();
+        let after = page::decode(page_token, &scope)?;
+        let limit = normalize_limit(requested);
+        tracing::Span::current().record("limit", limit);
+        // One extra row to distinguish "full page" from "there is more" — the
+        // same probe `list` uses, for the same reason.
+        let probe = limit.saturating_add(1);
+
+        // The inbox count is recorded because this query fans out over it:
+        // "slow with 12 accounts" and "slow with 1" are different problems,
+        // and the span is the only place that distinction survives.
+        let (mut messages, inboxes) = self
+            .db
+            .read(move |conn| {
+                let inbox_ids = repo::list_inbox_mailbox_ids(conn)?;
+                let messages = repo::list_unified_inbox(conn, &inbox_ids, after, probe)?;
+                let mut out = Vec::with_capacity(messages.len());
+                for message in messages {
+                    let flags = repo::list_flags(conn, message.id)?;
+                    out.push(MessageWithFlags { message, flags });
+                }
+                Ok((out, inbox_ids.len()))
+            })
+            .await?;
+        tracing::Span::current().record("inboxes", inboxes);
+
+        let overflow = i64::try_from(messages.len()).unwrap_or(i64::MAX) > limit;
+        messages.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        let last = messages
+            .last()
+            .map(|m| page::Cursor::new(m.message.sort_key(), m.message.id));
+        tracing::Span::current().record("rows", messages.len());
         Ok(MessagePage {
             next_page_token: page::next_token(&scope, last, overflow),
             messages,

@@ -10,6 +10,7 @@ pub mod ai;
 pub mod analytics;
 pub mod attach;
 pub mod auth;
+pub mod autoconfig;
 pub mod compose;
 pub mod config;
 pub mod credential;

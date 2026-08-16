@@ -16,6 +16,29 @@ service AccountService {
   // Verify the account can log in to its IMAP server (wired in task 8).
   rpc TestConnection(TestConnectionRequest) returns (TestConnectionResponse);
 
+  // Discover the IMAP/SMTP settings for an email address and return a ready
+  // `[[accounts]]` TOML block.
+  //
+  // Probes, in order: the domain's own autoconfig document, Mozilla's ISPDB,
+  // Microsoft autodiscover, then RFC 6186 SRV records. On a miss — and only
+  // if `allow_model_fallback` is set — the domain, its MX records and the
+  // probe responses go to Claude, which may *propose* settings; the proposal
+  // is validated exactly as strictly as a probe's and is never trusted on its
+  // own say-so.
+  //
+  // Nothing discovered here is stored. This RPC writes no account, touches no
+  // existing one, and returns a proposal for a human to apply — which is also
+  // why it can never silently change an already-configured account's security
+  // settings. If an account already exists for this address, its id comes back
+  // in `existing_account_id` and the response is explicitly a proposal against
+  // it, not a replacement of it.
+  //
+  // Everything discovered is untrusted input: hostnames must be syntactically
+  // valid public DNS names (never IP literals), ports must be in 1..=65535,
+  // and a server offering only an unencrypted connection is refused outright
+  // rather than accepted with a warning.
+  rpc Autoconfigure(AutoconfigureRequest) returns (AutoconfigureResponse);
+
   // Start a loopback-redirect OAuth2 + PKCE authorization for an account.
   // Returns the URL the user must open; no token material is ever returned.
   rpc BeginOAuth(BeginOAuthRequest) returns (BeginOAuthResponse);
@@ -95,6 +118,56 @@ message TestConnectionRequest {
 message TestConnectionResponse {
   bool ok = 1;
   string detail = 2;
+}
+
+message AutoconfigureRequest {
+  // The full email address to configure, e.g. "ada@example.com".
+  string email = 1;
+  // Optional credential reference. Supplied, the discovered settings are
+  // verified by a real IMAP login before they are returned; absent, the
+  // response says it was not verified rather than implying it was. As
+  // everywhere else on this service, only the reference travels — never the
+  // secret.
+  CredentialRef credential = 2;
+  // Opt in to the Claude inference step when every probe misses. Off by
+  // default: it costs money, and a proposal is a guess even after validation.
+  bool allow_model_fallback = 3;
+}
+
+// One discovered server. `security` is "tls" (implicit TLS) or "starttls";
+// there is deliberately no value for an unencrypted connection, because a
+// discovery that offered one was refused rather than reported.
+message DiscoveredServer {
+  string host = 1;
+  uint32 port = 2;
+  string security = 3;
+  // The username the provider says to log in with, after substituting the
+  // address (usually the address itself, sometimes its local part).
+  string username = 4;
+}
+
+message AutoconfigureResponse {
+  // Which probe answered: "autoconfig" (the domain's own document), "ispdb",
+  // "autodiscover", "srv", or "model".
+  string source = 1;
+  DiscoveredServer imap = 2;
+  DiscoveredServer smtp = 3;
+  // A ready-to-paste `[[accounts]]` block for rmail.toml.
+  string toml = 4;
+  // Whether a real IMAP login with the supplied credential succeeded. False
+  // whenever no credential was supplied, so it is never a claim about a check
+  // that did not run — see `validation_detail`.
+  bool login_validated = 5;
+  // Why validation did not run, or how it failed. Empty when it succeeded.
+  string validation_detail = 6;
+  // The id of an account already configured for this address, or 0. Nonzero
+  // means this response is a proposal *about* that account; nothing was
+  // changed.
+  int64 existing_account_id = 7;
+  // Anything a human should read before applying this — a proposal that came
+  // from a model, settings that differ from an existing account's, a
+  // discovered STARTTLS-only server.
+  repeated string warnings = 8;
 }
 
 message BeginOAuthRequest {

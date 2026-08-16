@@ -202,6 +202,7 @@ impl TestServer {
                             as std::sync::Arc<dyn rmail_core::ai::Provider>
                     }),
                     reranker: None,
+                    ..Default::default()
                 },
                 async move {
                     let _ = shutdown_rx.await;
@@ -292,8 +293,13 @@ fn enabled_config() -> NotifyConfig {
     NotifyConfig {
         enabled: true,
         channel: NotifyChannel::None,
-        // Long enough that the daemon's own delivery loop never races a test
-        // that is asserting about a `pending` row.
+        // Long enough that the daemon's delivery loop does not tick *again*
+        // during a test. It does not keep the loop out altogether: `spawn`
+        // ticks first and sleeps afterwards, so exactly one tick always races
+        // the window between a test scoring a row and asserting about it. A
+        // test that needs a row in a particular terminal state must therefore
+        // assert the state, not the return of the call that would set it —
+        // see `settle_suppressed`/`settle_delivered`.
         tick_interval: rmail_core::config::HumanDuration::new(Duration::from_secs(3600)),
         ..NotifyConfig::default()
     }
@@ -556,8 +562,7 @@ async fn stream_alerts_replays_the_backlog_from_a_cursor() {
     // Mark both delivered directly: this test is about the stream's cursor,
     // not about re-proving the delivery loop (rmail-core's own suite does).
     for id in [first, second] {
-        let row = repo::state_of(&server.db, id).await.unwrap().unwrap();
-        assert!(repo::mark_delivered(&server.db, row.1).await.unwrap());
+        settle_delivered(&server, id).await;
     }
 
     let mut stream = server
@@ -592,14 +597,8 @@ async fn stream_alerts_never_reports_a_suppressed_notification() {
     server.score(low, Tier::Low, "a newsletter").await;
     server.score(high, Tier::Critical, "outage").await;
 
-    let low_row = repo::state_of(&server.db, low).await.unwrap().unwrap();
-    assert!(
-        repo::mark_suppressed(&server.db, low_row.1, "below_threshold")
-            .await
-            .unwrap()
-    );
-    let high_row = repo::state_of(&server.db, high).await.unwrap().unwrap();
-    assert!(repo::mark_delivered(&server.db, high_row.1).await.unwrap());
+    settle_suppressed(&server, low).await;
+    settle_delivered(&server, high).await;
 
     let mut stream = server
         .client()
@@ -640,8 +639,7 @@ async fn stream_alerts_with_an_absent_cursor_starts_at_the_current_head() {
     let server = TestServer::start(enabled_config()).await;
     let id = server.message(1, "Outage").await;
     server.score(id, Tier::Critical, "outage").await;
-    let row = repo::state_of(&server.db, id).await.unwrap().unwrap();
-    assert!(repo::mark_delivered(&server.db, row.1).await.unwrap());
+    settle_delivered(&server, id).await;
 
     let mut stream = server
         .client()
@@ -673,4 +671,55 @@ async fn stream_alerts_rejects_a_negative_cursor() {
     assert_eq!(status.code(), Code::InvalidArgument);
 
     server.shutdown().await;
+}
+
+/// Leave `message_id`'s notification `suppressed`, whoever gets there first.
+///
+/// The daemon's delivery loop ticks once immediately on spawn — `spawn` calls
+/// `tick` and *then* sleeps — so a below-threshold row may already have been
+/// suppressed by the engine before a test touches it. `mark_suppressed` is
+/// conditional on `state = 'pending'`, so it returns `false` in exactly that
+/// case, and asserting on its return value asserts that the test won a race
+/// it has no way to win reliably. What these tests are actually about is the
+/// state the row ends in.
+async fn settle_suppressed(server: &TestServer, message_id: i64) {
+    let row = repo::state_of(&server.db, message_id)
+        .await
+        .unwrap()
+        .expect("a notification row");
+    if row.0 == "pending" {
+        repo::mark_suppressed(&server.db, row.1, "below_threshold")
+            .await
+            .unwrap();
+    }
+    let settled = repo::state_of(&server.db, message_id)
+        .await
+        .unwrap()
+        .expect("a notification row");
+    assert_eq!(
+        settled.0, "suppressed",
+        "message {message_id} should be suppressed, was {}",
+        settled.0
+    );
+}
+
+/// Leave `message_id`'s notification `delivered`. See [`settle_suppressed`]
+/// for why this cannot assert on the transition's return value.
+async fn settle_delivered(server: &TestServer, message_id: i64) {
+    let row = repo::state_of(&server.db, message_id)
+        .await
+        .unwrap()
+        .expect("a notification row");
+    if row.0 == "pending" {
+        repo::mark_delivered(&server.db, row.1).await.unwrap();
+    }
+    let settled = repo::state_of(&server.db, message_id)
+        .await
+        .unwrap()
+        .expect("a notification row");
+    assert_eq!(
+        settled.0, "delivered",
+        "message {message_id} should be delivered, was {}",
+        settled.0
+    );
 }

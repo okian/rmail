@@ -62,7 +62,65 @@ pub async fn admit(
     if let Some(mailbox) = mailbox {
         target = target.mailbox(mailbox.to_owned());
     }
-    let decision = policy.resolve(&target);
+    admit_target(db, policy, limits, &target, account_id, model).await
+}
+
+/// [`admit`] for a call that belongs to no account row — today, task 80's
+/// autoconfig inference, which runs *before* an account exists.
+///
+/// The two halves that were keyed by `account_id` get the only answers that
+/// are honest for a call with no account:
+///
+/// - **Policy** resolves against `subject`, the address being configured.
+///   Accounts are conventionally named for their address, so an operator who
+///   set `accounts.ai.enabled = false` for `ada@example.com` and then asks to
+///   reconfigure `ada@example.com` gets their opt-out honored rather than
+///   bypassed by the one call that happens to run before the account is
+///   loaded. An address that names no account resolves the daemon-wide
+///   default — including `ai.enabled = false`, which forbids it outright.
+/// - **Budget** charges [`GLOBAL_ACCOUNT_ID`], which is what that sentinel is
+///   for ("a call tied to no account"), and is what [`crate::digest`] already
+///   does for work that spans every account. Spend still counts; it simply
+///   counts against the only budget that can apply.
+///
+/// The ordering is unchanged, because it is the same code: policy, then the
+/// daily cap, then the budget. See the module docs for why that order is the
+/// security property.
+///
+/// # Errors
+/// [`Error::FailedPrecondition`] if policy forbids a network call for
+/// `subject` or the daily/monthly cap is reached; [`Error::ResourceExhausted`]
+/// if a budget hard cap blocks it.
+pub async fn admit_unattributed(
+    db: &Database,
+    policy: &PolicyEngine,
+    limits: &AiLimits,
+    subject: &str,
+    model: &str,
+) -> Result<String, Error> {
+    let target = PolicyTarget::account(subject.to_owned());
+    admit_target(
+        db,
+        policy,
+        limits,
+        &target,
+        crate::ai::budget::GLOBAL_ACCOUNT_ID,
+        model,
+    )
+    .await
+}
+
+/// The shared sequence: policy, daily cap, budget. One definition, because
+/// the order is the property being enforced.
+async fn admit_target(
+    db: &Database,
+    policy: &PolicyEngine,
+    limits: &AiLimits,
+    target: &PolicyTarget,
+    account_id: i64,
+    model: &str,
+) -> Result<String, Error> {
+    let decision = policy.resolve(target);
     if !decision.is_visible() || !decision.permits_network() {
         return Err(Error::failed_precondition(format!(
             "ai policy resolved {:?} for this account/folder; no network call is permitted",

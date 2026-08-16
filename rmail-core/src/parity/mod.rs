@@ -53,9 +53,9 @@
 //! Nothing generated exists to reconcile that against — the call sites are
 //! ordinary Rust, not a table — so the honest statement is that the `cli:` and
 //! `actions:` lists are maintained by hand and reviewed, while the *set* of
-//! verbs, actions and RPCs is enforced. `the_two_verbs_that_reach_two_rpcs_still_do`
-//! pins the two rows where this has already bitten rather than pretending to
-//! be a net.
+//! verbs, actions and RPCs is enforced. `the_verbs_that_reach_two_rpcs_still_do`
+//! pins the rows where this has already bitten rather than pretending to be a
+//! net.
 //!
 //! # Extending this table
 //!
@@ -259,6 +259,20 @@ commands! {
         actions: [],
         summary: "Verify an account's IMAP login and report its server capabilities.",
     }
+    // Autoconfig (task 80) persists nothing, and is still `Mutate` for the
+    // same reason `TestConnection` is: it reaches out to other people's
+    // servers — an autoconfig fetch, a DNS lookup, and (with a credential) a
+    // real login someone else's lockout counter observes — and it can spend
+    // at the model provider. `Read` here would advertise an MCP tool an agent
+    // could loop on until an account locked out.
+    AccountAutoconfigure {
+        rpc: "/rmail.v1.AccountService/Autoconfigure",
+        tool: "autoconfigure_account",
+        effect: Mutate,
+        cli: ["account add"],
+        actions: [],
+        summary: "Discover an address's IMAP/SMTP settings and return a ready TOML block.",
+    }
     // The OAuth trio (task 79). All three are `Mutate`, including the two that
     // sound like reads: `BeginOAuth` binds a loopback port and mints a PKCE
     // grant, and `RefreshToken` spends one use of a refresh token at the
@@ -267,7 +281,7 @@ commands! {
     //
     // `mail account login --oauth <provider>` reaches Begin and Complete in
     // one verb; that is the second row in this table to claim two RPCs, and
-    // `the_two_verbs_that_reach_two_rpcs_still_do` is the check that pins it.
+    // `the_verbs_that_reach_two_rpcs_still_do` is the check that pins it.
     AccountBeginOAuth {
         rpc: "/rmail.v1.AccountService/BeginOAuth",
         tool: "begin_account_oauth",
@@ -368,9 +382,21 @@ commands! {
         rpc: "/rmail.v1.MailService/List",
         tool: "list_messages",
         effect: Read,
-        cli: [],
+        cli: ["list"],
         actions: [],
         summary: "Stream a mailbox's messages, newest first.",
+    }
+    // The third row to claim a verb another row also claims: `mail list`
+    // reaches `List` with `--mailbox` and `ListUnified` with `--all`, which is
+    // the whole point of the flag. `the_verbs_that_reach_two_rpcs_still_do`
+    // pins the pattern.
+    MailListUnified {
+        rpc: "/rmail.v1.MailService/ListUnified",
+        tool: "list_unified_inbox",
+        effect: Read,
+        cli: ["list"],
+        actions: [],
+        summary: "Stream every account's inbox as one time-ordered, deduplicated view.",
     }
     MailGet {
         rpc: "/rmail.v1.MailService/Get",

@@ -13,17 +13,29 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rmail_core::account::{self, NewAccount};
+use rmail_core::autoconfig::{AutoconfigRequest, Autoconfigurator, ServerSettings};
 use rmail_core::oauth::{OAuthBroker, PendingAuthorization, Provider};
 use rmail_core::{CredentialSource, Database, Error};
 use rmail_proto::v1::account_service_server::AccountService;
 use rmail_proto::v1::{
-    credential_ref, Account as ProtoAccount, BeginOAuthRequest, BeginOAuthResponse,
-    CompleteOAuthRequest, CompleteOAuthResponse, CreateAccountRequest, CredentialRef,
-    DeleteAccountRequest, DeleteAccountResponse, GetAccountRequest, ListAccountsRequest,
-    ListAccountsResponse, RefreshTokenRequest, RefreshTokenResponse, TestConnectionRequest,
-    TestConnectionResponse,
+    credential_ref, Account as ProtoAccount, AutoconfigureRequest, AutoconfigureResponse,
+    BeginOAuthRequest, BeginOAuthResponse, CompleteOAuthRequest, CompleteOAuthResponse,
+    CreateAccountRequest, CredentialRef, DeleteAccountRequest, DeleteAccountResponse,
+    DiscoveredServer, GetAccountRequest, ListAccountsRequest, ListAccountsResponse,
+    RefreshTokenRequest, RefreshTokenResponse, TestConnectionRequest, TestConnectionResponse,
 };
 use tonic::{Request, Response, Status};
+
+/// The ceiling on one `Autoconfigure` call.
+///
+/// A discovery is a sequence of network round trips to hosts named by the
+/// address under configuration: up to three documents, four SRV lookups and
+/// an MX lookup at `probe`'s own per-request timeout, then an IMAP login at
+/// `imap::IMAP_DEADLINE`. Each step is bounded; nothing bounded their sum,
+/// and the sum is what an operator waits and what a caller can hold this
+/// daemon's task for. Generous enough that a slow-but-working provider still
+/// answers, short enough that it is not a way to pin resources.
+const AUTOCONFIGURE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Most authorizations that may be in flight at once.
 ///
@@ -144,6 +156,14 @@ pub struct AccountApi {
     /// future, which drops the wait with it — so this covers the one case that
     /// dropping the future does not.
     stopping: tokio_util::sync::CancellationToken,
+    /// The autoconfiguration engine (task 80).
+    ///
+    /// `None` on a daemon whose HTTP client could not be built, in which case
+    /// `Autoconfigure` declines with `FAILED_PRECONDITION` rather than the
+    /// RPC disappearing: reflection and the fail-closed scope table must see
+    /// every RPC regardless of runtime configuration — the convention
+    /// `AnalyticsService`/`AiService` established.
+    autoconfig: Option<Autoconfigurator>,
 }
 
 impl AccountApi {
@@ -159,7 +179,15 @@ impl AccountApi {
             broker: rmail_core::oauth::broker()?,
             flows: Arc::new(Mutex::new(HashMap::new())),
             stopping,
+            autoconfig: None,
         })
+    }
+
+    /// Serve `Autoconfigure` from `engine`.
+    #[must_use]
+    pub fn with_autoconfig(mut self, engine: Autoconfigurator) -> Self {
+        self.autoconfig = Some(engine);
+        self
     }
 
     fn flows(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingFlow>> {
@@ -250,6 +278,66 @@ impl AccountService for AccountApi {
             caps.move_,
         );
         Ok(Response::new(TestConnectionResponse { ok: true, detail }))
+    }
+
+    /// Discover settings for an address and return them as a proposal.
+    ///
+    /// Writes nothing — see [`rmail_core::autoconfig`]'s module docs. The
+    /// handler's own job is the boundary translation: the request's
+    /// `CredentialRef` becomes a [`CredentialSource`] (a reference, never a
+    /// secret), and the daemon's shutdown token bounds the probes so a
+    /// discovery against an unresponsive server cannot hold shutdown open.
+    ///
+    /// The whole call is bounded by [`AUTOCONFIGURE_DEADLINE`]. Each probe
+    /// already has its own timeout, but they run in sequence and there are up
+    /// to eight of them plus an IMAP login, so the *sum* is what an unlucky
+    /// caller waits and what this daemon holds a task for — every one of those
+    /// timeouts is against a host the request named.
+    #[tracing::instrument(skip(self, request), fields(domain))]
+    async fn autoconfigure(
+        &self,
+        request: Request<AutoconfigureRequest>,
+    ) -> Result<Response<AutoconfigureResponse>, Status> {
+        let req = request.into_inner();
+        let Some(engine) = &self.autoconfig else {
+            return Err(Status::from(Error::failed_precondition(
+                "autoconfiguration is unavailable on this daemon: its HTTP client could not \
+                 be built",
+            )));
+        };
+        // The address is logged by domain only: the local part is the user's
+        // identity and does not belong in a span field that ends up in logs.
+        if let Some((_, domain)) = req.email.split_once('@') {
+            tracing::Span::current().record("domain", domain);
+        }
+        let proposal = tokio::time::timeout(
+            AUTOCONFIGURE_DEADLINE,
+            engine.discover(
+                &AutoconfigRequest {
+                    email: req.email,
+                    credential: credential_from_proto(req.credential),
+                    allow_model_fallback: req.allow_model_fallback,
+                },
+                &self.stopping,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            Status::from(Error::deadline_exceeded(
+                "autoconfiguration did not finish within its deadline; the servers being \
+                 probed are unresponsive",
+            ))
+        })??;
+        Ok(Response::new(AutoconfigureResponse {
+            source: proposal.source.as_str().to_owned(),
+            imap: Some(server_to_proto(&proposal.imap)),
+            smtp: proposal.smtp.as_ref().map(server_to_proto),
+            toml: proposal.toml,
+            login_validated: proposal.login_validated,
+            validation_detail: proposal.validation_detail,
+            existing_account_id: proposal.existing_account_id.unwrap_or(0),
+            warnings: proposal.warnings,
+        }))
     }
 
     /// Start an authorization. The response carries a URL and a handle — never
@@ -471,6 +559,16 @@ fn credential_from_proto(credential: Option<CredentialRef>) -> CredentialSource 
         Some(credential_ref::Source::Keychain(service)) => CredentialSource::Keychain(service),
         Some(credential_ref::Source::Oauth(service)) => CredentialSource::OAuth(service),
         None => CredentialSource::None,
+    }
+}
+
+/// Project a validated discovered server onto the wire.
+fn server_to_proto(settings: &ServerSettings) -> DiscoveredServer {
+    DiscoveredServer {
+        host: settings.host.clone(),
+        port: u32::from(settings.port),
+        security: settings.security.as_str().to_owned(),
+        username: settings.username.clone(),
     }
 }
 

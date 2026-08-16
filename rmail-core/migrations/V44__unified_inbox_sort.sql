@@ -1,0 +1,27 @@
+-- V44: the unified inbox's own listing index (task 80, prd.md #33).
+--
+-- `MailService.ListUnified` reads every account's INBOX at once, so its
+-- predicate is `mailbox_id IN (...)` rather than `mailbox_id = ?`. That one
+-- change costs the whole benefit of `idx_messages_mailbox_page` (V37): with a
+-- set on the leading column, SQLite cannot walk that index in the listing's
+-- order, so it falls back to a full scan of `messages` plus a temp B-tree for
+-- the `ORDER BY`. Measured on 200k rows that is ~0.12 s *per page*, and it is
+-- paid on page 1 — the page every client asks for — not only on a deep walk.
+--
+-- The fix is an index whose own order already is the listing's total order,
+-- with no mailbox column in front of it. The keyset walk then becomes a
+-- forward range scan with the mailbox set applied as a filter: same 200k
+-- rows, ~0.13 ms per page.
+--
+-- Why not reuse `idx_messages_date_only` (V19): it indexes
+-- `COALESCE(date, internaldate)` -- two arguments, no `, 0` -- and carries no
+-- `id`. Neither matches. The three-argument form is the expression the cursor
+-- is built from (see `repo::LIST_SORT_KEY` and the
+-- `the_three_sort_key_spellings_agree` test), and without `id DESC` in the
+-- index a page boundary landing inside a timestamp tie still needs a sort.
+--
+-- `id` is the rowid, so naming it costs nothing on disk; it is named
+-- explicitly and DESC so the index order is exactly `ORDER BY <key> DESC,
+-- id DESC`.
+CREATE INDEX idx_messages_unified_page
+    ON messages(COALESCE(date, internaldate, 0) DESC, id DESC);

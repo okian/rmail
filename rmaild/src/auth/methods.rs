@@ -165,6 +165,18 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AccountService/TestConnection",
         Requirement::Scope(Scope::Admin),
     ),
+    // -- AccountService autoconfig (task 80) --------------------------------
+    // `admin`, with `TestConnection` and `Create`, for two reasons that both
+    // stand on their own: it makes outbound requests to hosts named by the
+    // caller's own input (and, with a credential reference, a real login
+    // attempt at whatever host a probe named), and it can spend money at the
+    // model provider. It stores nothing — but "read-only" is not the line
+    // this table draws; authority is, and this has the authority to make a
+    // remote server see a login from this machine.
+    (
+        "/rmail.v1.AccountService/Autoconfigure",
+        Requirement::Scope(Scope::Admin),
+    ),
     // -- AccountService OAuth (task 79) -------------------------------------
     // `admin`, and not a softer scope, because these three *are* credential
     // management: `BeginOAuth`/`CompleteOAuth` mint a grant that is a
@@ -262,6 +274,16 @@ const TABLE: &[(&str, Requirement)] = &[
     // (see rmail-core::mail's module docs), so those sit behind `mail.write`.
     (
         "/rmail.v1.MailService/List",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // The unified inbox is `List` over every account's inbox at once, and it
+    // reads the same local mirror from the same tables — so it needs exactly
+    // what `List` needs and nothing more. It is deliberately not `admin`
+    // despite spanning accounts: `mail.read` already grants `AccountService/
+    // List` and a `MailService/List` per mailbox, so a token holding it could
+    // assemble this view itself, one folder at a time.
+    (
+        "/rmail.v1.MailService/ListUnified",
         Requirement::Scope(Scope::MailRead),
     ),
     (

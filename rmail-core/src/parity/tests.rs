@@ -357,12 +357,13 @@ fn both_effects_are_used() {
 ///
 /// A cheap consistency check on the `cli:` lists themselves: a path is only
 /// ever declared on rows whose service could plausibly serve it. Written as a
-/// spot check on the two verbs that reach two RPCs each, because those are
-/// the rows where a later edit is most likely to drop one half — `mail sync`
-/// (a pass, then the event stream) and `mail ai scan-injection` (a scan, then
-/// an optional confirmation).
+/// spot check on the verbs that reach two RPCs each, because those are the
+/// rows where a later edit is most likely to drop one half — `mail sync` (a
+/// pass, then the event stream), `mail ai scan-injection` (a scan, then an
+/// optional confirmation), and `mail list` (one mailbox, or every account's
+/// inbox under `--all`).
 #[test]
-fn the_two_verbs_that_reach_two_rpcs_still_do() {
+fn the_verbs_that_reach_two_rpcs_still_do() {
     let sync: BTreeSet<&str> = Command::for_cli("sync").map(Command::rpc).collect();
     assert!(sync.contains("/rmail.v1.SyncService/SyncFolder"));
     assert!(sync.contains("/rmail.v1.SyncService/WatchEvents"));
@@ -372,4 +373,8 @@ fn the_two_verbs_that_reach_two_rpcs_still_do() {
         .collect();
     assert!(scan.contains("/rmail.v1.AiSafetyService/ScanInjection"));
     assert!(scan.contains("/rmail.v1.AiSafetyService/ConfirmInjection"));
+
+    let list: BTreeSet<&str> = Command::for_cli("list").map(Command::rpc).collect();
+    assert!(list.contains("/rmail.v1.MailService/List"));
+    assert!(list.contains("/rmail.v1.MailService/ListUnified"));
 }

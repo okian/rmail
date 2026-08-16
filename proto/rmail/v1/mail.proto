@@ -30,6 +30,37 @@ service MailService {
   // back as `ListMessagesRequest.page_token`.
   rpc List(ListMessagesRequest) returns (stream Message);
 
+  // List the synthetic unified inbox: every account's INBOX merged into one
+  // time-ordered, Message-ID-deduplicated view, newest first.
+  //
+  // Paginated exactly like `List` — same opaque token, same
+  // `x-rmail-next-page-token` initial-metadata header, same absence-is-final
+  // contract — but the token is bound to *this* method, so a `List` token
+  // cannot be replayed here or the other way round.
+  //
+  // Every row carries the `account_id` and `mailbox_id` it really came from,
+  // which is what routes an action back to the right account: `Move`, `Copy`,
+  // `SetFlags` and `Delete` all take a `message_id` and resolve the account
+  // and folder from the row itself, so a unified row needs no special
+  // handling to be acted on.
+  //
+  // Deduplication keeps one copy of each `Message-ID` — the one that sorts
+  // first (newest, then highest id) — so the same mail delivered to two of
+  // your accounts appears once. A message with no `Message-ID` header is
+  // never deduplicated against anything; it has no identity to be equal by.
+  // An action on a shown row affects that row's copy only: the hidden copy is
+  // a distinct message on a distinct server.
+  //
+  // "Once" is exact within one page and holds across a whole walk of a
+  // *stable* mailbox. It is not a promise across a walk that races a sync:
+  // which copy wins is a function of the copies that exist, so a copy
+  // arriving above the cursor mid-walk can leave that `Message-ID` on no page
+  // of this pass, and a copy vanishing above the cursor can let a second copy
+  // appear on a later one. Both windows are one sync apart and both are the
+  // same tradeoff every keyset listing here makes; a client that needs a
+  // point-in-time view starts a fresh walk.
+  rpc ListUnified(ListUnifiedRequest) returns (stream Message);
+
   // Fetch one message, with its body and attachment metadata.
   rpc Get(GetMessageRequest) returns (FullMessage);
 
@@ -95,6 +126,18 @@ message ListMessagesRequest {
   // is INVALID_ARGUMENT rather than a read at an arbitrary offset into
   // another folder.
   string page_token = 3;
+}
+
+message ListUnifiedRequest {
+  // Server-capped at 500; 0 means the server default.
+  int32 page_size = 1;
+  // The `x-rmail-next-page-token` value from the previous page; empty starts
+  // at the beginning.
+  //
+  // Opaque, and bound to this method: a token minted by `List` is
+  // INVALID_ARGUMENT here rather than a read at an arbitrary offset into one
+  // account's folder.
+  string page_token = 2;
 }
 
 // One message as it appears in a listing. Body and attachment metadata are on

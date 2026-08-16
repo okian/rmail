@@ -138,6 +138,7 @@ impl TestServer {
                     // Deliberately absent — see the module docs.
                     ai_provider: None,
                     reranker: None,
+                    ..Default::default()
                 },
                 async move {
                     let _ = shutdown_rx.await;

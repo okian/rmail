@@ -83,6 +83,9 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// List a mailbox, or every account's inbox at once
+    /// (`MailService.List`/`MailService.ListUnified`).
+    List(ListArgs),
     /// Account credentials (`AccountService.BeginOAuth/CompleteOAuth/RefreshToken`).
     Account {
         #[command(subcommand)]
@@ -400,6 +403,26 @@ enum BudgetAction {
     },
 }
 
+#[derive(Debug, clap::Args)]
+struct ListArgs {
+    /// Mailbox to list, by id.
+    #[arg(long, conflicts_with = "all")]
+    mailbox: Option<i64>,
+    /// Merge every account's inbox into one time-ordered, deduplicated view.
+    ///
+    /// The same message delivered to two of your accounts appears once, and
+    /// each row still names the account and folder it really lives in — which
+    /// is what lets you act on it.
+    #[arg(long)]
+    all: bool,
+    /// Rows per page (the server caps this at 500).
+    #[arg(long, default_value_t = 50)]
+    limit: i32,
+    /// Continue from the token the previous page printed.
+    #[arg(long, value_name = "TOKEN")]
+    page_token: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum TagRuleAction {
     /// List an account's tag rules, enabled or not.
@@ -433,6 +456,37 @@ enum TagRuleAction {
 
 #[derive(Debug, Subcommand)]
 enum AccountAction {
+    /// Discover an address's IMAP/SMTP settings and print a ready TOML block
+    /// (`AccountService.Autoconfigure`).
+    ///
+    /// Probes the domain's autoconfig document, Mozilla's ISPDB, Microsoft
+    /// autodiscover and RFC 6186 SRV records, validates whatever comes back,
+    /// and — with a credential — verifies it by logging in. Nothing is
+    /// written: the block is printed for you to paste into rmail.toml.
+    Add {
+        /// The email address to configure.
+        email: String,
+        /// A command whose stdout is the password. Supplying a credential is
+        /// what lets the discovery be verified by a real login.
+        #[arg(long, value_name = "COMMAND")]
+        password_command: Option<String>,
+        /// The name of an environment variable holding the password.
+        #[arg(long, value_name = "VAR", conflicts_with = "password_command")]
+        password_env: Option<String>,
+        /// A macOS Keychain service name holding the password.
+        #[arg(
+            long,
+            value_name = "SERVICE",
+            conflicts_with_all = ["password_command", "password_env"]
+        )]
+        keychain: Option<String>,
+        /// If every probe misses, let Claude propose settings from the
+        /// domain, its MX records and the probe responses. Costs money, and
+        /// the answer is a guess — it is validated and (with a credential)
+        /// login-checked before you see it, but it is still a guess.
+        #[arg(long)]
+        ai: bool,
+    },
     /// Authorize an account with OAuth2, opening a browser for consent.
     ///
     /// Runs the whole loopback+PKCE flow: the daemon binds a redirect port,
@@ -516,7 +570,15 @@ async fn main() -> Result<()> {
             full,
             watch,
         } => sync(&socket, account, mailbox, full, watch).await,
+        Command::List(args) => list(&socket, args).await,
         Command::Account { action } => match action {
+            AccountAction::Add {
+                email,
+                password_command,
+                password_env,
+                keychain,
+                ai,
+            } => account_add(&socket, email, password_command, password_env, keychain, ai).await,
             AccountAction::Login {
                 id,
                 oauth,
@@ -816,6 +878,200 @@ async fn account_login(
     println!("expires: {} (unix seconds)", done.expires_at);
     println!("The refresh token is in your Keychain; it never passed through this command.");
     Ok(())
+}
+
+/// `mail list`: one mailbox, or every account's inbox merged.
+///
+/// The next page's token comes back in the call's *initial metadata* rather
+/// than in the body — a server-streamed response has no envelope to carry one
+/// (see `rmail_core::page`) — so it is read off the response before the frames
+/// are drained, and printed for the caller to pass back with `--page-token`.
+/// Its absence is definitive: that was the last page.
+async fn list(socket: &Path, args: ListArgs) -> Result<()> {
+    use rmail_proto::v1::mail_service_client::MailServiceClient;
+    use rmail_proto::v1::{ListMessagesRequest, ListUnifiedRequest};
+
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let mut client = MailServiceClient::new(channel);
+    let page_token = args.page_token.unwrap_or_default();
+
+    let response = if args.all {
+        client
+            .list_unified(ListUnifiedRequest {
+                page_size: args.limit,
+                page_token,
+            })
+            .await
+            .context("ListUnified RPC failed")?
+    } else {
+        let mailbox_id = args
+            .mailbox
+            .context("`mail list` needs --mailbox <id>, or --all for every account's inbox")?;
+        client
+            .list(ListMessagesRequest {
+                mailbox_id,
+                page_size: args.limit,
+                page_token,
+            })
+            .await
+            .context("List RPC failed")?
+    };
+
+    let next = response
+        .metadata()
+        .get(rmail_core::page::NEXT_PAGE_TOKEN_METADATA_KEY)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    let mut stream = response.into_inner();
+    let mut shown = 0usize;
+    while let Some(message) = stream.message().await.context("List stream failed")? {
+        shown += 1;
+        // The account and mailbox are printed even for a single-mailbox
+        // listing: in the unified view they are the answer to "where does
+        // this actually live", and a format that changed between the two
+        // would be worse than one that is occasionally redundant.
+        println!(
+            "{:>8}  acct {:<3} mbox {:<3} {:<20} {:<28} {}",
+            message.id,
+            message.account_id,
+            message.mailbox_id,
+            message
+                .date
+                .and_then(|date| chrono::DateTime::<chrono::Utc>::from_timestamp(date, 0))
+                .map_or_else(
+                    || "-".to_owned(),
+                    |dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                ),
+            cell(message.from_addr.as_deref().unwrap_or("-"), 28),
+            cell(message.subject.as_deref().unwrap_or("(no subject)"), 60),
+        );
+    }
+    match next {
+        Some(token) => println!("\n{shown} shown; next page: --page-token {token}"),
+        None => println!("\n{shown} shown; end of list"),
+    }
+    Ok(())
+}
+
+/// `mail account add <email>`: discover, validate, verify, print.
+async fn account_add(
+    socket: &Path,
+    email: String,
+    password_command: Option<String>,
+    password_env: Option<String>,
+    keychain: Option<String>,
+    ai: bool,
+) -> Result<()> {
+    use rmail_proto::v1::{credential_ref, AutoconfigureRequest, CredentialRef};
+
+    let credential = password_command
+        .map(credential_ref::Source::PasswordCommand)
+        .or_else(|| password_env.map(credential_ref::Source::PasswordEnv))
+        .or_else(|| keychain.map(credential_ref::Source::Keychain))
+        .map(|source| CredentialRef {
+            source: Some(source),
+        });
+
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let response = AccountServiceClient::new(channel)
+        .autoconfigure(AutoconfigureRequest {
+            email,
+            credential,
+            allow_model_fallback: ai,
+        })
+        .await
+        .context("Autoconfigure RPC failed")?
+        .into_inner();
+
+    // Everything printed here crossed a wire and most of it originated
+    // further out still — a hostname from someone's autoconfig document, a
+    // refusal quoted from a remote IMAP server. It is sanitized on the way to
+    // the terminal for the same reason a subject line is.
+    if let Some(imap) = &response.imap {
+        println!(
+            "imap: {}:{} ({}) as {}   [source: {}]",
+            sanitized(&imap.host),
+            imap.port,
+            sanitized(&imap.security),
+            sanitized(&imap.username),
+            sanitized(&response.source)
+        );
+    }
+    match &response.smtp {
+        Some(smtp) => println!(
+            "smtp: {}:{} ({})",
+            sanitized(&smtp.host),
+            smtp.port,
+            sanitized(&smtp.security)
+        ),
+        None => println!("smtp: not discovered"),
+    }
+    if response.login_validated {
+        println!("login: verified");
+    } else {
+        println!("login: {}", sanitized(&response.validation_detail));
+    }
+    for warning in &response.warnings {
+        println!("warning: {}", sanitized(warning));
+    }
+    println!();
+    // Not sanitized, and deliberately: this is a configuration file fragment
+    // whose newlines are its structure. Its values are TOML-escaped by the
+    // serializer that produced it (see `autoconfig::render_toml`), which is
+    // the encoding that matters for text destined for a file.
+    print!("{}", response.toml);
+    Ok(())
+}
+
+/// One column of a listing row: sanitized, then truncated.
+///
+/// A subject and a From line are attacker-controlled text on their way to a
+/// terminal, so the control characters go first — an unsanitized subject can
+/// carry an escape sequence that repaints the screen, and truncation would
+/// happily cut one in half and leave the terminal in that state. Dropping
+/// them (rather than substituting a placeholder) matches what `mail search`
+/// already does; see `search_cli`'s "Terminal safety" section.
+fn cell(value: &str, width: usize) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in sanitized(value).chars() {
+        out.push(ch);
+        if out.chars().count() >= width {
+            // One character of headroom is spent on the ellipsis, so a
+            // truncated cell is visibly truncated.
+            if value.chars().count() > width {
+                out.pop();
+                out.push('…');
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// Text from somewhere else, made safe to print.
+///
+/// Used for every line this file prints that did not originate in it: a
+/// listing's subject and sender, and `mail account add`'s warnings and
+/// validation detail — the latter is `format!("login failed: {error}")`
+/// wrapping whatever a remote IMAP server said, which is exactly the shape of
+/// input this exists for. Whitespace is folded to spaces and other control
+/// characters are dropped, matching `mail search` (see `search_cli`'s
+/// "Terminal safety" section).
+fn sanitized(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' | '\r' | '\t' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 async fn account_refresh(socket: &Path, id: i64, force: bool) -> Result<()> {

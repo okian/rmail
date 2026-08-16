@@ -763,7 +763,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core oauth::` (PKCE flow against a mock authz server, XOAUTH2 string, refresh)
 
 ## 80. Unified inbox + AI account autoconfig
-- [ ] status
+- [x] status
 - **depends-on:** 8, 39, 43
 - **parallel-safe:** yes
 - **acceptance:**

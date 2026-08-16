@@ -321,6 +321,27 @@ pub fn list_mailboxes(conn: &Connection, account_id: i64) -> rusqlite::Result<Ve
     rows.collect()
 }
 
+/// The `mailboxes.id` of every account's inbox, ascending.
+///
+/// "The inbox" is the mailbox literally named `INBOX`, compared
+/// case-insensitively because RFC 3501 §5.1 makes that one name — and only
+/// that name — case-insensitive. A folder called `INBOX/Receipts` is a
+/// *child* of the inbox, not the inbox, so the comparison is on the whole
+/// name rather than a prefix.
+///
+/// `attributes` is deliberately not consulted: [`crate::imap::folders`]
+/// records only `\Noselect` there today, so a `\Inbox` special-use test would
+/// match nothing and read as though it did.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn list_inbox_mailbox_ids(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM mailboxes WHERE name = 'INBOX' COLLATE NOCASE ORDER BY id")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect()
+}
+
 // ---------------------------------------------------------------------------
 // Threads
 // ---------------------------------------------------------------------------
@@ -953,6 +974,127 @@ pub fn list_messages(
     let mut stmt = conn.prepare(&format!(
         "SELECT {MESSAGE_COLS} FROM messages WHERE mailbox_id = ?1 {cursor_sql}
          ORDER BY {LIST_SORT_KEY} DESC, id DESC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), Message::from_row)?;
+    rows.collect()
+}
+
+/// The same sort key as [`LIST_SORT_KEY`], qualified by a table alias.
+///
+/// Needed by [`list_unified_inbox`], whose deduplication subquery compares
+/// two rows' keys in one statement: an unqualified `date` inside a subquery
+/// binds to the *inner* table, so both sides have to name theirs.
+///
+/// There are now three spellings of one expression — this, [`LIST_SORT_KEY`],
+/// and [`Message::sort_key`], the Rust mirror a page cursor is built from —
+/// and a divergence between any two of them would make a page boundary land
+/// where the query never looks, exactly as [`crate::page`]'s docs describe.
+/// `the_three_sort_key_spellings_agree` evaluates all three against the same
+/// rows and is what keeps them one expression.
+fn sort_key_for(alias: &str) -> String {
+    format!("COALESCE({alias}.date, {alias}.internaldate, 0)")
+}
+
+/// List the unified inbox — every mailbox in `inbox_ids` merged into one
+/// newest-first order, one row per `Message-ID` — starting strictly after
+/// `after`.
+///
+/// # Why this is one query and not an N-way merge
+///
+/// `messages.id` is unique across accounts, so `(sort_key, id)` is already a
+/// total order over every account's mail: the same cursor that walks one
+/// mailbox walks all of them, and a page boundary between two accounts is not
+/// a special case. Merging N per-mailbox result sets in Rust would produce
+/// exactly this order and then need its own tie-breaking rules to do it.
+///
+/// # Why deduplication is a row-local predicate
+///
+/// A page is a window over a total order, and the caller has no memory of the
+/// previous page. Suppressing duplicates *within* the returned window would
+/// therefore let a duplicate through whenever its twin fell on the other side
+/// of a page boundary. The predicate here is instead a property of the row
+/// alone — "no copy of this `Message-ID` sorts ahead of me" — so it selects
+/// the same single copy no matter which page that copy lands on, and no
+/// matter how the caller pages.
+///
+/// The surviving copy is the one that sorts *first* (newest, then highest
+/// id), which is also the copy a user reading newest-first would have seen
+/// anyway. A row with no `Message-ID` (or an empty one, from a malformed
+/// header) is never deduplicated against anything: it has no identity to be
+/// equal by, and collapsing all of them together would hide unrelated mail.
+///
+/// What row-local buys is exactness *within a snapshot*: page any way you
+/// like over an unchanging store and each `Message-ID` appears once. It does
+/// not survive a walk that races a sync, and the honest statement of the
+/// window is: which copy wins depends on the set of copies, so a new copy
+/// landing above the cursor mid-walk can leave that `Message-ID` on no page
+/// of the pass, and a winning copy being expunged can let the runner-up
+/// appear on a later page. That is a strictly smaller window than a
+/// window-local dedup (which fails on a *static* store the moment a boundary
+/// separates two copies), and it closes on the next walk.
+///
+/// The `dup.mailbox_id IN (...)` clause is load-bearing and easy to read as
+/// redundant: without it, a copy of the same `Message-ID` in *any* folder
+/// suppresses the inbox copy — and every Gmail account has one, in
+/// `[Gmail]/All Mail`. `an_archived_copy_does_not_suppress_the_inbox_copy`
+/// is the probe.
+///
+/// A negative `limit` is clamped to 0 — in SQLite a negative LIMIT means "no
+/// limit", which would turn a bad page size into a full-table read.
+///
+/// # Errors
+/// Propagates any `rusqlite` error.
+pub fn list_unified_inbox(
+    conn: &Connection,
+    inbox_ids: &[i64],
+    after: Option<crate::page::Cursor>,
+    limit: i64,
+) -> rusqlite::Result<Vec<Message>> {
+    if inbox_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // ?1 is the limit; the mailbox ids follow, and the cursor (when there is
+    // one) comes last. The id list is referenced twice in the statement but
+    // bound once — the same placeholders serve both.
+    let mut params: Vec<i64> = vec![limit.max(0)];
+    let ids_sql = inbox_ids
+        .iter()
+        .map(|id| {
+            params.push(*id);
+            format!("?{}", params.len())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let cursor_sql = match after {
+        Some(cursor) => {
+            params.push(cursor.sort);
+            let sort = params.len();
+            params.push(cursor.id);
+            let id = params.len();
+            // A range bound on the index prefix plus a filter, not the
+            // equivalent disjunction — see `list_messages` for why.
+            format!("AND {LIST_SORT_KEY} <= ?{sort} AND ({LIST_SORT_KEY} < ?{sort} OR id < ?{id})")
+        }
+        None => String::new(),
+    };
+
+    let dup_key = sort_key_for("dup");
+    let own_key = sort_key_for("messages");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MESSAGE_COLS} FROM messages
+         WHERE mailbox_id IN ({ids_sql}) {cursor_sql}
+           AND (
+             message_id IS NULL OR message_id = ''
+             OR NOT EXISTS (
+               SELECT 1 FROM messages dup
+               WHERE dup.message_id = messages.message_id
+                 AND dup.mailbox_id IN ({ids_sql})
+                 AND ({dup_key} > {own_key}
+                      OR ({dup_key} = {own_key} AND dup.id > messages.id))
+             )
+           )
+         ORDER BY {LIST_SORT_KEY} DESC, id DESC LIMIT ?1"
     ))?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params), Message::from_row)?;
     rows.collect()

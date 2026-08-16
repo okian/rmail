@@ -858,3 +858,89 @@ fn listing_falls_back_to_internaldate_when_date_missing() {
     );
     assert_eq!(listed[1].id, with_date);
 }
+
+/// The three spellings of the listing sort key are one expression.
+///
+/// [`LIST_SORT_KEY`] is what the mailbox listing orders and filters by,
+/// [`sort_key_for`] is the alias-qualified form the unified inbox's
+/// deduplication subquery compares two rows with, and [`Message::sort_key`]
+/// is the Rust mirror a page *cursor* is built from. A cursor built from a
+/// value the query's own `ORDER BY` does not produce lands a page boundary
+/// where the query never looks — rows silently dropped or repeated,
+/// depending on which way the divergence went. Nothing but this test relates
+/// the three, so it evaluates all of them over the same rows, including the
+/// three combinations of NULL that make `COALESCE`'s argument list matter.
+#[test]
+fn the_three_sort_key_spellings_agree() {
+    let tmp = TempDb::open();
+    let account_id = seed_account(&tmp.db, "Personal");
+    let mailbox_id = tmp
+        .db
+        .with_write(|c| {
+            insert_mailbox(
+                c,
+                &NewMailbox {
+                    account_id,
+                    name: "INBOX".to_owned(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+    for (uid, date, internaldate) in [
+        (1_i64, Some(3_000_i64), Some(2_000_i64)),
+        (2, None, Some(2_500)),
+        (3, Some(1_500), None),
+        (4, None, None),
+        (5, Some(-10), Some(7)),
+    ] {
+        tmp.db
+            .with_write(|c| {
+                insert_message(
+                    c,
+                    &NewMessage {
+                        account_id,
+                        mailbox_id,
+                        uid,
+                        uidvalidity: 1,
+                        date,
+                        internaldate,
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+    }
+
+    let qualified = sort_key_for("m");
+    let rows: Vec<(i64, i64, i64)> = tmp
+        .db
+        .with_read(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT id, {LIST_SORT_KEY}, {qualified} FROM messages m ORDER BY id"
+            ))?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 5, "every seeded row must be readable");
+
+    for (id, unqualified, qualified) in rows {
+        assert_eq!(
+            unqualified, qualified,
+            "LIST_SORT_KEY and sort_key_for disagree on message {id}"
+        );
+        let message = tmp
+            .db
+            .with_read(move |c| get_message(c, id))
+            .unwrap()
+            .expect("the row was just inserted");
+        assert_eq!(
+            message.sort_key(),
+            unqualified,
+            "Message::sort_key and the SQL sort key disagree on message {id}; a page cursor \
+             would be built from a value the query never orders by"
+        );
+    }
+}

@@ -500,6 +500,15 @@ pub struct Injected {
     /// [`ClaudeReranker`] over that provider, which is usually what a test
     /// wants; supply one only to pin the *order* a rerank produces.
     pub reranker: Option<Arc<dyn CoreReranker>>,
+    /// Where `AccountService.Autoconfigure`'s probes look (task 80).
+    ///
+    /// The second network-facing dependency with no `[config]` knob, and for
+    /// the same reason as the first: the real endpoints are ISPDB, a domain's
+    /// own autoconfig document and a DNS-over-HTTPS resolver, none of which a
+    /// test may touch. `None` uses them. A test supplies endpoints pointing
+    /// at a loopback server and gets the whole RPC — scope check, handler,
+    /// probes, validator, TOML rendering — wired exactly as it ships.
+    pub autoconfig_endpoints: Option<rmail_core::autoconfig::ProbeEndpoints>,
 }
 
 impl std::fmt::Debug for Injected {
@@ -507,6 +516,7 @@ impl std::fmt::Debug for Injected {
         f.debug_struct("Injected")
             .field("ai_provider", &self.ai_provider.is_some())
             .field("reranker", &self.reranker.is_some())
+            .field("autoconfig_endpoints", &self.autoconfig_endpoints.is_some())
             .finish()
     }
 }
@@ -714,9 +724,11 @@ where
         config.grpc.idempotency.in_flight.into(),
     );
     let admin_service = AdminServiceServer::new(AdminApi::new(db.clone()));
-    let account_service = AccountServiceServer::new(
-        AccountApi::new(db.clone(), stopping.clone()).map_err(ServeError::OAuthBroker)?,
-    );
+    // Registered further down, once the AI provider and policy engine exist:
+    // `Autoconfigure`'s model fallback needs both, and `AccountApi` is built
+    // here because everything else on that service needs neither.
+    let account_api =
+        AccountApi::new(db.clone(), stopping.clone()).map_err(ServeError::OAuthBroker)?;
     let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
     // Built further down, once the AI provider and policy engine exist:
     // `AnalyticsService` is registered with the rest of the services below,
@@ -1548,6 +1560,49 @@ where
         Some(engine) => analytics_api.with_digest(engine),
         None => analytics_api,
     });
+
+    // Account autoconfiguration (task 80). The engine is built whenever its
+    // HTTP client can be; only the *model fallback* depends on `ai_active`,
+    // and a daemon without a provider still probes ISPDB/autodiscover/SRV
+    // perfectly well — it simply refuses `allow_model_fallback` rather than
+    // silently answering "nothing found" to a caller who asked for a guess.
+    //
+    // The model is `ai.models.deep`, not the cheap tier: this runs a handful
+    // of times in an account's whole life, on one small request, and the cost
+    // of a wrong hostname is a user typing their password at a machine that
+    // is not their mail provider. The budget enforcer may still downgrade it.
+    // The pacing pair is the process-wide one, as everywhere else.
+    let account_service = AccountServiceServer::new(
+        match rmail_core::autoconfig::Autoconfigurator::new(
+            db.clone(),
+            injected.autoconfig_endpoints.clone().unwrap_or_default(),
+        ) {
+            Ok(engine) => {
+                let engine = if ai_active {
+                    engine.with_inferrer(rmail_core::autoconfig::infer::SettingsInferrer::new(
+                        db.clone(),
+                        Arc::clone(&ai_provider),
+                        Arc::clone(&ai_policy),
+                        config.ai.limits.clone(),
+                        Arc::clone(&ai_semaphore),
+                        Arc::clone(&ai_rate_limiter),
+                        config.ai.models.deep.clone(),
+                    ))
+                } else {
+                    engine
+                };
+                account_api.with_autoconfig(engine)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not build the autoconfiguration engine; \
+                     AccountService.Autoconfigure will decline"
+                );
+                account_api
+            }
+        },
+    );
     let digest_handle = match (&digest_engine, config.digest.enabled) {
         (Some(engine), true) => {
             let scheduler = DigestScheduler::new(engine.clone(), db.clone());

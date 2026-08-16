@@ -114,8 +114,8 @@ use rmail_proto::v1::{
     Attachment as ProtoAttachment, AttachmentChunk, CopyRequest, DeleteRequest,
     Event as ProtoEvent, EventKind as ProtoEventKind, FullMessage as ProtoFullMessage,
     GetAttachmentRequest, GetMessageRequest, GetThreadRequest, ListMessagesRequest,
-    Message as ProtoMessage, MoveRequest, SetFlagsRequest, Thread as ProtoThread,
-    WatchEventsRequest,
+    ListUnifiedRequest, Message as ProtoMessage, MoveRequest, SetFlagsRequest,
+    Thread as ProtoThread, WatchEventsRequest,
 };
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
@@ -214,6 +214,51 @@ impl MailService for MailApi {
             // Tokens are base64url by construction, so this parse cannot fail
             // — but a `Status` beats a panic if that ever stops being true,
             // and an unpaginated answer would be a silent truncation.
+            let value = token.parse().map_err(|_| {
+                Status::from(Error::internal("page token was not a valid header value"))
+            })?;
+            response
+                .metadata_mut()
+                .insert(NEXT_PAGE_TOKEN_METADATA_KEY, value);
+        }
+        Ok(response)
+    }
+
+    type ListUnifiedStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ProtoMessage, Status>> + Send + 'static>>;
+
+    /// The unified inbox, paginated exactly like [`MailService::list`] — same
+    /// cap, same probe row, same `x-rmail-next-page-token` header, same
+    /// "absence is final" contract.
+    ///
+    /// The one thing it deliberately does *not* do is filter or re-map the
+    /// rows: each carries the `account_id`/`mailbox_id` it really has, which
+    /// is what lets a client act on a unified row through the ordinary
+    /// mutations with nothing unified-specific in the path.
+    async fn list_unified(
+        &self,
+        request: Request<ListUnifiedRequest>,
+    ) -> Result<Response<Self::ListUnifiedStream>, Status> {
+        let req = request.into_inner();
+        // Same answer `List` gives the same input: a negative page size is
+        // nonsense, not a request for the default.
+        if req.page_size < 0 {
+            return Err(Status::from(Error::invalid_argument(
+                "page_size must not be negative",
+            )));
+        }
+        let page = self
+            .store
+            .list_unified(i64::from(req.page_size), &req.page_token)
+            .await?;
+        let items: Vec<Result<ProtoMessage, Status>> = page
+            .messages
+            .iter()
+            .map(|m| Ok(message_to_proto(m)))
+            .collect();
+        let mut response: Response<Self::ListUnifiedStream> =
+            Response::new(Box::pin(tokio_stream::iter(items)));
+        if let Some(token) = page.next_page_token {
             let value = token.parse().map_err(|_| {
                 Status::from(Error::internal("page token was not a valid header value"))
             })?;
