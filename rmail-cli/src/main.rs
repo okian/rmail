@@ -13,6 +13,7 @@ mod outbox_cli;
 #[cfg(test)]
 mod parity;
 mod search_cli;
+mod stats_cli;
 mod tag_cli;
 mod tui;
 
@@ -186,6 +187,12 @@ enum Command {
     Followup {
         #[command(subcommand)]
         action: FollowupAction,
+    },
+    /// Mailbox analytics: response-time percentiles, trend and bottlenecks
+    /// (`AnalyticsService`).
+    Stats {
+        #[command(subcommand)]
+        action: stats_cli::StatsAction,
     },
     /// Serve the whole gRPC surface to an AI agent over the Model Context
     /// Protocol. The tool list is generated from the compiled service
@@ -444,6 +451,7 @@ async fn main() -> Result<()> {
         Command::Undo(args) => outbox_cli::undo(&socket, args).await,
         Command::Outbox(args) => outbox_cli::outbox(&socket, args).await,
         Command::Followup { action } => outbox_cli::followup(&socket, action).await,
+        Command::Stats { action } => stats_cli::run(&socket, action).await,
         Command::Mcp { action } => mcp_cli::run(&socket, action).await,
         Command::AcceptTags { message_tag_ids } => {
             tag_cli::resolve_suggestions(&socket, message_tag_ids, true).await

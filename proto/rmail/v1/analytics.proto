@@ -1,0 +1,203 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// AnalyticsService answers questions *about* a mailbox rather than about the
+// mail in it: how fast you answer, who you keep waiting, and whether that is
+// getting better or worse.
+//
+// Everything here is derived from the local mirror by SQL. No model is
+// called, nothing is written, and no message body is read — the inputs are
+// headers (`From`, `Date`, `In-Reply-To`, `References`) and folder names.
+// That is why it sits behind `mail.read` and is projected to MCP as a safe
+// tool.
+service AnalyticsService {
+  // Per-contact or per-mailbox response-time percentiles, a rolling trend,
+  // and a flag on the correspondences where *you* are the slow side
+  // (prd.md feature 58).
+  //
+  // RESOURCE_EXHAUSTED when the window covers more mail than one report may
+  // materialize; the fix is a narrower window or a single account, never a
+  // retry. INVALID_ARGUMENT for a window, bucket or ratio the fields below
+  // say is out of range.
+  rpc GetResponseTimes(GetResponseTimesRequest) returns (GetResponseTimesResponse);
+}
+
+// Which dimension a response-time report is grouped along.
+enum ResponseTimeGroupBy {
+  // Treated as RESPONSE_TIME_GROUP_BY_CONTACT.
+  RESPONSE_TIME_GROUP_BY_UNSPECIFIED = 0;
+  // One group per counterparty address — `mail stats response-time --by contact`.
+  RESPONSE_TIME_GROUP_BY_CONTACT = 1;
+  // One group per folder the *inbound* message of a pair lives in. Note this
+  // is never the Sent folder: a pair is always keyed on the side that was
+  // waited for, so grouping by mailbox answers "which folders do I let rot",
+  // not "where do my replies end up".
+  RESPONSE_TIME_GROUP_BY_MAILBOX = 2;
+}
+
+message GetResponseTimesRequest {
+  // Restrict to one account. 0 covers every configured account.
+  int64 account_id = 1;
+
+  // 0 (UNSPECIFIED) groups by contact.
+  ResponseTimeGroupBy group_by = 2;
+
+  // Window bounds in unix seconds, half-open: `since <= t < until`. A pair
+  // is in the window when the **reply** was sent inside it, not when the
+  // message it answers arrived — "how fast did I respond during March" is a
+  // statement about replies written in March.
+  //
+  // 0 means "since = until - 90 days" and "until = now".
+  int64 since = 3;
+  int64 until = 4;
+
+  // Trend granularity: one point every `bucket_seconds`, each summarizing the
+  // preceding `window_seconds`. 0 means 7 days and 28 days respectively —
+  // a weekly point over a rolling four-week window.
+  //
+  // `window_seconds` must be at least `bucket_seconds`; a window shorter than
+  // the step would leave gaps between points and is INVALID_ARGUMENT. The
+  // number of points is capped, so a wide range with a tiny bucket is
+  // INVALID_ARGUMENT asking for a coarser bucket rather than a silently
+  // truncated series.
+  int64 bucket_seconds = 5;
+  int64 window_seconds = 6;
+
+  // Maximum groups returned. 0 means 50; larger values are clamped to 500.
+  // `total_groups` reports how many existed before truncation.
+  uint32 limit = 7;
+
+  // How many observations a group needs before the bottleneck rule will fire
+  // on it — the evidence bar that stops one slow reply from labelling a
+  // relationship. 0 means 3.
+  uint32 min_samples = 8;
+
+  // How many times slower than the counterparty your median has to be to
+  // count as "slower". 0 means 2.0; anything below 1.0 is INVALID_ARGUMENT,
+  // since a ratio under 1 would flag correspondences where you are the
+  // *faster* side.
+  double bottleneck_ratio = 9;
+}
+
+// A percentile summary of one set of response latencies.
+//
+// Percentiles use the **nearest-rank** method (the value at 1-based rank
+// `ceil(p/100 * n)`), not linear interpolation: every number reported here is
+// therefore an observation that really happened, which is what makes "p90 is
+// 3 days" checkable against a specific message. With `samples = 0` every
+// other field is 0 and means nothing — check `samples` first.
+message ResponseStats {
+  uint64 samples = 1;
+  int64 p50_seconds = 2;
+  int64 p90_seconds = 3;
+  double mean_seconds = 4;
+  int64 min_seconds = 5;
+  int64 max_seconds = 6;
+}
+
+// One contact or one folder.
+message ResponseTimeGroup {
+  // The grouping key: a lowercased email address, or a folder name.
+  //
+  // Unique among groups when the report is scoped to one account. With
+  // `account_id = 0` and `group_by = MAILBOX` two accounts each contribute an
+  // `INBOX`, and they stay *separate* groups sharing one `key` — merging
+  // them would report a single median over two unrelated mailboxes.
+  // `mailbox_id` is what tells them apart.
+  string key = 1;
+  // What to show a human: the contact's display name if one is known,
+  // otherwise the same text as `key`.
+  string label = 2;
+  // The folder, when grouping by mailbox; 0 otherwise.
+  int64 mailbox_id = 3;
+
+  // How long *you* took to answer them.
+  ResponseStats ours = 4;
+  // How long *they* took to answer you — the comparison that makes "slow"
+  // mean something relative to the correspondence rather than to a global
+  // constant.
+  ResponseStats theirs = 5;
+
+  // Inbound messages from this contact/in this folder inside the window.
+  uint64 inbound = 6;
+  // How many of those have no later message of yours anywhere in the same
+  // thread — asked over all time, not only inside the window. Reported
+  // because a median computed only over the messages you did answer is
+  // survivorship bias: never replying is the fastest way to have an excellent
+  // p50.
+  uint64 awaiting_reply = 7;
+  // The subset of `awaiting_reply` that has been sitting longer than you
+  // normally take with this contact/folder — your own `ours.p90_seconds`,
+  // floored at one day. This, not `awaiting_reply`, is what `stalled` counts:
+  // every conversation ends with somebody's message and about half of them
+  // end with theirs, so plain "unanswered" describes most healthy
+  // correspondence and would make the flag meaningless.
+  uint64 overdue = 11;
+
+  // Whether you are the bottleneck here. Exactly
+  // `slower_than_counterpart || stalled`; the two component flags are
+  // reported so the verdict can be explained rather than trusted.
+  bool bottleneck = 8;
+  // Your median is at least `bottleneck_ratio` times theirs, with at least
+  // `min_samples` observations on both sides.
+  bool slower_than_counterpart = 9;
+  // At least `min_samples` messages are overdue.
+  //
+  // Overdue is counted per *sender*: a message only qualifies if you replied
+  // to that address at least once inside the window. That is what keeps
+  // newsletters, CI mail and cold outreach out — a sender you have never once
+  // replied to is not a relationship you are blocking — and it is why the
+  // test is on the sender rather than on the group: under
+  // `group_by = MAILBOX` one group holds mail from everybody, so a
+  // group-level version of this clause would be true of INBOX in every
+  // mailbox that exists.
+  bool stalled = 10;
+}
+
+// One point of the rolling trend, covering `[window_start, window_end)`.
+message ResponseTrendPoint {
+  // Clamped to the report's `since`, so the earliest points cover a shorter
+  // span than `window_seconds` rather than reaching for data the query never
+  // read. Compare against `window_end` before reading much into a point.
+  int64 window_start = 1;
+  int64 window_end = 2;
+  // Your own response times only. A trend that mixed in the counterparty's
+  // latency would move when *they* changed behavior.
+  ResponseStats stats = 3;
+}
+
+message GetResponseTimesResponse {
+  // The resolved window, after defaults were applied.
+  int64 since = 1;
+  int64 until = 2;
+  ResponseTimeGroupBy group_by = 3;
+
+  // Every pair in the window, ungrouped.
+  ResponseStats ours = 4;
+  ResponseStats theirs = 5;
+
+  // Groups, most-in-need-of-attention first: flagged groups lead, then by
+  // descending median, overdue count and sample count, with the key and the
+  // folder id as final tie-breaks so the order is total and a truncated
+  // report is reproducible.
+  repeated ResponseTimeGroup groups = 6;
+  // Groups before `limit` truncation.
+  uint32 total_groups = 7;
+
+  repeated ResponseTrendPoint trend = 8;
+
+  // The addresses treated as "you" — read from each account's configured
+  // username and from the senders found in its Sent folder. Reported because
+  // an empty report is almost always this list being empty, and a caller
+  // cannot otherwise tell "you answer nothing" from "rmail does not know who
+  // you are".
+  repeated string self_addresses = 9;
+
+  // Reply/original pairs matched in the window, both directions.
+  uint64 pairs = 10;
+  // Pairs discarded because the reply's timestamp preceded the message it
+  // answers. A negative latency is a clock or a forged `Date` header, not a
+  // fast reply, and averaging it in would drag every percentile down.
+  uint64 skipped_out_of_order = 11;
+}

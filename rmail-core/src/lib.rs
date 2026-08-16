@@ -7,6 +7,7 @@
 
 pub mod account;
 pub mod ai;
+pub mod analytics;
 pub mod attach;
 pub mod auth;
 pub mod compose;

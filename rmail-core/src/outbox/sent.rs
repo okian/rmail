@@ -44,6 +44,19 @@ const SENT_FOLDER_NAMES: &[&str] = &[
     "[gmail]/sent mail",
 ];
 
+/// Whether a folder name is one of the conventional `Sent` spellings.
+///
+/// `pub(crate)` so [`crate::analytics::response_time`] can identify the same
+/// folders when deriving which addresses are "you" from the mail you have
+/// already sent. A second list there would be a list that drifts: adding a
+/// server family's spelling in one place and not the other would leave the
+/// outbox filing into a folder the analytics never counts as yours.
+#[must_use]
+pub(crate) fn looks_like_sent(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SENT_FOLDER_NAMES.contains(&lower.as_str())
+}
+
 /// Files a delivered message in the account's `Sent` folder.
 #[async_trait::async_trait]
 pub trait SentAppender: Send + Sync + std::fmt::Debug {

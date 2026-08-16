@@ -385,6 +385,15 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SearchService/Explain",
         Requirement::Scope(Scope::MailRead),
     ),
+    // -- AnalyticsService (task 71) ------------------------------------------
+    // A response-time report is arithmetic over headers the caller could
+    // already list one by one through `MailService/List`, so it needs exactly
+    // what listing needs. It reaches no provider and writes nothing, which is
+    // what keeps it off `ai.invoke` and off `mail.write`.
+    (
+        "/rmail.v1.AnalyticsService/GetResponseTimes",
+        Requirement::Scope(Scope::MailRead),
+    ),
     // -- IndexService (task 24) -----------------------------------------------
     // The index is a derived artifact over mail the caller can already read, so
     // the read-only RPCs sit at `mail.read` for the same reason `SearchService`'s

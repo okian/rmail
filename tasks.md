@@ -687,7 +687,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmaild --test digest` (sectioned briefing, every line cites a message-id)
 
 ## 71. Response-time & SLA analytics
-- [ ] status
+- [x] status
 - **depends-on:** 9, 10
 - **parallel-safe:** yes
 - **acceptance:**

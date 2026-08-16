@@ -5,6 +5,7 @@
 //! `AccountService`/`SyncService`/`AdminService`/`AuditService`/
 //! `MailService`/`NoteService`/`TagService`/`SearchService`/
 //! `SavedSearchService`/`FinderService`/`ComposeService`/`SendSchedulerService`/`AiService`/
+//! `AnalyticsService`/
 //! `AiPolicyService`/`AiSafetyService`/`IndexService`/`HookService`/`RuleService` handlers — all wrapped in a
 //! [`RequestTraceLayer`] (opens a span per RPC) and an [`AuthLayer`] (enforces
 //! per-method capability scope; see `auth::methods` for the table). It is
@@ -16,6 +17,7 @@ mod admin_service;
 mod ai_policy_service;
 mod ai_safety_service;
 mod ai_service;
+mod analytics_service;
 mod attachment_service;
 mod audit_service;
 mod auth;
@@ -41,6 +43,7 @@ pub use account_service::AccountApi;
 pub use admin_service::AdminApi;
 pub use ai_safety_service::AiSafetyApi;
 pub use ai_service::AiApi;
+pub use analytics_service::AnalyticsApi;
 pub use attachment_service::AttachmentApi;
 pub use audit_service::AuditApi;
 pub use auth::AuthLayer;
@@ -109,6 +112,7 @@ use rmail_proto::v1::admin_service_server::AdminServiceServer;
 use rmail_proto::v1::ai_policy_service_server::AiPolicyServiceServer;
 use rmail_proto::v1::ai_safety_service_server::AiSafetyServiceServer;
 use rmail_proto::v1::ai_service_server::AiServiceServer;
+use rmail_proto::v1::analytics_service_server::AnalyticsServiceServer;
 use rmail_proto::v1::attachment_service_server::AttachmentServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
 use rmail_proto::v1::compose_service_server::ComposeServiceServer;
@@ -682,6 +686,8 @@ where
     let admin_service = AdminServiceServer::new(AdminApi::new(db.clone()));
     let account_service = AccountServiceServer::new(AccountApi::new(db.clone()));
     let audit_service = AuditServiceServer::new(AuditApi::new(db.clone(), stopping.clone()));
+    let analytics_service =
+        AnalyticsServiceServer::new(AnalyticsApi::new(db.clone(), stopping.clone()));
     let sync_service = SyncServiceServer::new(SyncApi::new(engine, stopping.clone()));
     // Cloned before the store moves into its own service: the rules engine's
     // action runner mutates mail and tags through the *same* stores the
@@ -1315,6 +1321,7 @@ where
         .add_service(reflection)
         .add_service(admin_service)
         .add_service(audit_service)
+        .add_service(analytics_service)
         .add_service(account_service)
         .add_service(sync_service)
         .add_service(mail_service)

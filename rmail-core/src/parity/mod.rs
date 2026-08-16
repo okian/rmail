@@ -629,6 +629,19 @@ commands! {
         summary: "Report how complete, how large and how fresh the fuzzy-finder index is.",
     }
 
+    // -- AnalyticsService (task 71) -------------------------------------------
+    // `Read` on the same grounds `SearchSearch` is, and more plainly: the
+    // report is arithmetic over headers already in the local mirror. It
+    // writes nothing, reaches no provider, and cannot spend anything.
+    AnalyticsGetResponseTimes {
+        rpc: "/rmail.v1.AnalyticsService/GetResponseTimes",
+        tool: "response_time_stats",
+        effect: Read,
+        cli: ["stats response-time"],
+        actions: [],
+        summary: "Per-contact or per-folder response-time percentiles, a rolling trend, and where you are the bottleneck.",
+    }
+
     // -- IndexService (task 24) -----------------------------------------------
     IndexStatus {
         rpc: "/rmail.v1.IndexService/Status",
