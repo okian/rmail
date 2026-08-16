@@ -155,7 +155,7 @@ use rmail_core::fuse::{FusedCandidate, Fuser};
 use rmail_core::index::fts::FtsIndex;
 use rmail_core::index::semantic::SemanticIndex;
 use rmail_core::present::{PresentedResult, Presenter};
-use rmail_core::query::{Intent, QueryPlan, QueryPlanner};
+use rmail_core::query::{Intent, QueryCompiler, QueryPlan, QueryPlanner};
 use rmail_core::rank::l1::{L1Ranker, Weights};
 use rmail_core::rank::l2::{L2Stage, SearchKind};
 use rmail_core::rank::Ranker;
@@ -163,10 +163,11 @@ use rmail_core::retrieve::{Candidate, DenseRetriever, Fanout, Source};
 use rmail_core::{present, repo, Database, Error as RmailError};
 use rmail_proto::v1::search_service_server::SearchService;
 use rmail_proto::v1::{
-    ByteRange as ProtoByteRange, EvalMetrics as ProtoEvalMetrics, EvalReport as ProtoEvalReport,
-    EvaluateRequest, ExplainRequest, FeatureContribution as ProtoFeatureContribution,
-    FeedbackAction as ProtoFeedbackAction, FeedbackRequest, Intent as ProtoIntent,
-    Message as ProtoMessage, Mode as ProtoMode, QueryEval as ProtoQueryEval,
+    ByteRange as ProtoByteRange, CompileQueryRequest, EvalMetrics as ProtoEvalMetrics,
+    EvalReport as ProtoEvalReport, EvaluateRequest, ExplainRequest,
+    FeatureContribution as ProtoFeatureContribution, FeedbackAction as ProtoFeedbackAction,
+    FeedbackRequest, Intent as ProtoIntent, Message as ProtoMessage, Mode as ProtoMode,
+    QueryEval as ProtoQueryEval, QueryPlan as ProtoQueryPlan,
     RankExplanation as ProtoRankExplanation, Rerank as ProtoRerank,
     ResultAction as ProtoResultAction, SearchAttachmentsRequest, SearchAttachmentsResponse,
     SearchHit as ProtoSearchHit, SearchRequest, Snippet as ProtoSnippet,
@@ -388,6 +389,17 @@ fn decode_intent(raw: i32) -> Option<Intent> {
     }
 }
 
+/// The wire form of a classified intent. The inverse of [`decode_intent`]'s
+/// non-`Unspecified` arms; never emits `Unspecified`, because a *compiled*
+/// plan always carries a classification.
+fn to_proto_intent(intent: Intent) -> ProtoIntent {
+    match intent {
+        Intent::Navigational => ProtoIntent::Navigational,
+        Intent::Exploratory => ProtoIntent::Exploratory,
+        Intent::Lookup => ProtoIntent::Lookup,
+    }
+}
+
 /// A stable lowercase name per [`Source`] — duplicated rather than reaching
 /// into `features::vector`'s private `source_serde` (a shared type gets no
 /// capability added by a downstream consumer that only needs one specific
@@ -441,6 +453,26 @@ pub(crate) fn to_proto_message(message: &repo::Message, flags: Vec<String>) -> P
         flags,
         created_at: message.created_at,
         updated_at: message.updated_at,
+    }
+}
+
+/// One compiled natural-language plan on the wire.
+///
+/// `pub(crate)` so `saved_search_service` renders the plan it stored a folder
+/// from identically to the one `CompileQuery` returns — a client confirming a
+/// plan and then defining a folder from it must not be shown two different
+/// descriptions of the same compile.
+pub(crate) fn to_proto_query_plan(compiled: &rmail_core::query::CompiledQuery) -> ProtoQueryPlan {
+    ProtoQueryPlan {
+        raw: compiled.raw.clone(),
+        compiled: compiled.query.clone(),
+        filters: compiled.filters.clone(),
+        semantic_query: compiled.semantic_query.clone(),
+        intent: to_proto_intent(compiled.intent).into(),
+        notes: compiled.notes.clone(),
+        cached: compiled.cached,
+        model: compiled.model.clone(),
+        compiled_at: compiled.compiled_at,
     }
 }
 
@@ -513,6 +545,14 @@ pub struct SearchApi {
     /// `MailApi`/`SyncApi`.
     shutdown: CancellationToken,
     generation: Generation,
+    /// Stage 0's NL→plan compiler (task 58), when the daemon has a provider.
+    ///
+    /// `Option` for the same reason `dense` is one: a handler built without it
+    /// is a real configuration (this crate's own unit fixtures, which have no
+    /// provider), and `CompileQuery` then answers `UNIMPLEMENTED` rather than
+    /// this file growing a second constructor. `rmaild::serve_*` always sets
+    /// it — the capability would otherwise have no surface at all.
+    compiler: Option<QueryCompiler>,
 }
 
 /// The half of [`SearchApi::build_hits`]' inputs that does not change between
@@ -600,7 +640,20 @@ impl SearchApi {
             search,
             shutdown,
             generation: Generation::default(),
+            compiler: None,
         }
+    }
+
+    /// Attach the natural-language query compiler `CompileQuery` serves from.
+    ///
+    /// A builder rather than a constructor parameter because the compiler
+    /// needs the daemon's single `ai::Provider` and its shared AI
+    /// semaphore/rate limiter — handles `rmaild::serve_*` owns and this
+    /// constructor cannot reach, exactly as with `rerank`.
+    #[must_use]
+    pub fn with_query_compiler(mut self, compiler: QueryCompiler) -> Self {
+        self.compiler = Some(compiler);
+        self
     }
 
     /// The feedback log this handler writes through, so the daemon can drive
@@ -1633,6 +1686,43 @@ impl SearchService for SearchApi {
         self.start_stream(request.into_inner(), true, cancel).await
     }
 
+    #[tracing::instrument(skip(self, request), fields(account_id, cached, filters))]
+    async fn compile_query(
+        &self,
+        request: Request<CompileQueryRequest>,
+    ) -> Result<Response<ProtoQueryPlan>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("account_id", req.account_id);
+        if req.account_id <= 0 {
+            // Not defaulted to "every account": the plan cache is per account
+            // and AI policy/budget resolve against one, so guessing here would
+            // charge a budget the caller never named.
+            return Err(Status::from(RmailError::invalid_argument(
+                "account_id is required to compile a query: the plan cache and the AI \
+                 policy/budget that admits the call are both per account",
+            )));
+        }
+        let Some(compiler) = &self.compiler else {
+            return Err(Status::unimplemented(
+                "this daemon was built without an AI provider, so natural-language \
+                 queries cannot be compiled; use the operator grammar directly",
+            ));
+        };
+
+        // A plain shutdown child, not `self.generation.begin(...)`: compiling
+        // is not the interactive search slot, and a compile that a later
+        // keystroke cancelled would have spent money for nothing.
+        let cancel = self.shutdown.child_token();
+        let compiled = compiler
+            .compile(req.account_id, &req.query, req.refresh, &cancel)
+            .await
+            .map_err(Status::from)?;
+        let span = tracing::Span::current();
+        span.record("cached", compiled.cached);
+        span.record("filters", compiled.filters.len());
+        Ok(Response::new(to_proto_query_plan(&compiled)))
+    }
+
     #[tracing::instrument(skip(self, request), fields(account_id, message_id, hits))]
     async fn search_attachments(
         &self,
@@ -2110,6 +2200,14 @@ mod tests {
             // Write-only, into the log. Returns `google.protobuf.Empty` —
             // it reports nothing back about what is stored.
             "LogFeedback",
+            // Compiles one sentence into a query string (task 58). It reads
+            // `query_plan_cache` and writes `ai_ledger`; no feedback table
+            // appears in either, and its response carries only the caller's
+            // own question and the plan derived from it. The one thing worth
+            // stating explicitly, because this RPC *does* egress: what leaves
+            // the machine is the sentence the caller just typed, never
+            // anything the daemon observed about past searches.
+            "CompileQuery",
         ];
 
         let set = prost_types::FileDescriptorSet::decode(rmail_proto::FILE_DESCRIPTOR_SET)

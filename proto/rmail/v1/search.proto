@@ -94,6 +94,29 @@ service SearchService {
   // written either way.
   rpc LogFeedback (FeedbackRequest) returns (google.protobuf.Empty);
 
+  // Compile plain English into a query in rmail's own grammar — prd.md's
+  // Stage 0 step 7, "NL → plan (Claude, cached)" (task 58). `mail search
+  // --nl "who did I forget to reply to about the lease?"`.
+  //
+  // This is the one RPC in this file that leaves the machine, which is why it
+  // is separate from `Search` rather than a flag on it. `Search` is authorized
+  // by the ordinary mail-read scope and clamps itself to whatever provider
+  // work the operator already sanctioned (see `SearchRequest.rerank`); a
+  // compile *is* a provider call, so it carries `ai.invoke` as well and cannot
+  // be reached by a read-only token.
+  //
+  // It also runs nothing. A plan comes back for a client to show and a human
+  // to confirm — prd.md's "confirmable" — and running it is an ordinary
+  // `Search` with `QueryPlan.compiled` as the query. Compiling and searching
+  // in one call would spend the user's money on a query they had not agreed
+  // to yet, and would give the daemon two entry points that differ in whether
+  // a search can cost anything.
+  //
+  // Cached by normalized query hash, per account, so re-asking the same
+  // question — including from `mail folder new`, which compiles through this
+  // same cache — is free. `CompileQueryRequest.refresh` is the escape hatch.
+  rpc CompileQuery (CompileQueryRequest) returns (QueryPlan);
+
   // Rank *attachments* rather than the messages that carried them (prd.md
   // feature 55): "the contract clause about termination for convenience"
   // returns the exact attachment and page.
@@ -118,6 +141,55 @@ service SearchService {
   // becomes correct earlier, so streaming would buy a cancellation contract
   // and a generation slot for no latency at all.
   rpc SearchAttachments (SearchAttachmentsRequest) returns (SearchAttachmentsResponse);
+}
+
+message CompileQueryRequest {
+  // The plain-English question, as typed. Bounded server-side
+  // (`rmail_core::query::compile::MAX_INPUT_LEN`); a longer one is
+  // INVALID_ARGUMENT rather than truncated, because a truncated question
+  // compiles to a plan for a different question.
+  string query = 1;
+  // Which account the plan is compiled for. The plan cache is per account,
+  // and AI policy/budget resolve against it, so this is required: 0 names no
+  // account and is INVALID_ARGUMENT.
+  int64 account_id = 2;
+  // Recompile even if a cached plan exists, replacing it. For a user who
+  // looks at what came back and wants a second opinion.
+  bool refresh = 3;
+}
+
+// A compiled natural-language query — prd.md's confirmable plan.
+//
+// Deliberately narrower than `rmail_core::query::plan::QueryPlan`, which also
+// carries spelling corrections, corpus synonyms and a query embedding. Those
+// are derived from this mailbox at search time and would go stale in a cache;
+// what is worth compiling once and confirming with a human is the *structure*
+// the sentence turned out to have.
+message QueryPlan {
+  // The plain-English input, trimmed.
+  string raw = 1;
+  // The compiled query, in rmail's operator grammar — exactly what `mail
+  // search` takes. Re-parsed by the daemon on every use; nothing downstream
+  // trusts it as a plan.
+  string compiled = 2;
+  // Each recognized operator rendered back as `key:value` (`-` prefixed when
+  // negated), for a confirmation line. Derived by re-parsing `compiled`, not
+  // by asking the model to describe its own answer.
+  repeated string filters = 3;
+  // The free-text half of `compiled`: what the lexical and dense retrievers
+  // rank on, and what a smart folder embeds.
+  string semantic_query = 4;
+  // The classified intent.
+  Intent intent = 5;
+  // The model's one-line note about what it understood. Display only —
+  // nothing branches on it.
+  string notes = 6;
+  // Whether this answer came from the plan cache. `true` means no provider
+  // call was made and nothing was charged.
+  bool cached = 7;
+  // Which model compiled it, and when (unix seconds).
+  string model = 8;
+  int64 compiled_at = 9;
 }
 
 message SearchAttachmentsRequest {

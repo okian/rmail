@@ -517,6 +517,19 @@ commands! {
         actions: [SearchExplain],
         summary: "Re-derive why one hit ranked where it did: feature contributions and matched spans.",
     }
+    // `Mutate`, unlike every other row in this service, and for the reason
+    // `AiAskMailbox` is: a compile is a provider call the caller chose, not a
+    // clamp-to-configured-backend read, so it spends real money and writes a
+    // cache row and an audit-ledger row. Calling it `Read` would let task 53
+    // project it as a safe tool an agent may call freely, once per phrasing.
+    SearchCompileQuery {
+        rpc: "/rmail.v1.SearchService/CompileQuery",
+        tool: "compile_query",
+        effect: Mutate,
+        cli: ["search"],
+        actions: [],
+        summary: "Compile plain English into a confirmable, cached query in the operator grammar.",
+    }
     SearchEvaluate {
         rpc: "/rmail.v1.SearchService/Evaluate",
         tool: "evaluate_search",
@@ -624,15 +637,26 @@ commands! {
         rpc: "/rmail.v1.SavedSearchService/CreateSmartFolder",
         tool: "create_smart_folder",
         effect: Mutate,
-        cli: [],
+        cli: ["folder new"],
         actions: [],
         summary: "Define a virtual mailbox from a plain-English predicate compiled to a query.",
+    }
+    // `Mutate` on both counts: it stores a folder *and* spends at the
+    // provider, which is why the scope table pairs `mail.write` with
+    // `ai.invoke` here and not on the row above.
+    SavedSearchCompileSmartFolder {
+        rpc: "/rmail.v1.SavedSearchService/CompileSmartFolder",
+        tool: "create_nl_smart_folder",
+        effect: Mutate,
+        cli: ["folder new"],
+        actions: [],
+        summary: "Compile a plain-English sentence into a stored hybrid smart folder plan.",
     }
     SavedSearchListSmartFolders {
         rpc: "/rmail.v1.SavedSearchService/ListSmartFolders",
         tool: "list_smart_folders",
         effect: Read,
-        cli: [],
+        cli: ["folder list"],
         actions: [],
         summary: "List the defined smart folders.",
     }
@@ -640,7 +664,7 @@ commands! {
         rpc: "/rmail.v1.SavedSearchService/DeleteSmartFolder",
         tool: "delete_smart_folder",
         effect: Mutate,
-        cli: [],
+        cli: ["folder rm"],
         actions: [],
         summary: "Delete a smart folder definition. The mail it matched is untouched.",
     }
@@ -648,7 +672,7 @@ commands! {
         rpc: "/rmail.v1.SavedSearchService/ListSmartFolderMembers",
         tool: "list_smart_folder_members",
         effect: Read,
-        cli: [],
+        cli: ["folder members"],
         actions: [],
         summary: "Stream the messages a smart folder currently matches.",
     }
@@ -656,7 +680,7 @@ commands! {
         rpc: "/rmail.v1.SavedSearchService/EvaluateSmartFolder",
         tool: "evaluate_smart_folder",
         effect: Mutate,
-        cli: [],
+        cli: ["folder eval"],
         actions: [],
         summary: "Re-evaluate a smart folder, auto-tagging and notifying on genuinely new members.",
     }

@@ -109,6 +109,7 @@ use rmail_core::outbox::followup::track::FollowupTracker;
 use rmail_core::outbox::{
     FollowupStore, ImapSentAppender, LettreSender, OutboxStore, SendPolicy, SendScheduler,
 };
+use rmail_core::query::QueryCompiler;
 use rmail_core::rank::l1::Weights;
 use rmail_core::rank::l2::{ClaudeReranker, L2Stage, Reranker as CoreReranker};
 use rmail_core::rules::{
@@ -116,6 +117,7 @@ use rmail_core::rules::{
 };
 use rmail_core::saved_search::SavedSearchStore;
 use rmail_core::send::preflight::PreflightGuardian;
+use rmail_core::smart_folder::nl::NlSmartFolderCompiler;
 use rmail_core::smart_folder::{SmartFolderEvaluator, SmartFolderStore};
 use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::tags::ai::{SuggestTagsPassHandler, SuggestionEngine};
@@ -985,6 +987,34 @@ where
         ),
         stopping.clone(),
     );
+    // Stage 0's NL->plan compiler (task 58). Wired only when the AI subsystem
+    // is genuinely active, for the reason the Claude reranker above is: with
+    // `NullProvider` behind it, `CompileQuery` would run a redaction pass and
+    // a budget check to reach a provider that always refuses, and
+    // `UNIMPLEMENTED` is the honest answer to "compile this sentence" on a
+    // daemon that has nothing to compile it with.
+    //
+    // `ai.models.deep` rather than `triage`: turning a sentence into a query
+    // is the one-off reasoning job the first names, and it is what
+    // `RuleService/SynthesizeRule` — the same shape of work — already uses.
+    // It shares `ai_semaphore`/`ai_rate_limiter` with the worker pool so the
+    // one `ai.limits` budget bounds this path too.
+    let query_compiler = ai_active.then(|| {
+        QueryCompiler::new(
+            db.clone(),
+            Arc::clone(&ai_provider),
+            Arc::clone(&ai_policy),
+            config.ai.privacy.clone(),
+            config.ai.limits.clone(),
+            config.ai.models.deep.clone(),
+            Arc::clone(&ai_semaphore),
+            Arc::clone(&ai_rate_limiter),
+        )
+    });
+    let search_api = match query_compiler.clone() {
+        Some(compiler) => search_api.with_query_compiler(compiler),
+        None => search_api,
+    };
     let search_service = SearchServiceServer::new(search_api.clone());
 
     // The implicit-feedback log's retention sweep (task 64). Separate from
@@ -1036,7 +1066,8 @@ where
     // and one definition of what "indexed" means for the thing that writes the
     // index and the thing that reads it.
     let indexer_queue = IndexQueue::new(db.clone(), IndexQueueOptions::default());
-    let indexer_semantic = SemanticIndex::new(db.clone(), embedder, &config.index.semantic);
+    let indexer_semantic =
+        SemanticIndex::new(db.clone(), Arc::clone(&embedder), &config.index.semantic);
     let index_pipeline = IndexPipeline::new(
         db.clone(),
         indexer_queue.clone(),
@@ -1086,13 +1117,31 @@ where
     // own IMAP sync mode) and publishes `notify` actions to the same
     // `EventLog` every other subsystem consumes.
     let smart_folder_store = SmartFolderStore::new(db.clone(), tag_store.clone(), events.clone());
-    let saved_search_service = SavedSearchServiceServer::new(SavedSearchApi::new(
+    //
+    // The NL half (task 58) compiles through the *same* `QueryCompiler`
+    // `SearchService.CompileQuery` serves from, so a plan confirmed with
+    // `mail search --nl` and a folder defined from the same sentence share one
+    // cache entry and one charge. It embeds with the same `Arc<dyn Embedder>`
+    // the index and the search pipeline use — a second embedder here would
+    // freeze a query vector from one model into a folder searching an index
+    // built by another, which produces cosines that mean nothing and still
+    // sort.
+    let saved_search_api = SavedSearchApi::new(
         db.clone(),
         SavedSearchStore::new(db.clone()),
         smart_folder_store.clone(),
         search_api.clone(),
         stopping.clone(),
-    ));
+    );
+    let saved_search_api = match query_compiler {
+        Some(compiler) => saved_search_api.with_nl_compiler(NlSmartFolderCompiler::new(
+            compiler,
+            Arc::clone(&embedder),
+            smart_folder_store.clone(),
+        )),
+        None => saved_search_api,
+    };
+    let saved_search_service = SavedSearchServiceServer::new(saved_search_api);
     // Membership is always live on read, so this loop exists only to keep
     // *actions* following sync — see `rmail_core::smart_folder`'s docs.
     let smart_folder_handle = SmartFolderEvaluator::new(smart_folder_store, events.clone())

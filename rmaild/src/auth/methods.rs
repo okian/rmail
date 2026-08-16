@@ -482,6 +482,23 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SearchService/Explain",
         Requirement::Scope(Scope::MailRead),
     ),
+    // `CompileQuery` (task 58) is where the clamp argument above runs out.
+    // There is no configured backend for it to reduce to: a compile *is* a
+    // provider call, one per uncached sentence, charged to the operator and
+    // chosen entirely by the caller. So it carries `ai.invoke` on top of the
+    // `mail.read` its neighbours have — `AllOf`, because either alone
+    // under-gates it, and it is what `mail search --nl` needs a token to hold
+    // that plain `mail search` does not.
+    //
+    // `mail.read` is not decorative here: a compiled plan echoes the operator
+    // structure of the question back, which for `from:` and `in:` restates
+    // whatever the asker already knew — but the RPC exists to be handed
+    // straight to `Search`, and an `ai.invoke`-only token that could compile
+    // but not search would be a strange half-capability to grant.
+    (
+        "/rmail.v1.SearchService/CompileQuery",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
+    ),
     // -- AnalyticsService (task 71) ------------------------------------------
     // A response-time report is arithmetic over headers the caller could
     // already list one by one through `MailService/List`, so it needs exactly
@@ -1151,6 +1168,23 @@ const TABLE: &[(&str, Requirement)] = &[
     (
         "/rmail.v1.SavedSearchService/CreateSmartFolder",
         Requirement::Scope(Scope::MailWrite),
+    ),
+    // The NL half (task 58) is the only RPC in this service that reaches a
+    // provider, so it is the only one carrying `ai.invoke` — and it carries
+    // `mail.write` too, because it also leaves a folder behind. `AllOf`, for
+    // the reason `ComposeService`'s AI half gives: either scope alone
+    // under-gates it. An `ai.invoke`-only token must not be able to define
+    // mailboxes; a `mail.write` token minted deliberately *without*
+    // `ai.invoke` (an automation token) must not be able to force provider
+    // spend.
+    //
+    // That split is also why this is a separate RPC from `CreateSmartFolder`
+    // rather than a field on it: folding the two together would push
+    // `ai.invoke` onto every deterministic folder that same automation token
+    // legitimately creates today.
+    (
+        "/rmail.v1.SavedSearchService/CompileSmartFolder",
+        Requirement::AllOf(&[Scope::MailWrite, Scope::AiInvoke]),
     ),
     (
         "/rmail.v1.SavedSearchService/ListSmartFolders",

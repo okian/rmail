@@ -9,11 +9,19 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
+use crate::embed::Embedding;
+use crate::index::semantic::VECTOR_DIM;
+
 use super::{NewSmartFolder, SmartFolder};
 
 /// Every column, in the order [`from_row`] reads them.
+///
+/// `query_vector` is deliberately absent: it is kilobytes per folder and no
+/// caller listing folders needs it. [`query_vector`] reads it on its own, on
+/// the one path that does.
 const COLUMNS: &str = "id, account_id, name, predicate, auto_tag, notify, \
-                       created_at, updated_at, last_evaluated_at";
+                       created_at, updated_at, last_evaluated_at, nl_source, \
+                       vector_model, min_similarity, compiled_model, compiled_at";
 
 fn from_row(row: &Row<'_>) -> rusqlite::Result<SmartFolder> {
     Ok(SmartFolder {
@@ -26,6 +34,11 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<SmartFolder> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         last_evaluated_at: row.get("last_evaluated_at")?,
+        nl_source: row.get("nl_source")?,
+        vector_model: row.get("vector_model")?,
+        min_similarity: row.get("min_similarity")?,
+        compiled_model: row.get("compiled_model")?,
+        compiled_at: row.get("compiled_at")?,
     })
 }
 
@@ -39,8 +52,10 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<SmartFolder> {
 pub(crate) fn insert(conn: &Connection, spec: &NewSmartFolder) -> rusqlite::Result<SmartFolder> {
     conn.query_row(
         &format!(
-            "INSERT INTO smart_folders (account_id, name, predicate, auto_tag, notify)
-             VALUES (?1, ?2, ?3, ?4, ?5) RETURNING {COLUMNS}"
+            "INSERT INTO smart_folders
+                 (account_id, name, predicate, auto_tag, notify, nl_source,
+                  query_vector, vector_model, min_similarity, compiled_model, compiled_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) RETURNING {COLUMNS}"
         ),
         rusqlite::params![
             spec.account_id,
@@ -48,9 +63,54 @@ pub(crate) fn insert(conn: &Connection, spec: &NewSmartFolder) -> rusqlite::Resu
             spec.predicate,
             spec.auto_tag,
             i64::from(spec.notify),
+            spec.nl_source,
+            spec.query_vector.as_ref().map(Embedding::to_bytes),
+            spec.vector_model,
+            spec.min_similarity,
+            spec.compiled_model,
+            // Stamped only for a folder that was actually compiled; a
+            // hand-written predicate has no compile to date.
+            spec.nl_source
+                .as_ref()
+                .map(|_| chrono::Utc::now().timestamp()),
         ],
         from_row,
     )
+}
+
+/// One folder's frozen query vector, if it has one.
+///
+/// A row whose blob does not deserialize at the index's width returns `None`
+/// with a warning rather than an error: a corrupt or stale vector must
+/// degrade the dense arm, never make the folder unreadable. That the folder
+/// then has *no* enforceable arm is impossible by construction —
+/// `SmartFolderStore::create` refuses to store a folder whose only arm was the
+/// dense one when no vector was available — so what a `None` here can cost is
+/// recall, not the account.
+pub(crate) fn query_vector(conn: &Connection, id: i64) -> rusqlite::Result<Option<Embedding>> {
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT query_vector FROM smart_folders WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    match Embedding::from_bytes(&bytes, VECTOR_DIM) {
+        Ok(vector) => Ok(Some(vector)),
+        Err(error) => {
+            tracing::warn!(
+                smart_folder_id = id,
+                %error,
+                "a smart folder's stored query vector could not be read; its dense arm \
+                 contributes nothing"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// One account's smart folders, alphabetical by name.

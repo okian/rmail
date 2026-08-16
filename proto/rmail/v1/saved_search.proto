@@ -26,9 +26,13 @@ import "rmail/v1/search.proto";
 //     synced a moment ago is a member a moment ago. New members can
 //     trigger an auto-tag and/or a notification, and only *new* ones do.
 //
-// Natural-language smart folders (a plain-English predicate Claude compiles
-// once into a stored hybrid plan) are task 58's, and extend `CreateSmartFolder`
-// rather than replacing it.
+//   * A natural-language smart folder is the same virtual mailbox defined by
+//     a plain-English sentence, which Claude compiles *once* into a hybrid
+//     plan — hard filters + an FTS match + an embedding predicate — that is
+//     then re-run cheaply on every sync. `CompileSmartFolder` is that path;
+//     everything after creation (list, members, evaluate, delete) is
+//     identical, because a compiled folder is an ordinary folder with a
+//     richer predicate.
 service SavedSearchService {
   // Persist a named query. The query string is stored verbatim and
   // re-parsed on every run.
@@ -57,6 +61,26 @@ service SavedSearchService {
   // defining a folder over an existing mailbox never notifies for the
   // backlog.
   rpc CreateSmartFolder(CreateSmartFolderRequest) returns (SmartFolder);
+
+  // Define a smart folder from a plain-English sentence, which Claude
+  // compiles once into a hybrid plan (prd.md feature 13; `mail folder new
+  // "<nl>"`). The compiled query is re-parsed and validated exactly as a
+  // hand-written predicate is — an operator the deterministic membership
+  // compiler cannot enforce is INVALID_ARGUMENT, and a plan that would hold
+  // the whole account is refused — so the model proposes and never commits.
+  //
+  // A separate RPC from `CreateSmartFolder` rather than a field on it,
+  // because the two need different authority. This one spends at the provider
+  // and therefore carries `ai.invoke` on top of `mail.write`; folding it into
+  // `CreateSmartFolder` would force that scope onto every deterministic
+  // folder an automation token creates, and a token minted deliberately
+  // *without* `ai.invoke` must keep working for the half of this feature that
+  // never calls a model.
+  //
+  // The compile goes through the same per-account plan cache
+  // `SearchService.CompileQuery` uses, so confirming a plan with `mail search
+  // --nl` and then defining a folder from the same sentence costs one call.
+  rpc CompileSmartFolder(CompileSmartFolderRequest) returns (CompiledSmartFolder);
 
   // List an account's smart folders, alphabetical by name.
   rpc ListSmartFolders(ListSmartFoldersRequest) returns (ListSmartFoldersResponse);
@@ -146,6 +170,19 @@ message SmartFolder {
   int64 updated_at = 8;
   // Unix seconds; 0 if never evaluated.
   int64 last_evaluated_at = 9;
+  // The plain-English sentence this folder was compiled from. Empty for a
+  // hand-written predicate. Kept because it, and not the compiled query, is
+  // what the user actually said.
+  string nl_source = 10;
+  // The embedding model behind the folder's frozen query vector. Empty means
+  // the folder has no semantic arm — either it is deterministic, or the
+  // embedder was unavailable when it was defined and membership rests on the
+  // filters and FTS alone.
+  string vector_model = 11;
+  // Which Claude model compiled `nl_source`, and when (unix seconds). Empty
+  // and 0 for a hand-written predicate.
+  string compiled_model = 12;
+  int64 compiled_at = 13;
 }
 
 message CreateSmartFolderRequest {
@@ -155,6 +192,32 @@ message CreateSmartFolderRequest {
   // Empty for no auto-tag. The tag is created on demand if it does not exist.
   string auto_tag = 4;
   bool notify = 5;
+}
+
+message CompileSmartFolderRequest {
+  int64 account_id = 1;
+  string name = 2;
+  // The plain-English predicate ("anything from the landlord about the
+  // lease"). Bounded server-side; a longer one is INVALID_ARGUMENT.
+  string description = 3;
+  // Empty for no auto-tag. The tag is created on demand if it does not exist.
+  string auto_tag = 4;
+  bool notify = 5;
+  // Recompile rather than serving the cached plan for this sentence.
+  bool refresh = 6;
+}
+
+// The stored folder plus what it was compiled from, so a client can show the
+// user what was understood without a second round trip.
+message CompiledSmartFolder {
+  SmartFolder folder = 1;
+  // The compiled plan — the same message `SearchService.CompileQuery`
+  // returns, including whether it came from the cache.
+  QueryPlan plan = 2;
+  // Whether the semantic arm made it in. `false` means the embedder was
+  // unavailable and membership rests on the filters and FTS alone, which is
+  // worth saying to someone who asked for a folder defined by meaning.
+  bool semantic_arm = 3;
 }
 
 message ListSmartFoldersRequest {

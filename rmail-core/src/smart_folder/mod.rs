@@ -106,6 +106,8 @@
 //! record a tag application, and a `tag:` predicate's membership genuinely
 //! does change when that happens.
 
+pub(crate) mod membership;
+pub mod nl;
 pub(crate) mod repo;
 
 use std::collections::{BTreeSet, HashMap};
@@ -121,6 +123,7 @@ use crate::events::{EventKind, EventLog, NewEvent};
 use crate::query::parse::Operator;
 use crate::retrieve::cancel::interruptible_read;
 use crate::saved_search::{validate_name, MAX_QUERY_LEN};
+use crate::smart_folder::membership::DEFAULT_MIN_SIMILARITY;
 use crate::storage::Database;
 use crate::tags::query as filter_query;
 use crate::tags::{BulkOutcome, BulkSelector, TagSource, TagStore};
@@ -139,7 +142,7 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const DRAIN_PAGE: i64 = 500;
 
 /// A smart folder's persisted definition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SmartFolder {
     /// Row id.
     pub id: i64,
@@ -147,8 +150,12 @@ pub struct SmartFolder {
     pub account_id: i64,
     /// Display name, unique per account and matched case-insensitively.
     pub name: String,
-    /// The operator-DSL predicate that defines membership. See
-    /// [`validate_predicate`] for what it may contain.
+    /// The query that defines membership.
+    ///
+    /// Operators only for a deterministic folder ([`validate_predicate`]);
+    /// operators plus free text for one Claude compiled from English
+    /// ([`validate_hybrid_predicate`]), where the free text drives the lexical
+    /// and dense arms [`membership`] documents.
     pub predicate: String,
     /// A tag applied to genuinely new members, if configured.
     pub auto_tag: Option<String>,
@@ -160,21 +167,52 @@ pub struct SmartFolder {
     pub updated_at: i64,
     /// Last evaluation (unix seconds), if any.
     pub last_evaluated_at: Option<i64>,
+    /// The plain-English predicate this folder was compiled from, when it was
+    /// — `None` for a hand-written one. Kept because it, not the compiled
+    /// query, is what the user actually said.
+    pub nl_source: Option<String>,
+    /// Which embedding model produced the frozen query vector, when there is
+    /// one. `None` means the folder has no dense arm.
+    pub vector_model: Option<String>,
+    /// The cosine floor the dense arm admits a message at.
+    pub min_similarity: Option<f64>,
+    /// Which Claude model compiled [`nl_source`](Self::nl_source).
+    pub compiled_model: Option<String>,
+    /// When it was compiled (unix seconds).
+    pub compiled_at: Option<i64>,
 }
 
 /// What [`SmartFolderStore::create`] needs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// The five plan fields are all `None` for a deterministic folder, which is
+/// what [`Default`] gives — task 35's call sites are unchanged by task 58.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct NewSmartFolder {
     /// Owning account.
     pub account_id: i64,
     /// Display name, unique per account.
     pub name: String,
-    /// The operator-DSL predicate.
+    /// The predicate. Operators only unless [`nl_source`](Self::nl_source) is
+    /// set — see [`SmartFolder::predicate`].
     pub predicate: String,
     /// A tag to apply to new members, if any.
     pub auto_tag: Option<String>,
     /// Whether a new member publishes an event.
     pub notify: bool,
+    /// The plain-English predicate Claude compiled, when it did. Setting this
+    /// is what selects the hybrid validation path.
+    pub nl_source: Option<String>,
+    /// The embedded free text, frozen at compile time, with the model that
+    /// produced it. Both or neither — a vector with no model cannot be joined
+    /// against the index, so the store refuses the pair half-set.
+    pub query_vector: Option<crate::embed::Embedding>,
+    /// The embedding model behind [`query_vector`](Self::query_vector).
+    pub vector_model: Option<String>,
+    /// The cosine floor for the dense arm. Defaulted by the store when a
+    /// vector is present and this is not.
+    pub min_similarity: Option<f64>,
+    /// Which Claude model compiled the predicate.
+    pub compiled_model: Option<String>,
 }
 
 /// What one [`SmartFolderStore::evaluate`] found and did.
@@ -266,18 +304,27 @@ impl SmartFolderStore {
     ///
     /// # Errors
     /// [`Error::InvalidArgument`] for an empty/over-long name, an empty
-    /// `auto_tag`, or a predicate [`validate_predicate`] rejects;
+    /// `auto_tag`, a half-set vector/model pair, or a predicate
+    /// [`validate_predicate`]/[`validate_hybrid_predicate`] rejects;
     /// [`Error::AlreadyExists`] if the account already has a folder by that
     /// name; [`Error::NotFound`] if `account_id` names no account.
     /// Otherwise a mapped storage error.
     #[tracing::instrument(
         skip(self, spec),
-        fields(account_id = spec.account_id, name = spec.name, notify = spec.notify),
+        fields(
+            account_id = spec.account_id,
+            name = spec.name,
+            notify = spec.notify,
+            hybrid = spec.nl_source.is_some(),
+        ),
         err
     )]
     pub async fn create(&self, spec: &NewSmartFolder) -> Result<SmartFolder, Error> {
         let name = validate_name(&spec.name)?;
-        let predicate = validate_predicate(&spec.predicate)?;
+        let predicate = match &spec.nl_source {
+            None => validate_predicate(&spec.predicate)?,
+            Some(_) => validate_hybrid_predicate(&spec.predicate)?,
+        };
         let auto_tag = match spec.auto_tag.as_deref().map(str::trim) {
             None => None,
             Some("") => {
@@ -287,6 +334,49 @@ impl SmartFolderStore {
             }
             Some(tag) => Some(tag.to_owned()),
         };
+        // A vector with no model cannot be joined against the semantic index
+        // and a model with no vector has nothing to search with; either half
+        // alone is a caller bug that would present as a folder whose dense arm
+        // silently never fires.
+        if spec.query_vector.is_some() != spec.vector_model.is_some() {
+            return Err(Error::invalid_argument(
+                "a smart folder's query vector and its embedding model must be set together",
+            ));
+        }
+        // And it must be a vector this index can actually search. A daemon
+        // configured with a wider embedder (`index.semantic.voyage.dim` is
+        // 1024 by default) produces one that `vec_chunks` cannot hold, so the
+        // dense arm would never fire — and if it was the plan's only
+        // enforceable arm, the folder would be stored on the strength of an
+        // arm that cannot exist. Refusing here is what lets `constrains`
+        // below give the honest answer.
+        if let Some(vector) = &spec.query_vector {
+            if vector.dim() != crate::index::semantic::VECTOR_DIM {
+                return Err(Error::invalid_argument(format!(
+                    "a smart folder's query vector is {}-dimensional; this index holds {}. \
+                     The configured embedder cannot search it, so the semantic arm could \
+                     never fire",
+                    vector.dim(),
+                    crate::index::semantic::VECTOR_DIM
+                )));
+            }
+        }
+        // The last line of defence for the invariant this whole module is
+        // built around: whatever a compiler proposed, a *stored* folder must
+        // impose at least one enforceable constraint. `validate_hybrid_predicate`
+        // accepts free text whose only enforceable arm is the dense one (that
+        // is the point of the feature), so a plan whose embedding could not be
+        // produced — a failed embedder, a hosted backend that was down — must
+        // be refused here rather than stored as a folder holding the account.
+        let plan = membership::Membership::compile(spec.account_id, &predicate, None, false);
+        if !plan.constrains(spec.query_vector.is_some()) {
+            return Err(Error::invalid_argument(
+                "this predicate has no enforceable constraint: its operators compile to \
+                 nothing, its free text yields no lexical match, and no query embedding \
+                 was available for the semantic arm — storing it would define a folder \
+                 holding every message in the account",
+            ));
+        }
 
         let account_id = spec.account_id;
         let stored = NewSmartFolder {
@@ -295,7 +385,20 @@ impl SmartFolderStore {
             predicate: predicate.clone(),
             auto_tag,
             notify: spec.notify,
+            nl_source: spec.nl_source.as_ref().map(|s| s.trim().to_owned()),
+            query_vector: spec.query_vector.clone(),
+            vector_model: spec.vector_model.clone(),
+            min_similarity: spec
+                .query_vector
+                .is_some()
+                .then(|| spec.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY)),
+            compiled_model: spec.compiled_model.clone(),
         };
+        let baseline_dense = dense_arm(
+            &stored.query_vector,
+            &stored.vector_model,
+            stored.min_similarity,
+        );
 
         let outcome = self
             .db
@@ -316,8 +419,18 @@ impl SmartFolderStore {
                 // between the insert and a separate baseline pass would
                 // otherwise be recorded as a "new match" and notify for mail
                 // that predates nothing.
-                let compiled = filter_query::compile_detailed(account_id, &predicate);
-                let current = filter_query::select_message_ids(&tx, &compiled)?;
+                let declared = baseline_dense.is_some();
+                let plan = membership::Membership::compile(
+                    account_id,
+                    &predicate,
+                    baseline_dense,
+                    declared,
+                );
+                let dense_ids = match plan.dense_arm() {
+                    Some(arm) => membership::resolve_dense(&tx, arm)?,
+                    None => Vec::new(),
+                };
+                let current = plan.select(&tx, &dense_ids, None)?;
                 repo::reconcile(&tx, folder.id, &current, true)?;
                 // Re-read, because `reconcile` stamps `last_evaluated_at`:
                 // the row `insert` returned predates that update, and handing
@@ -326,12 +439,14 @@ impl SmartFolderStore {
                 // for.
                 let folder = repo::get(&tx, folder.id)?;
                 tx.commit()?;
-                Ok(folder.map_or(CreateOutcome::Vanished, CreateOutcome::Created))
+                Ok(folder.map_or(CreateOutcome::Vanished, |folder| {
+                    CreateOutcome::Created(Box::new(folder))
+                }))
             })
             .await?;
 
         match outcome {
-            CreateOutcome::Created(folder) => Ok(folder),
+            CreateOutcome::Created(folder) => Ok(*folder),
             CreateOutcome::Vanished => Err(Error::internal(
                 "smart folder vanished between insert and read-back within its own transaction",
             )),
@@ -607,14 +722,51 @@ impl SmartFolderStore {
         limit: Option<usize>,
         cancel: &CancellationToken,
     ) -> Result<Vec<i64>, Error> {
-        let compiled = filter_query::compile_detailed(folder.account_id, &folder.predicate);
+        let id = folder.id;
+        let account_id = folder.account_id;
+        let predicate = folder.predicate.clone();
+        let arm_shape = folder.vector_model.clone().map(|model| {
+            (
+                model,
+                folder.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY),
+            )
+        });
+        // What the *row* claims, decided before any read: a vector that fails
+        // to load must still leave its clause in the query. See
+        // `membership::Membership::dense_declared`.
+        let declared = arm_shape.is_some();
         // `interruptible_read`, not a plain read: a superseded or
         // shutting-down evaluation must actually stop the scan, and — far
         // more importantly here — a cancelled scan must never be mistaken
         // for "this folder is now empty", which would delete the whole
         // ledger and re-fire every member on the next pass.
+        //
+        // The dense arm's kNN and the membership select run on the *same*
+        // connection inside one closure. Two separate reads would let the
+        // index move between them, which for a folder whose only enforceable
+        // arm is the dense one is the difference between a member and a
+        // departure.
         interruptible_read(&self.db, cancel, move |conn| {
-            filter_query::select_message_ids_limited(conn, &compiled, limit)
+            let dense = match arm_shape {
+                // The vector is read here rather than carried on `SmartFolder`
+                // on purpose: it is a few kilobytes per folder and every
+                // `ListSmartFolders` would otherwise pay for it to render a
+                // name.
+                Some((model, min_similarity)) => {
+                    repo::query_vector(conn, id)?.map(|vector| membership::DenseArm {
+                        vector,
+                        model,
+                        min_similarity,
+                    })
+                }
+                None => None,
+            };
+            let plan = membership::Membership::compile(account_id, &predicate, dense, declared);
+            let dense_ids = match plan.dense_arm() {
+                Some(arm) => membership::resolve_dense(conn, arm)?,
+                None => Vec::new(),
+            };
+            plan.select(conn, &dense_ids, limit)
         })
         .await?
         .ok_or_else(|| {
@@ -659,7 +811,9 @@ impl SmartFolderStore {
 /// that are not storage faults need somewhere to live that
 /// `rusqlite::Result` has no room for.
 enum CreateOutcome {
-    Created(SmartFolder),
+    /// Boxed: task 58's plan columns made `SmartFolder` much the largest
+    /// variant, and every rejection arm would otherwise carry its footprint.
+    Created(Box<SmartFolder>),
     Duplicate,
     NoAccount,
     /// Unreachable in practice (a row this same transaction just inserted
@@ -731,6 +885,92 @@ pub fn validate_predicate(predicate: &str) -> Result<String, Error> {
     Ok(predicate.to_owned())
 }
 
+/// Check a predicate compiled from natural language, returning it trimmed.
+///
+/// The hybrid sibling of [`validate_predicate`], and the difference is exactly
+/// one rule: free text is *allowed*, because a hybrid plan has somewhere to
+/// put it — the FTS and embedding arms [`membership`] documents. Everything
+/// else is identical, deliberately:
+///
+/// - an operator the deterministic membership compiler cannot express is still
+///   refused, because there is still nowhere for it to go. A folder defined as
+///   `larger:10mb` would silently be "every message", on every sync, forever.
+///   That is the same failure whether a human or a model wrote it, and the
+///   model does not get a looser grammar than the human.
+/// - a predicate that constrains nothing is still refused.
+///
+/// This is the checkpoint the module's contract rests on: *the model proposes,
+/// it does not commit*. Nothing reaches `smart_folders.predicate` without
+/// having been through the real parser and this function.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] if the predicate is empty, longer than
+/// [`crate::saved_search::MAX_QUERY_LEN`], names an operator
+/// [`crate::tags::query`] does not compile, or resolves to no constraint at
+/// all.
+pub fn validate_hybrid_predicate(predicate: &str) -> Result<String, Error> {
+    let predicate = predicate.trim();
+    if predicate.is_empty() {
+        return Err(Error::invalid_argument(
+            "smart folder predicate must not be empty",
+        ));
+    }
+    if predicate.len() > MAX_QUERY_LEN {
+        return Err(Error::invalid_argument(format!(
+            "smart folder predicate must be at most {MAX_QUERY_LEN} bytes"
+        )));
+    }
+    let compiled = filter_query::compile_detailed(0, predicate);
+    if !compiled.dropped_operators.is_empty() {
+        let names: Vec<String> = compiled
+            .dropped_operators
+            .iter()
+            .map(|op| format!("{}:", operator_key(op)))
+            .collect();
+        return Err(Error::invalid_argument(format!(
+            "a smart folder predicate cannot use {} — that operator is not part of \
+             the membership grammar, so it would be ignored and the folder would \
+             match more than was asked for",
+            quoted_list(&names)
+        )));
+    }
+    let parsed = crate::query::parse::parse(predicate);
+    if compiled.applied == 0 && parsed.terms.is_empty() && parsed.phrases.is_empty() {
+        // Non-empty input that parses to no token at all — `""`, an empty
+        // quoted phrase, is the canonical case. As in [`validate_predicate`],
+        // what is guarded is the outcome rather than the cause: compiling to
+        // the bare `account_id = ?` scope means "every message in this
+        // account", and no path may reach that by accident.
+        return Err(Error::invalid_argument(
+            "smart folder predicate resolves to no constraint at all, which would \
+             match every message in the account",
+        ));
+    }
+    // Free text that yields no *lexical* arm (every term `~`-forced semantic,
+    // or nothing the tokenizer produces a token from) is still acceptable
+    // here: the dense arm may carry it. Whether one actually exists is a fact
+    // only `SmartFolderStore::create` has, and it refuses the folder if not.
+    Ok(predicate.to_owned())
+}
+
+/// Assemble the dense arm from a folder's stored plan columns, when it has
+/// one. `None` whenever either half is missing — see
+/// [`NewSmartFolder::query_vector`].
+fn dense_arm(
+    vector: &Option<crate::embed::Embedding>,
+    model: &Option<String>,
+    min_similarity: Option<f64>,
+) -> Option<membership::DenseArm> {
+    match (vector, model) {
+        (Some(vector), Some(model)) => Some(membership::DenseArm {
+            vector: vector.clone(),
+            model: model.clone(),
+            min_similarity: min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY),
+        }),
+        _ => None,
+    }
+}
+
 /// `"a", "b"` — a human-readable list for a rejection message.
 fn quoted_list(items: &[String]) -> String {
     items
@@ -742,32 +982,12 @@ fn quoted_list(items: &[String]) -> String {
 
 /// The DSL key an [`Operator`] was written as, for error messages.
 ///
-/// Spelled out rather than derived from `Debug`: this string is shown to a
-/// user next to the predicate they typed, and `DateRange("a", "b")` is not
-/// something they wrote.
+/// Delegates to [`crate::query::parse::render_operator`], which is the one
+/// place this crate spells an operator back the way a user wrote it — a second
+/// copy here could disagree with the confirmable plan `mail search --nl`
+/// prints, about the very operator the message is complaining about.
 fn operator_key(op: &Operator) -> &'static str {
-    match op {
-        Operator::From(_) => "from",
-        Operator::To(_) => "to",
-        Operator::Cc(_) => "cc",
-        Operator::Subject(_) => "subject",
-        Operator::Body(_) => "body",
-        Operator::Has(_) => "has",
-        Operator::Filename(_) => "filename",
-        Operator::Larger(_) => "larger",
-        Operator::Smaller(_) => "smaller",
-        Operator::Before(_) => "before",
-        Operator::After(_) => "after",
-        Operator::On(_) => "on",
-        Operator::DateRange(_, _) => "date",
-        Operator::Is(_) => "is",
-        Operator::Tag(_) => "tag",
-        Operator::Note(_) => "note",
-        Operator::In(_) => "in",
-        Operator::Account(_) => "account",
-        Operator::Thread(_) => "thread",
-        Operator::Ai(_) => "ai",
-    }
+    crate::query::parse::render_operator(op).0
 }
 
 /// The background consumer that keeps smart folder actions following sync.

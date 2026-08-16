@@ -47,25 +47,27 @@
 use std::pin::Pin;
 
 use rmail_core::saved_search::{SavedSearch as CoreSavedSearch, SavedSearchStore};
+use rmail_core::smart_folder::nl::{NewNlSmartFolder, NlSmartFolderCompiler};
 use rmail_core::smart_folder::{
     Evaluation, NewSmartFolder, SmartFolder as CoreSmartFolder, SmartFolderStore,
 };
 use rmail_core::{repo, Database, Error as RmailError};
 use rmail_proto::v1::saved_search_service_server::SavedSearchService;
 use rmail_proto::v1::{
-    CreateSavedSearchRequest, CreateSmartFolderRequest, DeleteSavedSearchRequest,
-    DeleteSmartFolderRequest, EvaluateSmartFolderRequest, ListSavedSearchesRequest,
-    ListSavedSearchesResponse, ListSmartFolderMembersRequest, ListSmartFoldersRequest,
-    ListSmartFoldersResponse, Message as ProtoMessage, RunSavedSearchRequest,
-    SavedSearch as ProtoSavedSearch, SearchHit as ProtoSearchHit, SearchRequest,
-    SmartFolder as ProtoSmartFolder, SmartFolderEvaluation, UpdateSavedSearchRequest,
+    CompileSmartFolderRequest, CompiledSmartFolder, CreateSavedSearchRequest,
+    CreateSmartFolderRequest, DeleteSavedSearchRequest, DeleteSmartFolderRequest,
+    EvaluateSmartFolderRequest, ListSavedSearchesRequest, ListSavedSearchesResponse,
+    ListSmartFolderMembersRequest, ListSmartFoldersRequest, ListSmartFoldersResponse,
+    Message as ProtoMessage, RunSavedSearchRequest, SavedSearch as ProtoSavedSearch,
+    SearchHit as ProtoSearchHit, SearchRequest, SmartFolder as ProtoSmartFolder,
+    SmartFolderEvaluation, UpdateSavedSearchRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
-use crate::search_service::{to_proto_message, SearchApi};
+use crate::search_service::{to_proto_message, to_proto_query_plan, SearchApi};
 
 /// How many members may sit between the predicate scan and a client before
 /// `ListSmartFolderMembers` applies backpressure. See
@@ -92,6 +94,10 @@ pub struct SavedSearchApi {
     folders: SmartFolderStore,
     /// The one search pipeline in the process — see the module docs.
     search: SearchApi,
+    /// The natural-language folder compiler (task 58), when the daemon has a
+    /// provider. `None` answers `UNIMPLEMENTED`; see `SearchApi::compiler`
+    /// for why an `Option` rather than a second constructor.
+    nl: Option<NlSmartFolderCompiler>,
     /// Cancelled at daemon shutdown, so an open member stream stops with it.
     shutdown: CancellationToken,
 }
@@ -111,8 +117,20 @@ impl SavedSearchApi {
             searches,
             folders,
             search,
+            nl: None,
             shutdown,
         }
+    }
+
+    /// Attach the natural-language folder compiler `CompileSmartFolder`
+    /// serves from.
+    ///
+    /// A builder for the reason `SearchApi::with_query_compiler` is one: it
+    /// needs the daemon's single provider and embedder.
+    #[must_use]
+    pub fn with_nl_compiler(mut self, compiler: NlSmartFolderCompiler) -> Self {
+        self.nl = Some(compiler);
+        self
     }
 }
 
@@ -218,9 +236,60 @@ impl SavedSearchService for SavedSearchApi {
                 // in-process one.
                 auto_tag: Some(req.auto_tag).filter(|tag| !tag.trim().is_empty()),
                 notify: req.notify,
+                // The deterministic path: no NL source, so
+                // `SmartFolderStore::create` runs `validate_predicate` and
+                // free text stays refused.
+                ..NewSmartFolder::default()
             })
             .await?;
         Ok(Response::new(smart_folder_to_proto(&folder)))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(account_id, cached, semantic_arm), err)]
+    async fn compile_smart_folder(
+        &self,
+        request: Request<CompileSmartFolderRequest>,
+    ) -> Result<Response<CompiledSmartFolder>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("account_id", req.account_id);
+        if req.account_id <= 0 {
+            return Err(Status::from(RmailError::invalid_argument(
+                "account_id is required to compile a smart folder: the plan cache and \
+                 the AI policy/budget that admits the call are both per account",
+            )));
+        }
+        let Some(compiler) = &self.nl else {
+            return Err(Status::unimplemented(
+                "this daemon was built without an AI provider, so a plain-English smart \
+                 folder cannot be compiled; define one with CreateSmartFolder and an \
+                 operator predicate",
+            ));
+        };
+        // A plain shutdown child, not the interactive search generation: a
+        // compile that a later keystroke cancelled would have spent money for
+        // nothing.
+        let cancel = self.shutdown.child_token();
+        let created = compiler
+            .create(
+                &NewNlSmartFolder {
+                    account_id: req.account_id,
+                    name: req.name,
+                    description: req.description,
+                    auto_tag: Some(req.auto_tag).filter(|tag| !tag.trim().is_empty()),
+                    notify: req.notify,
+                    refresh: req.refresh,
+                },
+                &cancel,
+            )
+            .await?;
+        let span = tracing::Span::current();
+        span.record("cached", created.compiled.cached);
+        span.record("semantic_arm", created.semantic_arm);
+        Ok(Response::new(CompiledSmartFolder {
+            folder: Some(smart_folder_to_proto(&created.folder)),
+            plan: Some(to_proto_query_plan(&created.compiled)),
+            semantic_arm: created.semantic_arm,
+        }))
     }
 
     #[tracing::instrument(skip(self, request), err)]
@@ -350,6 +419,10 @@ fn smart_folder_to_proto(folder: &CoreSmartFolder) -> ProtoSmartFolder {
         created_at: folder.created_at,
         updated_at: folder.updated_at,
         last_evaluated_at: folder.last_evaluated_at.unwrap_or(0),
+        nl_source: folder.nl_source.clone().unwrap_or_default(),
+        vector_model: folder.vector_model.clone().unwrap_or_default(),
+        compiled_model: folder.compiled_model.clone().unwrap_or_default(),
+        compiled_at: folder.compiled_at.unwrap_or(0),
     }
 }
 

@@ -573,13 +573,14 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **closed at merge:** `tag_rules` shipped with no RPC/CLI/MCP surface, so `TagStore::set_tag_rule`/`list_tag_rules` had no caller outside `rmail-core` and an operator could not create the `mode='auto'` rule auto-apply requires — every suggestion pended. Added `TagService.SetTagRule`/`ListTagRules` (additive to v1), the matching `parity` variants and `auth::methods` rows (`mail.write` to set, `mail.read` to list), and `mail tag-rules list|set`. Covered by `rmaild --test tag_service`: reachable through the daemon, upserts on (account, name) rather than accumulating, an unspecified mode resolves to `suggest` not `auto`, and an out-of-range floor is refused. Deleting a rule is `--disabled`; a hard delete has no caller yet.
 
 ## 58. NL smart folders (Claude compile)
-- [ ] status
+- [x] status
 - **depends-on:** 35, 43
 - **parallel-safe:** yes
 - **acceptance:**
   - `SmartFolderService.Create` accepts a plain-English predicate; Claude compiles it once into a stored hybrid plan (`from:` + FTS + embedding predicate), re-run cheaply each sync; `mail folder new "<nl>"`.
   - Also completes the Stage-0 NL→plan path (`SearchService.CompileQuery`, `mail search --nl`) with a confirmable cached plan.
 - **verify:** `cargo nextest run -p rmaild smart_folder:: compile_query::` (NL→plan compile+cache, live membership)
+- **notes:** one compiler serves both halves (`rmail_core::query::compile`), cached per account by normalized query hash (V47 `query_plan_cache`), so `mail search --nl` and `mail folder new` share a compile. Membership is `<hard filters> AND (<FTS> OR <embedding kNN ≥ floor>)` — `rmail_core::smart_folder::membership`; the query vector is frozen at create time, so an evaluation makes no provider or embedder call. `CompileSmartFolder` is a separate RPC from `CreateSmartFolder` so `ai.invoke` is not forced onto deterministic folders. Model output round-trips through `query::parse` and `validate_hybrid_predicate` before storage; an empty arm compiles to `0`, never a dropped clause.
 
 ## 59. Fuzzy finder (III-1)
 - [x] status

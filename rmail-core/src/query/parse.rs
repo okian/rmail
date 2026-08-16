@@ -334,6 +334,69 @@ pub struct Phrase {
     pub mode: Mode,
 }
 
+/// Render one [`Operator`] back to the `key` and `value` a user would have
+/// typed for it.
+///
+/// The inverse of [`classify`]'s operator half, and deliberately hand-written
+/// rather than derived from `Debug`: both halves are shown to a human next to
+/// a query they are about to run (`mail search --nl`'s confirmable plan) or
+/// quoted in a rejection message (`smart_folder::validate_predicate`), and
+/// `DateRange("a", "b")` is not something anyone wrote.
+///
+/// The value is returned unquoted; a caller that needs the token to round-trip
+/// through [`parse`] re-quotes one containing a space.
+#[must_use]
+pub fn render_operator(op: &Operator) -> (&'static str, String) {
+    match op {
+        Operator::From(v) => ("from", v.clone()),
+        Operator::To(v) => ("to", v.clone()),
+        Operator::Cc(v) => ("cc", v.clone()),
+        Operator::Subject(v) => ("subject", v.clone()),
+        Operator::Body(v) => ("body", v.clone()),
+        Operator::Has(target) => (
+            "has",
+            match target {
+                HasTarget::Attachment => "attachment".to_owned(),
+                HasTarget::Note => "note".to_owned(),
+                HasTarget::Tag => "tag".to_owned(),
+                HasTarget::Other(v) => v.clone(),
+            },
+        ),
+        Operator::Filename(v) => ("filename", v.clone()),
+        Operator::Larger(bytes) => ("larger", bytes.to_string()),
+        Operator::Smaller(bytes) => ("smaller", bytes.to_string()),
+        Operator::Before(v) => ("before", v.clone()),
+        Operator::After(v) => ("after", v.clone()),
+        Operator::On(v) => ("on", v.clone()),
+        Operator::DateRange(start, end) => ("date", format!("{start}..{end}")),
+        Operator::Is(flag) => (
+            "is",
+            match flag {
+                IsFlag::Unread => "unread".to_owned(),
+                IsFlag::Read => "read".to_owned(),
+                IsFlag::Flagged => "flagged".to_owned(),
+                IsFlag::Pinned => "pinned".to_owned(),
+                IsFlag::Replied => "replied".to_owned(),
+                IsFlag::Muted => "muted".to_owned(),
+                IsFlag::Other(v) => v.clone(),
+            },
+        ),
+        Operator::Tag(v) => ("tag", v.clone()),
+        Operator::Note(v) => ("note", v.clone()),
+        Operator::In(v) => ("in", v.clone()),
+        Operator::Account(v) => ("account", v.clone()),
+        Operator::Thread(v) => ("thread", v.clone()),
+        Operator::Ai(predicate) => (
+            "ai",
+            match predicate {
+                AiPredicate::Flag(v) => v.clone(),
+                AiPredicate::Equals(k, v) => format!("{k}:{v}"),
+                AiPredicate::GreaterThan(k, v) => format!("{k}>{v}"),
+            },
+        ),
+    }
+}
+
 /// Parse a raw query string into hard filters and ranked free text.
 ///
 /// See the module docs for the fallback rules this function follows — in

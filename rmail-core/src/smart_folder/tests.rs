@@ -253,6 +253,9 @@ fn spec(account_id: i64, name: &str, predicate: &str) -> NewSmartFolder {
         predicate: predicate.to_owned(),
         auto_tag: None,
         notify: false,
+        // The deterministic form task 35 shipped: no NL source, so
+        // `validate_predicate` runs and free text stays refused.
+        ..NewSmartFolder::default()
     }
 }
 
@@ -1461,4 +1464,517 @@ async fn a_retention_gap_recovers_by_re_reading_state_not_replaying_history() {
         EvaluatorReport::default()
     );
     let _ = folder;
+}
+
+// ---------------------------------------------------------------------------
+// Task 58: NL-compiled hybrid plans
+// ---------------------------------------------------------------------------
+//
+// What these owe, on top of task 35's deterministic guarantees above:
+//
+// - free text is *accepted* on the hybrid path and becomes a real constraint
+//   (the FTS arm), rather than being silently dropped the way the operator
+//   compiler would drop it;
+// - an operator the membership compiler cannot enforce is still refused, so
+//   the model gets no looser grammar than a human;
+// - a plan whose only enforceable arm would have been an embedding that could
+//   not be produced is refused rather than stored as a folder holding the
+//   account — the invariant this whole module exists for, reached from the
+//   direction only task 58 opens up;
+// - the two text arms *union*, and the dense arm gates rather than merely
+//   ranking;
+// - a stale query vector degrades the dense arm to nothing without making the
+//   folder unreadable.
+
+use crate::embed::hash::HashEmbedder;
+use crate::embed::{Embedder, Embedding};
+use crate::index::fts::FtsIndex;
+use crate::index::semantic::{SemanticIndex, VECTOR_DIM};
+
+impl Fixture {
+    /// Give a message indexable text and put it in the lexical index — what
+    /// the FTS arm of a hybrid plan reads.
+    async fn index_text(&self, message_id: i64, body: &str) {
+        let body = body.to_owned();
+        let chars = i64::try_from(body.chars().count()).unwrap_or(i64::MAX);
+        self.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO index_content
+                         (message_id, part, text, chars, content_hash, extractor)
+                     VALUES (?1, 'body', ?2, ?3, X'00', 'test')",
+                    rusqlite::params![message_id, body, chars],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed index_content");
+        let fts = FtsIndex::new(self.db.clone(), crate::config::Bm25Weights::default());
+        fts.index_message(message_id).await.expect("index message");
+    }
+
+    /// Chunk and embed a message with `embedder`, so the dense arm has
+    /// something to find.
+    async fn index_semantic(&self, message_id: i64, embedder: &Arc<dyn Embedder>) {
+        let index = SemanticIndex::new(
+            self.db.clone(),
+            Arc::clone(embedder),
+            &crate::config::IndexSemanticConfig::default(),
+        );
+        index
+            .index_message(message_id)
+            .await
+            .expect("semantic index");
+    }
+}
+
+fn test_embedder() -> Arc<dyn Embedder> {
+    // Deterministic and offline: the same text always produces the same
+    // vector, which is what makes a similarity floor assertable at all.
+    Arc::new(HashEmbedder::new(VECTOR_DIM))
+}
+
+/// A spec for a folder compiled from English, with `predicate` standing in
+/// for whatever the compiler produced.
+fn nl_spec(account_id: i64, name: &str, predicate: &str) -> NewSmartFolder {
+    NewSmartFolder {
+        account_id,
+        name: name.to_owned(),
+        predicate: predicate.to_owned(),
+        nl_source: Some("what the user actually said".to_owned()),
+        compiled_model: Some("test-compile-model".to_owned()),
+        ..NewSmartFolder::default()
+    }
+}
+
+#[test]
+fn a_hybrid_predicate_accepts_free_text_and_a_deterministic_one_still_does_not() {
+    // The one rule that differs between the two paths. Everything free text
+    // could mean is enforceable on the hybrid path and nothing of it is on the
+    // deterministic one, which is exactly why they are two functions.
+    assert!(validate_hybrid_predicate("from:stripe invoice").is_ok());
+    assert!(validate_hybrid_predicate("lease renewal").is_ok());
+    assert_eq!(
+        validate_predicate("from:stripe invoice")
+            .expect_err("free text is not a deterministic predicate")
+            .reason(),
+        ErrorReason::InvalidArgument
+    );
+}
+
+#[test]
+fn a_hybrid_predicate_still_refuses_an_unenforceable_operator() {
+    // `larger:` is a perfectly good *search* operator that the membership
+    // compiler cannot express. Accepting it because a model wrote it would
+    // define a folder that silently ignores the constraint and holds
+    // everything else the predicate names.
+    let error = validate_hybrid_predicate("larger:10mb lease")
+        .expect_err("an unenforceable operator must be refused on both paths");
+    assert_eq!(error.reason(), ErrorReason::InvalidArgument);
+    assert!(
+        error.to_string().contains("larger:"),
+        "the rejection must name the operator: {error}"
+    );
+}
+
+#[test]
+fn a_hybrid_predicate_that_parses_to_nothing_is_refused() {
+    for predicate in ["", "   ", "\"\""] {
+        let error = validate_hybrid_predicate(predicate)
+            .expect_err("a predicate that constrains nothing must be refused");
+        assert_eq!(error.reason(), ErrorReason::InvalidArgument);
+    }
+    let long = "x ".repeat(MAX_QUERY_LEN);
+    assert_eq!(
+        validate_hybrid_predicate(&long)
+            .expect_err("an over-long predicate must be refused")
+            .reason(),
+        ErrorReason::InvalidArgument
+    );
+}
+
+#[tokio::test]
+async fn free_text_in_a_hybrid_folder_actually_gates_membership() {
+    // The whole point of the hybrid path: `from:stripe invoice` must mean
+    // "from Stripe AND about invoices", not "from Stripe" with the rest
+    // quietly dropped. Without the lexical arm this folder would hold both
+    // messages.
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let about_invoice = f.seed_message("billing@stripe.com", true);
+    let about_outage = f.seed_message("status@stripe.com", true);
+    f.index_text(about_invoice, "your invoice for June is attached")
+        .await;
+    f.index_text(about_outage, "we had a brief outage this morning")
+        .await;
+
+    let folder = store
+        .create(&nl_spec(
+            f.account_id,
+            "stripe-invoices",
+            "from:stripe invoice",
+        ))
+        .await
+        .expect("create");
+
+    let members = store
+        .members(folder.id, None, &token())
+        .await
+        .expect("members");
+    assert_eq!(members, vec![about_invoice]);
+}
+
+#[tokio::test]
+async fn a_hybrid_folder_with_no_enforceable_arm_is_refused() {
+    // The dangerous case task 58 introduces and nothing else can reach: a
+    // compiled plan whose only constraint was going to be an embedding, on a
+    // daemon whose embedder was unavailable. Storing it would define a folder
+    // holding every message in the account, re-confirmed on every sync.
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let seen = f.seed_message("anyone@example.com", true);
+
+    // `~lease` forces the term semantic, so it yields no lexical arm; with no
+    // vector there is nothing left.
+    let error = store
+        .create(&nl_spec(f.account_id, "unconstrained", "~lease"))
+        .await
+        .expect_err("a plan with no enforceable arm must be refused");
+    assert_eq!(error.reason(), ErrorReason::InvalidArgument);
+    assert!(
+        error.to_string().contains("every message"),
+        "the rejection must say what it is preventing: {error}"
+    );
+
+    // Nothing was stored, so nothing is holding the account.
+    assert!(store.list(f.account_id).await.expect("list").is_empty());
+    let _ = seen;
+}
+
+#[tokio::test]
+async fn a_query_vector_without_its_model_is_refused() {
+    // Either half alone is a caller bug that would present as a folder whose
+    // dense arm silently never fires — the failure this pair check exists to
+    // make impossible.
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let mut spec = nl_spec(f.account_id, "half-set", "from:stripe lease");
+    spec.query_vector = Some(Embedding::new(vec![0.5; VECTOR_DIM]));
+
+    let error = store
+        .create(&spec)
+        .await
+        .expect_err("a vector with no model must be refused");
+    assert_eq!(error.reason(), ErrorReason::InvalidArgument);
+}
+
+#[tokio::test]
+async fn the_dense_arm_admits_a_paraphrase_the_lexical_arm_misses() {
+    // "hybrid" earning its name: the folder's free text appears verbatim in
+    // one message and not at all in the other, and the second is a member
+    // anyway because its embedding is what the query was built from.
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let embedder = test_embedder();
+
+    let verbatim = f.seed_message("landlord@example.com", true);
+    let paraphrase = f.seed_message("landlord@example.com", true);
+    let unrelated = f.seed_message("landlord@example.com", true);
+    f.index_text(verbatim, "lease renewal terms").await;
+    f.index_text(paraphrase, "tenancy agreement extension")
+        .await;
+    f.index_text(unrelated, "the parking barrier is broken again")
+        .await;
+    for id in [verbatim, paraphrase, unrelated] {
+        f.index_semantic(id, &embedder).await;
+    }
+
+    let vector = embedder
+        .embed(&["tenancy agreement extension".to_owned()])
+        .await
+        .expect("embed")
+        .remove(0);
+    let mut spec = nl_spec(f.account_id, "lease", "from:landlord lease renewal");
+    spec.query_vector = Some(vector);
+    spec.vector_model = Some(embedder.model().to_owned());
+    // A floor just under an exact hit, so the identical text clears it and
+    // unrelated text does not.
+    spec.min_similarity = Some(0.99);
+
+    let folder = store.create(&spec).await.expect("create");
+    let members = store
+        .members(folder.id, None, &token())
+        .await
+        .expect("members");
+
+    assert!(
+        members.contains(&verbatim),
+        "the lexical arm must still admit the verbatim match: {members:?}"
+    );
+    assert!(
+        members.contains(&paraphrase),
+        "the dense arm must admit a message the lexical arm cannot: {members:?}"
+    );
+    assert!(
+        !members.contains(&unrelated),
+        "the dense arm must gate, not merely rank: {members:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_query_vector_degrades_the_dense_arm_without_breaking_the_folder() {
+    // A re-index under a different model leaves every stored vector pointing
+    // at a space the index no longer holds. The join on `vector_model` is what
+    // turns that into "this arm finds nothing" rather than "these cosines mean
+    // nothing and still sort".
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let embedder = test_embedder();
+    let message = f.seed_message("landlord@example.com", true);
+    f.index_text(message, "lease renewal terms").await;
+    f.index_semantic(message, &embedder).await;
+
+    let vector = embedder
+        .embed(&["lease renewal terms".to_owned()])
+        .await
+        .expect("embed")
+        .remove(0);
+    let mut spec = nl_spec(f.account_id, "lease", "from:landlord lease");
+    spec.query_vector = Some(vector);
+    spec.vector_model = Some("a-model-this-index-was-never-built-with".to_owned());
+    spec.min_similarity = Some(0.0);
+
+    let folder = store.create(&spec).await.expect("create");
+    let members = store
+        .members(folder.id, None, &token())
+        .await
+        .expect("members");
+
+    // The lexical arm still answers, so the folder is readable; what the stale
+    // vector cost is recall, which is the honest degradation.
+    assert_eq!(members, vec![message]);
+}
+
+#[tokio::test]
+async fn a_dense_arm_that_matches_nothing_does_not_widen_the_folder() {
+    // The single most dangerous mistake available in this design: dropping an
+    // arm whose input came back empty, leaving `WHERE <hard filters>` — which
+    // for a folder defined by meaning is "every message from this sender".
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let embedder = test_embedder();
+    let indexed = f.seed_message("landlord@example.com", true);
+    let never_indexed = f.seed_message("landlord@example.com", true);
+    f.index_text(indexed, "lease renewal terms").await;
+    f.index_semantic(indexed, &embedder).await;
+
+    let vector = embedder
+        .embed(&["something no message resembles".to_owned()])
+        .await
+        .expect("embed")
+        .remove(0);
+    // `~lease` yields no lexical arm, so the dense arm is the only text arm —
+    // and its floor is set high enough that it matches nothing at all.
+    let mut spec = nl_spec(f.account_id, "meaning-only", "from:landlord ~lease");
+    spec.query_vector = Some(vector);
+    spec.vector_model = Some(embedder.model().to_owned());
+    spec.min_similarity = Some(0.999);
+
+    let folder = store.create(&spec).await.expect("create");
+    let members = store
+        .members(folder.id, None, &token())
+        .await
+        .expect("members");
+
+    assert!(
+        members.is_empty(),
+        "an empty dense arm must compile to `0`, not to a dropped clause — this \
+         folder would otherwise hold {members:?}"
+    );
+    let _ = never_indexed;
+}
+
+#[tokio::test]
+async fn a_hybrid_folder_fires_only_for_genuinely_new_members() {
+    // Task 35's exactly-once ledger contract, re-proven over the hybrid path:
+    // the arms changed, the firing rule did not.
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let backlog = f.seed_message("billing@stripe.com", true);
+    f.index_text(backlog, "your invoice for June").await;
+
+    let mut spec = nl_spec(f.account_id, "invoices", "from:stripe invoice");
+    spec.notify = true;
+    let folder = store.create(&spec).await.expect("create");
+
+    // Creation records a baseline, so the backlog notifies for nothing.
+    let first = store.evaluate(folder.id, &token()).await.expect("evaluate");
+    assert_eq!(first.members, 1);
+    assert_eq!(first.entered, Vec::<i64>::new());
+    assert_eq!(first.notified, 0);
+
+    let newcomer = f.seed_message("billing@stripe.com", true);
+    f.index_text(newcomer, "invoice for July is ready").await;
+    let second = store.evaluate(folder.id, &token()).await.expect("evaluate");
+    assert_eq!(second.entered, vec![newcomer]);
+    assert_eq!(second.notified, 1);
+
+    // And a third pass over unchanged membership fires nothing.
+    let third = store.evaluate(folder.id, &token()).await.expect("evaluate");
+    assert_eq!(third.entered, Vec::<i64>::new());
+    assert_eq!(third.notified, 0);
+    let _ = backlog;
+}
+
+#[tokio::test]
+async fn a_hybrid_folder_reports_its_provenance() {
+    // The compiled query is not what the user said; both are kept, and a
+    // client needs the sentence to explain the folder.
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let folder = store
+        .create(&nl_spec(f.account_id, "invoices", "from:stripe invoice"))
+        .await
+        .expect("create");
+
+    assert_eq!(
+        folder.nl_source.as_deref(),
+        Some("what the user actually said")
+    );
+    assert_eq!(folder.compiled_model.as_deref(), Some("test-compile-model"));
+    assert!(folder.compiled_at.is_some_and(|at| at > 0));
+    // No vector was supplied, so nothing claims a semantic arm exists.
+    assert_eq!(folder.vector_model, None);
+
+    // And a deterministic folder claims none of it.
+    let plain = store
+        .create(&spec(f.account_id, "plain", "from:stripe"))
+        .await
+        .expect("create");
+    assert_eq!(plain.nl_source, None);
+    assert_eq!(plain.compiled_model, None);
+    assert_eq!(plain.compiled_at, None);
+}
+
+#[tokio::test]
+async fn a_declared_dense_arm_whose_vector_will_not_load_empties_the_folder() {
+    // The regression this test exists for: `Membership` used to build the `0`
+    // arm from whether the vector *resolved* rather than whether the folder
+    // *declared* one, so a stored blob that would not decode dropped the
+    // clause entirely — and a folder defined as "anything about the lease"
+    // became `WHERE account_id = ?`, i.e. every message in the account, whose
+    // very first evaluation auto-tags and notifies for the whole mailbox.
+    //
+    // A wrong-width blob is the reachable case, not a corrupt one: a daemon
+    // configured with a wider embedder (`index.semantic.voyage.dim` is 1024)
+    // writes one, and `Embedding::from_bytes` refuses it at read time.
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let embedder = test_embedder();
+    let message = f.seed_message("landlord@example.com", true);
+    f.index_text(message, "lease renewal terms").await;
+    f.index_semantic(message, &embedder).await;
+
+    let vector = embedder
+        .embed(&["lease renewal terms".to_owned()])
+        .await
+        .expect("embed")
+        .remove(0);
+    // `~lease` yields no lexical arm, so the dense arm is the only text arm —
+    // exactly the shape where dropping it is catastrophic rather than merely
+    // wrong.
+    let mut spec = nl_spec(f.account_id, "meaning-only", "from:landlord ~lease");
+    spec.query_vector = Some(vector);
+    spec.vector_model = Some(embedder.model().to_owned());
+    let folder = store.create(&spec).await.expect("create");
+
+    // Rewrite the stored vector at a width this index cannot hold — what a
+    // re-index under a different model leaves behind.
+    let id = folder.id;
+    f.db.write(move |conn| {
+        conn.execute(
+            "UPDATE smart_folders SET query_vector = ?2 WHERE id = ?1",
+            rusqlite::params![id, vec![0u8; 64]],
+        )?;
+        Ok(())
+    })
+    .await
+    .expect("corrupt the stored vector");
+
+    let members = store
+        .members(folder.id, None, &token())
+        .await
+        .expect("members");
+    assert!(
+        members.is_empty(),
+        "a declared dense arm that could not be loaded must still constrain — this \
+         folder would otherwise hold {members:?}, which is every message from that \
+         sender"
+    );
+
+    // And an evaluation of it fires for nobody, rather than for the account.
+    let evaluation = store.evaluate(folder.id, &token()).await.expect("evaluate");
+    assert_eq!(evaluation.members, 0);
+    assert_eq!(evaluation.entered, Vec::<i64>::new());
+}
+
+#[tokio::test]
+async fn a_query_vector_this_index_cannot_search_is_refused_at_create() {
+    // Refusing at the source is what lets `constrains` give the honest answer:
+    // a folder stored on the strength of an arm that can never fire is a
+    // folder with one fewer constraint than it claims.
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let mut spec = nl_spec(f.account_id, "too-wide", "from:landlord lease");
+    spec.query_vector = Some(Embedding::new(vec![0.5; VECTOR_DIM * 2]));
+    spec.vector_model = Some("a-wider-model".to_owned());
+
+    let error = store
+        .create(&spec)
+        .await
+        .expect_err("a vector this index cannot hold must be refused");
+    assert_eq!(error.reason(), ErrorReason::InvalidArgument);
+    assert!(
+        error.to_string().contains("dimensional"),
+        "the rejection must say what is wrong with it: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_predicate_that_constrains_nothing_holds_nothing_even_if_it_is_stored() {
+    // The unconditional floor in `Membership::sql`. Every path here is
+    // supposed to be refused at create time, so this reaches past `create` and
+    // writes the row directly — the shape a future bug, a hand edit, or an
+    // older build's row would take. Wrong in the safe direction: an empty
+    // folder someone reports, not a full one nobody looks at.
+    let f = Fixture::open();
+    let store = f.store_no_imap();
+    let message = f.seed_message("anyone@example.com", true);
+    let folder = store
+        .create(&nl_spec(f.account_id, "ok", "from:anyone"))
+        .await
+        .expect("create");
+
+    let id = folder.id;
+    f.db.write(move |conn| {
+        conn.execute(
+            // `~lease` compiles to no filter and no lexical arm, and there is
+            // no vector.
+            "UPDATE smart_folders SET predicate = '~lease' WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    })
+    .await
+    .expect("plant an unconstrained predicate");
+
+    let members = store
+        .members(folder.id, None, &token())
+        .await
+        .expect("members");
+    assert!(
+        members.is_empty(),
+        "an unconstrained stored predicate must hold nothing, not {members:?}"
+    );
+    let _ = message;
 }

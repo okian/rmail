@@ -141,10 +141,11 @@ use rmail_core::eval::{EvalReport, EvalThresholds, GoldenSet, Metrics, QueryEval
 use rmail_proto::v1::mail_service_client::MailServiceClient;
 use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::{
-    ByteRange, EvalMetrics as WireEvalMetrics, EvalReport as WireEvalReport, EvaluateRequest,
-    FeatureContribution, FullMessage, GetMessageRequest, GoldenQuery as WireGoldenQuery,
-    Intent as ProtoIntent, Judgment as WireJudgment, Mode as ProtoMode, RankExplanation,
-    Rerank as ProtoRerank, SearchHit, SearchRequest, Snippet,
+    ByteRange, CompileQueryRequest, EvalMetrics as WireEvalMetrics, EvalReport as WireEvalReport,
+    EvaluateRequest, FeatureContribution, FullMessage, GetMessageRequest,
+    GoldenQuery as WireGoldenQuery, Intent as ProtoIntent, Judgment as WireJudgment,
+    Mode as ProtoMode, QueryPlan, RankExplanation, Rerank as ProtoRerank, SearchHit, SearchRequest,
+    Snippet,
 };
 use tokio_stream::StreamExt;
 
@@ -223,6 +224,26 @@ pub struct SearchArgs {
     /// cross-encoder.
     #[arg(long)]
     deep: bool,
+    /// Read `query` as plain English and have Claude compile it into a query
+    /// first (`SearchService.CompileQuery`; prd.md Stage 0 step 7).
+    ///
+    /// The compiled plan is printed before anything runs — that is the
+    /// "confirmable" half — and the search then uses it. `--plan-only` stops
+    /// after printing. Compiles are cached per account by normalized
+    /// question, so re-asking is free; `--refresh` recompiles.
+    ///
+    /// Requires `--account`: the plan cache and the AI budget that admits the
+    /// call are both per account.
+    #[arg(long, requires = "account")]
+    nl: bool,
+    /// Print the compiled plan and stop, without searching. Only meaningful
+    /// with `--nl`.
+    #[arg(long = "plan-only", requires = "nl")]
+    plan_only: bool,
+    /// Recompile instead of serving the cached plan. Only meaningful with
+    /// `--nl`.
+    #[arg(long, requires = "nl")]
+    refresh: bool,
 }
 
 /// `mail similar <id>` flags. `similar` has no `--mode`/`--explore`/
@@ -358,11 +379,34 @@ pub async fn search(socket: &Path, args: SearchArgs) -> Result<()> {
         .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
     let mut client = SearchServiceClient::new(channel);
 
+    // `required = true` on the arg; clap rejects a plain `mail search` with
+    // no query before this runs, so the fallback is unreachable rather than a
+    // silent empty-query search.
+    let typed = args.query.unwrap_or_default();
+    let query = if args.nl {
+        let plan = client
+            .compile_query(CompileQueryRequest {
+                query: typed,
+                account_id: args.account.unwrap_or(0),
+                refresh: args.refresh,
+            })
+            .await
+            .context("CompileQuery RPC failed")?
+            .into_inner();
+        // To stderr, not stdout: `mail search --nl ... --json | jq` must keep
+        // emitting only hits. The plan is something a human reads before
+        // deciding the answer was to the right question.
+        print_plan(&plan);
+        if args.plan_only {
+            return Ok(());
+        }
+        plan.compiled
+    } else {
+        typed
+    };
+
     let request = SearchRequest {
-        // `required = true` on the arg; clap rejects a plain `mail search`
-        // with no query before this runs, so the fallback is unreachable
-        // rather than a silent empty-query search.
-        query: args.query.unwrap_or_default(),
+        query,
         filter: args.filter.unwrap_or_default(),
         mode: args
             .mode
@@ -399,6 +443,30 @@ pub async fn search(socket: &Path, args: SearchArgs) -> Result<()> {
         println!("no results");
     }
     Ok(())
+}
+
+/// Print a compiled plan for a human to confirm, on stderr — see [`search`].
+///
+/// Prints what the daemon derived (`filters` re-parsed from the compiled
+/// query), never a re-derivation of its own: a client that parsed the query
+/// itself to describe it would be a second reading of the grammar, and the
+/// one shown would be the one that is not enforced.
+fn print_plan(plan: &QueryPlan) {
+    let source = if plan.cached {
+        "cached"
+    } else {
+        plan.model.as_str()
+    };
+    eprintln!("compiled ({source}): {}", plan.compiled);
+    if !plan.filters.is_empty() {
+        eprintln!("  filters:  {}", plan.filters.join(" "));
+    }
+    if !plan.semantic_query.is_empty() {
+        eprintln!("  ranked:   {}", plan.semantic_query);
+    }
+    if !plan.notes.is_empty() {
+        eprintln!("  reading:  {}", plan.notes);
+    }
 }
 
 /// `mail search eval` — score the golden set and, when asked to gate, fail

@@ -13,12 +13,22 @@
 //! synonym expansion, date resolution, and the query embedding — the rest of
 //! Stage 0 — to produce the [`plan::QueryPlan`] every retriever downstream
 //! consumes.
+//!
+//! [`compile`] is Stage 0's last step and the only one that leaves the
+//! machine: when the input is prose an operator grammar cannot structure
+//! ([`plan::QueryPlan::needs_nl_compile`] is the local signal for it), Claude
+//! translates it into a query in *this* grammar, which is then parsed by
+//! [`parse`] like any other. Cached by normalized query hash, so the
+//! translation is paid for once.
 
+pub mod compile;
 pub mod parse;
 pub mod plan;
 
+pub use compile::{CompiledQuery, QueryCompiler};
 pub use parse::{
-    parse, AiPredicate, Filter, HasTarget, IsFlag, Mode, Operator, ParsedQuery, Phrase, Term,
+    parse, render_operator, AiPredicate, Filter, HasTarget, IsFlag, Mode, Operator, ParsedQuery,
+    Phrase, Term,
 };
 pub use plan::{
     DateRange, EntityRef, EntityRefKind, HardFilter, Intent, PlanTerm, QueryPlan, QueryPlanner,

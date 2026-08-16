@@ -4,6 +4,7 @@ mod digest_cli;
 mod export_cli;
 mod extract_cli;
 mod find_cli;
+mod folder_cli;
 mod hook_cli;
 mod index_cli;
 mod keymap;
@@ -107,7 +108,20 @@ enum Command {
         action: keys_cli::KeysAction,
     },
     /// Ranked search over the local index (`SearchService.Search`).
+    ///
+    /// `--nl` compiles a plain-English question into a query first
+    /// (`SearchService.CompileQuery`) and prints the plan before running it.
     Search(SearchArgs),
+    /// Smart folders: virtual mailboxes whose membership is a live predicate
+    /// (`SavedSearchService`).
+    ///
+    /// `mail folder new "<plain English>"` has Claude compile the sentence
+    /// once into a stored hybrid plan; `--predicate` defines the same folder
+    /// from operators and reaches no model.
+    Folder {
+        #[command(subcommand)]
+        action: folder_cli::FolderAction,
+    },
     /// Jump to anything by name — messages, folders, contacts, saved
     /// searches, tags, commands (`FinderService.Find`).
     ///
@@ -643,6 +657,7 @@ async fn main() -> Result<()> {
         Command::Tui(args) => tui::run(&socket, args).await,
         Command::Keys { action } => keys_cli::run(action),
         Command::Search(args) => search_cli::search(&socket, args).await,
+        Command::Folder { action } => folder_cli::dispatch(&socket, action).await,
         Command::Find(args) => find_cli::find(&socket, args).await,
         Command::Similar(args) => search_cli::similar(&socket, args).await,
         Command::Ai { action } => match action {
