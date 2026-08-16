@@ -300,10 +300,11 @@ fn print_tag_with_count(with_count: &TagWithCount) {
     );
 }
 
-/// Drain a `SuggestTags` stream and print each pending suggestion —
-/// `mail suggest-tags <id>` (task 57 owns generating them; this only
-/// displays what is already pending, per `TagService.SuggestTags`'s own
-/// contract).
+/// Drain a `SuggestTags` stream and print each suggestion as it arrives —
+/// `mail suggest-tags <id>`. Printed inside the loop, not collected first,
+/// because the server genuinely produces them incrementally: the rows the
+/// background pass already wrote come back at once, and each newly classified
+/// one follows as it is written (see `TagService.SuggestTags`).
 pub async fn suggest_tags(socket: &Path, message_id: i64) -> Result<()> {
     let mut stream = client(socket)
         .await?
@@ -320,9 +321,19 @@ pub async fn suggest_tags(socket: &Path, message_id: i64) -> Result<()> {
             .as_ref()
             .map(|t| t.name.as_str())
             .unwrap_or("?");
+        // The rationale is model-authored text about attacker-authored mail.
+        // `rmail_core::tags::ai` already strips control characters before
+        // storing it, but this print must not depend on that: a daemon on the
+        // other end of this socket may be an older build, and `terminal_safe`
+        // is what every other model-derived string this CLI prints goes
+        // through (`mail ask`). The tag name is bounded by the taxonomy, and
+        // is passed through the same filter rather than trusted by exception.
         println!(
             "{:<6} {:<28} {:.2}  {}",
-            suggestion.message_tag_id, name, suggestion.confidence, suggestion.rationale
+            suggestion.message_tag_id,
+            crate::terminal_safe(name),
+            suggestion.confidence,
+            crate::terminal_safe(&suggestion.rationale)
         );
     }
     if !any {
@@ -344,6 +355,89 @@ pub async fn resolve_suggestions(socket: &Path, ids: Vec<i64>, accept: bool) -> 
     }
     println!("{}", if accept { "accepted" } else { "rejected" });
     Ok(())
+}
+
+/// Map `--mode` onto the wire enum.
+///
+/// Unrecognized input is an error rather than a fallback. Everywhere else in
+/// this subsystem an unknown mode degrades to `suggest`, which is the safe
+/// direction for a *stored* value nobody is watching — but a typo the user
+/// just typed is worth telling them about, and silently giving them the
+/// opposite of `--mode auto` is the one outcome they cannot detect.
+fn parse_rule_mode(mode: &str) -> Result<rmail_proto::v1::TagRuleMode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "suggest" => Ok(rmail_proto::v1::TagRuleMode::Suggest),
+        "auto" => Ok(rmail_proto::v1::TagRuleMode::Auto),
+        other => anyhow::bail!("unknown --mode {other:?}: expected \"suggest\" or \"auto\""),
+    }
+}
+
+/// `mail tag-rules set <name> <tag> [--mode auto] [--min-conf 0.9]`.
+pub async fn set_tag_rule(
+    socket: &Path,
+    account: i64,
+    name: &str,
+    tag_name: &str,
+    mode: &str,
+    min_conf: f64,
+    enabled: bool,
+) -> Result<()> {
+    let mode = parse_rule_mode(mode)?;
+    let rule = client(socket)
+        .await?
+        .set_tag_rule(rmail_proto::v1::SetTagRuleRequest {
+            account_id: account,
+            name: name.to_owned(),
+            tag_name: tag_name.to_owned(),
+            mode: mode as i32,
+            min_conf,
+            enabled,
+        })
+        .await
+        .context("SetTagRule RPC failed")?
+        .into_inner();
+    print_rule(&rule);
+    Ok(())
+}
+
+/// `mail tag-rules list`.
+pub async fn list_tag_rules(socket: &Path, account: i64) -> Result<()> {
+    let rules = client(socket)
+        .await?
+        .list_tag_rules(rmail_proto::v1::ListTagRulesRequest {
+            account_id: account,
+        })
+        .await
+        .context("ListTagRules RPC failed")?
+        .into_inner()
+        .rules;
+    if rules.is_empty() {
+        println!("no tag rules; every AI suggestion will stay pending");
+        return Ok(());
+    }
+    for rule in &rules {
+        print_rule(rule);
+    }
+    Ok(())
+}
+
+fn print_rule(rule: &rmail_proto::v1::TagRule) {
+    let mode = match rmail_proto::v1::TagRuleMode::try_from(rule.mode).unwrap_or_default() {
+        rmail_proto::v1::TagRuleMode::Auto => "auto",
+        _ => "suggest",
+    };
+    // Tag and rule names are user-authored, but a tag can also be created by
+    // the classifier from its taxonomy, so both go through the same filter
+    // every other printed name does.
+    println!(
+        "{:<6} {:<20} {:<28} {:<8} {:.2}  {}",
+        rule.id,
+        crate::terminal_safe(&rule.name),
+        crate::terminal_safe(&rule.tag_name),
+        mode,
+        rule.min_conf,
+        if rule.enabled { "enabled" } else { "disabled" }
+    );
 }
 
 #[cfg(test)]

@@ -11,11 +11,15 @@ import "google/protobuf/empty.proto";
 // hierarchy, the `auto` downgrade); this service is a thin translation over
 // it.
 //
-// SuggestTags/ResolveSuggestion are the *surface* for AI tag suggestions —
-// this task defines the pending/accepted state model and these two RPCs,
-// but never calls a model itself. SuggestTags streams back whatever is
-// already `state = PENDING` for a message (written by task 57's suggestion
-// job, or by any other caller); ResolveSuggestion accepts or rejects one.
+// SuggestTags/ResolveSuggestion are the surface for AI tag suggestions.
+// SuggestTags first streams whatever is already `state = PENDING` for the
+// message (written by the background `suggest_tags` pass), then — on a daemon
+// whose AI subsystem is active — classifies the message against
+// `tags.ai.taxonomy` and streams each new suggestion as it is written. It
+// therefore spends a model call and mutates the mailbox: it requires
+// `mail.write` + `ai.invoke`, not `mail.read`. ResolveSuggestion accepts or
+// rejects a pending suggestion, and that decision is what the tagger learns
+// from.
 service TagService {
   // Apply one or more tags (created on demand) to a message or thread.
   rpc AddTag(AddTagRequest) returns (AddTagResponse);
@@ -37,9 +41,9 @@ service TagService {
   // (not one round trip per message).
   rpc BulkTag(BulkTagRequest) returns (BulkTagResponse);
 
-  // Stream a message's currently pending AI tag suggestions. Never calls a
-  // model (see the service's own doc comment) — this reads
-  // `message_tags(state = 'pending')` exactly as it stands.
+  // Stream a message's AI tag suggestions: what is already pending, then
+  // whatever a fresh classification adds. Mail the recipient has already
+  // tagged is not classified. See the service's own doc comment.
   rpc SuggestTags(SuggestTagsRequest) returns (stream TagSuggestion);
 
   // Accept or reject a pending suggestion. Accepting applies the tag
@@ -47,6 +51,17 @@ service TagService {
   // would; rejecting marks it `rejected` (kept, not deleted, so a future
   // suggestion pass can learn from it).
   rpc ResolveSuggestion(ResolveSuggestionRequest) returns (google.protobuf.Empty);
+
+  // Create or re-point a `tag_rules` row, upserting on (account, name).
+  //
+  // Without this the auto-apply half of task 57 is unreachable: the engine
+  // consults `tag_rules` to decide whether a confident suggestion may apply
+  // itself, and with no way to write one, every suggestion pends forever.
+  // `mode = TAG_RULE_MODE_SUGGEST` is the safe default a rule degrades to.
+  rpc SetTagRule(SetTagRuleRequest) returns (TagRule);
+
+  // Every `tag_rules` row for an account, enabled or not, oldest first.
+  rpc ListTagRules(ListTagRulesRequest) returns (ListTagRulesResponse);
 }
 
 // What a tag application/removal targets: exactly one of a message or a
@@ -181,4 +196,53 @@ message TagSuggestion {
 message ResolveSuggestionRequest {
   int64 message_tag_id = 1;
   bool accept = 2;
+}
+
+// `tag_rules.mode` — whether a confident suggestion may apply itself.
+enum TagRuleMode {
+  TAG_RULE_MODE_UNSPECIFIED = 0;
+  // Every suggestion for this tag stays pending, whatever its confidence.
+  // Also what an unrecognized stored value degrades to: the safe direction.
+  TAG_RULE_MODE_SUGGEST = 1;
+  // A suggestion at or above the effective floor is applied outright.
+  TAG_RULE_MODE_AUTO = 2;
+}
+
+// One `tag_rules` row: which tag it governs, and on what terms.
+message TagRule {
+  int64 id = 1;
+  int64 account_id = 2;
+  // Human label, unique per account. Re-using it re-points the rule rather
+  // than accumulating a second one beside it.
+  string name = 3;
+  int64 tag_id = 4;
+  // The tag's full hierarchical name.
+  string tag_name = 5;
+  TagRuleMode mode = 6;
+  // The rule's own confidence floor. It never *lowers* the global
+  // `tags.ai.auto_apply_min_confidence`; the effective floor is the higher
+  // of the two.
+  double min_conf = 7;
+  // Whether this rule is consulted at all. Setting it false is how a rule
+  // is retired without losing the row.
+  bool enabled = 8;
+}
+
+message SetTagRuleRequest {
+  int64 account_id = 1;
+  string name = 2;
+  // Tag name; created on demand, like `AddTag`'s names.
+  string tag_name = 3;
+  TagRuleMode mode = 4;
+  // Must be a finite value in 0.0..=1.0.
+  double min_conf = 5;
+  bool enabled = 6;
+}
+
+message ListTagRulesRequest {
+  int64 account_id = 1;
+}
+
+message ListTagRulesResponse {
+  repeated TagRule rules = 1;
 }

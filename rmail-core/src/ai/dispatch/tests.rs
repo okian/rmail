@@ -11,10 +11,11 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use tokio_util::sync::CancellationToken;
 
-use super::{AiDispatchLoop, AiPauseFlag};
+use super::{AiDispatchLoop, AiPauseFlag, PRIORITY_BACKFILL};
 use crate::ai::policy::PolicyEngine;
 use crate::ai::provider::{ChatRequest, ChatResponse, Provider, ProviderStream};
 use crate::ai::queue::{AiWorkerPool, QueueOptions};
+use crate::ai::triage;
 use crate::ai::AiQueue;
 use crate::config::{AiLimits, AiPolicyMode, AiPrivacy};
 use crate::error::Error;
@@ -222,6 +223,76 @@ async fn syncing_a_message_makes_a_triage_job_appear() {
         fx.queue_state(message_id, "triage").await.as_deref(),
         Some("pending"),
         "the synced message must now have a pending triage job"
+    );
+}
+
+/// Task 57's acceptance criterion opens with "New mail → low-priority
+/// `suggest_tags` job", and both halves of that clause are asserted here: the
+/// job exists at all, and it is enqueued *behind* triage rather than beside
+/// it. The priority is not cosmetic — `budget::WorkClass::for_priority`
+/// classifies at `PRIORITY_BACKFILL` as `Bulk`, which is what keeps auto-
+/// tagging drawing on the bulk sub-budget instead of competing with
+/// user-facing calls.
+#[tokio::test]
+async fn syncing_a_message_makes_a_low_priority_suggest_tags_job_appear() {
+    let fx = Fixture::open().await;
+    let message_id = fx.sync_new_message().await;
+
+    let loop_ = AiDispatchLoop::new(fx.events.clone(), fx.queue.clone(), no_handler_pool(&fx))
+        .with_suggest_tags_pass(true);
+    let (enqueued, _cursor) = loop_.drain_new_mail(0).await.unwrap();
+
+    assert_eq!(enqueued, 2, "triage and auto-tagging, one message");
+    assert_eq!(
+        fx.queue_state(message_id, crate::tags::ai::PASS)
+            .await
+            .as_deref(),
+        Some("pending")
+    );
+    let priorities = fx
+        .db
+        .read(move |c| {
+            let mut stmt =
+                c.prepare("SELECT pass, priority FROM ai_queue WHERE message_id = ?1")?;
+            let rows = stmt.query_map([message_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+        .unwrap();
+    let suggest = priorities
+        .iter()
+        .find(|(pass, _)| pass == crate::tags::ai::PASS)
+        .expect("the suggest_tags row");
+    let triage_row = priorities
+        .iter()
+        .find(|(pass, _)| pass == triage::PASS)
+        .expect("the triage row");
+    assert_eq!(suggest.1, PRIORITY_BACKFILL);
+    assert!(
+        suggest.1 > triage_row.1,
+        "auto-tagging must sort behind triage, got {suggest:?} vs {triage_row:?}"
+    );
+}
+
+/// The switch lives at the enqueue site precisely so a disabled feature
+/// queues nothing: a job enqueued and then declined would still occupy
+/// `ai_queue`, and `AiQueue::enqueue`'s `(message_id, pass)` dedup would make
+/// that permanent.
+#[tokio::test]
+async fn the_suggest_tags_pass_enqueues_nothing_when_it_is_switched_off() {
+    let fx = Fixture::open().await;
+    let message_id = fx.sync_new_message().await;
+
+    let loop_ = AiDispatchLoop::new(fx.events.clone(), fx.queue.clone(), no_handler_pool(&fx));
+    let (enqueued, _) = loop_.drain_new_mail(0).await.unwrap();
+
+    assert_eq!(enqueued, 1, "triage only");
+    assert_eq!(
+        fx.queue_state(message_id, crate::tags::ai::PASS).await,
+        None,
+        "no auto-tagging job may be created while the feature is off"
     );
 }
 

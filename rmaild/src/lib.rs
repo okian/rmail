@@ -114,6 +114,7 @@ use rmail_core::saved_search::SavedSearchStore;
 use rmail_core::send::preflight::PreflightGuardian;
 use rmail_core::smart_folder::{SmartFolderEvaluator, SmartFolderStore};
 use rmail_core::sync::{SyncEngine, SyncOptions};
+use rmail_core::tags::ai::{SuggestTagsPassHandler, SuggestionEngine};
 use rmail_core::tags::TagStore;
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
@@ -742,7 +743,11 @@ where
         idempotency.clone(),
         stopping.clone(),
     ));
-    let tag_service = TagServiceServer::new(TagApi::new(tag_store.clone()));
+    // `TagService` is built further down, after the AI provider/policy/limits
+    // handles exist: `SuggestTags` classifies on demand (task 57) and must
+    // draw on the *same* semaphore and rate limiter every other AI call site
+    // in this process shares.
+    //
     // `ComposeService` needs nothing but the database: drafts are local, and
     // this task deliberately stops short of SMTP (task 61 owns submission),
     // so there is no client, pool, or background loop to wire up here.
@@ -1054,7 +1059,7 @@ where
     // `TagStore` `TagService` uses (so a rule-applied tag honours the tag's
     // own IMAP sync mode) and publishes `notify` actions to the same
     // `EventLog` every other subsystem consumes.
-    let smart_folder_store = SmartFolderStore::new(db.clone(), tag_store, events.clone());
+    let smart_folder_store = SmartFolderStore::new(db.clone(), tag_store.clone(), events.clone());
     let saved_search_service = SavedSearchServiceServer::new(SavedSearchApi::new(
         db.clone(),
         SavedSearchStore::new(db.clone()),
@@ -1138,11 +1143,53 @@ where
             .with_policy(notify_policy.clone())
             .with_max_message_age(config.notify.max_message_age.as_duration()),
     );
+    // Auto-tagging (task 57). Registered unconditionally for the same reason
+    // the notification pass is: `tags.ai.enabled`/`suggest_on_new_mail` gate
+    // whether a `NewMail` event *enqueues* one of these jobs (see
+    // `AiDispatchLoop::with_suggest_tags_pass`), not whether the pool can
+    // finish one enqueued before the operator switched the feature off. The
+    // handler declines the same config in its own `build_request` anyway, so
+    // such a job terminates without ever reaching a provider.
+    let suggest_tags_handler: Arc<dyn PassHandler> = Arc::new(
+        SuggestTagsPassHandler::new(db.clone(), tag_store.clone(), config.tags.ai.clone())
+            .with_injection_config(config.ai.injection.clone()),
+    );
     let ai_handlers: Vec<Arc<dyn PassHandler>> = vec![
         triage_handler,
         Arc::clone(&deep_handler) as Arc<dyn PassHandler>,
         notify_handler,
+        suggest_tags_handler,
     ];
+
+    // `TagService`, deferred from further up so `SuggestTags`' on-demand
+    // classifier can share this process's one `ai.limits` budget rather than
+    // minting a second pair (see `ai_semaphore`'s own comment). The engine is
+    // wired only when the AI subsystem is genuinely active: behind
+    // `NullProvider` every call would spend a policy resolution, a budget
+    // check and a redaction pass to reach a provider that always refuses, so a
+    // disabled daemon keeps `SuggestTags` as the pending-only replay instead —
+    // the background pass's work stays readable either way.
+    let tag_api = TagApi::new(tag_store.clone());
+    let tag_api = if ai_active {
+        tag_api.with_suggestions(
+            SuggestionEngine::new(
+                db.clone(),
+                tag_store.clone(),
+                Arc::clone(&ai_provider),
+                Arc::clone(&ai_policy),
+                config.ai.limits.clone(),
+                config.ai.privacy.clone(),
+                config.ai.injection.clone(),
+                config.tags.ai.clone(),
+                Arc::clone(&ai_semaphore),
+                Arc::clone(&ai_rate_limiter),
+            ),
+            stopping.clone(),
+        )
+    } else {
+        tag_api
+    };
+    let tag_service = TagServiceServer::new(tag_api);
 
     let ai_worker_pool = AiWorkerPool::new(
         db.clone(),
@@ -1258,7 +1305,8 @@ where
     let ai_dispatch_handle = if ai_active {
         let mut dispatch = AiDispatchLoop::new(events.clone(), ai_queue.clone(), ai_worker_pool)
             .with_pause_flag(ai_pause)
-            .with_notify_pass(config.notify.enabled);
+            .with_notify_pass(config.notify.enabled)
+            .with_suggest_tags_pass(config.tags.ai.enabled && config.tags.ai.suggest_on_new_mail);
         if config.ai.batching.enabled {
             match BatchClient::new() {
                 Ok(client) => match BatchCoordinator::new(

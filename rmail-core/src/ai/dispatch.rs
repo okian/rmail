@@ -68,8 +68,11 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{Error, ErrorReason};
 use crate::events::{EventKind, EventLog};
 use crate::notify;
+use crate::tags;
 
-use super::queue::{AiWorkerPool, BatchCoordinator, BatchPollOutcome, DispatchSummary};
+use super::queue::{
+    AiWorkerPool, BatchCoordinator, BatchPollOutcome, DispatchSummary, PRIORITY_BACKFILL,
+};
 use super::triage;
 use super::{AiQueue, NewAiJob};
 
@@ -189,6 +192,14 @@ pub struct AiDispatchLoop {
     /// See [`Self::drain_new_mail`] for why the switch lives at the enqueue
     /// site rather than in the handler.
     notify_pass: bool,
+    /// Whether a `NewMail` event also enqueues a
+    /// [`crate::tags::ai::PASS`] job — `tags.ai.enabled` *and*
+    /// `tags.ai.suggest_on_new_mail`. Same reasoning as `notify_pass`: the
+    /// switch belongs at the enqueue site, because a job enqueued for a
+    /// disabled feature would still occupy `ai_queue` and
+    /// [`AiQueue::enqueue`]'s `(message_id, pass)` dedup would make that
+    /// permanent.
+    suggest_tags_pass: bool,
 }
 
 impl fmt::Debug for AiDispatchLoop {
@@ -219,6 +230,7 @@ impl AiDispatchLoop {
             cursor: Arc::new(AtomicI64::new(0)),
             active_batches: Arc::new(Mutex::new(Vec::new())),
             notify_pass: false,
+            suggest_tags_pass: false,
         }
     }
 
@@ -227,6 +239,15 @@ impl AiDispatchLoop {
     #[must_use]
     pub fn with_notify_pass(mut self, enabled: bool) -> Self {
         self.notify_pass = enabled;
+        self
+    }
+
+    /// Also enqueue a [`crate::tags::ai`] auto-tagging job for every
+    /// `NewMail` event — what `tags.ai.enabled && tags.ai.suggest_on_new_mail`
+    /// turn on.
+    #[must_use]
+    pub fn with_suggest_tags_pass(mut self, enabled: bool) -> Self {
+        self.suggest_tags_pass = enabled;
         self
     }
 
@@ -365,6 +386,22 @@ impl AiDispatchLoop {
                     let mut jobs = vec![NewAiJob::new(message_id, account_id, triage::PASS)];
                     if self.notify_pass {
                         jobs.push(NewAiJob::new(message_id, account_id, notify::PASS));
+                    }
+                    // Auto-tagging (task 57) is enqueued at
+                    // `PRIORITY_BACKFILL`, not `PRIORITY_NORMAL`, because
+                    // prd.md asks for a *low-priority* `suggest_tags` job and
+                    // that word carries two consequences here, not one: the
+                    // queue orders it behind every triage and notification
+                    // job (nobody is waiting on a tag chip the way they are
+                    // on a triage verdict), and `budget::WorkClass::for_priority`
+                    // classifies it as `Bulk`, so it draws on the bulk
+                    // sub-budget that exists precisely to keep background
+                    // walks from starving user-facing calls.
+                    if self.suggest_tags_pass {
+                        jobs.push(
+                            NewAiJob::new(message_id, account_id, tags::ai::PASS)
+                                .priority(PRIORITY_BACKFILL),
+                        );
                     }
                     jobs
                 })

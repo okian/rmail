@@ -24,13 +24,15 @@
 //!   grouping, and the `auto` downgrade.
 //! - [`query`] — a small, `tag:`/`from:`/`is:`/... hard-filter-only SQL
 //!   compiler for `BulkTag`'s `query` selector.
+//! - [`ai`] — the auto-tagging classifier (task 57): the `suggest_tags` pass,
+//!   `tag_rules`' auto-apply thresholds, and the accept/reject learning
+//!   signal. The only submodule that reaches a model.
 //!
-//! # The pending-suggestion state model (for task 57)
+//! # The pending-suggestion state model
 //!
-//! Task 57 ("AI auto-tagging + suggestions") populates suggestions; this
-//! task defines the storage and the RPC surface they land in, and does not
-//! itself call a model. The contract task 57's suggestion job writes
-//! against:
+//! Task 55 defined this storage and the RPC surface suggestions land in;
+//! task 57 ([`ai`]) is what fills it, and it is the only part of this
+//! subsystem that ever reaches a model. The contract between them:
 //!
 //! - [`TagStore::record_suggestion`] writes one pending row
 //!   (`target = Target::Message(id)`, `source = TagSource::Ai`,
@@ -40,13 +42,17 @@
 //!   (`tag_id, message_id`) makes a repeat suggestion for the same
 //!   `(message, tag)` pair a no-op rather than a duplicate row — safe to
 //!   call idempotently from a retried job.
+//! - [`TagStore::record_ai_suggestion`] is the seam [`ai::persist`] actually
+//!   writes every classifier answer through — pending, or applied outright
+//!   when an [`ai::TagRule`] authorizes it. It is
+//!   [`TagStore::record_suggestion`] plus the wire round-trip an application
+//!   needs, and it is what new code should call.
 //! - [`TagStore::list_pending_suggestions`] is `SuggestTags`'s backing read:
 //!   it streams back whatever is currently `state = Pending` for a message,
-//!   regardless of who wrote it. Task 57's suggestion job is expected to
-//!   write pending rows directly (or via this module) and let a client's
-//!   next `SuggestTags` call — or a live `mail suggest-tags <id>` — surface
-//!   them; this task's own `SuggestTags` implementation never calls a model
-//!   itself (see the RPC's own doc comment in `rmaild::tag_service`).
+//!   regardless of who wrote it. `SuggestTags` sends those first and then
+//!   classifies the message live (see [`ai::SuggestionEngine`]), so the two
+//!   halves — the background pass and the on-demand one — write through the
+//!   same primitives and reach the same decisions.
 //! - [`TagStore::resolve_suggestion`] is `ResolveSuggestion`'s backing
 //!   write: `accept = true` flips the row to `TagState::Applied` (and, if
 //!   the tag's `sync_mode` allows it, pushes the tag to IMAP exactly like a
@@ -56,14 +62,13 @@
 //!   guard makes a duplicate resolution a no-op rather than a silent
 //!   overwrite, surfaced to the caller as [`Error::FailedPrecondition`].
 //! - A `Rejected` row is *kept*, not deleted — prd.md's "learns from
-//!   accept/reject decisions" needs the history, and task 57's rule-learning
-//!   pass (`tag_rules`, its own migration) is expected to read
+//!   accept/reject decisions" needs the history, and [`ai::Learning`] reads
 //!   `message_tags` filtered to `source = 'ai'` for exactly that signal.
 //!
-//! Nothing here ever reads `tags.ai` config or calls
-//! [`crate::ai::provider::Provider`] — that wiring, the `suggest_tags`
-//! background job, and `tag_rules`' auto-apply-above-threshold logic are
-//! entirely task 57's to add.
+//! Nothing in *this* module reads `tags.ai` config or calls
+//! [`crate::ai::provider::Provider`]; that all lives in [`ai`], and every
+//! other file here stays a plain storage layer with no opinion about where a
+//! tag came from.
 //!
 //! # A known gap: tags do not survive a client-initiated move today
 //!
@@ -80,6 +85,7 @@
 //! this means changing task 39's move semantics, not this module's —
 //! tracked here rather than silently assumed away.
 
+pub mod ai;
 pub mod hierarchy;
 pub mod model;
 pub mod query;
@@ -664,6 +670,189 @@ impl TagStore {
             .await?)
     }
 
+    /// Write one AI tag suggestion against `target` — the single seam
+    /// [`ai::persist`] (task 57's classifier) writes every one of its answers
+    /// through.
+    ///
+    /// `auto_apply` selects between the two shapes a suggestion can take, and
+    /// they differ in more than a state flag:
+    ///
+    /// - `false` — a pending suggestion: `source = TagSource::Ai`,
+    ///   `state = TagState::Pending`, no wire traffic. Nothing has been
+    ///   applied yet, so there is nothing for the server to hear about until
+    ///   [`resolve_suggestion`](Self::resolve_suggestion) accepts it.
+    /// - `true` — an outright application authorized by a `tag_rules` row:
+    ///   `source = TagSource::Rule`, `state = TagState::Applied`, and the same
+    ///   IMAP round-trip (and `auto` downgrade) [`add_tag`](Self::add_tag)
+    ///   performs, in the same order — wire first, local write second.
+    ///
+    /// `source = Rule` rather than `Ai` for the applied case is load-bearing
+    /// and not cosmetic: it is what keeps `source = 'ai'` rows in a terminal
+    /// state meaning "a person ruled on this", which is the entire input to
+    /// [`ai::Learning`]. See `V43__tag_rules.sql`'s header.
+    ///
+    /// The confidence and rationale are recorded either way, so a tag that
+    /// appeared unprompted can still answer "why". Idempotent through the same
+    /// `UNIQUE` partial index every apply path relies on: a repeat for the
+    /// same `(tag, target)` writes nothing and returns `Ok(None)` — which is
+    /// what makes a retried queue job safe, and what makes a suggestion that
+    /// is *already* pending stay pending rather than being silently upgraded.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] if `name` is empty; [`Error::NotFound`] if
+    /// `target` does not exist; the IMAP mutator's error when `auto_apply` is
+    /// set and a `sync_mode = imap` tag's `STORE` is refused (an `auto` tag
+    /// downgrades instead — see [`sync`]). Otherwise a mapped storage error.
+    #[tracing::instrument(
+        skip(self, name, rationale),
+        fields(target = ?target, confidence = confidence, auto_apply = auto_apply),
+        err
+    )]
+    pub async fn record_ai_suggestion(
+        &self,
+        target: Target,
+        name: &str,
+        confidence: f64,
+        rationale: String,
+        auto_apply: bool,
+    ) -> Result<Option<i64>, Error> {
+        let account_id = self.resolve_account_for_target(target).await?;
+        let tag = self.get_or_create_tag(account_id, name).await?;
+        let tag_id = tag.id;
+
+        // Checked *before* the wire push, not left to the insert's
+        // `ON CONFLICT DO NOTHING`. The insert being a no-op for an existing
+        // `(tag, target)` row is what makes this method idempotent, but
+        // `apply_wire` runs first and is not: without this guard, auto-applying
+        // a tag that already has a `pending` row would set the keyword on the
+        // server and then write nothing locally, leaving the mailbox claiming
+        // the tag is merely suggested while the server says it is applied —
+        // the exact "a caller never sees a tag applied that the server
+        // disagrees with" invariant this module's header states, inverted.
+        //
+        // Racy in the strict sense (a concurrent writer can land a row between
+        // this read and the insert), and that is the harmless direction: the
+        // worst case is the pre-existing behaviour, one redundant `STORE` for
+        // a keyword that ends up set either way.
+        if repo_has_row(&self.db, tag_id, target).await? {
+            tracing::debug!(
+                tag_id,
+                target = ?target,
+                "this tag already has a message_tags row; nothing to write or push"
+            );
+            return Ok(None);
+        }
+
+        let mut downgrade = false;
+        if auto_apply {
+            let message_ids = self.target_message_ids(target).await?;
+            let groups = sync::group_by_mailbox(&self.db, &message_ids).await?;
+            if let sync::WireOutcome::Downgrade =
+                sync::apply_wire(self.imap.as_ref(), &tag, &self.config.imap, &groups, true).await?
+            {
+                downgrade = true;
+            }
+        }
+
+        let (source, state) = if auto_apply {
+            (TagSource::Rule, TagState::Applied)
+        } else {
+            (TagSource::Ai, TagState::Pending)
+        };
+        Ok(self
+            .db
+            .write(move |conn| {
+                let tx = conn.transaction()?;
+                if downgrade {
+                    repo::downgrade_tag_to_local(&tx, tag_id)?;
+                }
+                let id = repo::insert_message_tag(
+                    &tx,
+                    &NewMessageTag {
+                        tag_id,
+                        target,
+                        source,
+                        state,
+                        confidence: Some(confidence),
+                        rationale: Some(rationale),
+                    },
+                )?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .await?)
+    }
+
+    /// Create or update a `tag_rules` row (migration V43) — the per-tag
+    /// auto-apply policy [`ai::AutoApplyPolicy`] reads. The tag named by
+    /// `tag_name` is created on demand, the same "type a name, it gets
+    /// created" contract [`get_or_create_tag`](Self::get_or_create_tag)
+    /// provides everywhere else.
+    ///
+    /// Upserts on `(account_id, name)`: writing the same rule name twice
+    /// re-points/re-thresholds the existing rule rather than accumulating a
+    /// second one beside it.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] if `name` or `tag_name` is empty, or
+    /// `min_conf` is not a finite value in `0.0..=1.0` — checked here rather
+    /// than left to V43's `CHECK`, which would surface an operator's typo as
+    /// an opaque [`Error::Internal`]. Otherwise a mapped storage error.
+    #[tracing::instrument(
+        skip(self, name, tag_name),
+        fields(account_id = account_id, mode = mode.as_str(), min_conf = min_conf),
+        err
+    )]
+    pub async fn set_tag_rule(
+        &self,
+        account_id: i64,
+        name: &str,
+        tag_name: &str,
+        mode: ai::TagRuleMode,
+        min_conf: f64,
+        enabled: bool,
+    ) -> Result<ai::TagRule, Error> {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err(Error::invalid_argument("rule name must not be empty"));
+        }
+        if !min_conf.is_finite() || !(0.0..=1.0).contains(&min_conf) {
+            return Err(Error::invalid_argument(format!(
+                "min_conf must be between 0.0 and 1.0, got {min_conf}"
+            )));
+        }
+        let tag = self.get_or_create_tag(account_id, tag_name).await?;
+        let tag_id = tag.id;
+        let rule_name = name.clone();
+        let id = self
+            .db
+            .write(move |conn| {
+                ai::repo::upsert_rule(
+                    conn, account_id, &rule_name, tag_id, mode, min_conf, enabled,
+                )
+            })
+            .await?;
+        self.list_tag_rules(account_id)
+            .await?
+            .into_iter()
+            .find(|rule| rule.id == id)
+            .ok_or_else(|| {
+                Error::internal("tag rule vanished between its own upsert and read-back")
+            })
+    }
+
+    /// Every `tag_rules` row for an account, enabled or not, oldest first.
+    ///
+    /// # Errors
+    /// A mapped storage error.
+    #[tracing::instrument(skip(self), fields(account_id = account_id), err)]
+    pub async fn list_tag_rules(&self, account_id: i64) -> Result<Vec<ai::TagRule>, Error> {
+        Ok(self
+            .db
+            .read(move |conn| ai::repo::all_rules(conn, account_id))
+            .await?)
+    }
+
     /// Accept or reject a pending suggestion — `ResolveSuggestion`'s backing
     /// call. Accepting pushes the tag to IMAP exactly like [`add_tag`](Self::
     /// add_tag) would (including the `auto` downgrade) before flipping the
@@ -885,6 +1074,32 @@ enum Outcome {
     /// than an `.expect()` so the impossible case is still a typed `Error`,
     /// not a panic.
     Missing,
+}
+
+/// Whether a `message_tags` row already exists for `(tag_id, target)`, in any
+/// state — [`TagStore::record_ai_suggestion`]'s pre-wire guard. See its own
+/// comment for why the check has to precede the IMAP round-trip rather than
+/// being left to the insert's `ON CONFLICT DO NOTHING`.
+async fn repo_has_row(db: &Database, tag_id: i64, target: Target) -> Result<bool, Error> {
+    Ok(db
+        .read(move |conn| {
+            let (message_id, thread_id) = match target {
+                Target::Message(id) => (Some(id), None),
+                Target::Thread(id) => (None, Some(id)),
+            };
+            conn.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM message_tags
+                     WHERE tag_id = ?1
+                       AND message_id IS ?2
+                       AND thread_id IS ?3
+                 )",
+                rusqlite::params![tag_id, message_id, thread_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n != 0)
+        })
+        .await?)
 }
 
 /// Whether `parent_id` names a tag that exists and belongs to `account_id`

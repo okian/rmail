@@ -563,13 +563,14 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core notes::` · `cargo nextest run -p rmaild --test note_service`
 
 ## 57. AI auto-tagging + suggestions
-- [ ] status
+- [x] status
 - **depends-on:** 55, 47
 - **parallel-safe:** no
 - **acceptance:**
   - New mail → low-priority `suggest_tags` job → Haiku structured `[{tag,confidence,rationale}]` → `message_tags(state='pending',source='ai')`; `tag_rules` auto-apply above `min_conf`, rest pending for accept/reject; learns from accept/reject; skips already-user-tagged mail.
   - `mail suggest-tags/accept-tags/reject-tags` verbs; `SuggestTags` streams as Claude responds.
 - **verify:** `cargo nextest run -p rmail-core tags::ai` (pending write, auto-apply threshold, accept/reject learning)
+- **closed at merge:** `tag_rules` shipped with no RPC/CLI/MCP surface, so `TagStore::set_tag_rule`/`list_tag_rules` had no caller outside `rmail-core` and an operator could not create the `mode='auto'` rule auto-apply requires — every suggestion pended. Added `TagService.SetTagRule`/`ListTagRules` (additive to v1), the matching `parity` variants and `auth::methods` rows (`mail.write` to set, `mail.read` to list), and `mail tag-rules list|set`. Covered by `rmaild --test tag_service`: reachable through the daemon, upserts on (account, name) rather than accumulating, an unspecified mode resolves to `suggest` not `auto`, and an out-of-range floor is refused. Deleting a rule is `--disabled`; a hard delete has no caller yet.
 
 ## 58. NL smart folders (Claude compile)
 - [ ] status

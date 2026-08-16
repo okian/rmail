@@ -13,12 +13,14 @@
 //! into the daemon and reachable over the wire.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rmail_core::ai::{ChatRequest, ChatResponse, Provider, ProviderStream, StopReason, Usage};
 use rmail_core::events::{EventLog, Retention};
 use rmail_core::imap::mutate::ImapMutator;
 use rmail_core::mail::MailStore;
@@ -28,13 +30,15 @@ use rmail_core::tags::TagStore;
 use rmail_core::Error;
 use rmail_proto::v1::tag_service_client::TagServiceClient;
 use rmail_proto::v1::{
-    bulk_tag_request, target, AddTagRequest, BulkTagRequest, CreateTagRequest, ListTagsRequest,
-    MessageIds, RemoveTagRequest, ResolveSuggestionRequest, SuggestTagsRequest, TagSource,
-    TagState, TagSyncMode as ProtoTagSyncMode, Target,
+    bulk_tag_request, target, AddTagRequest, BulkTagRequest, CreateTagRequest, ListTagRulesRequest,
+    ListTagsRequest, MessageIds, RemoveTagRequest, ResolveSuggestionRequest, SetTagRuleRequest,
+    SuggestTagsRequest, TagRuleMode as ProtoTagRuleMode, TagSource, TagState,
+    TagSyncMode as ProtoTagSyncMode, Target,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use tonic::Code;
 
@@ -104,6 +108,77 @@ impl ImapMutator for FakeImap {
 }
 
 // ---------------------------------------------------------------------------
+// A scriptable provider for the on-demand `SuggestTags` path (task 57).
+// Running out of scripted replies is an error rather than a default answer, so
+// an unexpected extra call fails a test loudly instead of quietly succeeding —
+// which is exactly how "we called the model for mail we should have skipped"
+// would otherwise hide.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct MockProvider {
+    completions: Mutex<VecDeque<String>>,
+    calls: AtomicUsize,
+}
+
+impl MockProvider {
+    /// Script one classifier answer from `(tag, confidence)` pairs.
+    fn queue_suggestions(&self, items: &[(&str, f64)]) {
+        let suggestions: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(tag, confidence)| {
+                serde_json::json!({
+                    "tag": tag,
+                    "confidence": confidence,
+                    "rationale": format!("because of {tag}"),
+                })
+            })
+            .collect();
+        self.completions
+            .lock()
+            .unwrap()
+            .push_back(serde_json::json!({ "suggestions": suggestions }).to_string());
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Provider for MockProvider {
+    async fn complete(
+        &self,
+        _request: &ChatRequest,
+        _cancel: &CancellationToken,
+    ) -> Result<ChatResponse, Error> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.completions.lock().unwrap().pop_front() {
+            Some(text) => Ok(ChatResponse {
+                id: "msg_mock".to_owned(),
+                model: "mock-model".to_owned(),
+                stop_reason: StopReason::EndTurn,
+                text,
+                usage: Usage::default(),
+            }),
+            None => Err(Error::unavailable(
+                "mock provider: no scripted reply".to_owned(),
+            )),
+        }
+    }
+
+    async fn stream(
+        &self,
+        _request: &ChatRequest,
+        _cancel: &CancellationToken,
+    ) -> Result<ProviderStream, Error> {
+        Err(Error::unavailable(
+            "mock provider: streaming is not scripted".to_owned(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test server harness
 // ---------------------------------------------------------------------------
 
@@ -122,6 +197,18 @@ impl TestServer {
     }
 
     async fn with_imap(imap: FakeImap) -> Self {
+        Self::build(imap, None).await
+    }
+
+    /// A daemon whose AI subsystem is active, backed by a scripted provider —
+    /// what task 57's on-demand `SuggestTags` needs. Every other test in this
+    /// suite runs without one, which is what keeps them exercising the
+    /// pending-only replay path.
+    async fn with_provider(provider: Arc<MockProvider>) -> Self {
+        Self::build(FakeImap::default(), Some(provider)).await
+    }
+
+    async fn build(imap: FakeImap, provider: Option<Arc<MockProvider>>) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         let socket = PathBuf::from("/tmp").join(format!("rmail-tag-{pid}-{n}.sock"));
@@ -150,13 +237,33 @@ impl TestServer {
         let handle = tokio::spawn(async move {
             let mut config = rmail_core::Config::default();
             config.index.semantic.enabled = false;
-            rmaild::serve_uds_with_stores(
+            // The background pass would otherwise race every assertion in
+            // this suite: the AI dispatch loop replays `NewMail` events and
+            // would enqueue a `suggest_tags` job for each seeded message,
+            // spending the provider script these tests hand to the *on-demand*
+            // path. The RPC path is what this suite proves; the queued pass is
+            // proven in `rmail_core::tags::ai`.
+            config.tags.ai.suggest_on_new_mail = false;
+            // Without an injected provider the daemon would still count its
+            // AI subsystem as active (`ai.enabled` defaults on, and building
+            // a client does not validate the key), which since task 57 means
+            // `SuggestTags` tries a real network call. Every test that does
+            // not script a provider is about proto translation, not the
+            // classifier, so those get AI switched off outright and keep the
+            // pending-only replay contract.
+            config.ai.enabled = provider.is_some();
+            let injected = rmaild::Injected {
+                ai_provider: provider.map(|p| p as Arc<dyn Provider>),
+                reranker: None,
+            };
+            rmaild::serve_uds_injected(
                 &server_socket,
                 server_db,
                 engine,
                 mail_store,
                 tag_store,
                 &config,
+                injected,
                 async move {
                     let _ = shutdown_rx.await;
                 },
@@ -666,4 +773,339 @@ fn tag_state_wire_values_are_stable() {
     assert_eq!(TagState::Applied as i32, 1);
     assert_eq!(TagState::Pending as i32, 2);
     assert_eq!(TagState::Rejected as i32, 3);
+}
+
+// ---------------------------------------------------------------------------
+// The on-demand classifier behind `SuggestTags` (task 57)
+// ---------------------------------------------------------------------------
+
+/// The acceptance criterion's "`SuggestTags` streams as Claude responds": with
+/// an active AI subsystem the RPC classifies the message and streams each new
+/// suggestion as it is written, rather than replaying only what a background
+/// pass happened to leave behind.
+#[tokio::test]
+async fn suggest_tags_classifies_on_demand_and_streams_each_suggestion() {
+    let provider = Arc::new(MockProvider::default());
+    // With no `tag_rules` row nothing auto-applies at any confidence, so both
+    // land pending and both are streamed.
+    provider.queue_suggestions(&[("finance/invoice", 0.91), ("work", 0.62)]);
+    let server = TestServer::with_provider(Arc::clone(&provider)).await;
+    let (account_id, mailbox_id) = server.seed_account();
+    let message_id = server.seed_message(account_id, mailbox_id, 1);
+    let mut client = server.client().await;
+
+    let mut stream = client
+        .suggest_tags(SuggestTagsRequest { message_id })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut got: Vec<(String, f64, String)> = Vec::new();
+    while let Some(item) = stream.next().await {
+        let s = item.unwrap();
+        got.push((
+            s.tag.as_ref().unwrap().name.clone(),
+            s.confidence,
+            s.rationale,
+        ));
+    }
+
+    assert_eq!(provider.calls(), 1, "exactly one model call");
+    assert_eq!(got.len(), 2, "both suggestions streamed: {got:?}");
+    // Best first, and the confidence and rationale survive the round trip.
+    assert_eq!(got[0].0, "finance/invoice");
+    assert!((got[0].1 - 0.91).abs() < 1e-9);
+    assert_eq!(got[0].2, "because of finance/invoice");
+    assert_eq!(got[1].0, "work");
+
+    // ...and they are durable pending rows, not stream-only artifacts. The
+    // second read replays them and — the cost control — does *not* classify
+    // again, which is why the exhausted script never errors.
+    let mut again = client
+        .suggest_tags(SuggestTagsRequest { message_id })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut replayed: Vec<String> = Vec::new();
+    while let Some(item) = again.next().await {
+        replayed.push(item.unwrap().tag.unwrap().name);
+    }
+    replayed.sort();
+    assert_eq!(replayed, ["finance/invoice", "work"]);
+    assert_eq!(
+        provider.calls(),
+        1,
+        "a message with unanswered suggestions must not be classified twice"
+    );
+
+    server.stop().await;
+}
+
+/// The cost control prd.md names outright: "skip already-user-tagged mail".
+/// The provider is scripted with nothing at all, so any call would be an
+/// error — which is the point, since a silent extra call is exactly the
+/// failure this guards.
+#[tokio::test]
+async fn suggest_tags_never_calls_a_model_for_mail_the_recipient_already_tagged() {
+    let provider = Arc::new(MockProvider::default());
+    let server = TestServer::with_provider(Arc::clone(&provider)).await;
+    let (account_id, mailbox_id) = server.seed_account();
+    let message_id = server.seed_message(account_id, mailbox_id, 1);
+    let mut client = server.client().await;
+
+    client
+        .add_tag(AddTagRequest {
+            target: Some(Target {
+                of: Some(target::Of::MessageId(message_id)),
+            }),
+            names: vec!["work".to_owned()],
+        })
+        .await
+        .unwrap();
+
+    let mut stream = client
+        .suggest_tags(SuggestTagsRequest { message_id })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut count = 0;
+    while let Some(item) = stream.next().await {
+        item.unwrap();
+        count += 1;
+    }
+
+    assert_eq!(count, 0, "a filed message yields no suggestions");
+    assert_eq!(
+        provider.calls(),
+        0,
+        "and must not have reached a provider at all"
+    );
+
+    server.stop().await;
+}
+
+/// The error path: a provider failure must reach the client as a `Status` on
+/// the stream, not as a silently truncated success. `SuggestTags` opens its
+/// response before the call is made, so this is the only way the failure can
+/// be reported at all — and a stream that just ends looks exactly like "no
+/// suggestions", which is the wrong answer to show somebody.
+#[tokio::test]
+async fn a_provider_failure_reaches_the_client_as_a_stream_status() {
+    // Nothing scripted: `MockProvider` answers `Unavailable`.
+    let provider = Arc::new(MockProvider::default());
+    let server = TestServer::with_provider(Arc::clone(&provider)).await;
+    let (account_id, mailbox_id) = server.seed_account();
+    let message_id = server.seed_message(account_id, mailbox_id, 1);
+    let mut client = server.client().await;
+
+    let mut stream = client
+        .suggest_tags(SuggestTagsRequest { message_id })
+        .await
+        .unwrap()
+        .into_inner();
+    let status = stream
+        .next()
+        .await
+        .expect("the failure is reported, not swallowed")
+        .expect_err("expected a Status");
+
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(provider.calls(), 1, "the call really was attempted");
+    assert!(stream.next().await.is_none(), "and the stream then ends");
+
+    server.stop().await;
+}
+
+/// A message the background pass has already left suggestions on is replayed,
+/// not re-classified — the second half of the cost control. Nothing is
+/// scripted, so a model call here would surface as a stream error.
+#[tokio::test]
+async fn suggest_tags_replays_unanswered_suggestions_without_classifying_again() {
+    let provider = Arc::new(MockProvider::default());
+    let server = TestServer::with_provider(Arc::clone(&provider)).await;
+    let (account_id, mailbox_id) = server.seed_account();
+    let message_id = server.seed_message(account_id, mailbox_id, 1);
+    let mut client = server.client().await;
+
+    let tag = client
+        .create_tag(CreateTagRequest {
+            account_id,
+            name: "travel".to_owned(),
+            color: None,
+            sync_mode: Some(ProtoTagSyncMode::Local as i32),
+            parent_id: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let store = TagStore::new(
+        server.db.clone(),
+        Arc::new(FakeImap::default()) as Arc<dyn ImapMutator>,
+        rmail_core::config::TagsConfig::default(),
+    );
+    store
+        .record_suggestion(
+            tag.id,
+            rmail_core::tags::Target::Message(message_id),
+            0.7,
+            "an itinerary".to_owned(),
+        )
+        .await
+        .unwrap();
+
+    let mut stream = client
+        .suggest_tags(SuggestTagsRequest { message_id })
+        .await
+        .unwrap()
+        .into_inner();
+    let first = stream
+        .next()
+        .await
+        .expect("the pending row arrives first")
+        .unwrap();
+    assert_eq!(first.tag.as_ref().unwrap().name, "travel");
+    assert!(
+        stream.next().await.is_none(),
+        "nothing follows: the message was replayed, not re-classified"
+    );
+    assert_eq!(provider.calls(), 0, "and no model call was made");
+
+    server.stop().await;
+}
+
+/// An operator can turn on auto-apply without hand-written SQL.
+///
+/// # Why this test exists
+///
+/// Task 57 shipped the whole auto-apply mechanism — `tag_rules`, the
+/// confidence floor, the `mode = auto` branch — and tested it inside
+/// `rmail-core`, but exposed no way to *write* a rule. `TagStore::set_tag_rule`
+/// had no caller outside the crate, so in a running daemon every suggestion
+/// pended forever and the tested code path was unreachable.
+///
+/// That is the same shape as this project's worst prior defect: tasks 16-21
+/// shipped an index pipeline nothing in the daemon ever enqueued work into,
+/// and each of those tasks passed its own gate. A unit test proves a mechanism
+/// works; only a test that goes through the daemon proves it is *reachable*.
+#[tokio::test]
+async fn a_tag_rule_can_be_created_and_read_back_through_the_daemon() {
+    let server = TestServer::start().await;
+    let (account_id, _mailbox_id) = server.seed_account();
+    let mut client = server.client().await;
+
+    // Nothing configured: the listing says so rather than being silently
+    // empty, because "no rules" and "auto-apply is off" are the same state.
+    let empty = client
+        .list_tag_rules(ListTagRulesRequest { account_id })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(empty.rules.is_empty());
+
+    let rule = client
+        .set_tag_rule(SetTagRuleRequest {
+            account_id,
+            name: "invoices".to_owned(),
+            tag_name: "finance/invoices".to_owned(),
+            mode: ProtoTagRuleMode::Auto as i32,
+            min_conf: 0.95,
+            enabled: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rule.name, "invoices");
+    assert_eq!(rule.tag_name, "finance/invoices");
+    assert_eq!(rule.mode, ProtoTagRuleMode::Auto as i32);
+    assert!((rule.min_conf - 0.95).abs() < f64::EPSILON);
+    assert!(rule.enabled);
+
+    let listed = client
+        .list_tag_rules(ListTagRulesRequest { account_id })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.rules.len(), 1);
+    assert_eq!(listed.rules[0].id, rule.id);
+    assert_eq!(listed.rules[0].mode, ProtoTagRuleMode::Auto as i32);
+
+    // Upsert on (account, name): the same name re-points rather than
+    // accumulating a second rule the operator cannot see the effect of.
+    let repointed = client
+        .set_tag_rule(SetTagRuleRequest {
+            account_id,
+            name: "invoices".to_owned(),
+            tag_name: "finance/invoices".to_owned(),
+            mode: ProtoTagRuleMode::Suggest as i32,
+            min_conf: 0.5,
+            enabled: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(repointed.id, rule.id, "same row, not a second one");
+    assert_eq!(repointed.mode, ProtoTagRuleMode::Suggest as i32);
+    assert!(!repointed.enabled);
+    let listed = client
+        .list_tag_rules(ListTagRulesRequest { account_id })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.rules.len(), 1);
+
+    server.stop().await;
+}
+
+/// An unspecified mode must not be read as `auto`.
+///
+/// `TAG_RULE_MODE_UNSPECIFIED` is proto3's zero value, so an older client, a
+/// hand-built request, or a field the caller simply did not set all arrive
+/// here as 0. Applying tags without anyone confirming them is the privileged
+/// half of this feature; defaulting to it would hand that privilege to a
+/// caller who never asked for it.
+#[tokio::test]
+async fn an_unspecified_rule_mode_is_suggest_not_auto() {
+    let server = TestServer::start().await;
+    let (account_id, _mailbox_id) = server.seed_account();
+    let mut client = server.client().await;
+
+    let rule = client
+        .set_tag_rule(SetTagRuleRequest {
+            account_id,
+            name: "unset".to_owned(),
+            tag_name: "misc".to_owned(),
+            mode: ProtoTagRuleMode::Unspecified as i32,
+            min_conf: 0.9,
+            enabled: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rule.mode, ProtoTagRuleMode::Suggest as i32);
+
+    server.stop().await;
+}
+
+/// A confidence floor outside 0.0..=1.0 is refused rather than stored.
+#[tokio::test]
+async fn an_out_of_range_confidence_floor_is_invalid_argument() {
+    let server = TestServer::start().await;
+    let (account_id, _mailbox_id) = server.seed_account();
+    let mut client = server.client().await;
+
+    for min_conf in [-0.1, 1.5, f64::NAN] {
+        let status = client
+            .set_tag_rule(SetTagRuleRequest {
+                account_id,
+                name: "bad".to_owned(),
+                tag_name: "misc".to_owned(),
+                mode: ProtoTagRuleMode::Auto as i32,
+                min_conf,
+                enabled: true,
+            })
+            .await
+            .expect_err("min_conf {min_conf} must be refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "min_conf {min_conf}");
+    }
+
+    server.stop().await;
 }

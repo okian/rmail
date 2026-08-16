@@ -29,12 +29,21 @@
 //! `import_imap_keywords` is a correct, callable seam, not yet a running
 //! pipeline stage.
 //!
-//! `SuggestTags` is bounded, not truly streamed, the same way
-//! `MailService::list` is (see that module's own docs): a message has at
-//! most a handful of pending suggestions, so collecting them into a `Vec`
-//! before wrapping in [`tokio_stream::iter`] costs nothing in practice,
-//! while keeping the RPC's wire shape (`stream TagSuggestion`) ready for a
-//! future truly-incremental producer without a breaking change.
+//! `SuggestTags` grew a real producer in task 57. With a
+//! [`SuggestionEngine`] wired in (see [`TagApi::with_suggestions`]) it sends
+//! whatever is already `pending` first, then classifies the message and sends
+//! each new suggestion as it is decided and written — so the wire shape
+//! (`stream TagSuggestion`) is now load-bearing rather than reserved. Without
+//! one — a daemon whose AI subsystem is off — it stays the bounded replay task
+//! 55 shipped: the background pass's work is still readable, nothing new is
+//! generated. See [`rmail_core::tags::ai::SuggestionEngine`] for precisely
+//! what "streams as Claude responds" does and does not mean here.
+//!
+//! That change moved the RPC out of the read half of the scope table
+//! (`rmaild::auth::methods`) and out of `effect: Read` in
+//! `rmail_core::parity`: it now spends a model call and writes
+//! `message_tags`. Both are asserted against each other by the agreement test
+//! in `auth::methods`' own suite.
 //
 // `tonic::Status` is intentionally the error type throughout a gRPC service
 // boundary; its size makes `result_large_err` fire on every `Result<_, Status>`
@@ -43,6 +52,7 @@
 
 use std::pin::Pin;
 
+use rmail_core::tags::ai::{self, SuggestionEngine};
 use rmail_core::tags::{
     self, BulkSelector, PendingSuggestion, Tag, TagApplication, TagStore, TagWithCount,
 };
@@ -50,24 +60,59 @@ use rmail_core::Error;
 use rmail_proto::v1::tag_service_server::TagService;
 use rmail_proto::v1::{
     bulk_tag_request, target, AddTagRequest, AddTagResponse, BulkTagRequest, BulkTagResponse,
-    CreateTagRequest, ListTagsRequest, ListTagsResponse, RemoveTagRequest,
-    ResolveSuggestionRequest, SuggestTagsRequest, Tag as ProtoTag,
-    TagApplication as ProtoTagApplication, TagSource as ProtoTagSource, TagSuggestion,
+    CreateTagRequest, ListTagRulesRequest, ListTagRulesResponse, ListTagsRequest, ListTagsResponse,
+    RemoveTagRequest, ResolveSuggestionRequest, SetTagRuleRequest, SuggestTagsRequest,
+    Tag as ProtoTag, TagApplication as ProtoTagApplication, TagRule as ProtoTagRule,
+    TagRuleMode as ProtoTagRuleMode, TagSource as ProtoTagSource, TagSuggestion,
     TagSyncMode as ProtoTagSyncMode, TagWithCount as ProtoTagWithCount, Target as ProtoTarget,
 };
+use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 /// The `TagService` handler, backed by a [`TagStore`].
 #[derive(Clone)]
 pub struct TagApi {
     store: TagStore,
+    /// The live classifier behind `SuggestTags`, when the daemon's AI
+    /// subsystem is usable — see [`TagApi::with_suggestions`]. `None` leaves
+    /// `SuggestTags` the pending-only replay task 55 shipped, which is the
+    /// right behaviour for a daemon with AI switched off: the background
+    /// pass's work is still readable, nothing new is generated.
+    suggestions: Option<SuggestionEngine>,
+    /// Parent of the per-request token each `SuggestTags` classification runs
+    /// under, so daemon shutdown cancels every one of them. A client that
+    /// hangs up is handled a level down, in
+    /// [`rmail_core::tags::ai::SuggestionEngine::suggest`], which races the
+    /// whole call against the response channel closing.
+    stopping: CancellationToken,
 }
 
 impl TagApi {
-    /// Create a handler over a tag store.
+    /// Create a handler over a tag store, with no live classifier.
     #[must_use]
     pub fn new(store: TagStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            suggestions: None,
+            stopping: CancellationToken::new(),
+        }
+    }
+
+    /// Let `SuggestTags` classify a message it has no pending suggestions for,
+    /// streaming each new one as it lands (see
+    /// [`rmail_core::tags::ai::SuggestionEngine`] for exactly what "streams as
+    /// Claude responds" means, and for the gate ordering the call goes
+    /// through).
+    #[must_use]
+    pub fn with_suggestions(
+        mut self,
+        engine: SuggestionEngine,
+        stopping: CancellationToken,
+    ) -> Self {
+        self.suggestions = Some(engine);
+        self.stopping = stopping;
+        self
     }
 }
 
@@ -149,10 +194,24 @@ impl TagService for TagApi {
         request: Request<SuggestTagsRequest>,
     ) -> Result<Response<Self::SuggestTagsStream>, Status> {
         let message_id = request.into_inner().message_id;
-        let pending = self.store.list_pending_suggestions(message_id).await?;
-        let items: Vec<Result<TagSuggestion, Status>> =
-            pending.iter().map(|p| Ok(suggestion_to_proto(p))).collect();
-        Ok(Response::new(Box::pin(tokio_stream::iter(items))))
+        let Some(engine) = self.suggestions.as_ref() else {
+            // No AI subsystem: replay what the background pass already wrote.
+            let pending = self.store.list_pending_suggestions(message_id).await?;
+            let items: Vec<Result<TagSuggestion, Status>> =
+                pending.iter().map(|p| Ok(suggestion_to_proto(p))).collect();
+            return Ok(Response::new(Box::pin(tokio_stream::iter(items))));
+        };
+        // A child token, the same shape every other streaming/AI RPC in this
+        // daemon uses (`ai_service`, `notification_service`, `search_service`,
+        // `finder_service`): daemon shutdown still cancels it, and the
+        // classification is scoped to this one request rather than sharing a
+        // token with every other in flight.
+        let stream = engine
+            .suggest(message_id, &self.stopping.child_token())
+            .await?;
+        Ok(Response::new(Box::pin(stream.map(|item| {
+            item.map(|p| suggestion_to_proto(&p)).map_err(Status::from)
+        }))))
     }
 
     async fn resolve_suggestion(
@@ -164,6 +223,65 @@ impl TagService for TagApi {
             .resolve_suggestion(req.message_tag_id, req.accept)
             .await?;
         Ok(Response::new(()))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(account_id, mode), err)]
+    async fn set_tag_rule(
+        &self,
+        request: Request<SetTagRuleRequest>,
+    ) -> Result<Response<ProtoTagRule>, Status> {
+        let req = request.into_inner();
+        // An unspecified mode is the caller not saying, which must not be
+        // read as "auto" — the whole point of the rule is that applying a
+        // tag without asking is the privileged half.
+        let mode = match ProtoTagRuleMode::try_from(req.mode).unwrap_or_default() {
+            ProtoTagRuleMode::Auto => ai::TagRuleMode::Auto,
+            ProtoTagRuleMode::Suggest | ProtoTagRuleMode::Unspecified => ai::TagRuleMode::Suggest,
+        };
+        tracing::Span::current()
+            .record("account_id", req.account_id)
+            .record("mode", mode.as_str());
+        let rule = self
+            .store
+            .set_tag_rule(
+                req.account_id,
+                &req.name,
+                &req.tag_name,
+                mode,
+                req.min_conf,
+                req.enabled,
+            )
+            .await?;
+        Ok(Response::new(tag_rule_to_proto(&rule)))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(account_id), err)]
+    async fn list_tag_rules(
+        &self,
+        request: Request<ListTagRulesRequest>,
+    ) -> Result<Response<ListTagRulesResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("account_id", req.account_id);
+        let rules = self.store.list_tag_rules(req.account_id).await?;
+        Ok(Response::new(ListTagRulesResponse {
+            rules: rules.iter().map(tag_rule_to_proto).collect(),
+        }))
+    }
+}
+
+fn tag_rule_to_proto(rule: &ai::TagRule) -> ProtoTagRule {
+    ProtoTagRule {
+        id: rule.id,
+        account_id: rule.account_id,
+        name: rule.name.clone(),
+        tag_id: rule.tag_id,
+        tag_name: rule.tag_name.clone(),
+        mode: match rule.mode {
+            ai::TagRuleMode::Auto => ProtoTagRuleMode::Auto as i32,
+            ai::TagRuleMode::Suggest => ProtoTagRuleMode::Suggest as i32,
+        },
+        min_conf: rule.min_conf,
+        enabled: rule.enabled,
     }
 }
 

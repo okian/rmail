@@ -794,13 +794,20 @@ commands! {
         actions: [],
         summary: "Apply tags to every message a filter-only query selects, in one transaction.",
     }
+    // `Mutate`, not `Read`, since task 57: this RPC streams what is already
+    // pending *and then* classifies the message, which spends a model call and
+    // writes `message_tags` rows (pending ones, plus any a `tag_rules` row
+    // auto-applies). Task 55 declared it `Read` because its implementation
+    // genuinely could not do either. Leaving it `Read` would let MCP project a
+    // paid, mailbox-mutating tool as a safe one — exactly what the
+    // parity/scope agreement test exists to catch.
     TagSuggestTags {
         rpc: "/rmail.v1.TagService/SuggestTags",
         tool: "suggest_tags",
-        effect: Read,
+        effect: Mutate,
         cli: ["suggest-tags"],
         actions: [],
-        summary: "Stream a message's pending AI tag suggestions. Triggers no model call.",
+        summary: "Classify a message against the tag taxonomy and stream its pending suggestions.",
     }
     TagResolveSuggestion {
         rpc: "/rmail.v1.TagService/ResolveSuggestion",
@@ -809,6 +816,22 @@ commands! {
         cli: ["accept-tags", "reject-tags"],
         actions: [],
         summary: "Accept or reject a pending tag suggestion, which also trains the tagger.",
+    }
+    TagSetTagRule {
+        rpc: "/rmail.v1.TagService/SetTagRule",
+        tool: "set_tag_rule",
+        effect: Mutate,
+        cli: ["tag-rules set"],
+        actions: [],
+        summary: "Create or re-point a tag rule, which decides whether a confident suggestion applies itself.",
+    }
+    TagListTagRules {
+        rpc: "/rmail.v1.TagService/ListTagRules",
+        tool: "list_tag_rules",
+        effect: Read,
+        cli: ["tag-rules list"],
+        actions: [],
+        summary: "List an account's tag rules, enabled or not.",
     }
 
     // -- NoteService (task 56) ------------------------------------------------

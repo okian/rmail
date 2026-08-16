@@ -941,23 +941,33 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.NotificationService/StreamAlerts",
         Requirement::Scope(Scope::MailRead),
     ),
-    // -- TagService (task 55) -------------------------------------------------
-    // `ListTags`/`SuggestTags` are pure reads over the local mirror (no IMAP
-    // round trip — `SuggestTags` in particular never calls a model, see
-    // `rmaild::tag_service`'s own docs), so `mail.read` is the right ceiling,
-    // the same reasoning `MailService`'s reads sit behind. Every mutation
-    // (`AddTag`/`RemoveTag`/`CreateTag`/`BulkTag`/`ResolveSuggestion`) can
-    // reflect to IMAP and always writes `message_tags`/`tags`, so those sit
-    // behind `mail.write` — matching `MailService::SetFlags`'s row exactly,
-    // since a tag is conceptually the same kind of per-message annotation a
-    // flag is.
+    // -- TagService (tasks 55, 57) --------------------------------------------
+    // `ListTags` is a pure read over the local mirror (no IMAP round trip), so
+    // `mail.read` is the right ceiling, the same reasoning `MailService`'s
+    // reads sit behind. Every mutation (`AddTag`/`RemoveTag`/`CreateTag`/
+    // `BulkTag`/`ResolveSuggestion`) can reflect to IMAP and always writes
+    // `message_tags`/`tags`, so those sit behind `mail.write` — matching
+    // `MailService::SetFlags`'s row exactly, since a tag is conceptually the
+    // same kind of per-message annotation a flag is.
+    //
+    // `SuggestTags` moved out of the read half in task 57. It was `mail.read`
+    // when it could only replay `message_tags(state = 'pending')`; it now
+    // classifies the message as well, which spends a Haiku call and writes
+    // rows (pending ones, and applied ones where a `tag_rules` row in
+    // `mode = 'auto'` authorizes it). Both halves of that need naming:
+    // `ai.invoke` because it reaches a provider, `mail.write` because it
+    // mutates the mailbox. This is a deliberate tightening — a token holding
+    // only `mail.read` could call it before and cannot now — and the
+    // alternative is a read-scoped RPC that spends money and applies tags,
+    // which is the failure the parity/scope agreement test below exists to
+    // catch.
     (
         "/rmail.v1.TagService/ListTags",
         Requirement::Scope(Scope::MailRead),
     ),
     (
         "/rmail.v1.TagService/SuggestTags",
-        Requirement::Scope(Scope::MailRead),
+        Requirement::AllOf(&[Scope::MailWrite, Scope::AiInvoke]),
     ),
     (
         "/rmail.v1.TagService/AddTag",
@@ -978,6 +988,18 @@ const TABLE: &[(&str, Requirement)] = &[
     (
         "/rmail.v1.TagService/ResolveSuggestion",
         Requirement::Scope(Scope::MailWrite),
+    ),
+    // A rule at `mode = auto` lets a classifier apply tags without anyone
+    // confirming them, so writing one is a `mail.write` decision. Reading the
+    // rules is not: knowing which tags auto-apply is exactly what a client
+    // needs to explain a tag it did not put there.
+    (
+        "/rmail.v1.TagService/SetTagRule",
+        Requirement::Scope(Scope::MailWrite),
+    ),
+    (
+        "/rmail.v1.TagService/ListTagRules",
+        Requirement::Scope(Scope::MailRead),
     ),
     // -- SavedSearchService (task 35) -----------------------------------------
     // Reads sit at `mail.read` for the same reason `SearchService`'s do: they

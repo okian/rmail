@@ -171,9 +171,9 @@ enum Command {
     Untag(UntagArgs),
     /// List tags, or create one (`TagService.ListTags`/`CreateTag`).
     Tags(TagsArgs),
-    /// Print a message's pending AI tag suggestions
-    /// (`TagService.SuggestTags`). Never triggers a model call — task 57
-    /// owns generating suggestions; this only displays what is pending.
+    /// Suggest tags for a message (`TagService.SuggestTags`): prints what is
+    /// already pending, then classifies the message and prints each new
+    /// suggestion as it lands. Mail you have already tagged is left alone.
     #[command(name = "suggest-tags")]
     SuggestTags {
         /// Message id.
@@ -192,6 +192,17 @@ enum Command {
     RejectTags {
         #[arg(required = true)]
         message_tag_ids: Vec<i64>,
+    },
+    /// Tag rules — which tags a confident suggestion may apply by itself
+    /// (`TagService.SetTagRule/ListTagRules`).
+    ///
+    /// Without a rule at `--mode auto`, every AI suggestion stays pending
+    /// for you to accept or reject. That is the safe default, not an
+    /// oversight.
+    #[command(name = "tag-rules")]
+    TagRules {
+        #[command(subcommand)]
+        action: TagRuleAction,
     },
     /// Send a message now (undoable) or schedule it for later
     /// (`SendSchedulerService.ScheduleSend`).
@@ -390,6 +401,37 @@ enum BudgetAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum TagRuleAction {
+    /// List an account's tag rules, enabled or not.
+    List {
+        #[arg(long, default_value_t = 1)]
+        account: i64,
+    },
+    /// Create a rule, or re-point an existing one of the same name.
+    Set {
+        /// Rule name, unique per account. Re-using it re-points the rule
+        /// rather than adding a second one beside it.
+        name: String,
+        /// The tag this rule governs, created on demand.
+        tag: String,
+        /// `suggest` (default) leaves every suggestion pending; `auto` lets
+        /// one at or above the floor apply itself.
+        #[arg(long, default_value = "suggest")]
+        mode: String,
+        /// This rule's confidence floor, 0.0..=1.0. It never lowers the
+        /// global `tags.ai.auto_apply_min_confidence` — the effective floor
+        /// is the higher of the two.
+        #[arg(long, default_value_t = 0.9)]
+        min_conf: f64,
+        /// Retire the rule without deleting it.
+        #[arg(long)]
+        disabled: bool,
+        #[arg(long, default_value_t = 1)]
+        account: i64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum AccountAction {
     /// Authorize an account with OAuth2, opening a browser for consent.
     ///
@@ -554,6 +596,20 @@ async fn main() -> Result<()> {
         Command::RejectTags { message_tag_ids } => {
             tag_cli::resolve_suggestions(&socket, message_tag_ids, false).await
         }
+        Command::TagRules { action } => match action {
+            TagRuleAction::List { account } => tag_cli::list_tag_rules(&socket, account).await,
+            TagRuleAction::Set {
+                name,
+                tag,
+                mode,
+                min_conf,
+                disabled,
+                account,
+            } => {
+                tag_cli::set_tag_rule(&socket, account, &name, &tag, &mode, min_conf, !disabled)
+                    .await
+            }
+        },
     }
 }
 
