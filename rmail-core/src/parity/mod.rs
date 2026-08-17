@@ -562,6 +562,19 @@ commands! {
         actions: [],
         summary: "Rank extracted attachment text, returning the exact attachment and page that matched.",
     }
+    // -- SearchService (task 73) ----------------------------------------------
+    // The unqualified `Read`: it queries `entities`/`entity_mentions` and
+    // touches nothing else. No extractor runs, no model is reached, and there
+    // is no configured backend for a caller to escalate — so unlike its two
+    // neighbours above this row needs no clamp argument at all.
+    SearchSearchEntities {
+        rpc: "/rmail.v1.SearchService/SearchEntities",
+        tool: "search_entities",
+        effect: Read,
+        cli: ["entities"],
+        actions: [],
+        summary: "Search extracted entities — amounts, references, tracking numbers, IBANs — and return the mail behind each hit.",
+    }
 
     // -- AttachmentService (task 74) -------------------------------------------
     // `Mutate` for the reason `AiAskMailbox` is, and it is the same reason
@@ -590,6 +603,33 @@ commands! {
         cli: ["attach tables"],
         actions: [],
         summary: "Read one attachment's tables as typed rows with per-cell provenance, saying which were inferred.",
+    }
+
+    // -- AttachmentService (task 73) -------------------------------------------
+    // `Mutate`, unlike `ExtractTables` next door, and the model is not why:
+    // every call *stores* what it read in `invoices`, which the next
+    // `ExportInvoices` returns. A read that changed what a later read answers
+    // is not a read, which is the same line `ExtractExtractEvents` is on for
+    // its idempotency claim. (`use_model` adds provider spend on top, but a
+    // caller can leave it unset and this row would still be `Mutate`.)
+    AttachmentExtractInvoice {
+        rpc: "/rmail.v1.AttachmentService/ExtractInvoice",
+        tool: "extract_invoice",
+        effect: Mutate,
+        cli: ["attach invoice"],
+        actions: [],
+        summary: "Detect an invoice or receipt and read vendor, number, dates, totals and line items into the invoice table, per-field provenance included.",
+    }
+    // `list_invoices` rather than `export_invoices` as the tool name: prd.md
+    // #53 names the MCP tool that way, and a listing is what an agent calls
+    // it — the CSV is one rendering of the same read.
+    AttachmentExportInvoices {
+        rpc: "/rmail.v1.AttachmentService/ExportInvoices",
+        tool: "list_invoices",
+        effect: Read,
+        cli: ["invoices"],
+        actions: [],
+        summary: "List stored invoices, optionally rendered as CSV with each row's inferred fields named.",
     }
 
     // -- SavedSearchService (task 35) -----------------------------------------
@@ -1305,6 +1345,19 @@ commands! {
         cli: ["extract tasks"],
         actions: [],
         summary: "Extract actionable tasks from a message and any .ics, and deliver them once.",
+    }
+    // -- ExtractService (task 73) ----------------------------------------------
+    // `Mutate` on both counts this enum draws the line at: the model call is
+    // the whole mechanism (there is no deterministic route to a caller-chosen
+    // schema, so a caller *can* force spend), and the validated document is
+    // stored under `(message, schema)` for later reads.
+    ExtractExtractStructured {
+        rpc: "/rmail.v1.ExtractService/ExtractStructured",
+        tool: "extract_data",
+        effect: Mutate,
+        cli: ["extract data"],
+        actions: [],
+        summary: "Read one message against a named or supplied JSON schema, validate the answer, and store it.",
     }
     LinkExtractLinks {
         rpc: "/rmail.v1.LinkService/ExtractLinks",

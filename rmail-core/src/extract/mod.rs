@@ -73,8 +73,11 @@
 //! looking at either way.
 
 pub mod events;
+pub mod invoice;
 pub mod links;
 pub mod model;
+pub mod store;
+pub mod structured;
 pub mod tables;
 
 use std::sync::Arc;
@@ -89,8 +92,14 @@ use crate::storage::Database;
 pub use events::{
     CalendarReport, Delivery, DeliveryReport, Event, Sink, Source as EventSource, Task,
 };
+pub use invoice::{
+    Claim, DocKind, Invoice, InvoiceReport, LineItem, Money, Origin, PaymentStatus, Provenance,
+    StoredInvoice,
+};
 pub use links::{Link, LinkKind, LinkPart, LinkReport};
 pub use model::{Ask, ExtractModel};
+pub use store::InvoiceFilter;
+pub use structured::{Extraction, StructuredReport};
 pub use tables::{Cell, CellSource, CellType, CellValue, Column, Table, TableOrigin, TableReport};
 
 /// How much of a document's text reaches the model on the table route.
@@ -102,6 +111,15 @@ const MAX_DOCUMENT_CHARS: usize = 24_000;
 
 /// How much of a message body reaches the model on the calendar route.
 const MAX_BODY_CHARS: usize = 8_000;
+
+/// How many attachments the invoice detector will open when the caller named
+/// no part.
+///
+/// Each one costs a full text extraction — a PDF parse, a workbook walk — so
+/// the count is the cost of an unnamed request, and it has to be small enough
+/// that a mail with forty attachments is not a way to make one RPC do forty
+/// documents' work.
+const MAX_CANDIDATE_PARTS: usize = 4;
 
 /// The one place the three extractors meet the database, the message store and
 /// the model.
@@ -718,6 +736,478 @@ impl ExtractEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Invoices and receipts (task 73)
+    // -----------------------------------------------------------------------
+
+    /// Detect and extract an invoice or receipt, and store what was found.
+    ///
+    /// `part_id` names one attachment; `None` detects across the message's
+    /// document attachments and falls back to the body. The deterministic
+    /// reader always runs; `use_model` adds a model pass whose fields are
+    /// marked [`invoice::Origin::Model`] and which never overrides a value the
+    /// document stated in words — see [`invoice::merge`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if the message or the named part does not exist;
+    /// [`Error::FailedPrecondition`] if the message has no stored body, if no
+    /// part of it yielded readable text, or if nothing invoice-shaped could be
+    /// read out of the text there was; [`Error::InvalidArgument`] if a model
+    /// pass is asked for on a daemon with no provider.
+    #[tracing::instrument(skip(self, cancel), fields(part, kind, inferred))]
+    pub async fn invoice(
+        &self,
+        message_id: i64,
+        part_id: Option<&str>,
+        use_model: bool,
+        cancel: &CancellationToken,
+    ) -> Result<InvoiceReport, Error> {
+        let scope = self.scope(message_id).await?;
+        let raw = self.raw(message_id).await?;
+        let wanted = part_id.map(str::to_owned);
+        let (parts, decoded) =
+            tokio::task::spawn_blocking(move || (attachment_parts(&raw), decode_message(&raw)))
+                .await
+                .map_err(|e| Error::internal(format!("message decode task failed: {e}")))?;
+
+        let mut candidates = Vec::new();
+        let (kind, part, text, tables) = match wanted {
+            Some(wanted) => {
+                // Resolved by index rather than out of `parts`: a caller who
+                // named one attachment must not pay to have all sixty-four
+                // decoded into memory, and this is the same positional
+                // identity `ExtractTables` uses.
+                let part = parts
+                    .iter()
+                    .find(|(id, _)| *id == wanted)
+                    .map(|(_, part)| part)
+                    .ok_or_else(|| {
+                        Error::not_found(format!("message {message_id} has no part {wanted}"))
+                    })?;
+                let (text, tables) = self.document(part).await?;
+                let kind = invoice::detect(
+                    part.filename.as_deref(),
+                    part.content_type.as_deref(),
+                    &text,
+                );
+                candidates.push(invoice::Candidate {
+                    part: wanted.clone(),
+                    filename: part.filename.clone().unwrap_or_default(),
+                    kind,
+                });
+                // A caller who named a part is telling this daemon what to
+                // read. Declining because the detector disagreed would make
+                // the explicit request weaker than the automatic one; the
+                // disagreement is recorded as a warning instead.
+                (kind.unwrap_or(DocKind::Invoice), wanted, text, tables)
+            }
+            None => {
+                self.detect_invoice(&parts, &decoded, &mut candidates)
+                    .await?
+            }
+        };
+
+        let span = tracing::Span::current();
+        span.record("part", part.as_str());
+        span.record("kind", kind.as_str());
+
+        // On the blocking pool, like every other parser in this module. The
+        // line loop is `MAX_LABELS_PER_LINE` label scans over each of
+        // `MAX_LINES` lines of up to `MAX_DOCUMENT_BYTES`, plus a
+        // `to_lowercase()` and an `entities::scan` per line — hundreds of
+        // milliseconds of CPU on an attachment a stranger chose, which
+        // CLAUDE.md forbids holding a runtime worker for.
+        let (document, part_owned) = (text.clone(), part.clone());
+        let mut parsed = blocking(move || {
+            let mut parsed = invoice::parse_document(kind, &part_owned, &document);
+            if parsed.line_items.is_empty() {
+                for table in &tables {
+                    let items = invoice::line_items_from_table(table, parsed.currency.as_deref());
+                    if !items.is_empty() {
+                        parsed.line_items = items;
+                        break;
+                    }
+                }
+            }
+            Ok(parsed)
+        })
+        .await?;
+        if candidates
+            .last()
+            .is_some_and(|candidate| candidate.kind.is_none())
+        {
+            parsed.warnings.push(
+                "this document does not read as an invoice or a receipt; it was extracted \
+                 because it was named explicitly"
+                    .to_owned(),
+            );
+        }
+
+        let mut used_model = false;
+        if use_model {
+            let inferred = self
+                .model_invoice(&scope, message_id, kind, &part, &text, cancel)
+                .await?;
+            parsed = invoice::merge(parsed, inferred);
+            used_model = true;
+        }
+        span.record("inferred", parsed.inferred());
+
+        let stored = store::save_invoice(&self.db, message_id, &parsed).await?;
+        Ok(InvoiceReport {
+            stored,
+            candidates,
+            used_model,
+        })
+    }
+
+    /// Pick the part to read when the caller named none.
+    ///
+    /// Bounded at [`MAX_CANDIDATE_PARTS`] documents, and images are not
+    /// considered: OCR is a subprocess with a deadline, and running one per
+    /// image attachment on the chance that a scan is an invoice is a cost a
+    /// caller has to ask for by naming the part.
+    async fn detect_invoice(
+        &self,
+        parts: &[(String, AttachmentPart)],
+        decoded: &Decoded,
+        candidates: &mut Vec<invoice::Candidate>,
+    ) -> Result<(DocKind, String, String, Vec<Table>), Error> {
+        let mut ordered: Vec<&(String, AttachmentPart)> = parts
+            .iter()
+            .filter(|(_, part)| {
+                crate::attach::extract::detect(
+                    &part.bytes,
+                    part.filename.as_deref(),
+                    part.content_type.as_deref(),
+                )
+                .is_some()
+            })
+            .collect();
+        // A filename that says `invoice` is a deliberate label and is read
+        // first, so a five-attachment mail does not spend its budget on the
+        // logo before reaching the bill.
+        ordered.sort_by_key(|(_, part)| {
+            let name = part.filename.clone().unwrap_or_default().to_lowercase();
+            u8::from(!(name.contains("invoice") || name.contains("receipt")))
+        });
+
+        for (id, part) in ordered.into_iter().take(MAX_CANDIDATE_PARTS) {
+            let (text, tables) = match self.document(part).await {
+                Ok(document) => document,
+                // One unreadable attachment costs that attachment, not the
+                // request: a password-protected workbook next to a readable
+                // PDF must not hide the PDF.
+                Err(error) => {
+                    tracing::debug!(%error, part = %id, "an attachment could not be read");
+                    candidates.push(invoice::Candidate {
+                        part: id.clone(),
+                        filename: part.filename.clone().unwrap_or_default(),
+                        kind: None,
+                    });
+                    continue;
+                }
+            };
+            let kind = invoice::detect(
+                part.filename.as_deref(),
+                part.content_type.as_deref(),
+                &text,
+            );
+            candidates.push(invoice::Candidate {
+                part: id.clone(),
+                filename: part.filename.clone().unwrap_or_default(),
+                kind,
+            });
+            if let Some(kind) = kind {
+                return Ok((kind, id.clone(), text, tables));
+            }
+        }
+
+        // The body last, and it is a real answer rather than a fallback: a
+        // hosted-billing "your receipt" mail keeps its numbers in the body and
+        // attaches nothing at all.
+        let kind = invoice::detect(None, None, &decoded.body);
+        candidates.push(invoice::Candidate {
+            part: String::new(),
+            filename: String::new(),
+            kind,
+        });
+        match kind {
+            Some(kind) => Ok((kind, String::new(), decoded.body.clone(), Vec::new())),
+            None => Err(Error::failed_precondition(
+                "neither this message nor its attachments reads as an invoice or a receipt"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// One attachment's text, plus any tables it natively carries.
+    ///
+    /// The tables are the line-item route for a spreadsheet invoice: see
+    /// [`invoice::line_items_from_table`].
+    async fn document(&self, part: &AttachmentPart) -> Result<(String, Vec<Table>), Error> {
+        let format = crate::attach::extract::detect(
+            &part.bytes,
+            part.filename.as_deref(),
+            part.content_type.as_deref(),
+        );
+        match format {
+            Some(Format::Xlsx) => {
+                let report = tables::from_xlsx(part.bytes.clone()).await?;
+                let (status, text) =
+                    crate::attach::extract::extract(Format::Xlsx, part.bytes.clone()).await?;
+                Self::require_document_text(status, &text)?;
+                Ok((text.text, report.tables))
+            }
+            // Both routes decode the bytes directly rather than going through
+            // `attach::extract`, which *normalizes* whitespace on the way out
+            // — right for an index, fatal here: it collapses the whole
+            // document onto one line, and an invoice is read by its lines.
+            // `Total: 1,299.00` on its own line and the same words in the
+            // middle of a 4 KB paragraph are not equally readable, and a
+            // vendor label would swallow the rest of the file. The same
+            // reasoning `tables`' CSV route already documents.
+            Some(Format::Csv) => {
+                let name = part
+                    .filename
+                    .clone()
+                    .unwrap_or_else(|| "Table 1".to_owned());
+                let bytes = part.bytes.clone();
+                blocking(move || {
+                    let text = decode_text(&bytes);
+                    if text.trim().is_empty() {
+                        return Err(Error::failed_precondition(
+                            "this attachment yielded no text (status empty)".to_owned(),
+                        ));
+                    }
+                    let report = tables::from_csv(&name, &text)?;
+                    Ok((text, report.tables))
+                })
+                .await
+            }
+            Some(Format::Text) => {
+                let bytes = part.bytes.clone();
+                blocking(move || {
+                    let text = decode_text(&bytes);
+                    if text.trim().is_empty() {
+                        return Err(Error::failed_precondition(
+                            "this attachment yielded no text (status empty)".to_owned(),
+                        ));
+                    }
+                    Ok((text, Vec::new()))
+                })
+                .await
+            }
+            Some(Format::Html) => {
+                let bytes = part.bytes.clone();
+                blocking(move || {
+                    let source = decode_text(&bytes);
+                    let report = tables::from_html(&source)?;
+                    let text = crate::index::extract::strip_html(&source);
+                    if text.trim().is_empty() {
+                        return Err(Error::failed_precondition(
+                            "this attachment yielded no text (status empty)".to_owned(),
+                        ));
+                    }
+                    Ok((text, report.tables))
+                })
+                .await
+            }
+            Some(format) => {
+                let (status, text) =
+                    crate::attach::extract::extract(format, part.bytes.clone()).await?;
+                Self::require_document_text(status, &text)?;
+                Ok((paginate(&text), Vec::new()))
+            }
+            None if crate::attach::ocr::is_image(&part.bytes) => {
+                Ok((self.ocr_text(part.bytes.clone()).await?, Vec::new()))
+            }
+            None => Err(Error::invalid_argument(
+                "this attachment is not a format an invoice can be read from".to_owned(),
+            )),
+        }
+    }
+
+    /// [`Self::require_text`] with a message that names this feature.
+    fn require_document_text(status: Status, text: &Extracted) -> Result<(), Error> {
+        if status != Status::Ok || text.text.trim().is_empty() {
+            return Err(Error::failed_precondition(format!(
+                "this attachment yielded no text to read an invoice from (status {})",
+                status.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The model route for invoices.
+    async fn model_invoice(
+        &self,
+        scope: &Scope,
+        message_id: i64,
+        kind: DocKind,
+        part: &str,
+        document: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Invoice, Error> {
+        let model = self.require_model(true)?;
+        let mut text = document.to_owned();
+        if let Some((index, _)) = text.char_indices().nth(MAX_DOCUMENT_CHARS) {
+            text.truncate(index);
+        }
+        let answer = model
+            .ask(
+                &Ask {
+                    system: invoice::INVOICE_SYSTEM_PROMPT,
+                    instruction: "Extract the invoice or receipt stated in the document below."
+                        .to_owned(),
+                    untrusted: vec![("document", text)],
+                    schema: invoice::invoice_schema(),
+                    max_tokens: self.config.max_tokens,
+                    account_id: scope.account_id,
+                    mailbox: scope.mailbox.clone(),
+                    message_id: Some(message_id),
+                },
+                cancel,
+            )
+            .await?;
+        invoice::from_model_answer(kind, part, &answer)
+    }
+
+    /// Read stored invoices.
+    ///
+    /// # Errors
+    ///
+    /// A mapped storage error.
+    pub async fn list_invoices(&self, filter: &InvoiceFilter) -> Result<Vec<StoredInvoice>, Error> {
+        store::list_invoices(&self.db, filter).await
+    }
+
+    // -----------------------------------------------------------------------
+    // General structured extraction (task 73)
+    // -----------------------------------------------------------------------
+
+    /// Extract one message against a JSON schema, validate the answer, and
+    /// store it.
+    ///
+    /// `schema` is a built-in's name ([`structured::BUILTINS`]) or, with
+    /// `custom` supplied alongside, a caller's own schema. `refresh` re-runs a
+    /// message that has already been extracted under the same schema; without
+    /// it the stored document is returned and no tokens are spent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for a message that does not exist;
+    /// [`Error::FailedPrecondition`] for one with no stored body, or on a
+    /// daemon with no AI provider — there is no deterministic route here, so an
+    /// empty document would be a lie rather than a degraded answer;
+    /// [`Error::InvalidArgument`] for an unknown schema name or a supplied
+    /// schema this build cannot enforce; [`Error::Internal`] if the answer does
+    /// not satisfy the schema.
+    #[tracing::instrument(skip(self, custom, cancel), fields(schema, cached))]
+    pub async fn structured(
+        &self,
+        message_id: i64,
+        schema: &str,
+        custom: Option<serde_json::Value>,
+        refresh: bool,
+        cancel: &CancellationToken,
+    ) -> Result<StructuredReport, Error> {
+        let name = schema.trim();
+        let (name, schema) = match custom {
+            Some(custom) => {
+                structured::check_schema(&custom)?;
+                (structured::CUSTOM.to_owned(), custom)
+            }
+            None => {
+                let builtin = structured::schema_for(name).ok_or_else(|| {
+                    Error::invalid_argument(format!(
+                        "unknown schema {name:?}; this build knows {}",
+                        structured::BUILTINS
+                            .iter()
+                            .map(|schema| schema.name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?;
+                (name.to_owned(), builtin)
+            }
+        };
+        let hash = structured::schema_hash(&schema);
+        let span = tracing::Span::current();
+        span.record("schema", name.as_str());
+
+        if !refresh {
+            if let Some(existing) =
+                store::find_extraction(&self.db, message_id, &name, &hash).await?
+            {
+                span.record("cached", true);
+                return Ok(StructuredReport {
+                    extraction: existing,
+                    cached: true,
+                });
+            }
+        }
+        span.record("cached", false);
+
+        // Checked before anything is fetched or decoded. Running the whole
+        // MIME decode and *then* refusing meant a provider-less daemon paid for
+        // the parse once per request, for an answer that was always a refusal —
+        // the same ordering mistake `tables()` documents fixing.
+        let model = self.model.as_deref().ok_or_else(|| {
+            Error::failed_precondition(
+                "no AI provider is configured, so a message cannot be read against a schema"
+                    .to_owned(),
+            )
+        })?;
+        let scope = self.scope(message_id).await?;
+        let raw = self.raw(message_id).await?;
+        let decoded = tokio::task::spawn_blocking(move || decode_message(&raw))
+            .await
+            .map_err(|e| Error::internal(format!("message decode task failed: {e}")))?;
+
+        let mut body = decoded.body.clone();
+        if let Some((index, _)) = body.char_indices().nth(MAX_BODY_CHARS) {
+            body.truncate(index);
+        }
+        let instruction = structured::builtin(&name).map_or_else(
+            || "Extract the data the schema below asks for from the email.".to_owned(),
+            |builtin| builtin.instruction.to_owned(),
+        );
+        let answer = model
+            .ask(
+                &Ask {
+                    system: structured::STRUCTURED_SYSTEM_PROMPT,
+                    instruction,
+                    untrusted: vec![("subject", decoded.subject.clone()), ("email", body)],
+                    schema: schema.clone(),
+                    max_tokens: self.config.max_tokens,
+                    account_id: scope.account_id,
+                    mailbox: scope.mailbox.clone(),
+                    message_id: Some(message_id),
+                },
+                cancel,
+            )
+            .await?;
+        // Re-validated here even though the provider was asked to constrain
+        // the answer: see `structured`'s module docs on why a schema somebody
+        // else enforced is not a schema this daemon has checked.
+        let data = structured::from_model_answer(&schema, &answer)?;
+        let extraction = store::save_extraction(
+            &self.db,
+            message_id,
+            &name,
+            &hash,
+            &self.config.model,
+            &data,
+        )
+        .await?;
+        Ok(StructuredReport {
+            extraction,
+            cached: false,
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Shared plumbing
     // -----------------------------------------------------------------------
 
@@ -957,6 +1447,45 @@ struct AttachmentPart {
     bytes: Vec<u8>,
     filename: Option<String>,
     content_type: Option<String>,
+}
+
+/// Every attachment, with the same positional part ids
+/// [`attachment_part`] resolves.
+///
+/// Bounded by [`MAX_PARTS`], like the body decoder: a message may nest
+/// `multipart/*` arbitrarily and `mail_parser` hands back every leaf. The
+/// consequence is worth stating plainly: a part past the sixty-fourth is
+/// `NOT_FOUND` to the invoice reader while `ExtractTables` — which resolves one
+/// part by index and never enumerates — would still open it. The bound is on
+/// the side that has to hold every attachment's bytes at once, and answering
+/// "no such part" is the honest failure for a message with more attachments
+/// than this daemon will enumerate.
+fn attachment_parts(raw: &[u8]) -> Vec<(String, AttachmentPart)> {
+    use mail_parser::{MessageParser, MimeHeaders};
+
+    let Some(message) = MessageParser::default().parse(raw) else {
+        return Vec::new();
+    };
+    message
+        .attachments()
+        .take(MAX_PARTS)
+        .enumerate()
+        .map(|(index, part)| {
+            (
+                index.to_string(),
+                AttachmentPart {
+                    bytes: part.contents().to_vec(),
+                    filename: part.attachment_name().map(str::to_owned),
+                    content_type: part.content_type().map(|ct| {
+                        ct.subtype().map_or_else(
+                            || ct.ctype().to_owned(),
+                            |sub| format!("{}/{}", ct.ctype(), sub),
+                        )
+                    }),
+                },
+            )
+        })
+        .collect()
 }
 
 /// The attachment at `part_id`, using the same positional identity

@@ -36,14 +36,20 @@ use rmail_core::attach::ask::{
 };
 use rmail_core::attach::search::AttachmentSearch;
 use rmail_core::config::{AiAsk, AiLimits, AiPrivacy};
-use rmail_core::extract::{tables, ExtractEngine, Table, TableReport};
+use rmail_core::extract::{
+    invoice, tables, Claim, DocKind, ExtractEngine, InvoiceFilter, Money, Origin, PaymentStatus,
+    Provenance, StoredInvoice, Table, TableReport,
+};
 use rmail_core::{Database, Error};
 use rmail_proto::v1::attachment_service_server::AttachmentService;
 use rmail_proto::v1::{
     ask_attachment_chunk, AskAttachmentChunk, AskAttachmentDone, AskAttachmentRequest,
     AttachmentCitation as ProtoCitation, AttachmentRetrievalTrace as ProtoTrace,
     AttachmentUsage as ProtoUsage, CellSource as ProtoCellSource, CellType as ProtoCellType,
-    ExtractTablesRequest, ExtractTablesResponse, Table as ProtoTable, TableCell as ProtoCell,
+    ExportInvoicesRequest, ExportInvoicesResponse, ExtractInvoiceRequest, ExtractInvoiceResponse,
+    ExtractTablesRequest, ExtractTablesResponse, ExtractedInvoice, FieldOrigin, FieldProvenance,
+    InvoiceCandidate, InvoiceDate, InvoiceDocKind, InvoiceExportFormat, InvoiceLineItem,
+    InvoiceMoney, InvoicePaymentStatus, InvoiceText, Table as ProtoTable, TableCell as ProtoCell,
     TableColumn as ProtoColumn, TableOrigin as ProtoOrigin, TableRow as ProtoRow,
 };
 use tokio::sync::Semaphore;
@@ -203,6 +209,224 @@ impl AttachmentService for AttachmentApi {
             .map_err(Status::from)?;
         tracing::Span::current().record("tables", report.tables.len());
         Ok(Response::new(to_proto_tables(&report)))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(message_id, inferred))]
+    async fn extract_invoice(
+        &self,
+        request: Request<ExtractInvoiceRequest>,
+    ) -> Result<Response<ExtractInvoiceResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("message_id", req.message_id);
+        if req.message_id <= 0 {
+            return Err(Status::from(Error::invalid_argument(
+                "message_id must be a positive message id",
+            )));
+        }
+        let engine = self.extract_engine()?;
+        let cancel = self.shutdown.child_token();
+        // Empty means "detect across the message". An explicit empty part id
+        // and an absent one are the same request, so there is no way to ask
+        // for "the part called empty string" and get a NOT_FOUND for it.
+        let part = req.part_id.trim();
+        let part = (!part.is_empty()).then_some(part);
+        let report = engine
+            .invoice(req.message_id, part, req.use_model, &cancel)
+            .await
+            .map_err(Status::from)?;
+        tracing::Span::current().record("inferred", report.stored.invoice.inferred());
+        Ok(Response::new(ExtractInvoiceResponse {
+            invoice: Some(to_proto_invoice(&report.stored)),
+            candidates: report
+                .candidates
+                .iter()
+                .map(|candidate| InvoiceCandidate {
+                    part_id: candidate.part.clone(),
+                    filename: candidate.filename.clone(),
+                    kind: to_proto_kind(candidate.kind) as i32,
+                })
+                .collect(),
+            used_model: report.used_model,
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(invoices))]
+    async fn export_invoices(
+        &self,
+        request: Request<ExportInvoicesRequest>,
+    ) -> Result<Response<ExportInvoicesResponse>, Status> {
+        let req = request.into_inner();
+        // A negative id is a client bug, and letting it through would answer
+        // "no invoices" — which reads as "you have none" rather than "you
+        // asked wrong".
+        for (name, value) in [
+            ("account_id", req.account_id),
+            ("message_id", req.message_id),
+        ] {
+            if value < 0 {
+                return Err(Status::from(Error::invalid_argument(format!(
+                    "{name} must be a positive id or 0 for every one"
+                ))));
+            }
+        }
+        let engine = self.extract_engine()?;
+        let vendor = req.vendor.trim();
+        let filter = InvoiceFilter {
+            account_id: (req.account_id > 0).then_some(req.account_id),
+            message_id: (req.message_id > 0).then_some(req.message_id),
+            vendor: (!vendor.is_empty()).then(|| vendor.to_owned()),
+            since: (req.since > 0).then_some(req.since),
+            until: (req.until > 0).then_some(req.until),
+            limit: req.limit,
+        };
+        let rows = engine.list_invoices(&filter).await.map_err(Status::from)?;
+        tracing::Span::current().record("invoices", rows.len());
+        let csv = match InvoiceExportFormat::try_from(req.format) {
+            Ok(InvoiceExportFormat::Csv) => invoice::to_csv(&rows),
+            Ok(InvoiceExportFormat::Unspecified | InvoiceExportFormat::Rows) => String::new(),
+            // A number this build has no variant for is a newer client. Named
+            // rather than defaulted, which would silently return rows to a
+            // caller that asked for a file.
+            Err(_) => {
+                return Err(Status::from(Error::invalid_argument(format!(
+                    "format {} is not one this daemon knows",
+                    req.format
+                ))))
+            }
+        };
+        Ok(Response::new(ExportInvoicesResponse {
+            invoices: rows.iter().map(to_proto_invoice).collect(),
+            csv,
+        }))
+    }
+}
+
+impl AttachmentApi {
+    /// The extraction engine, or the reason there is not one.
+    fn extract_engine(&self) -> Result<&ExtractEngine, Status> {
+        self.extract.as_ref().ok_or_else(|| {
+            Status::from(Error::failed_precondition(
+                "structured extraction is not wired on this daemon".to_owned(),
+            ))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExtractInvoice / ExportInvoices conversions
+// ---------------------------------------------------------------------------
+
+fn to_proto_invoice(stored: &StoredInvoice) -> ExtractedInvoice {
+    let invoice = &stored.invoice;
+    ExtractedInvoice {
+        invoice_id: stored.invoice_id,
+        message_id: stored.message_id,
+        part_id: invoice.part.clone(),
+        kind: to_proto_kind(Some(invoice.kind)) as i32,
+        vendor: invoice.vendor.as_ref().map(|claim| InvoiceText {
+            value: claim.value.clone(),
+            provenance: Some(to_proto_provenance(&claim.provenance)),
+        }),
+        number: invoice.number.as_ref().map(|claim| InvoiceText {
+            value: claim.value.clone(),
+            provenance: Some(to_proto_provenance(&claim.provenance)),
+        }),
+        currency: invoice.currency.clone().unwrap_or_default(),
+        subtotal: invoice.subtotal.as_ref().map(to_proto_money),
+        tax: invoice.tax.as_ref().map(to_proto_money),
+        total: invoice.total.as_ref().map(to_proto_money),
+        issued_at: invoice.issued_at.as_ref().map(to_proto_date),
+        due_at: invoice.due_at.as_ref().map(to_proto_date),
+        status: invoice
+            .status
+            .as_ref()
+            .map_or(InvoicePaymentStatus::Unspecified, |claim| {
+                match claim.value {
+                    PaymentStatus::Paid => InvoicePaymentStatus::Paid,
+                    PaymentStatus::Unpaid => InvoicePaymentStatus::Unpaid,
+                    PaymentStatus::Overdue => InvoicePaymentStatus::Overdue,
+                    PaymentStatus::Refunded => InvoicePaymentStatus::Refunded,
+                    PaymentStatus::Void => InvoicePaymentStatus::Void,
+                }
+            }) as i32,
+        // The status enum has no message to hang a provenance off, so it gets
+        // its own field rather than losing it: a status a model inferred and
+        // one the document stamped are not the same claim either.
+        status_provenance: invoice
+            .status
+            .as_ref()
+            .map(|claim| to_proto_provenance(&claim.provenance)),
+        line_items: invoice
+            .line_items
+            .iter()
+            .map(|item| InvoiceLineItem {
+                description: item.description.clone(),
+                quantity: item.quantity.unwrap_or_default(),
+                has_quantity: item.quantity.is_some(),
+                unit_price: item.unit_price.as_ref().map(|money| InvoiceMoney {
+                    currency: money.currency.clone(),
+                    minor_units: money.minor_units,
+                    provenance: Some(to_proto_provenance(&Provenance {
+                        part: invoice.part.clone(),
+                        origin: item.origin,
+                        ..Provenance::default()
+                    })),
+                }),
+                total: item.total.as_ref().map(|money| InvoiceMoney {
+                    currency: money.currency.clone(),
+                    minor_units: money.minor_units,
+                    provenance: Some(to_proto_provenance(&Provenance {
+                        part: invoice.part.clone(),
+                        origin: item.origin,
+                        ..Provenance::default()
+                    })),
+                }),
+                origin: to_proto_origin(item.origin) as i32,
+            })
+            .collect(),
+        warnings: invoice.warnings.clone(),
+        inferred: invoice.inferred(),
+        extracted_at: stored.extracted_at,
+    }
+}
+
+fn to_proto_money(claim: &Claim<Money>) -> InvoiceMoney {
+    InvoiceMoney {
+        currency: claim.value.currency.clone(),
+        minor_units: claim.value.minor_units,
+        provenance: Some(to_proto_provenance(&claim.provenance)),
+    }
+}
+
+fn to_proto_date(claim: &Claim<i64>) -> InvoiceDate {
+    InvoiceDate {
+        at: claim.value,
+        provenance: Some(to_proto_provenance(&claim.provenance)),
+    }
+}
+
+fn to_proto_provenance(provenance: &Provenance) -> FieldProvenance {
+    FieldProvenance {
+        part: provenance.part.clone(),
+        page: provenance.page.unwrap_or_default(),
+        span_start: i64::try_from(provenance.span_start).unwrap_or(i64::MAX),
+        span_end: i64::try_from(provenance.span_end).unwrap_or(i64::MAX),
+        origin: to_proto_origin(provenance.origin) as i32,
+    }
+}
+
+fn to_proto_origin(origin: Origin) -> FieldOrigin {
+    match origin {
+        Origin::Parsed => FieldOrigin::Parsed,
+        Origin::Model => FieldOrigin::Model,
+    }
+}
+
+fn to_proto_kind(kind: Option<DocKind>) -> InvoiceDocKind {
+    match kind {
+        Some(DocKind::Invoice) => InvoiceDocKind::Invoice,
+        Some(DocKind::Receipt) => InvoiceDocKind::Receipt,
+        None => InvoiceDocKind::Unspecified,
     }
 }
 

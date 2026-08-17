@@ -1198,3 +1198,280 @@ async fn an_oversized_part_is_skipped_rather_than_scanned() {
         "declined, not scanned — the address in it is the proof"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Search (task 73)
+// ---------------------------------------------------------------------------
+
+/// A message with a subject, a date and a body, so a search hit has something
+/// to place itself with.
+async fn dated_message(fx: &Fixture, subject: &str, date: i64, body: &str) -> i64 {
+    let uid = fx.next_uid.get();
+    fx.next_uid.set(uid + 1);
+    let (account_id, mailbox_id) = (fx.account_id, fx.mailbox_id);
+    let (subject, body) = (subject.to_owned(), body.to_owned());
+    fx.db
+        .write(move |c| {
+            let id = repo::insert_message(
+                c,
+                &repo::NewMessage {
+                    account_id,
+                    mailbox_id,
+                    uid,
+                    uidvalidity: 1,
+                    subject: Some(subject),
+                    date: Some(date),
+                    ..Default::default()
+                },
+            )?;
+            c.execute(
+                "INSERT INTO index_content
+                     (message_id, part, text, chars, content_hash, extractor)
+                 VALUES (?1, 'body', ?2, ?3, X'00', 'test')",
+                rusqlite::params![id, body, body.len() as i64],
+            )?;
+            Ok(id)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_search_returns_the_mail_behind_each_hit() {
+    let fx = Fixture::open().await;
+    let older = dated_message(&fx, "First", 1_700_000_000, "Invoice INV-2024-0231 is due.").await;
+    let newer = dated_message(
+        &fx,
+        "Chasing",
+        1_700_100_000,
+        "Chasing invoice INV-2024-0231 again.",
+    )
+    .await;
+    extract_entities(&fx.db, older).await.unwrap();
+    extract_entities(&fx.db, newer).await.unwrap();
+
+    let hits = search(
+        &fx.db,
+        &EntityQuery {
+            text: "inv-2024".to_owned(),
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let hit = &hits[0];
+    assert_eq!(hit.kind, EntityKind::InvoiceId);
+    assert_eq!(hit.norm, "INV-2024-0231");
+    assert_eq!(hit.messages, 2);
+    assert_eq!(hit.last_seen, Some(1_700_100_000));
+    // The examples are what make this a search rather than a listing, and they
+    // come back newest first.
+    assert_eq!(
+        hit.examples
+            .iter()
+            .map(|example| example.message_id)
+            .collect::<Vec<_>>(),
+        vec![newer, older]
+    );
+    assert_eq!(hit.examples[0].subject, "Chasing");
+    assert!(hit.examples[0].span_end > hit.examples[0].span_start);
+}
+
+#[tokio::test]
+async fn a_search_narrows_by_kind_account_and_date() {
+    let fx = Fixture::open().await;
+    let message_id = dated_message(
+        &fx,
+        "Invoice",
+        1_700_000_000,
+        "Invoice INV-2024-0231 for $1,299.00, contact ada@example.com.",
+    )
+    .await;
+    extract_entities(&fx.db, message_id).await.unwrap();
+
+    let amounts = search(
+        &fx.db,
+        &EntityQuery {
+            kinds: vec![EntityKind::Amount],
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(amounts.len(), 1, "{amounts:?}");
+    assert_eq!(amounts[0].norm, "USD 1299.00");
+    // The kind-specific meta survives, which is what makes an amount hit
+    // usable as a number rather than as a string.
+    assert!(amounts[0]
+        .meta
+        .as_deref()
+        .is_some_and(|meta| meta.contains("129900")));
+
+    let other_account = search(
+        &fx.db,
+        &EntityQuery {
+            account_id: Some(fx.account_id + 1),
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(other_account.is_empty());
+
+    let future = search(
+        &fx.db,
+        &EntityQuery {
+            since: Some(1_800_000_000),
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(future.is_empty());
+}
+
+#[tokio::test]
+async fn a_wildcard_in_a_query_is_matched_literally() {
+    // `LIKE` is being used as a substring test. Without escaping, a query of
+    // `%` would match the entire entity table.
+    let fx = Fixture::open().await;
+    let message_id = dated_message(&fx, "One", 1_700_000_000, "Write to ada@example.com.").await;
+    extract_entities(&fx.db, message_id).await.unwrap();
+
+    let everything = search(
+        &fx.db,
+        &EntityQuery {
+            text: "%".to_owned(),
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(everything.is_empty(), "{everything:?}");
+
+    let underscore = search(
+        &fx.db,
+        &EntityQuery {
+            text: "_".to_owned(),
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(underscore.is_empty(), "{underscore:?}");
+}
+
+#[tokio::test]
+async fn an_empty_query_lists_everything_in_scope() {
+    let fx = Fixture::open().await;
+    let message_id = dated_message(
+        &fx,
+        "One",
+        1_700_000_000,
+        "Write to ada@example.com about invoice INV-2024-0231 for $12.00.",
+    )
+    .await;
+    extract_entities(&fx.db, message_id).await.unwrap();
+
+    let hits = search(&fx.db, &EntityQuery::default()).await.unwrap();
+    // Every kind the message contributed, not a filtered subset: an empty
+    // query is a listing, and it must reach kinds the caller did not name.
+    let kinds: std::collections::BTreeSet<EntityKind> = hits.iter().map(|hit| hit.kind).collect();
+    assert_eq!(
+        kinds,
+        [EntityKind::Email, EntityKind::InvoiceId, EntityKind::Amount]
+            .into_iter()
+            .collect(),
+        "{hits:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_ascii_query_folds_the_same_way_the_database_does() {
+    // The needle is compared against SQLite's own `lower()`, which folds ASCII
+    // only. Folding the needle with Rust's Unicode mapping put `\u{e4}` on one
+    // side and `\u{c4}` on the other, so every non-ASCII query silently matched
+    // nothing. Both sides ASCII-fold, so case-insensitivity stops at ASCII and
+    // a non-ASCII query matches what it says.
+    let fx = Fixture::open().await;
+    let message_id = dated_message(
+        &fx,
+        "One",
+        1_700_000_000,
+        "see https://example.com/\u{c4}rger for details",
+    )
+    .await;
+    extract_entities(&fx.db, message_id).await.unwrap();
+
+    let hits = search(
+        &fx.db,
+        &EntityQuery {
+            text: "\u{c4}rger".to_owned(),
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].norm.ends_with("\u{c4}rger"), "{}", hits[0].norm);
+
+    // ASCII case-insensitivity is unaffected.
+    let ascii = search(
+        &fx.db,
+        &EntityQuery {
+            text: "EXAMPLE.COM".to_owned(),
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ascii.len(), 1, "{ascii:?}");
+}
+
+#[tokio::test]
+async fn an_oversized_query_is_refused_rather_than_scanned() {
+    let fx = Fixture::open().await;
+    let error = search(
+        &fx.db,
+        &EntityQuery {
+            text: "x".repeat(MAX_ENTITY_QUERY_BYTES + 1),
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .expect_err("too long");
+    assert_eq!(error.reason(), crate::ErrorReason::InvalidArgument);
+}
+
+#[tokio::test]
+async fn the_examples_per_hit_are_bounded() {
+    let fx = Fixture::open().await;
+    for n in 0..(MAX_ENTITY_EXAMPLES + 4) {
+        let id = dated_message(
+            &fx,
+            &format!("Note {n}"),
+            1_700_000_000 + n as i64,
+            "Write to ada@example.com.",
+        )
+        .await;
+        extract_entities(&fx.db, id).await.unwrap();
+    }
+
+    let hits = search(
+        &fx.db,
+        &EntityQuery {
+            text: "ada@example.com".to_owned(),
+            ..EntityQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].messages,
+        i64::try_from(MAX_ENTITY_EXAMPLES + 4).unwrap()
+    );
+    assert_eq!(hits[0].examples.len(), MAX_ENTITY_EXAMPLES);
+}

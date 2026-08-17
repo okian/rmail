@@ -681,6 +681,18 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SearchService/SearchAttachments",
         Requirement::Scope(Scope::MailRead),
     ),
+    // -- SearchService (task 73) ----------------------------------------------
+    // `SearchEntities` is `mail.read`, and the reason is disclosure rather
+    // than cost: it reaches no model at all, but an entity hit carries the
+    // subject of every message behind it, and the entity set of a mailbox is
+    // its bank accounts, its correspondents' phone numbers, its invoice
+    // numbers and its parcel tracking codes. That set is more sensitive per
+    // byte than a message list, not less, so it sits behind the same scope a
+    // message list does.
+    (
+        "/rmail.v1.SearchService/SearchEntities",
+        Requirement::Scope(Scope::MailRead),
+    ),
     // -- AttachmentService (task 74) ------------------------------------------
     // `AskAttachment` needs both scopes for the reasons `AiService/AskMailbox`
     // gives at length below, and the second half is if anything stronger here.
@@ -723,6 +735,33 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AttachmentService/ExtractTables",
         Requirement::Scope(Scope::MailRead),
     ),
+    // -- AttachmentService (task 73) ------------------------------------------
+    // `ExtractInvoice` is `mail.read` alone, on exactly the argument
+    // `ExtractTables` above makes: the deterministic reader needs no provider,
+    // and only a request that sets `use_model` reaches one. A read-only token
+    // can leave it unset and still get every field the document states in
+    // words, so requiring `ai.invoke` here would deny that token a capability
+    // that costs nothing. A caller that *does* set it hands the request to
+    // `rmail_core::ai::gate`, which resolves `ai.policy` and both spend caps
+    // before anything is assembled.
+    //
+    // Deliberately *not* `mail.write` either, despite the `invoices` row this
+    // writes. That row is the daemon's reading of a message, not a change to
+    // one: nothing about the mailbox, the message or its flags is touched, and
+    // `mail.write` is the authority to alter mail. The same distinction
+    // `ExtractEvents` draws for `extraction_deliveries`.
+    (
+        "/rmail.v1.AttachmentService/ExtractInvoice",
+        Requirement::Scope(Scope::MailRead),
+    ),
+    // `ExportInvoices` returns vendor names, invoice numbers, line-item
+    // descriptions and totals lifted out of message bodies and attachments.
+    // That is message content in a compact form, so `mail.read` — a token
+    // forbidden from reading a message must not read the bill inside it.
+    (
+        "/rmail.v1.AttachmentService/ExportInvoices",
+        Requirement::Scope(Scope::MailRead),
+    ),
     // -- ExtractService / LinkService (task 75) -------------------------------
     // `ExtractEvents`/`ExtractTasks` need `automation` on top of `mail.read`,
     // and the reason is the sink rather than the extraction. With
@@ -757,6 +796,20 @@ const TABLE: &[(&str, Requirement)] = &[
     (
         "/rmail.v1.LinkService/ExtractLinks",
         Requirement::Scope(Scope::MailRead),
+    ),
+    // -- ExtractService (task 73) ---------------------------------------------
+    // `ExtractStructured` is the one extraction RPC that needs `ai.invoke`,
+    // and the split from its two neighbours is the line this table draws
+    // everywhere: whether a caller can *force* spend. `ExtractTables` and
+    // `ExtractInvoice` answer fully with no provider and only reach one when
+    // the request opts in. Here the caller supplies the shape at call time, so
+    // there is nothing deterministic to fall back to — the model is the whole
+    // mechanism, every call spends, and a token not trusted with `ai.invoke`
+    // must not be able to. `mail.read` alongside it, because the answer is the
+    // message's own content rearranged into the caller's fields.
+    (
+        "/rmail.v1.ExtractService/ExtractStructured",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
     ),
     // -- WebhookService (task 68) ---------------------------------------------
     // This is the only service in the API whose whole job is to put mail

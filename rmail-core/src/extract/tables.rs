@@ -1068,7 +1068,7 @@ fn parse_number(text: &str) -> Option<f64> {
 }
 
 /// A date, in one of the three layouts that cannot be read two ways.
-fn parse_date(text: &str) -> Option<i64> {
+pub(crate) fn parse_date(text: &str) -> Option<i64> {
     use chrono::{NaiveDate, NaiveDateTime};
 
     let text = text.trim();

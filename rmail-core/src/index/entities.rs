@@ -747,7 +747,7 @@ fn scan_amounts(text: &str) -> Vec<Mention> {
 /// is the decimal point if it is followed by one or two digits, and a grouping
 /// mark otherwise. `1.299` is one thousand two hundred and ninety-nine, because
 /// three trailing digits is a group, not a fraction.
-fn parse_minor_units(raw: &str) -> Option<u128> {
+pub(crate) fn parse_minor_units(raw: &str) -> Option<u128> {
     // A separator with no digits after it belongs to the sentence, not the
     // number: `£42.00,` ends a clause, and treating that comma as part of the
     // figure makes it four thousand two hundred.
@@ -1337,6 +1337,299 @@ pub async fn collect_orphans(db: &Database) -> Result<u64, Error> {
 /// How many orphans one pass of [`collect_orphans`] removes before releasing
 /// the writer.
 const ORPHAN_BATCH: i64 = 1024;
+
+// ---------------------------------------------------------------------------
+// Search (task 73)
+// ---------------------------------------------------------------------------
+
+/// Most entities one search returns.
+pub const MAX_ENTITY_HITS: i64 = 200;
+
+/// Default page size when a caller asks for none.
+pub const DEFAULT_ENTITY_HITS: i64 = 25;
+
+/// Most example messages carried back per entity.
+///
+/// The point of an example is to make a hit placeable — "this IBAN, in these
+/// three messages". Returning every mention of a URL that appears in nine
+/// hundred newsletters is a different feature (`mail search`), and it would
+/// make the response size a function of the mailbox.
+pub const MAX_ENTITY_EXAMPLES: usize = 5;
+
+/// Longest query this search will run.
+///
+/// The match is a `LIKE '%…%'`, which SQLite answers with a scan whose cost is
+/// the query length times the table; a kilobyte-long needle is not a search.
+pub const MAX_ENTITY_QUERY_BYTES: usize = 256;
+
+/// One message that mentions an entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityExample {
+    /// The message.
+    pub message_id: i64,
+    /// Its subject, so a hit is placeable without a second round trip.
+    pub subject: String,
+    /// Its internal date, Unix seconds, when it has one.
+    pub date: Option<i64>,
+    /// Which `index_content` part the mention was found in.
+    pub part: String,
+    /// Byte offsets into that part's normalized text, for highlighting.
+    pub span_start: i64,
+    /// Byte offset just past the mention.
+    pub span_end: i64,
+}
+
+/// One entity that matched, with the mail behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityHit {
+    /// Row id in `entities`.
+    pub entity_id: i64,
+    /// What kind of thing.
+    pub kind: EntityKind,
+    /// As written, for display.
+    pub value: String,
+    /// The canonical form — the identity.
+    pub norm: String,
+    /// Kind-specific detail, JSON-encoded.
+    pub meta: Option<String>,
+    /// Mentions across every message in scope.
+    pub mentions: i64,
+    /// Distinct messages in scope that mention it.
+    pub messages: i64,
+    /// The most recent message that mentions it, Unix seconds.
+    pub last_seen: Option<i64>,
+    /// A bounded sample of those messages, most recent first.
+    pub examples: Vec<EntityExample>,
+}
+
+/// What to search for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntityQuery {
+    /// Free text, matched case-insensitively against both the canonical form
+    /// and the text as written. Empty lists everything in scope.
+    pub text: String,
+    /// Restrict to these kinds; empty means every kind.
+    pub kinds: Vec<EntityKind>,
+    /// Restrict to one account; `None` means every configured account.
+    pub account_id: Option<i64>,
+    /// Restrict to messages at or after this instant.
+    pub since: Option<i64>,
+    /// Page size, clamped to [`MAX_ENTITY_HITS`].
+    pub limit: i64,
+}
+
+/// Search the entity graph across kinds, returning the mail behind each hit.
+///
+/// # How this differs from `IndexService.ListEntities`
+///
+/// `ListEntities` is an index-maintenance read: one kind, required, listed. It
+/// exists so an operator can see what the extractor produced. This is a
+/// *search*: free text across kinds, scoped to an account and a time window,
+/// ranked by how much of the mailbox stands behind each hit, and it carries
+/// the messages back with it — which is what makes "find the invoice number
+/// that turns up in three threads" a question with an answer.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] for a query longer than
+/// [`MAX_ENTITY_QUERY_BYTES`]; a mapped storage error otherwise.
+#[tracing::instrument(skip(db, query), fields(hits))]
+pub async fn search(db: &Database, query: &EntityQuery) -> Result<Vec<EntityHit>, Error> {
+    if query.text.len() > MAX_ENTITY_QUERY_BYTES {
+        return Err(Error::invalid_argument(format!(
+            "an entity query may be at most {MAX_ENTITY_QUERY_BYTES} bytes"
+        )));
+    }
+    let limit = if query.limit <= 0 {
+        DEFAULT_ENTITY_HITS
+    } else {
+        query.limit.min(MAX_ENTITY_HITS)
+    };
+    // `LIKE` is being used as a substring test, so the wildcards a caller
+    // typed have to stop being wildcards: without escaping, a query of `%`
+    // matches every entity in the mailbox and a query of `_` matches on every
+    // single character. `ESCAPE '\'` in the statement pairs with this.
+    let needle = if query.text.trim().is_empty() {
+        None
+    } else {
+        Some(format!(
+            "%{}%",
+            query
+                .text
+                .trim()
+                // ASCII, not Unicode: the comparison below is against SQLite's
+                // own `lower()`, which folds ASCII only. Folding the needle
+                // with Rust's Unicode mapping made every non-ASCII query
+                // silently match nothing — `Ä` became `ä` on one side of the
+                // comparison and stayed `Ä` on the other.
+                .to_ascii_lowercase()
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        ))
+    };
+    // Deduplicated, which also bounds it: `EntityKind::ALL` is a closed set, so
+    // a client sending a hundred thousand repeats of `url` cannot make the SQL
+    // string — or the work `prepare` does on it — a function of the request.
+    let kinds: BTreeSet<&'static str> = query.kinds.iter().map(|kind| kind.as_str()).collect();
+    let kind_filter = if kinds.is_empty() {
+        String::new()
+    } else {
+        // Built from `EntityKind::as_str`, never from caller text: the values
+        // are a closed set this crate owns, so there is no interpolation of
+        // anything a client sent.
+        format!(
+            " AND e.kind IN ({})",
+            kinds
+                .into_iter()
+                .map(|kind| format!("'{kind}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let account_id = query.account_id;
+    let since = query.since;
+
+    let rows: Vec<HitRow> = db
+        .read(move |conn| {
+            let sql = format!(
+                "SELECT e.entity_id, e.kind, e.value, e.norm, e.meta,
+                        COUNT(em.rowid) AS mentions,
+                        COUNT(DISTINCT em.message_id) AS messages,
+                        MAX(m.date) AS last_seen
+                   FROM entities e
+                   JOIN entity_mentions em ON em.entity_id = e.entity_id
+                   JOIN messages m ON m.id = em.message_id
+                  WHERE (?1 IS NULL OR lower(e.norm) LIKE ?1 ESCAPE '\\'
+                                    OR lower(e.value) LIKE ?1 ESCAPE '\\')
+                    AND (?2 IS NULL OR m.account_id = ?2)
+                    AND (?3 IS NULL OR (m.date IS NOT NULL AND m.date >= ?3))
+                    {kind_filter}
+                  GROUP BY e.entity_id
+                  ORDER BY messages DESC, mentions DESC, last_seen DESC, e.entity_id
+                  LIMIT ?4"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mapped = stmt
+                .query_map(rusqlite::params![needle, account_id, since, limit], |row| {
+                    Ok(HitRow {
+                        entity_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        value: row.get(2)?,
+                        norm: row.get(3)?,
+                        meta: row.get(4)?,
+                        mentions: row.get(5)?,
+                        messages: row.get(6)?,
+                        last_seen: row.get(7)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(mapped)
+        })
+        .await?;
+
+    let ids: Vec<i64> = rows.iter().map(|row| row.entity_id).collect();
+    let examples = entity_examples(db, ids, account_id, since).await?;
+
+    let mut hits = Vec::with_capacity(rows.len());
+    for row in rows {
+        // A stored kind this build has no variant for is a row a newer version
+        // wrote; it is skipped rather than failing the search, so a downgrade
+        // degrades instead of breaking.
+        let kind = match EntityKind::parse(&row.kind) {
+            Ok(kind) => kind,
+            Err(error) => {
+                tracing::debug!(%error, entity_id = row.entity_id, "skipping an unknown kind");
+                continue;
+            }
+        };
+        hits.push(EntityHit {
+            examples: examples.get(&row.entity_id).cloned().unwrap_or_default(),
+            entity_id: row.entity_id,
+            kind,
+            value: row.value,
+            norm: row.norm,
+            meta: row.meta,
+            mentions: row.mentions,
+            messages: row.messages,
+            last_seen: row.last_seen,
+        });
+    }
+    tracing::Span::current().record("hits", hits.len());
+    Ok(hits)
+}
+
+/// One aggregated `entities` row as read by [`search`].
+struct HitRow {
+    entity_id: i64,
+    kind: String,
+    value: String,
+    norm: String,
+    meta: Option<String>,
+    mentions: i64,
+    messages: i64,
+    last_seen: Option<i64>,
+}
+
+/// A bounded sample of the messages behind each hit, most recent first.
+async fn entity_examples(
+    db: &Database,
+    ids: Vec<i64>,
+    account_id: Option<i64>,
+    since: Option<i64>,
+) -> Result<BTreeMap<i64, Vec<EntityExample>>, Error> {
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let limit = i64::try_from(MAX_ENTITY_EXAMPLES).unwrap_or(5);
+    let rows: Vec<(i64, EntityExample)> = db
+        .read(move |conn| {
+            // One statement per entity rather than one `IN (…)` over all of
+            // them: the per-entity `LIMIT` is the point, and a single query
+            // would need a window function to get it. The statement is
+            // prepared once and the loop is bounded by the page size.
+            let mut stmt = conn.prepare(
+                "SELECT em.message_id, m.subject, m.date, em.part, em.span_start, em.span_end
+                   FROM entity_mentions em
+                   JOIN messages m ON m.id = em.message_id
+                  WHERE em.entity_id = ?1
+                    AND (?2 IS NULL OR m.account_id = ?2)
+                    AND (?3 IS NULL OR (m.date IS NOT NULL AND m.date >= ?3))
+                  ORDER BY m.date DESC, em.message_id DESC, em.span_start
+                  LIMIT ?4",
+            )?;
+            let mut out = Vec::new();
+            for entity_id in ids {
+                let mapped = stmt
+                    .query_map(
+                        rusqlite::params![entity_id, account_id, since, limit],
+                        |row| {
+                            Ok((
+                                entity_id,
+                                EntityExample {
+                                    message_id: row.get(0)?,
+                                    subject: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                                    date: row.get(2)?,
+                                    part: row.get(3)?,
+                                    span_start: row.get(4)?,
+                                    span_end: row.get(5)?,
+                                },
+                            ))
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                out.extend(mapped);
+            }
+            Ok(out)
+        })
+        .await?;
+
+    let mut by_entity: BTreeMap<i64, Vec<EntityExample>> = BTreeMap::new();
+    for (entity_id, example) in rows {
+        by_entity.entry(entity_id).or_default().push(example);
+    }
+    Ok(by_entity)
+}
 
 #[cfg(test)]
 mod tests;

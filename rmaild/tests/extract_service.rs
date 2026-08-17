@@ -31,9 +31,12 @@ use std::time::Duration;
 use rmail_proto::v1::attachment_service_client::AttachmentServiceClient;
 use rmail_proto::v1::extract_service_client::ExtractServiceClient;
 use rmail_proto::v1::link_service_client::LinkServiceClient;
+use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::{
-    CellType, ExtractEventsRequest, ExtractLinksRequest, ExtractTablesRequest, ExtractTasksRequest,
-    ExtractionSink, ExtractionSource, LinkKind, TableOrigin,
+    CellType, ExportInvoicesRequest, ExtractEventsRequest, ExtractInvoiceRequest,
+    ExtractLinksRequest, ExtractStructuredRequest, ExtractTablesRequest, ExtractTasksRequest,
+    ExtractionSink, ExtractionSource, FieldOrigin, InvoiceDocKind, InvoiceExportFormat,
+    InvoicePaymentStatus, LinkKind, SearchEntitiesRequest, TableOrigin,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -685,6 +688,431 @@ just some prose with no delimiters at all\r\n\
         })
         .await
         .expect_err("declined");
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// ExtractInvoice / ExportInvoices (task 73)
+// ---------------------------------------------------------------------------
+
+/// A message carrying a plain-text invoice as an attachment. The vendor name
+/// deliberately begins with `=`, which is a spreadsheet formula and is exactly
+/// what a document a stranger sent is allowed to contain.
+fn invoice_attachment_raw() -> String {
+    "From: billing@acme.example.com\r\n\
+To: grace@example.com\r\n\
+Subject: Your invoice\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b1\"\r\n\
+\r\n\
+--b1\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Please find the attached invoice.\r\n\
+--b1\r\n\
+Content-Type: text/plain; name=\"invoice-2291.txt\"\r\n\
+Content-Disposition: attachment; filename=\"invoice-2291.txt\"\r\n\
+\r\n\
+Invoice\r\n\
+Vendor: =Acme Consulting Ltd\r\n\
+Bill to: Grace Hopper\r\n\
+Invoice Number: INV-2291\r\n\
+Invoice date: 2024-03-01\r\n\
+Due date: 2024-03-31\r\n\
+Subtotal: $1,200.00\r\n\
+Tax: $99.00\r\n\
+Total: $1,299.00\r\n\
+--b1--\r\n"
+        .to_owned()
+}
+
+#[tokio::test]
+async fn an_invoice_attachment_is_detected_read_and_stored_with_its_provenance() {
+    let server = TestServer::start().await;
+    let mut client = AttachmentServiceClient::new(server.channel().await);
+    let message_id = server
+        .message("Your invoice", &invoice_attachment_raw())
+        .await;
+
+    let response = client
+        .extract_invoice(ExtractInvoiceRequest {
+            message_id,
+            // Empty: the daemon detects across the message's attachments.
+            part_id: String::new(),
+            use_model: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!response.used_model);
+    let invoice = response.invoice.expect("an invoice");
+    assert_eq!(invoice.kind, InvoiceDocKind::Invoice as i32);
+    assert_eq!(invoice.part_id, "0", "the attachment, not the body");
+    assert_eq!(invoice.currency, "USD");
+    assert_eq!(invoice.total.as_ref().unwrap().minor_units, 129_900);
+    assert_eq!(invoice.subtotal.as_ref().unwrap().minor_units, 120_000);
+    assert_eq!(invoice.number.as_ref().unwrap().value, "INV-2291");
+    assert_eq!(
+        invoice.vendor.as_ref().unwrap().value,
+        "=Acme Consulting Ltd"
+    );
+    assert_eq!(invoice.status, InvoicePaymentStatus::Unspecified as i32);
+    // Nothing here came from a model, and the wire has to say so field by
+    // field — this is the property the whole feature rests on.
+    assert!(!invoice.inferred);
+    for provenance in [
+        invoice.total.as_ref().unwrap().provenance.as_ref().unwrap(),
+        invoice
+            .number
+            .as_ref()
+            .unwrap()
+            .provenance
+            .as_ref()
+            .unwrap(),
+        invoice
+            .vendor
+            .as_ref()
+            .unwrap()
+            .provenance
+            .as_ref()
+            .unwrap(),
+    ] {
+        assert_eq!(provenance.origin, FieldOrigin::Parsed as i32);
+        assert_eq!(provenance.part, "0");
+        assert!(provenance.span_end > provenance.span_start);
+    }
+    // Both parts were considered, and the detector's verdict on each is
+    // reported: the body is a covering note with no figures.
+    assert!(response
+        .candidates
+        .iter()
+        .any(|candidate| candidate.filename == "invoice-2291.txt"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn extracting_an_invoice_twice_replaces_the_row_and_the_csv_guards_formulas() {
+    let server = TestServer::start().await;
+    let mut client = AttachmentServiceClient::new(server.channel().await);
+    let message_id = server
+        .message("Your invoice", &invoice_attachment_raw())
+        .await;
+
+    for _ in 0..2 {
+        client
+            .extract_invoice(ExtractInvoiceRequest {
+                message_id,
+                part_id: "0".to_owned(),
+                use_model: false,
+            })
+            .await
+            .unwrap();
+    }
+
+    let rows = client
+        .export_invoices(ExportInvoicesRequest {
+            format: InvoiceExportFormat::Csv as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rows.invoices.len(), 1, "re-extraction replaces");
+
+    let csv = rows.csv;
+    assert!(csv.starts_with("invoice_id,message_id"), "{csv}");
+    assert!(csv.contains("\r\n"), "RFC 4180 line endings: {csv}");
+    // The vendor is a formula and must arrive neutralized, or opening this
+    // file in a spreadsheet executes a stranger's expression.
+    assert!(csv.contains("'=Acme Consulting Ltd"), "{csv}");
+    assert!(!csv.contains(",=Acme"), "{csv}");
+
+    // And the filters reach the daemon: a vendor nobody billed returns nothing.
+    let none = client
+        .export_invoices(ExportInvoicesRequest {
+            vendor: "globex".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(none.invoices.is_empty());
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_message_with_no_bill_in_it_is_a_precondition_failure() {
+    let server = TestServer::start().await;
+    let mut client = AttachmentServiceClient::new(server.channel().await);
+    let message_id = server.message("This week", &newsletter_raw()).await;
+
+    let status = client
+        .extract_invoice(ExtractInvoiceRequest {
+            message_id,
+            part_id: String::new(),
+            use_model: false,
+        })
+        .await
+        .expect_err("no bill");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+
+    // And the two client-reachable argument errors.
+    let status = client
+        .extract_invoice(ExtractInvoiceRequest {
+            message_id: 0,
+            part_id: String::new(),
+            use_model: false,
+        })
+        .await
+        .expect_err("zero id");
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    let status = client
+        .extract_invoice(ExtractInvoiceRequest {
+            message_id,
+            part_id: "42".to_owned(),
+            use_model: false,
+        })
+        .await
+        .expect_err("no such part");
+    assert_eq!(status.code(), Code::NotFound);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_message_whose_body_was_never_fetched_cannot_be_read_for_an_invoice() {
+    let server = TestServer::start().await;
+    let mut client = AttachmentServiceClient::new(server.channel().await);
+    let message_id = server.headers_only().await;
+
+    let status = client
+        .extract_invoice(ExtractInvoiceRequest {
+            message_id,
+            part_id: String::new(),
+            use_model: false,
+        })
+        .await
+        .expect_err("no body");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn asking_for_a_model_pass_reaches_the_gate_and_fails_there() {
+    // This daemon is configured with a provider but no credentials, so a
+    // `use_model` request runs the deterministic reader, reaches the model
+    // sink, and fails at the provider. The assertion that matters is that it
+    // *fails* rather than silently returning the deterministic reading as if a
+    // model had confirmed it — an invoice that quietly skipped the pass it was
+    // asked for is the same lie as an inferred figure marked parsed.
+    //
+    // The no-provider-at-all path is a `rmail-core` unit test
+    // (`extract::invoice::tests::a_model_pass_on_a_daemon_with_no_provider_is_refused`),
+    // where an engine can actually be built without one.
+    let server = TestServer::start().await;
+    let mut client = AttachmentServiceClient::new(server.channel().await);
+    let message_id = server
+        .message("Your invoice", &invoice_attachment_raw())
+        .await;
+
+    let status = client
+        .extract_invoice(ExtractInvoiceRequest {
+            message_id,
+            part_id: "0".to_owned(),
+            use_model: true,
+        })
+        .await
+        .expect_err("the provider has no credentials here");
+    assert_ne!(status.code(), Code::Ok);
+    assert_eq!(status.code(), Code::Unauthenticated, "{status:?}");
+
+    // And nothing was stored: a failed model pass must not leave a partial
+    // reading behind that a later `ExportInvoices` presents as complete.
+    let rows = client
+        .export_invoices(ExportInvoicesRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(rows.invoices.is_empty(), "{:?}", rows.invoices);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_export_format_this_daemon_does_not_know_is_refused() {
+    let server = TestServer::start().await;
+    let mut client = AttachmentServiceClient::new(server.channel().await);
+
+    let status = client
+        .export_invoices(ExportInvoicesRequest {
+            format: 99,
+            ..Default::default()
+        })
+        .await
+        .expect_err("unknown format");
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// ExtractStructured (task 73)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_structured_extraction_that_cannot_reach_a_provider_stores_nothing() {
+    // There is no deterministic route to a caller-chosen schema. This daemon
+    // has a provider with no credentials, so the call reaches it and fails
+    // there; the property being pinned is that a failed call leaves no row —
+    // `structured_extractions` must only ever hold documents that were
+    // actually validated against their schema.
+    //
+    // The no-provider-at-all path (FAILED_PRECONDITION) is a `rmail-core` unit
+    // test, where an engine can be built without one.
+    let server = TestServer::start().await;
+    let mut client = ExtractServiceClient::new(server.channel().await);
+    let message_id = server
+        .message("Your invoice", &invoice_attachment_raw())
+        .await;
+
+    let status = client
+        .extract_structured(ExtractStructuredRequest {
+            message_id,
+            schema: "invoice".to_owned(),
+            schema_json: String::new(),
+            refresh: false,
+        })
+        .await
+        .expect_err("the provider has no credentials here");
+    assert_eq!(status.code(), Code::Unauthenticated, "{status:?}");
+
+    let stored: i64 = server
+        .db
+        .read(|c| {
+            c.query_row("SELECT count(*) FROM structured_extractions", [], |r| {
+                r.get(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_schema_the_daemon_cannot_use_is_rejected_before_any_spend() {
+    let server = TestServer::start().await;
+    let mut client = ExtractServiceClient::new(server.channel().await);
+    let message_id = server
+        .message("Your invoice", &invoice_attachment_raw())
+        .await;
+
+    // Every one of these has to be INVALID_ARGUMENT rather than the
+    // FAILED_PRECONDITION the test above gets: the schema is checked before
+    // the provider is looked for, so a caller learns their request was wrong
+    // rather than that this daemon has no AI.
+    for (schema, schema_json, why) in [
+        ("horoscope", String::new(), "unknown built-in"),
+        ("", "{not json".to_owned(), "unparseable"),
+        (
+            "",
+            serde_json::json!({"type": "array"}).to_string(),
+            "not an object at the root",
+        ),
+        (
+            "",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"type": "string", "pattern": "^x"}},
+            })
+            .to_string(),
+            "a keyword this build cannot enforce",
+        ),
+    ] {
+        let status = client
+            .extract_structured(ExtractStructuredRequest {
+                message_id,
+                schema: schema.to_owned(),
+                schema_json,
+                refresh: false,
+            })
+            .await
+            .expect_err(why);
+        assert_eq!(status.code(), Code::InvalidArgument, "{why}");
+    }
+
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// SearchEntities (task 73)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn entities_are_searchable_across_kinds_with_the_mail_behind_them() {
+    let server = TestServer::start().await;
+    let message_id = server
+        .message("Your invoice", &invoice_attachment_raw())
+        .await;
+    // The entity stage reads `index_content`, so seed it the way the indexer
+    // would: this RPC is a read over what the pipeline already wrote.
+    let body = "Invoice INV-2291 for $1,299.00 is due.";
+    server
+        .db
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO index_content
+                     (message_id, part, text, chars, content_hash, extractor)
+                 VALUES (?1, 'body', ?2, ?3, X'00', 'test')",
+                rusqlite::params![message_id, body, body.len() as i64],
+            )
+        })
+        .await
+        .unwrap();
+    rmail_core::index::entities::extract_entities(&server.db, message_id)
+        .await
+        .unwrap();
+
+    let mut client = SearchServiceClient::new(server.channel().await);
+    let response = client
+        .search_entities(SearchEntitiesRequest {
+            query: "inv-2291".to_owned(),
+            kinds: vec!["invoice_id".to_owned()],
+            account_id: server.account_id,
+            since: 0,
+            limit: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.hits.len(), 1, "{:?}", response.hits);
+    let hit = &response.hits[0];
+    assert_eq!(hit.kind, "invoice_id");
+    assert_eq!(hit.norm, "INV-2291");
+    assert_eq!(hit.messages, 1);
+    assert_eq!(hit.examples.len(), 1);
+    assert_eq!(hit.examples[0].message_id, message_id);
+    assert_eq!(hit.examples[0].subject, "Your invoice");
+
+    // A kind no version of this code writes is an argument error, not an
+    // empty page: a typo and "nothing of that kind" are different answers.
+    let status = client
+        .search_entities(SearchEntitiesRequest {
+            query: String::new(),
+            kinds: vec!["horoscope".to_owned()],
+            ..Default::default()
+        })
+        .await
+        .expect_err("unknown kind");
     assert_eq!(status.code(), Code::InvalidArgument);
 
     server.shutdown().await;

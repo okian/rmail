@@ -706,13 +706,14 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core analytics::` (subscription classification, SQL whitelist guard rejects writes)
 
 ## 73. Structured invoice/receipt & data extraction
-- [ ] status
+- [x] status
 - **depends-on:** 22, 43
 - **parallel-safe:** yes
 - **acceptance:**
   - Detect invoice/receipt attachments; Claude with a strict schema pulls vendor/number/line-items/totals/currency/due/status into a queryable, CSV-exportable table; general `ExtractStructured` against a JSON schema (invoice/flight/meeting/etc.), validated and stored; `SearchService.SearchEntities`.
   - `mail invoices [--export csv]`, `mail extract <id> --schema invoice`.
-- **verify:** `cargo nextest run -p rmail-core extract::invoice extract::structured` (schema-valid rows, CSV export)
+- **verify:** `cargo nextest run -p rmail-core extract::invoice extract::structured` (79 tests: parsed-vs-inferred provenance through merge/SQLite/CSV, every bound, schema rejections) · `cargo nextest run -p rmail-core index::entities` (SearchEntities' query, `LIKE` wildcard escaping) · `cargo nextest run -p rmaild --test extract_service` (the four RPCs end-to-end: detection, re-extraction replaces, CSV formula guard, the INVALID_ARGUMENT/FAILED_PRECONDITION/NOT_FOUND paths)
+- **note:** deterministic first — `index::entities` supplies every amount, date and reference (no second money parser), `extract::tables` supplies spreadsheet line items, and the model only fills what the document did not label. `merge` never lets an inferred figure overwrite a parsed one and records the disagreement instead. `ExtractStructured` lives on `ExtractService` rather than prd.md #4's `MailService` (that service did not exist when the PRD was written) and is the one extraction RPC gated `AllOf[mail.read, ai.invoke]`, because a caller-chosen schema has no deterministic route. CLI: `mail invoices [--export csv]`, `mail attach invoice <id> [part]`, `mail extract data <id> --schema invoice` (a subcommand rather than prd.md's bare `mail extract <id> --schema`, which clap cannot distinguish from `mail extract events`), `mail entities --search`.
 
 ## 74. Attachment semantic search & ask-your-attachment
 - [x] status

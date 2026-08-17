@@ -85,6 +85,228 @@ service AttachmentService {
   // nesting depth. A table cut short by one of them arrives with
   // `truncated` set rather than silently short.
   rpc ExtractTables(ExtractTablesRequest) returns (ExtractTablesResponse);
+
+  // Detect an invoice or a receipt and read it into the queryable invoice
+  // table (prd.md feature 53).
+  //
+  // # Every field is a claim, and it says where it came from
+  //
+  // A total lifted off a line that reads `Total: $1,299.00` and a total a
+  // model recovered from a rendered page are not the same fact. So every
+  // field arrives with a FieldProvenance naming the part, the page, the byte
+  // span, and whether it was PARSED or inferred by a MODEL. There is no way
+  // to receive a value without one, deliberately: a structured extraction
+  // nobody can check against the source is a claim, not data, and money is
+  // the case where that matters most.
+  //
+  // # Deterministic first
+  //
+  // The reader that needs no provider always runs, and it claims only what
+  // the document states in words: labelled totals, labelled dates, an invoice
+  // reference, a vendor on a line that names one, and — for a spreadsheet or
+  // an HTML invoice — the line items straight out of the grid. `use_model`
+  // adds a pass that fills what is left. It never overwrites a parsed value;
+  // where the two disagree about a total, both readings are reported and the
+  // disagreement lands in `warnings` rather than being reconciled away.
+  //
+  // `part_id` empty detects across the message's document attachments (images
+  // excluded: OCR is a subprocess with a deadline, so a scan has to be named)
+  // and falls back to the body, which is where a hosted-billing receipt keeps
+  // its numbers. `candidates` reports everything that was looked at.
+  //
+  // NOT_FOUND for a message or a named part that does not exist.
+  // FAILED_PRECONDITION when nothing in the message reads as an invoice or a
+  // receipt, when the named part yielded no text, or when no invoice field
+  // could be read out of the text there was — deliberately distinct from an
+  // invoice with empty fields, which would be a fiction in a table people
+  // query.
+  rpc ExtractInvoice(ExtractInvoiceRequest) returns (ExtractInvoiceResponse);
+
+  // List stored invoices, optionally as CSV (prd.md feature 53).
+  //
+  // A read over the invoice table: it runs no extractor and calls no model,
+  // so it costs nothing and returns only documents ExtractInvoice has already
+  // read.
+  //
+  // With `format = CSV` the response also carries a rendered RFC 4180
+  // document. Its `inferred_fields` column names every field on the row a
+  // model inferred — the provenance has to survive the export, because a
+  // spreadsheet is exactly where these numbers stop being a claim and start
+  // being somebody's accounts. Every field is guarded against spreadsheet
+  // formula injection: a vendor named `=cmd|...` came out of a document a
+  // stranger sent.
+  rpc ExportInvoices(ExportInvoicesRequest) returns (ExportInvoicesResponse);
+}
+
+message ExtractInvoiceRequest {
+  // The message to read.
+  int64 message_id = 1;
+  // One attachment's MIME part id. Empty detects across the message.
+  string part_id = 2;
+  // Whether a model pass may run over the document text. Costs a model call;
+  // without it the deterministic reading stands, which is a complete answer
+  // for a document that labels its own fields.
+  bool use_model = 3;
+}
+
+// Which document this is.
+enum InvoiceDocKind {
+  INVOICE_DOC_KIND_UNSPECIFIED = 0;
+  // A demand for payment.
+  INVOICE_DOC_KIND_INVOICE = 1;
+  // A record that payment happened.
+  INVOICE_DOC_KIND_RECEIPT = 2;
+}
+
+// Whether a value was read out of the document or inferred by a model. The
+// distinction this whole message set exists to preserve.
+enum FieldOrigin {
+  FIELD_ORIGIN_UNSPECIFIED = 0;
+  FIELD_ORIGIN_PARSED = 1;
+  FIELD_ORIGIN_MODEL = 2;
+}
+
+// What the document said about payment. Never derived by the daemon from a
+// due date and the clock: that would put this server's opinion in a field
+// that is supposed to hold the document's.
+enum InvoicePaymentStatus {
+  INVOICE_PAYMENT_STATUS_UNSPECIFIED = 0;
+  INVOICE_PAYMENT_STATUS_PAID = 1;
+  INVOICE_PAYMENT_STATUS_UNPAID = 2;
+  INVOICE_PAYMENT_STATUS_OVERDUE = 3;
+  INVOICE_PAYMENT_STATUS_REFUNDED = 4;
+  INVOICE_PAYMENT_STATUS_VOID = 5;
+}
+
+// Where one extracted field came from, precisely enough to check it.
+message FieldProvenance {
+  // The MIME part id, or empty for the message body.
+  string part = 1;
+  // The one-based page, 0 when the document had none.
+  int64 page = 2;
+  // Byte offsets into that part's extracted text, naming the source region a
+  // field was read from. Both 0 when there is no span to give: a MODEL field
+  // read the document rather than a byte range of it, and a line item's money
+  // is positioned by its row rather than by an offset. An invented span would
+  // be inventing the one checkable detail this message carries.
+  int64 span_start = 3;
+  int64 span_end = 4;
+  FieldOrigin origin = 5;
+}
+
+// A sum of money as integer minor units. Never a float: two totals a penny
+// apart must not collide, and a float cent is not a cent.
+message InvoiceMoney {
+  // ISO 4217, uppercase.
+  string currency = 1;
+  // Hundredths of `currency`. Negative for a credit or a refund.
+  int64 minor_units = 2;
+  FieldProvenance provenance = 3;
+}
+
+message InvoiceText {
+  string value = 1;
+  FieldProvenance provenance = 2;
+}
+
+message InvoiceDate {
+  // Unix seconds, UTC midnight of the stated day.
+  int64 at = 1;
+  FieldProvenance provenance = 2;
+}
+
+message InvoiceLineItem {
+  string description = 1;
+  // 0 when the line did not state one. `has_quantity` disambiguates a line
+  // that really billed zero.
+  double quantity = 2;
+  bool has_quantity = 3;
+  InvoiceMoney unit_price = 4;
+  InvoiceMoney total = 5;
+  // Read out of a spreadsheet row, or recognized by a model in prose.
+  FieldOrigin origin = 6;
+}
+
+// One extracted document. Every optional field is absent rather than
+// zero-valued when the document did not state it: an invoice with no vendor
+// and an invoice whose vendor is the empty string are different statements,
+// and only one of them is honest.
+message ExtractedInvoice {
+  int64 invoice_id = 1;
+  int64 message_id = 2;
+  // The MIME part it was read from, empty for the body.
+  string part_id = 3;
+  InvoiceDocKind kind = 4;
+  optional InvoiceText vendor = 5;
+  optional InvoiceText number = 6;
+  // ISO 4217, uppercase. Empty when no amount carried one.
+  string currency = 7;
+  optional InvoiceMoney subtotal = 8;
+  optional InvoiceMoney tax = 9;
+  optional InvoiceMoney total = 10;
+  optional InvoiceDate issued_at = 11;
+  optional InvoiceDate due_at = 12;
+  InvoicePaymentStatus status = 13;
+  FieldProvenance status_provenance = 14;
+  repeated InvoiceLineItem line_items = 15;
+  // Anything a reader must not have to discover for themselves: a subtotal
+  // plus tax that does not reach the total, a model contradicting the
+  // document, a bound that cut the reading short. Never silently reconciled.
+  repeated string warnings = 16;
+  // Whether any field on this document was inferred rather than read.
+  bool inferred = 17;
+  // Unix seconds.
+  int64 extracted_at = 18;
+}
+
+// One part the detector looked at, and what it concluded. Returned even for
+// parts it rejected: "I read the PDF and it is not a bill" and "I never
+// opened the PDF" are different answers.
+message InvoiceCandidate {
+  string part_id = 1;
+  string filename = 2;
+  // UNSPECIFIED means "neither".
+  InvoiceDocKind kind = 3;
+}
+
+message ExtractInvoiceResponse {
+  ExtractedInvoice invoice = 1;
+  repeated InvoiceCandidate candidates = 2;
+  // Whether a model pass ran. Not the same as `invoice.inferred`: a model may
+  // run and contribute nothing the document had not already stated.
+  bool used_model = 3;
+}
+
+// How ExportInvoices renders its answer.
+enum InvoiceExportFormat {
+  // Structured rows only.
+  INVOICE_EXPORT_FORMAT_UNSPECIFIED = 0;
+  INVOICE_EXPORT_FORMAT_ROWS = 1;
+  // Structured rows *and* a rendered CSV document.
+  INVOICE_EXPORT_FORMAT_CSV = 2;
+}
+
+message ExportInvoicesRequest {
+  // Restrict to one account; 0 means every configured account.
+  int64 account_id = 1;
+  // Restrict to one message; 0 means every message.
+  int64 message_id = 2;
+  // Case-insensitive substring of the vendor.
+  string vendor = 3;
+  // Only invoices issued at or after this instant, Unix seconds. 0 means no
+  // lower bound.
+  int64 since = 4;
+  // Only invoices issued at or before this instant. 0 means no upper bound.
+  int64 until = 5;
+  // Page size; 0 means the daemon's default. Clamped to its ceiling.
+  int64 limit = 6;
+  InvoiceExportFormat format = 7;
+}
+
+message ExportInvoicesResponse {
+  repeated ExtractedInvoice invoices = 1;
+  // The rendered CSV, when `format` asked for it. Empty otherwise.
+  string csv = 2;
 }
 
 message ExtractTablesRequest {

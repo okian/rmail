@@ -40,8 +40,9 @@ use rmail_proto::v1::extract_service_server::ExtractService;
 use rmail_proto::v1::link_service_server::LinkService;
 use rmail_proto::v1::{
     ExtractEventsRequest, ExtractEventsResponse, ExtractLinksRequest, ExtractLinksResponse,
-    ExtractTasksRequest, ExtractTasksResponse, ExtractedEvent, ExtractedLink, ExtractedTask,
-    ExtractionSink, ExtractionSource, LinkClassifier, LinkKind, LinkSource,
+    ExtractStructuredRequest, ExtractStructuredResponse, ExtractTasksRequest, ExtractTasksResponse,
+    ExtractedEvent, ExtractedLink, ExtractedTask, ExtractionSink, ExtractionSource, LinkClassifier,
+    LinkKind, LinkSource,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -142,6 +143,58 @@ impl ExtractService for ExtractApi {
             delivered: count(delivery.delivered),
             already_delivered: count(delivery.skipped),
             sink_output: delivery.output,
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(schema, cached))]
+    async fn extract_structured(
+        &self,
+        request: Request<ExtractStructuredRequest>,
+    ) -> Result<Response<ExtractStructuredResponse>, Status> {
+        let cancel = self.shutdown.child_token();
+        let request = request.into_inner();
+        let message_id = validate_id(request.message_id)?;
+
+        // A caller-supplied schema is parsed here rather than in the engine so
+        // "that is not JSON" answers INVALID_ARGUMENT — it is the caller's own
+        // input — where a schema-shaped-but-unenforceable one is the engine's
+        // judgement to make.
+        let custom = {
+            let text = request.schema_json.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(serde_json::from_str(text).map_err(|e| {
+                    Status::from(Error::invalid_argument(format!(
+                        "schema_json is not valid JSON: {e}"
+                    )))
+                })?)
+            }
+        };
+        let report = self
+            .engine
+            .structured(
+                message_id,
+                &request.schema,
+                custom,
+                request.refresh,
+                &cancel,
+            )
+            .await
+            .map_err(Status::from)?;
+
+        let span = tracing::Span::current();
+        span.record("schema", report.extraction.schema_name.as_str());
+        span.record("cached", report.cached);
+        Ok(Response::new(ExtractStructuredResponse {
+            extraction_id: report.extraction.extraction_id,
+            message_id: report.extraction.message_id,
+            schema: report.extraction.schema_name,
+            schema_hash: report.extraction.schema_hash,
+            data: report.extraction.data,
+            model: report.extraction.model,
+            created_at: report.extraction.created_at,
+            cached: report.cached,
         }))
     }
 }

@@ -49,6 +49,75 @@ service ExtractService {
   // body). Same routes, same sinks, same idempotency — under its own `kind`,
   // so extracting the events of a message does not suppress its tasks.
   rpc ExtractTasks(ExtractTasksRequest) returns (ExtractTasksResponse);
+
+  // Read one message against a JSON schema and store the validated result
+  // (prd.md feature 4).
+  //
+  // # Why this lives here and not on MailService
+  //
+  // prd.md #4 sketches `MailService.ExtractStructured`, written before this
+  // service existed. ExtractService is the extraction surface — the same
+  // engine, the same bounds, the same model fencing, the same message-level
+  // scope — and MailService is list/get/move/flags. The capability is the one
+  // the PRD asks for; only its address moved.
+  //
+  // # Validated means validated here
+  //
+  // The provider is asked for a schema-constrained answer, and the daemon
+  // re-checks the answer against the same schema before storing it. A schema
+  // the provider enforced is a schema this daemon took somebody else's word
+  // for; a provider bug, a provider swap or a truncated response all land in
+  // the same place — INTERNAL, and nothing stored.
+  //
+  // # There is no deterministic route
+  //
+  // The caller chose the shape at call time, so there is nothing to be
+  // deterministic about. That is why this RPC requires `ai.invoke` where
+  // AttachmentService.ExtractInvoice does not: a model is the whole
+  // mechanism, not a refinement, and a daemon with no provider answers
+  // FAILED_PRECONDITION rather than an empty document.
+  //
+  // INVALID_ARGUMENT for an unknown schema name, or for a supplied schema
+  // that is too large, nests too deep, declares too many properties, or uses
+  // a keyword this build does not enforce — a schema that appears to
+  // constrain and does not is worse than no schema at all.
+  rpc ExtractStructured(ExtractStructuredRequest) returns (ExtractStructuredResponse);
+}
+
+message ExtractStructuredRequest {
+  int64 message_id = 1;
+  // A built-in schema's name (`invoice`, `receipt`, `flight`, `meeting`,
+  // `order`). Ignored when `schema_json` is set.
+  string schema = 2;
+  // A JSON Schema of the caller's own, serialized. Bounded and admitted by
+  // the daemon before use; the root must be {"type": "object"}.
+  string schema_json = 3;
+  // Re-run a message already extracted under this exact schema. Without it
+  // the stored document is returned and no tokens are spent.
+  bool refresh = 4;
+}
+
+message ExtractStructuredResponse {
+  int64 extraction_id = 1;
+  int64 message_id = 2;
+  // The built-in's name, or `custom`.
+  string schema = 3;
+  // SHA-256 of the schema, hex. Part of the storage key, so re-extracting
+  // with a changed custom schema stores a second document rather than
+  // silently overwriting one that was valid for a different shape.
+  string schema_hash = 4;
+  // The validated document, serialized JSON.
+  string data = 5;
+  // The model this daemon was *configured* to extract with. Not necessarily
+  // the one that answered: the budget enforcer may downgrade a request under a
+  // soft cap, and AuditService's ledger is the authority for what actually
+  // ran. Claiming otherwise here would be a plausible-looking wrong answer.
+  string model = 6;
+  int64 created_at = 7;
+  // Whether this call read an existing extraction rather than paying for a
+  // new one. Surfaced rather than hidden: a caller that wanted a fresh
+  // reading needs to know it did not get one.
+  bool cached = 8;
 }
 
 // Which route produced an item.

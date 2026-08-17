@@ -29,10 +29,11 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use rmail_proto::v1::index_service_client::IndexServiceClient;
+use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::{
     IndexGcRequest, IndexKind as ProtoKind, IndexKindStatus, IndexProgress, IndexStatusRequest,
-    ListEntitiesRequest, RebuildRequest, ReindexMode, ReindexRequest, SetIndexPausedRequest,
-    VerifyIndexRequest,
+    ListEntitiesRequest, RebuildRequest, ReindexMode, ReindexRequest, SearchEntitiesRequest,
+    SetIndexPausedRequest, VerifyIndexRequest,
 };
 use tokio_stream::StreamExt;
 
@@ -118,11 +119,24 @@ pub enum IndexAction {
 #[derive(Debug, Args)]
 pub struct EntitiesArgs {
     /// Entity kind: email, phone, url, amount, date, tracking_no, order_id,
-    /// invoice_id, iban.
-    kind: String,
-    /// Only entities whose canonical form contains this, case-insensitively.
+    /// invoice_id, iban. Required for a listing; with `--search` it narrows
+    /// the search to that kind instead.
+    kind: Option<String>,
+    /// Only entities whose canonical form contains this, case-insensitively
+    /// (listing only).
     #[arg(long)]
     value: Option<String>,
+    /// Search across kinds instead of listing one
+    /// (`SearchService.SearchEntities`), printing the mail behind each hit.
+    ///
+    /// The listing is index maintenance — "what did the extractor produce for
+    /// this kind". This is the question a person actually has: "where does
+    /// this number turn up".
+    #[arg(long)]
+    search: Option<String>,
+    /// Restrict a search to one account.
+    #[arg(long)]
+    account: Option<i64>,
     /// Page size.
     #[arg(long, default_value_t = 50)]
     limit: i64,
@@ -472,16 +486,23 @@ async fn gc(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `mail entities <kind>`.
+/// `mail entities <kind>`, or `mail entities --search <text>`.
 ///
 /// # Errors
 ///
-/// A connection or RPC failure; an unknown kind is rejected by the daemon.
+/// A connection or RPC failure; a missing kind on a listing; an unknown kind
+/// is rejected by the daemon.
 pub async fn entities(socket: &Path, args: EntitiesArgs) -> Result<()> {
+    if let Some(query) = args.search.clone() {
+        return search_entities(socket, &query, &args).await;
+    }
+    let Some(kind) = args.kind.clone() else {
+        anyhow::bail!("name a kind to list, or pass --search <text> to search across kinds");
+    };
     let response = client(socket)
         .await?
         .list_entities(ListEntitiesRequest {
-            kind: args.kind,
+            kind,
             value: args.value,
             limit: args.limit,
         })
@@ -498,6 +519,49 @@ pub async fn entities(socket: &Path, args: EntitiesArgs) -> Result<()> {
             "{:<8} {:<40} {:>5} mentions in {:>5} messages",
             entity.entity_id, entity.norm, entity.mentions, entity.messages
         );
+    }
+    Ok(())
+}
+
+/// The `--search` half of `mail entities`.
+async fn search_entities(socket: &Path, query: &str, args: &EntitiesArgs) -> Result<()> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let response = SearchServiceClient::new(channel)
+        .search_entities(SearchEntitiesRequest {
+            query: query.to_owned(),
+            kinds: args.kind.clone().into_iter().collect(),
+            account_id: args.account.unwrap_or_default(),
+            since: 0,
+            limit: args.limit,
+        })
+        .await
+        .context("SearchEntities RPC failed")?
+        .into_inner();
+
+    if response.hits.is_empty() {
+        println!("no entities matched");
+        return Ok(());
+    }
+    for hit in response.hits {
+        println!(
+            "{:<8} {:<12} {:<40} {:>4} messages",
+            hit.entity_id, hit.kind, hit.norm, hit.messages
+        );
+        // The mail behind the hit is the whole reason this is a search and not
+        // a listing, so it is printed rather than hidden behind a flag.
+        for example in hit.examples {
+            println!(
+                "         {:<10} {}",
+                example.message_id,
+                if example.subject.is_empty() {
+                    "(no subject)"
+                } else {
+                    &example.subject
+                }
+            );
+        }
     }
     Ok(())
 }

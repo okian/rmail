@@ -152,6 +152,7 @@ use rmail_core::feedback::{
     Action as FeedbackActionRecord, ActionKind, FeedbackStore, Impression, QueryRecord,
 };
 use rmail_core::fuse::{FusedCandidate, Fuser};
+use rmail_core::index::entities::{self, EntityHit, EntityKind, EntityQuery};
 use rmail_core::index::fts::FtsIndex;
 use rmail_core::index::semantic::SemanticIndex;
 use rmail_core::present::{PresentedResult, Presenter};
@@ -163,14 +164,16 @@ use rmail_core::retrieve::{Candidate, DenseRetriever, Fanout, Source};
 use rmail_core::{present, repo, Database, Error as RmailError};
 use rmail_proto::v1::search_service_server::SearchService;
 use rmail_proto::v1::{
-    ByteRange as ProtoByteRange, CompileQueryRequest, EvalMetrics as ProtoEvalMetrics,
+    ByteRange as ProtoByteRange, CompileQueryRequest, EntityHit as ProtoEntityHit,
+    EntityMention as ProtoEntityMention, EvalMetrics as ProtoEvalMetrics,
     EvalReport as ProtoEvalReport, EvaluateRequest, ExplainRequest,
     FeatureContribution as ProtoFeatureContribution, FeedbackAction as ProtoFeedbackAction,
     FeedbackRequest, Intent as ProtoIntent, Message as ProtoMessage, Mode as ProtoMode,
     QueryEval as ProtoQueryEval, QueryPlan as ProtoQueryPlan,
     RankExplanation as ProtoRankExplanation, Rerank as ProtoRerank,
     ResultAction as ProtoResultAction, SearchAttachmentsRequest, SearchAttachmentsResponse,
-    SearchHit as ProtoSearchHit, SearchRequest, Snippet as ProtoSnippet,
+    SearchEntitiesRequest, SearchEntitiesResponse, SearchHit as ProtoSearchHit, SearchRequest,
+    Snippet as ProtoSnippet,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -473,6 +476,32 @@ pub(crate) fn to_proto_query_plan(compiled: &rmail_core::query::CompiledQuery) -
         cached: compiled.cached,
         model: compiled.model.clone(),
         compiled_at: compiled.compiled_at,
+    }
+}
+
+/// One core [`rmail_core::index::entities::EntityHit`] on the wire.
+fn to_proto_entity_hit(hit: &EntityHit) -> ProtoEntityHit {
+    ProtoEntityHit {
+        entity_id: hit.entity_id,
+        kind: hit.kind.as_str().to_owned(),
+        value: hit.value.clone(),
+        norm: hit.norm.clone(),
+        meta: hit.meta.clone().unwrap_or_default(),
+        mentions: hit.mentions,
+        messages: hit.messages,
+        last_seen: hit.last_seen.unwrap_or_default(),
+        examples: hit
+            .examples
+            .iter()
+            .map(|example| ProtoEntityMention {
+                message_id: example.message_id,
+                subject: example.subject.clone(),
+                date: example.date.unwrap_or_default(),
+                part: example.part.clone(),
+                span_start: example.span_start,
+                span_end: example.span_end,
+            })
+            .collect(),
     }
 }
 
@@ -1768,6 +1797,47 @@ impl SearchService for SearchApi {
         }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(account_id, hits))]
+    async fn search_entities(
+        &self,
+        request: Request<SearchEntitiesRequest>,
+    ) -> Result<Response<SearchEntitiesResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("account_id", req.account_id);
+        if req.account_id < 0 {
+            return Err(Status::from(RmailError::invalid_argument(
+                "account_id must be a positive account id or 0 for every one",
+            )));
+        }
+        // A kind this build does not know is INVALID_ARGUMENT rather than an
+        // empty page, the same call `IndexService.ListEntities` makes: a
+        // typo'd kind and a kind with no entities are very different answers.
+        let mut kinds = Vec::with_capacity(req.kinds.len());
+        for kind in &req.kinds {
+            kinds.push(EntityKind::parse(kind.trim()).map_err(|_| {
+                Status::from(RmailError::invalid_argument(format!(
+                    "unknown entity kind {kind:?}"
+                )))
+            })?);
+        }
+        let hits = entities::search(
+            &self.db,
+            &EntityQuery {
+                text: req.query,
+                kinds,
+                account_id: (req.account_id > 0).then_some(req.account_id),
+                since: (req.since > 0).then_some(req.since),
+                limit: req.limit,
+            },
+        )
+        .await
+        .map_err(Status::from)?;
+        tracing::Span::current().record("hits", hits.len());
+        Ok(Response::new(SearchEntitiesResponse {
+            hits: hits.iter().map(to_proto_entity_hit).collect(),
+        }))
+    }
+
     async fn explain(
         &self,
         request: Request<ExplainRequest>,
@@ -2208,6 +2278,11 @@ mod tests {
             // the machine is the sentence the caller just typed, never
             // anything the daemon observed about past searches.
             "CompileQuery",
+            // Task 73. Reads `entities`/`entity_mentions` joined to
+            // `messages`; it names none of `search_log`, `search_impression`
+            // or `search_action`, so the feedback log stays unreadable over
+            // the wire. It reaches no provider either.
+            "SearchEntities",
         ];
 
         let set = prost_types::FileDescriptorSet::decode(rmail_proto::FILE_DESCRIPTOR_SET)

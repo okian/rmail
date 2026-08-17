@@ -292,7 +292,15 @@ enum Command {
         #[command(subcommand)]
         action: extract_cli::AttachAction,
     },
-    /// Calendar events and tasks out of a message and any .ics it carries
+    /// Invoices and receipts already extracted, newest first
+    /// (`AttachmentService.ExportInvoices`).
+    ///
+    /// A read over the stored table: it extracts nothing and calls no model,
+    /// so it lists only what `mail attach invoice` has already read.
+    /// `--export csv` writes an RFC 4180 document on stdout whose
+    /// `inferred_fields` column names every field on the row a model inferred.
+    Invoices(extract_cli::InvoicesArgs),
+    /// Calendar events, tasks, and schema-shaped data out of a message
     /// (`ExtractService`). Delivery is idempotent per message: running this
     /// twice does not create the reminder twice.
     Extract {
@@ -700,12 +708,15 @@ async fn main() -> Result<()> {
         Command::Note { action } => note_cli::dispatch(&socket, action).await,
         Command::Notes(args) => note_cli::list(&socket, args).await,
         Command::Export(args) => export_cli::export(&socket, args).await,
-        Command::Attach {
-            action: extract_cli::AttachAction::Tables(args),
-        } => extract_cli::tables(&socket, args).await,
+        Command::Attach { action } => match action {
+            extract_cli::AttachAction::Tables(args) => extract_cli::tables(&socket, args).await,
+            extract_cli::AttachAction::Invoice(args) => extract_cli::invoice(&socket, args).await,
+        },
+        Command::Invoices(args) => extract_cli::invoices(&socket, args).await,
         Command::Extract { action } => match action {
             extract_cli::ExtractAction::Events(args) => extract_cli::events(&socket, args).await,
             extract_cli::ExtractAction::Tasks(args) => extract_cli::tasks(&socket, args).await,
+            extract_cli::ExtractAction::Data(args) => extract_cli::structured(&socket, args).await,
         },
         Command::Links(args) => extract_cli::links(&socket, args).await,
         Command::Hook { action } => hook_cli::run(&socket, action).await,

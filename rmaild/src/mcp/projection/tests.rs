@@ -141,7 +141,22 @@ fn read_only_hint_is_exactly_effect_read() {
 /// rather than restating it: task 54's default listing must contain exactly
 /// these, and its `--read-only` listing exactly none of them. A second copy of
 /// this list is how the two would drift.
-pub(crate) const MUTATIONS_A_READ_TOKEN_REACHES: &[&str] = &["log_search_feedback"];
+pub(crate) const MUTATIONS_A_READ_TOKEN_REACHES: &[&str] =
+    &["extract_invoice", "log_search_feedback"];
+
+// `extract_invoice` (task 73) is `Effect::Mutate` and sits at `mail.read`
+// alone, deliberately, on the same argument `log_search_feedback` rests on: it
+// changes nothing a `mail.read` token could not already obtain. What it writes
+// is *this daemon's reading of a message the caller may already read*, into a
+// table only this feature owns — no mailbox, no message, no flag, no
+// configuration and nothing outside the process is touched, and re-running it
+// replaces the row rather than accumulating. It is `Mutate` because a later
+// `list_invoices` sees the effect, which is the line `parity::Effect` draws;
+// it is not `mail.write`, because `mail.write` is the authority to alter mail.
+//
+// The model half is gated separately and does not reach here: `use_model`
+// hands the request to `ai::gate`, which resolves `ai.policy` and both spend
+// caps before anything is assembled.
 
 /// The acceptance's "mutating tools gated by capability-token scope".
 ///

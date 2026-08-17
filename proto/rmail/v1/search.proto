@@ -141,6 +141,90 @@ service SearchService {
   // becomes correct earlier, so streaming would buy a cancellation contract
   // and a generation slot for no latency at all.
   rpc SearchAttachments (SearchAttachmentsRequest) returns (SearchAttachmentsResponse);
+
+  // Search the extracted entity graph — amounts, dates, invoice and order
+  // references, tracking numbers, IBANs, addresses, phones, URLs — and return
+  // the mail behind each hit (prd.md feature 4).
+  //
+  // # How this differs from IndexService.ListEntities
+  //
+  // ListEntities is an index-maintenance read: one kind, required, listed, so
+  // an operator can see what the extractor produced. This is a search — free
+  // text across kinds, scoped to an account and a time window, ranked by how
+  // much of the mailbox stands behind each hit, and it carries a bounded
+  // sample of the messages back with it. That is what makes "the invoice
+  // number that keeps turning up in three threads" a question with an answer.
+  //
+  // Nothing here runs an extractor or calls a model: it reads what the
+  // entities index stage already wrote, so a mailbox whose entity stage is
+  // disabled answers with no hits rather than with an error.
+  //
+  // INVALID_ARGUMENT for a query longer than the daemon's ceiling, or for a
+  // kind string no version of this code writes — a typo'd kind and a kind
+  // with no entities are very different answers.
+  rpc SearchEntities (SearchEntitiesRequest) returns (SearchEntitiesResponse);
+}
+
+message SearchEntitiesRequest {
+  // Free text, matched case-insensitively against both an entity's canonical
+  // form and the text as written. Empty lists everything in scope, ranked.
+  // `%` and `_` are matched literally, not as wildcards.
+  string query = 1;
+  // Restrict to these kinds: email | phone | url | amount | date |
+  // tracking_no | order_id | invoice_id | iban. Empty means every kind.
+  // (`entities.kind` also admits person/org/address, which no extractor in
+  // this build writes; naming one is INVALID_ARGUMENT, not an empty page.)
+  repeated string kinds = 2;
+  // Restrict to one account; 0 means every configured account.
+  int64 account_id = 3;
+  // Only entities mentioned by mail at or after this instant, Unix seconds.
+  // 0 means no lower bound.
+  int64 since = 4;
+  // Page size; 0 means the daemon's default. Clamped to its ceiling.
+  int64 limit = 5;
+}
+
+// One message that mentions an entity, enough to place the hit without a
+// second round trip.
+message EntityMention {
+  int64 message_id = 1;
+  string subject = 2;
+  // Unix seconds; 0 when the message carries no date.
+  int64 date = 3;
+  // Which `index_content` part the mention was found in.
+  string part = 4;
+  // Byte offsets into that part's normalized text, for highlighting.
+  int64 span_start = 5;
+  int64 span_end = 6;
+}
+
+message EntityHit {
+  int64 entity_id = 1;
+  string kind = 2;
+  // As written, for display.
+  string value = 3;
+  // The canonical form — the identity `UNIQUE(kind, norm)` keys on, so
+  // `Ada@Example.COM` and `ada@example.com` are one hit.
+  string norm = 4;
+  // Kind-specific detail as JSON: the currency and minor units of an amount,
+  // the carrier of a tracking number.
+  string meta = 5;
+  // Mentions across every message in scope.
+  int64 mentions = 6;
+  // Distinct messages in scope that mention it.
+  int64 messages = 7;
+  // The most recent of those messages, Unix seconds; 0 when none carried a
+  // date.
+  int64 last_seen = 8;
+  // A bounded sample of those messages, most recent first. Bounded because
+  // the point of an example is to place a hit, not to re-implement search:
+  // returning every mention of a URL that appears in nine hundred
+  // newsletters would make the response a function of the mailbox.
+  repeated EntityMention examples = 9;
+}
+
+message SearchEntitiesResponse {
+  repeated EntityHit hits = 1;
 }
 
 message CompileQueryRequest {
