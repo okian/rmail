@@ -158,6 +158,30 @@ mail-parser = "0.9"
 # transitive dependency, so this only promotes it to a direct one.
 base64 = "0.22"
 html2text = "0.12"
+# OpenPGP for the auto-encrypt path (`rmail-core::crypto`): parsing discovered
+# transferable public keys, and PGP/MIME encryption of outbound mail.
+#
+# rPGP rather than `sequoia-openpgp` because it is pure Rust. Sequoia's default
+# backend is Nettle, which needs a C toolchain plus `pkg-config` at build time
+# — a host dependency the `scripts/docker-test.sh` image does not carry and
+# which would make the gate's build depend on the developer's machine.
+#
+# `default-features = false` drops the `bzip2` default, which is a C library
+# for a compression algorithm essentially unused in OpenPGP messages; zlib and
+# zip stay available, and rPGP treats an unsupported algorithm on a *received*
+# key as a parse error rather than a panic. `getrandom` for the OS RNG that
+# session keys are drawn from — encryption cannot be correct without it.
+#
+# NOTE: this brings `rsa` and RUSTSEC-2023-0071 into the tree. See `deny.toml`
+# for why the advisory does not apply to how this crate is used, and for the
+# condition under which that stops being true.
+pgp = { version = "0.20", default-features = false, features = ["getrandom"] }
+# The CSPRNG rPGP's encryption API takes by reference. Pinned to 0.8 because
+# that is the major rPGP's public signatures are written against — a 0.9 `Rng`
+# here would not satisfy `encrypt_to_key`'s bound, and the mismatch surfaces as
+# an inscrutable trait error rather than a version conflict. Already in the
+# tree via rPGP; this promotes it to a direct dependency.
+rand = "0.8"
 # Attachment text extraction. `pdf-extract` carries ~100 panicking call sites,
 # so it is always driven from an isolated task whose panic is caught — a
 # malformed PDF is a thing a mailbox receives, not an exceptional event.
@@ -183,6 +207,13 @@ fastembed = { version = "5", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
 ] }
 sha2 = "0.10"
+# Web Key Directory (`rmail-core::crypto::discover::wkd`) hashes the local part
+# of an address with SHA-1 and z-base-32s the result to form the lookup path.
+# That is not a security use and the choice is not ours: the algorithm is fixed
+# by the WKD draft, and computing anything else produces a URL no WKD server
+# will answer. Already in the tree via rPGP; this promotes it to a direct
+# dependency so the call site is not reaching through another crate's exports.
+sha1 = "0.10"
 # Capability-token secret hashing (task 38). `std` for the OS RNG the CLI/admin
 # service uses to mint tokens; default features otherwise (password-hash+rand).
 argon2 = { version = "0.5", features = ["std"] }

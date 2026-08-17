@@ -17,6 +17,11 @@
 #   scripts/docker-test.sh -- <cmd>...           # run an arbitrary command instead
 #   scripts/docker-test.sh --clean               # drop the cache volumes and the image
 #
+# Env:
+#   RMAIL_TEST_JOBS  cargo build jobs inside the container (default 3). Bounded
+#                    by the daemon's memory, not its cores -- see the comment
+#                    above `JOBS` below before raising it.
+#
 # Exit code is the test command's own, so this drops into any gate unchanged.
 set -uo pipefail
 
@@ -117,10 +122,34 @@ name="rmail-test-$$-${RANDOM}"
 cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
 trap cleanup EXIT INT TERM
 
+# ---------------------------------------------------------------------------
+# Build parallelism is bounded by memory here, not by cores
+#
+# Every integration test in this workspace links the entire dependency tree
+# statically -- ~250 rlibs each, and since the OpenPGP work (`rmail-core::crypto`)
+# that includes rPGP's crypto tree as well: rsa, the curve25519/p256/p384/p521
+# stack, and their bigint backends. A single `cc` invocation for one of those
+# binaries peaks in the low gigabytes.
+#
+# Cargo defaults to one build job per CPU. On this daemon that is 8 jobs against
+# a VM with far less than 8x that peak, and the result is the Linux OOM killer
+# taking out `ld` -- which surfaces as `collect2: fatal error: ld terminated
+# with signal 9` and `rustc ... (signal: 9, SIGKILL: kill)`. Neither message
+# says "out of memory", which is what makes this worth a comment rather than a
+# number: the failure reads like a broken toolchain, and the last person to hit
+# it went looking for a linker bug.
+#
+# 3 is chosen to fit the default Docker Desktop allocation (~12GB) with room for
+# the test processes themselves. Raise it with RMAIL_TEST_JOBS on a machine with
+# more memory given to the daemon; the setting only bounds *build* concurrency,
+# so test execution parallelism is unaffected.
+JOBS="${RMAIL_TEST_JOBS:-3}"
+
 run_args=(
   --rm
   --init
   --name "$name"
+  -e "CARGO_BUILD_JOBS=$JOBS"
   -v "$repo_root:/w"
   -v "$VOL_REGISTRY:/usr/local/cargo/registry"
   -v "$VOL_GIT:/usr/local/cargo/git"

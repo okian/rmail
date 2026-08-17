@@ -376,6 +376,27 @@ fn every_network_capable_client_is_built_in_a_listed_file() {
              carrying message metadata and excerpts. Not a model; configured \
              per webhook, off by default.",
         ),
+        (
+            "rmail-core/src/crypto/discover.rs",
+            "",
+            "OpenPGP key discovery: Web Key Directory at the recipient's own \
+             domain, then any configured keyservers. Carries a recipient's \
+             *address* and nothing else — no subject, no body, no excerpt, and \
+             no model on the other end. \
+             \
+             Ungated, on the same reading as the `autoconfig` and `oauth` rows: \
+             the local-only claim is scoped to AI generation, and this is \
+             neither AI nor generation. It is still real metadata egress, and a \
+             worse kind than autoconfig's — a keyserver query discloses *who \
+             the user is about to email*, which is the contact graph rather \
+             than a domain they typed into a setup screen. What bounds it is \
+             configuration, not a runtime guard: `crypto.keyservers` ships \
+             empty, so no third-party server is contacted until someone adds \
+             one, and the chain runs every non-disclosing source (Autocrypt \
+             from local mail, then WKD to the recipient's own domain, which is \
+             about to receive the message anyway) to exhaustion first, stopping \
+             at the first hit. See `crypto::discover`'s module docs.",
+        ),
     ];
 
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

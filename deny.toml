@@ -54,6 +54,30 @@ ignore = [
     # written against. That is a deliberate upgrade with its own test pass,
     # not a lockfile bump. Revisit with the next `tonic` major.
     { id = "RUSTSEC-2025-0134", reason = "unmaintained PEM parser pulled in transitively by tonic 0.12; no direct dependency to move, successor requires a tonic major upgrade" },
+    # `rsa` 0.9, reached through `pgp` (rPGP), the OpenPGP implementation
+    # behind `rmail-core::crypto`'s auto-encrypt path.
+    #
+    # This is the only *vulnerability* in this list — the others are
+    # unmaintained-crate and unsoundness findings. It is kept anyway, and the
+    # reason is narrower than "no fix is available" (though none is: the
+    # advisory has had no patched release since 2023, and RSA cannot be
+    # feature-flagged out of an OpenPGP implementation that has to interoperate
+    # with existing keys).
+    #
+    # The Marvin attack is a timing sidechannel in RSA *private-key*
+    # operations: an attacker who can submit chosen ciphertexts and measure
+    # decryption time can recover the key. `crypto::encrypt` performs public-key
+    # operations only — it encrypts a session key to a recipient's discovered
+    # public key. There is no private-key RSA operation anywhere in this
+    # workspace, so there is no decryption oracle to time.
+    #
+    # THIS STOPS BEING TRUE THE MOMENT DECRYPTION OF INCOMING MAIL LANDS. That
+    # feature makes the daemon perform RSA private-key operations on
+    # attacker-supplied ciphertext, which is precisely the threat model above.
+    # Whoever implements it must re-evaluate this entry rather than inherit it
+    # — check for a patched `rsa`, and if there is none, treat the timing
+    # exposure as a design constraint on where decryption runs.
+    { id = "RUSTSEC-2023-0071", reason = "RSA timing sidechannel in private-key ops, reached via rPGP; this workspace performs public-key (encrypt-to-recipient) operations only, so no decryption oracle exists. MUST be re-evaluated if incoming-mail decryption is added." },
     # Two unsoundness findings in `lru` 0.12.5, reached only through
     # `ratatui` 0.29's internal widget cache. Neither is a vulnerability:
     # RUSTSEC-2026-0253 needs a panic *inside* `LruCache::pop()` to reach a

@@ -16,6 +16,7 @@ pub mod cache;
 pub mod compose;
 pub mod config;
 pub mod credential;
+pub mod crypto;
 pub mod digest;
 pub mod embed;
 pub mod error;

@@ -42,7 +42,7 @@ pub use duration::{parse_human_duration, HumanDuration};
 /// missing: it had been unreachable from the environment since it landed.
 const KNOWN_TABLES: &[&str] = &[
     "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc",
-    "hooks", "webhooks", "rules", "notify", "digest", "extract", "agent",
+    "hooks", "webhooks", "rules", "notify", "digest", "extract", "agent", "crypto",
 ];
 
 /// Errors produced while loading or parsing configuration.
@@ -351,6 +351,8 @@ pub struct Config {
     pub extract: ExtractConfig,
     /// Autonomous inbox-agent settings.
     pub agent: AgentConfig,
+    /// OpenPGP auto-encryption and key-discovery settings.
+    pub crypto: CryptoConfig,
 }
 
 impl Config {
@@ -3395,6 +3397,173 @@ const fn mins(n: u64) -> std::time::Duration {
 }
 const fn days(n: u64) -> std::time::Duration {
     std::time::Duration::from_secs(n * 86_400)
+}
+
+// ---------------------------------------------------------------------------
+// Crypto
+// ---------------------------------------------------------------------------
+
+/// What to do about encryption when a draft's recipients are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptPolicy {
+    /// Encrypt when every recipient has a usable key; send in the clear
+    /// otherwise. The default, and the only value that never blocks a send.
+    #[default]
+    Auto,
+    /// Refuse to send unless every recipient has a usable key.
+    ///
+    /// Not a stricter `Auto` — a different promise. `Auto` guarantees the mail
+    /// goes; `Always` guarantees it is never readable in transit, and accepts
+    /// a failed send as the price. Anyone who needs the second cannot be given
+    /// the first with a warning attached, because a warning is something you
+    /// can miss at 2am.
+    Always,
+    /// Never encrypt, whatever discovery finds.
+    Never,
+}
+
+/// How a keyserver is reached, and what trusting it implies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyserverKind {
+    /// A server operated by someone else, queried over the public internet.
+    ///
+    /// Querying one *tells it who you are about to email*. That is the entire
+    /// reason this enum exists: the discovery order in
+    /// [`crate::crypto::discover`] runs every private source to exhaustion
+    /// before any server marked `public`, so the contact graph only leaves the
+    /// machine for addresses nothing local could answer for.
+    #[default]
+    Public,
+    /// A server the user or their organization runs. Queried before any
+    /// public one, and not subject to the public-source suppression.
+    Private,
+}
+
+/// One keyserver in the discovery chain.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyserverConfig {
+    /// Short name, used in logs and stored in `pgp_keys.source` so an
+    /// operator can see which server answered for a given address.
+    pub name: String,
+    /// Base URL of an HKP(S) endpoint, e.g. `https://keys.example.com`.
+    pub url: String,
+    /// Public or private. See [`KeyserverKind`].
+    #[serde(default)]
+    pub kind: KeyserverKind,
+    /// Optional bearer token for a private server behind auth.
+    ///
+    /// Names an environment variable rather than holding the secret: the
+    /// config file is committed, quoted in bug reports, and printed by
+    /// `mail config show`. Same rule as `AccountConfig::password_env`.
+    #[serde(default)]
+    pub token_env: Option<String>,
+}
+
+/// OpenPGP auto-encryption and key discovery.
+///
+/// # The shape of the feature, in one paragraph
+///
+/// When a draft's recipient list changes, the daemon asks — in the background,
+/// never on the compose path's critical section — whether each address has a
+/// usable public key. Answers are cached for [`CryptoConfig::key_ttl`] or
+/// until the key expires, whichever is sooner; *non*-answers are cached too,
+/// for [`CryptoConfig::negative_ttl`], because most addresses have no key and
+/// re-asking the world about them on every draft is both slow and a contact-
+/// graph leak. The compose UI then shows whether the message would be
+/// encrypted, and the send path acts on it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CryptoConfig {
+    /// Master switch. When `true`, drafts to recipients with known keys are
+    /// encrypted without anyone asking for it.
+    ///
+    /// Defaults to `true`: the case for opportunistic encryption is that it
+    /// only helps when it is on by default, and the failure mode of this
+    /// default is a message the recipient can read anyway (see
+    /// [`EncryptPolicy::Auto`] — no key means plaintext, not a blocked send).
+    pub auto_encrypt: bool,
+    /// The default policy for addresses with no `pgp_overrides` row.
+    pub policy: EncryptPolicy,
+    /// How long a *successful* discovery is trusted before revalidation.
+    ///
+    /// Capped by the key's own expiry on write, so this is an upper bound
+    /// rather than the effective lifetime; see `V55__pgp_keys.sql`.
+    pub key_ttl: HumanDuration,
+    /// How long "this address has no key" suppresses further lookups.
+    ///
+    /// The knob behind "if found none, don't search for a month". Lowering it
+    /// makes rmail notice a newly-published key sooner at the cost of
+    /// re-querying every keyless correspondent that much more often.
+    pub negative_ttl: HumanDuration,
+    /// Whole-budget timeout for one address's discovery, across every source.
+    ///
+    /// Bounds the chain, not each hop: three sources at ten seconds each is a
+    /// half-minute of background work for an address that will most likely
+    /// turn out to have no key at all.
+    pub discovery_timeout: HumanDuration,
+    /// Harvest keys from `Autocrypt:` headers on mail already in the mailbox.
+    ///
+    /// First in the discovery order and by some distance the best source: it
+    /// costs no network call, leaks nothing, and the key arrived over the same
+    /// channel as the correspondence it belongs to.
+    pub autocrypt: bool,
+    /// Query Web Key Directory at the recipient's own domain.
+    ///
+    /// Second in the order. Still a network call, but only ever to the domain
+    /// in the address — which is about to receive the mail regardless, so it
+    /// learns nothing from the lookup.
+    pub wkd: bool,
+    /// Keyservers, tried after Autocrypt and WKD.
+    ///
+    /// Order within the list is preserved, but every [`KeyserverKind::Private`]
+    /// entry is tried before any [`KeyserverKind::Public`] one regardless of
+    /// position — a privacy property should not depend on how someone happened
+    /// to sort a TOML array.
+    pub keyservers: Vec<KeyserverConfig>,
+    /// Maximum accepted size of a fetched key, in bytes.
+    ///
+    /// Keyservers serve attacker-influenced bytes: anyone can upload a key
+    /// claiming any address. Without a ceiling, a single crafted upload with
+    /// tens of thousands of certifications is a memory-exhaustion vector
+    /// against the *background* task of a mail client that never asked for it.
+    pub max_key_bytes: u32,
+    /// Warn instead of silently switching when a known address presents a new
+    /// fingerprint.
+    ///
+    /// See `pgp_key_history` in `V55__pgp_keys.sql` for why this matters more
+    /// than it looks: it is the only defence against a substituted key, and it
+    /// works by refusing to be quiet rather than by detecting the attack.
+    pub warn_on_key_change: bool,
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        Self {
+            auto_encrypt: true,
+            policy: EncryptPolicy::Auto,
+            // A month, as specified. Long enough that a stable correspondent
+            // is one local lookup essentially forever; short enough that a
+            // rotated or revoked key is picked up without anyone intervening.
+            key_ttl: HumanDuration::new(days(30)),
+            negative_ttl: HumanDuration::new(days(30)),
+            discovery_timeout: HumanDuration::new(secs(20)),
+            autocrypt: true,
+            wkd: true,
+            // Empty rather than a baked-in `keys.openpgp.org`: a mail client
+            // should not ship a default that sends the user's contact graph
+            // to a third party before anyone has read the manual. `.env.example`
+            // carries the entry, commented, so turning it on is one uncomment
+            // and an informed choice.
+            keyservers: Vec::new(),
+            // 256 KiB. A normal key with a few subkeys and signatures is a
+            // few kilobytes; keys with heavy certification are tens.
+            max_key_bytes: 256 * 1024,
+            warn_on_key_change: true,
+        }
+    }
 }
 
 /// Expand a leading `~` or `~/` to `$HOME`. Other paths are returned unchanged.

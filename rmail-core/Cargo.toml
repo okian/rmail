@@ -50,6 +50,8 @@ futures.workspace = true
 mail-parser.workspace = true
 base64.workspace = true
 html2text.workspace = true
+pgp.workspace = true
+rand.workspace = true
 pdf-extract.workspace = true
 calamine.workspace = true
 zip.workspace = true
@@ -60,6 +62,7 @@ async-trait.workspace = true
 reqwest.workspace = true
 fastembed = { workspace = true, optional = true }
 sha2.workspace = true
+sha1.workspace = true
 argon2.workspace = true
 whatlang.workspace = true
 unicode-normalization.workspace = true

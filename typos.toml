@@ -99,3 +99,11 @@ iif = "iif"
 # unknown field is refused rather than silently dropped — correcting it would
 # make the request valid and delete the case.
 nam = "nam"
+
+# The leading fragment of `iy9q119eutrkn8s1mk4r39qejnbu3n5q`, which the
+# splitter cuts off and reads as a word. That string is the Web Key Directory
+# draft's own published test vector -- the z-base-32 of SHA-1("joe.doe") --
+# and `crypto::discover`'s test pins it. "Correcting" it would assert the
+# wrong hash, and the symptom would be every WKD lookup silently 404ing with
+# encryption quietly never engaging.
+iy = "iy"
