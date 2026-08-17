@@ -46,6 +46,31 @@ ignore = [
     # `pdf-extract` note in the root `Cargo.toml`), so a parsing bug here is
     # already contained by that boundary. Revisit when `lopdf` moves off it.
     { id = "RUSTSEC-2026-0192", reason = "unmaintained font-parsing crate pulled in transitively by lopdf (via pdf-extract); no replacement released upstream, parsing is already fault-isolated per attachment" },
+    # `rustls-pemfile` is unmaintained and reaches us only through `tonic`
+    # 0.12's TLS support. Unlike the two above there *is* a successor (the
+    # PEM parsing moved into `rustls-pki-types`), but nothing in this
+    # workspace depends on `rustls-pemfile` directly — moving off it means
+    # moving `tonic`, which is the transport every service in the build is
+    # written against. That is a deliberate upgrade with its own test pass,
+    # not a lockfile bump. Revisit with the next `tonic` major.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained PEM parser pulled in transitively by tonic 0.12; no direct dependency to move, successor requires a tonic major upgrade" },
+    # Two unsoundness findings in `lru` 0.12.5, reached only through
+    # `ratatui` 0.29's internal widget cache. Neither is a vulnerability:
+    # RUSTSEC-2026-0253 needs a panic *inside* `LruCache::pop()` to reach a
+    # use-after-free, and RUSTSEC-2026-0002 is a Stacked Borrows violation in
+    # `IterMut`. No rmail code calls `lru` at all.
+    #
+    # A fix exists and was tried: `ratatui` 0.30 moves to `lru` 0.18 and
+    # clears both. It was **deliberately not taken**, because it adds ~100
+    # transitive crates to a mail client — among them `mac_address`, `nix`
+    # and the `wezterm-*` tree. Trading two unreachable unsoundness warnings
+    # in a terminal widget's cache for a hardware-address reader and a
+    # hundred new supply-chain entries is a worse security posture, not a
+    # better one. Revisit if `ratatui` slims its default features, if either
+    # advisory is upgraded to a vulnerability, or if the TUI ever exercises
+    # `lru` through a panicking path.
+    { id = "RUSTSEC-2026-0253", reason = "unsound (not vulnerable) lru 0.12 via ratatui 0.29's internal cache; the ratatui 0.30 fix costs ~100 transitive crates including mac_address, judged the worse trade" },
+    { id = "RUSTSEC-2026-0002", reason = "unsound (not vulnerable) lru 0.12 via ratatui 0.29's internal cache; same trade as RUSTSEC-2026-0253" },
 ]
 
 # ---------------------------------------------------------------------------

@@ -111,6 +111,9 @@ esac
 # run it, and make sure nothing outlives this script
 # ---------------------------------------------------------------------------
 name="rmail-test-$$-${RANDOM}"
+# shellcheck disable=SC2329  # invoked by the `trap` below, which shellcheck
+# cannot see. Removing it because it "is never invoked" would leave a
+# container running after every interrupted run.
 cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
 trap cleanup EXIT INT TERM
 

@@ -94,3 +94,8 @@ whos = "whos"
 # SQLite's own ternary function, on `analytics::sql`'s allow-list. Renaming it
 # would remove a real function from the sandbox's vocabulary.
 iif = "iif"
+
+# Deliberately misspelled. `api_call`'s test sends `{"nam":...}` to prove an
+# unknown field is refused rather than silently dropped — correcting it would
+# make the request valid and delete the case.
+nam = "nam"
