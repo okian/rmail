@@ -6,16 +6,18 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**85 of 86 done, 1 remaining.** `tasks.md` is authoritative — count with
+**86 of 86 done. Feature-complete.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **4292/4292** on the full
+after merge, never on the agent's own report: currently **4362/4362** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: **42** (CLI structured output + generic call) — in flight, and the
-last unchecked task in the file. When it lands the build is feature-complete.
+Nothing remains in `tasks.md`. The full gate is green on
+`docs/tasks-breakdown`: fmt, clippy `-D warnings`, 4362/4362 in-container,
+`buf lint`, gitleaks, typos, shellcheck, `cargo deny`, `cargo audit`, and
+`cargo build --release`.
 
-Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75, 58, 68, 73, 72, 36, 78,
-69, 65. Every one verified on the
+Merged so far: every task. The last wave was 74, 71, 82, 79, 81, 70, 63, 57,
+80, 62, 75, 58, 68, 73, 72, 36, 78, 69, 65, 42. Every one verified on the
 *combined* tree, never on the agent's own count — the reports quoted a dozen
 different bases; the truth after merging all of them is 4292.
 
@@ -514,3 +516,38 @@ Do not silently re-run a failure like this. Re-run it, yes — but record that
 you did, and what the wall-clock difference was. The finder-index race
 earlier in this build looked exactly like a flake and was a real data-loss
 bug; the only way to tell them apart is to write down what was observed.
+
+## The supply-chain gate at the end, and one trade worth re-examining
+
+`cargo deny`/`cargo audit` were **red** when the last task landed — three
+transitive advisories, none a vulnerability. Two are now recorded exceptions
+with reasoning in both `deny.toml` and `.cargo/audit.toml` (the tools cannot
+read each other's config, so an id must be added to both or it goes silently
+unenforced by the one that still ignores it).
+
+**The `lru` one is a judgement call the owner may want to revisit.**
+`ratatui` 0.30 moves to `lru` 0.18 and clears both unsoundness advisories —
+it was tried, confirmed to work, and reverted, because it adds ~100
+transitive crates including `mac_address`, `nix` and the `wezterm-*` tree.
+For a mail client the dependency surface looked like the worse risk, but that
+is a preference, not a fact: someone who weights RUSTSEC cleanliness above
+dependency count should take the bump. It is a one-line change in the root
+`Cargo.toml` plus whatever the ratatui 0.29 -> 0.30 API delta costs the TUI.
+
+## What is deliberately not finished
+
+`tasks.md` is complete, but three things are known-partial and recorded at
+their task entries rather than implied to be done:
+
+- **Task 42**: `--format` is accepted on every verb and never falls through
+  to a table, but only 16 verbs *render* it; ~88 refuse with exit 12 naming
+  `mail api call`. Enforced by `every_cli_verb_declares_how_it_answers_format_json`,
+  which fails for a verb in neither list, so the gap cannot widen unnoticed.
+  `--tls-*` is implemented but not testable end to end — `rmaild` has no TCP
+  listener.
+- **Task 73**: its agent stopped during its own bite-check, so its fixes are
+  applied and green but its probe-strength claim is weaker than its
+  siblings'.
+- **Task 78**: local-only is structural for *configuration*, runtime for
+  *dispatch*. Four call sites still refuse local-only work rather than
+  serving it on-device.
