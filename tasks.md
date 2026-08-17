@@ -875,4 +875,195 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **acceptance:**
   - `cargo deny check` and `cargo audit` wired as the final CI gate; `buf breaking` runs against the committed baseline on proto changes; criterion perf benchmarks assert the key budgets (first search hit, full ranked search, fuzzy first batch); macOS release packaging script for `rmaild`+`mail`.
   - Deny/audit/breaking failures fail the build.
+
+---
+
+# PART V — TUI REIMAGINING (Neovim-style commands, WhichKey, settings, manual)
+
+Architecture proposal in full at the time these tasks were cut: see the session that produced them. Ground rules (do not weaken these; several tasks below exist specifically to extend them):
+
+- **One shared vocabulary.** The `:` command grammar *is* the existing `Action` id namespace — `.` and ` ` are the same separator (`message.archive` ≡ `:message archive`). No parallel command registry.
+- **`update` stays pure, synchronous, clockless.** WhichKey is a render-time function of existing state, not a new timer — see task 91's proof.
+- **`Model::mode()` stays derived, never stored.** New screens are new derivation arms.
+- **Modes are layers; overlay modes stop at `Global`.** A new `Settings` mode restates list bindings rather than inheriting `Normal`, exactly as `Menu`/`Pick` already do.
+- **Help stays generated from data, never hand-maintained.** WhichKey, the command index, and the manual's capability footers are all derived from the live `Keymap` and `parity::Command` registry; only manual *prose* is authored.
+- **Feature parity stays enforced.** Every new bindable `Action` must land in a `parity` capability row's `actions()` or in `LOCAL_ACTIONS` in the same commit, or `every_tui_action_is_a_capability_or_declared_local` fails by name.
+
+Known backend gaps this phase deliberately does **not** paper over (Settings shows these as blocked/config-file-only rather than pretending an RPC exists): free-text NL fallback on the command line (no `CommandService.ResolveIntent`), `:ai redact preview`/set-redaction-level (no RPC), `:ai policy explain` (library-only, not exposed), general bulk preview/apply/undo beyond tags (no `BulkService`), Prompt Library, Conversation Memory, Mute/Kill-file.
+
+## 87. TUI semantic theme module
+- [ ] status
+- **depends-on:** 85
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/theme.rs`: a `Theme` struct of semantic tokens (surfaces, text, semantics, mail, keys, daemon, AI-spend) and four built-ins (`dark`, `light`, `mono`, `high-contrast`); every `Style::default().fg(Color::…)` literal in `view.rs`/`overlays.rs` replaced with a token lookup.
+  - `dark` is behavior-preserving: a render test asserts byte-identical frames to today for the list, viewer, and each existing overlay. A lint test asserts no `Color::` literal remains outside `theme.rs`. `mono` carries every state by glyph or modifier alone (no color-only meaning), matching the existing unread/flagged/attachment glyph convention.
+- **verify:** `cargo nextest run -p rmail-cli tui::theme tui::view` (frame parity under `dark`, no stray `Color::` literals, `mono` glyph coverage)
+
+## 88. Command registry and parser (`rmail-core`)
+- [ ] status
+- **depends-on:** 84
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail_core::command`: a verb trie with per-verb positionals, long-only flags, an optional `parity::Command` capability, an optional `Action`, and pure `parse`/`complete`/`describe` functions covering ranges (`'<,'>`, `%`, `N`), a trailing bang, quoted arguments, and dot-or-space verb paths. Every existing `Action::id()` resolves as a verb with zero registry entries needed.
+  - Drift tests: every verb carrying a capability spells its path exactly as `parity::Command::cli()` does (modulo one declared `cli_alias` for `tag-rules`); no verb with a handler is a proper prefix of another; every capability with a declared TUI verb is reachable from the trie. Errors name the offending token, in `KeymapError`'s idiom.
+- **verify:** `cargo nextest run -p rmail-core command::` (parse/complete round-trip, range/bang/quoting, cli-path drift test, prefix-collision refusal)
+
+## 89. Command line overlay and dispatch
+- [ ] status
+- **depends-on:** 87, 88
+- **parallel-safe:** no
+- **acceptance:**
+  - `Action::CommandOpen` (id `"command"`) bound to `:` in Normal/Viewer/Visual/Menu; `Overlay::Command(Box<CommandPane>)` deriving `Mode::Prompt`; `run_command` dispatches a parsed `Invocation`, delegating straight to the existing `run_action` whenever the verb carries an `Action` and no arguments — the 39 existing behaviours keep exactly one implementation.
+  - `Overlay::Palette`/`PalettePane` deleted; `Action::PaletteOpen` re-points at the same command overlay (kept as a documented alias, since renaming an action id breaks a user's `keys.toml`); `palette_matches` generalized into the command completer, same 4-tier ranking.
+  - Parse errors render in red inside the command line without closing the overlay. Opening `:` while `Model::visual.is_some()` pre-fills `'<,'>`. History is an in-memory ring plus a `0600`, 500-entry file written via `keymap::file::write_atomic`, prefix-filtered on `<up>`/`<down>`, never recording `token`/`account login` lines or any line with a `--*secret*`/`--*password*` flag.
+- **verify:** `cargo nextest run -p rmail-cli tui::command` (dispatch delegates to `run_action`, palette alias still resolves, visual-range prefill, history redaction, parse-error-keeps-overlay-open)
+
+## 90. Generic Report overlay
+- [ ] status
+- **depends-on:** 89
+- **parallel-safe:** no
+- **acceptance:**
+  - `Overlay::Report(Box<ReportPane>)` in `Mode::Menu`: fixed-width columns, append-or-replace rows, the existing `generation` supersession discipline (matching `SearchPane`/`FinderPane`), `Cmd::CancelStream` fired on Esc for an in-flight stream, `r` re-runs the pane's own stored `Invocation`, and each row carries `on_enter: Option<Invocation>` gated by `parity::Command::effect()` so a mutating row asks for confirmation first.
+  - One overlay type serves line/table/stream results — no per-domain report screens.
+- **verify:** `cargo nextest run -p rmail-cli tui::report` (streamed report superseded mid-flight drops stale frames and cancels the stream, mutating row confirms, `r` re-issues the same invocation)
+
+## 91. WhichKey band
+- [ ] status
+- **depends-on:** 87, 89
+- **parallel-safe:** no
+- **acceptance:**
+  - `Keymap::continuations(mode, prefix) -> Vec<Continuation>` and `Keymap::shadowed_across_layers() -> Vec<(Mode,Chord,Chord)>` added to `rmail-core`. A bottom band renders whenever `!pending.keys().is_empty()` (never on a count-only pending) **or** the command overlay is open (showing completion candidates instead). Group labels are derived from the longest common dot-prefix of member action ids — no hand-maintained group table. `<esc>`/`<c-c>` are pinned in every band; a continuation killed by cross-layer shadowing renders struck-through with a warning.
+  - A proof test documents *why* zero delay is correct: for every mode and every bound prefix, `pending.keys()` is non-empty only after a `Keymap::lookup` on that prefix already returned `None` — so nothing pending could have fired on its own, and no timer is needed.
+- **verify:** `cargo nextest run -p rmail-core keymap::continuations` · `cargo nextest run -p rmail-cli tui::whichkey` (band key-set equals extendable-key set for every mode/prefix, count-only pending renders no band, shadow warning renders)
+
+## 92. Status bar and daemon heartbeat
+- [ ] status
+- **depends-on:** 87, 90
+- **parallel-safe:** no
+- **acceptance:**
+  - Status bar restructured into fixed-width zones: mode (all ten modes render, not three), account/folder/unread-total, message, a daemon indicator zone, inflight, pending.
+  - `Cmd::Heartbeat` fans out to `SyncService.Status`, `IndexService.Status`, `AiService.GetUsage`, and `AiPolicyService.GetSpend` every 5s **without incrementing `inflight`** (a heartbeat that blinked the busy marker forever would destroy the one signal it carries), superseded by `WatchEvents`/`WatchOutbox`/`StreamAlerts` where those already push. Each indicator carries a glyph as well as a color and names the `:` command that expands it into a Report.
+- **verify:** `cargo nextest run -p rmail-cli tui::status` (all ten mode labels render, heartbeat never touches `inflight`, indicator glyph/color pairs for each daemon state, push events preempt polling)
+
+## 93. Responsive layout and toast queue
+- [ ] status
+- **depends-on:** 87
+- **parallel-safe:** yes
+- **acceptance:**
+  - `render_panes` drops the preview column below ~100 terminal columns and the folder column below ~60 (2-pane, then 1-pane; `<tab>`/`h` still switch focus); pane widths and the AI-panel width become `:set` options; `Model::summary_pinned`'s pin state becomes visible in the AI panel header.
+  - The single toast row becomes a capped queue (1 visible + `+N` badge) carrying undo countdowns (existing), completion notices, and priority alerts, without growing past its existing one-line reflow.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (breakpoint transitions at ~100/~60 columns, toast queue caps at 1+N, pin indicator visible)
+
+## 94. Daemon-observability commands
+- [ ] status
+- **depends-on:** 90, 92
+- **parallel-safe:** no
+- **acceptance:**
+  - `IndexService` (all 7 RPCs), `SyncService.SyncFolder/Pause/Resume/Status`, `AiService.GetUsage/SetPaused/RetryFailed/AnalyzeMessage`, and `FinderService.RebuildIndex/IndexStatus` wired behind `:index status|run|start|stop|reindex|rebuild|verify|gc|entities`, `:sync now|pause|resume|status`, `:ai status|pause|resume|retry|process|cost`, `:finder rebuild|status`.
+  - Streaming verbs (`reindex`, `rebuild`) render live progress in a Report; `:index rebuild` refuses without confirmation unless suffixed `!`.
+- **verify:** `cargo nextest run -p rmaild --test tui_index_commands` (or equivalent integration harness) covering each verb's happy path and the rebuild confirm/bang gate
+
+## 95. Tag and rule commands
+- [ ] status
+- **depends-on:** 94
+- **parallel-safe:** yes
+- **acceptance:**
+  - All nine `TagService` RPCs and all six `RuleService` RPCs wired behind `:tag add|rm|list|new|bulk|suggest|rules` and `:rule list|new|add|run|backtest|correct`, including ranged `:'<,'>tag add <tag>` and a streaming `:tag suggest` Report whose rows accept/reject inline.
+  - This is `RuleService`'s first human surface anywhere — its command spellings are what a future `mail rule` CLI verb must adopt (recorded in the manual per task 104).
+- **verify:** `cargo nextest run -p rmail-cli tui::commands::tag tui::commands::rule` (ranged tag ops, suggest accept/reject, rule dry-run and backtest rendering)
+
+## 96. AI policy, safety and audit commands
+- [ ] status
+- **depends-on:** 94
+- **parallel-safe:** yes
+- **acceptance:**
+  - `AiPolicyService` (4), `AiSafetyService` (2), and `AuditService` (2) wired behind `:ai budget status|set`, `:ai provider status|set`, `:ai scan`, `:ai audit`.
+  - `:ai budget set` with no arguments opens the Settings-style form pre-filled from `GetSpend` rather than issuing a partial `SetBudget` (which would clear unset caps); flags pre-fill the form; a trailing `!` applies immediately with CLI replace-semantics. Spend renders against caps with soft/hard color *and* glyph.
+- **verify:** `cargo nextest run -p rmail-cli tui::commands::ai_policy` (bare budget-set opens prefilled form, bang applies immediately and clears unset caps, soft/hard glyph thresholds)
+
+## 97. Accounts, sync control and tokens
+- [ ] status
+- **depends-on:** 94
+- **parallel-safe:** yes
+- **acceptance:**
+  - `Model.accounts: Vec<Account>` added alongside the existing single `account` field; `:account use <id>` switches the active account within a session (previously explicitly deferred).
+  - All nine `AccountService` RPCs and all three `AdminService` RPCs wired behind `:account list|show|add|login|refresh|test|rm|use` and `:token list|create|revoke`; `Autoconfigure` output and OAuth URLs render in a Report with copy/open affordances (reusing the existing `html::CommandOpener`); a minted token secret is shown exactly once with an unrecoverable marker.
+- **verify:** `cargo nextest run -p rmail-cli tui::commands::account tui::commands::token` (in-session account switch, OAuth URL open path, token shown once and not recoverable from subsequent state)
+
+## 98. Automation and notifications
+- [ ] status
+- **depends-on:** 94
+- **parallel-safe:** yes
+- **acceptance:**
+  - `WebhookService` (7), `HookService` (2), and `NotificationService` (2) wired behind `:webhook list|add|rm|enable|disable|deliveries|replay`, `:hook list|test|add`, `:forward`, `:notify list|score|set`.
+  - `:hook add` and `:notify set` follow the `ReadOnlyReason::ConfigFileOnly` presentation established in task 101's field model — the exact TOML block to paste, its path, and a copy affordance — never a fabricated write RPC. `:notify list` renders `StreamAlerts` live in a Report.
+- **verify:** `cargo nextest run -p rmail-cli tui::commands::automation` (webhook CRUD + replay, hook test round-trip, config-block presentation for hook/notify config-only fields, live alert Report)
+
+## 99. Content, export and analytics commands
+- [ ] status
+- **depends-on:** 94
+- **parallel-safe:** yes
+- **acceptance:**
+  - `ExportService`, `AnalyticsService` (5), `AttachmentService` (4), `ExtractService` (3), `LinkService`, `NoteService` (5), `SavedSearchService` (11), and the untouched `SearchService` methods (`CompileQuery`, `SearchAttachments`, `SearchEntities`, `Evaluate`) wired behind `:export`, `:digest`, `:stats response-time|ask`, `:contact`, `:subs`, `:attach list|tables|invoice|ask|search`, `:extract events|tasks|data`, `:links`, `:note add|list|edit|rm`, `:saved list|save|run|rm`, `:folder new|list|members|eval|rm`, `:search compile|attachments|entities|eval`.
+  - `:digest` rows open their cited source message on Enter.
+- **verify:** `cargo nextest run -p rmail-cli tui::commands::content` (export streams to each format, digest row citation navigation, saved-search/smart-folder CRUD, attachment ask/search)
+
+## 100. Compose, send and follow-up commands
+- [ ] status
+- **depends-on:** 94
+- **parallel-safe:** yes
+- **acceptance:**
+  - All ten `ComposeService` RPCs and the remaining `SendSchedulerService` methods wired behind `:reply [--ai]` (streaming `DraftReply`), `:draft list|show|rewrite|revisions|revert`, `:send [--at][--undo]`, `:outbox`/`:outbox cancel|retry|reschedule`, `:followup list|new|dismiss`, `:waiting`, `:nudge`, `:preflight`.
+  - The existing undo toast remains the only countdown surface (no second one introduced for the command path).
+- **verify:** `cargo nextest run -p rmail-cli tui::commands::compose` (AI reply streams to an editable draft, send/undo window unchanged, follow-up lifecycle round-trips)
+
+## 101. Settings screen
+- [ ] status
+- **depends-on:** 95, 96, 97, 98
+- **parallel-safe:** no
+- **acceptance:**
+  - `Screen::Settings` and `Mode::Settings` (chain `[Settings, Global]`, restating j/k/gg/G/`<tab>`/`<enter>` rather than inheriting `Normal` — the same reason `Menu`/`Pick` already restate them). Reached via `:settings [<section>]`, the `<space>cc` leader chord (task 105), and an `s` key from any Report.
+  - A `FieldKind` model (`Toggle`, `Choice`, `Number`, `Text`, `Run`, `ReadOnly{ConfigFileOnly|NoRpc}`) where **every field's write is expressed as a `:` command `Invocation`** — the screen has no private path to the daemon, so it is testable by asserting the invocation a keypress produces, with no daemon required. `ReadOnly::ConfigFileOnly` fields render the exact TOML block, its path, and a copy affordance. Settings › Keys writes through `rmail_core::keymap::file::edit` directly, not `ConfigService.SetBinding`, so rebinding still works with the daemon down.
+  - Sections: Accounts, Sync, Index, AI, Safety & audit, Rules, Tags, Automation, Notifications, Saved searches, Keys, Interface, Tokens, Daemon.
+- **verify:** `cargo nextest run -p rmail-cli tui::settings` (every field's keypress produces the expected Invocation with no daemon connection, config-file-only fields render their block, Keys section bypasses gRPC)
+
+## 102. Help overlay redesign
+- [ ] status
+- **depends-on:** 91
+- **parallel-safe:** yes
+- **acceptance:**
+  - `?` becomes mode-aware (renders `Model::mode()`'s actual chain at the moment it was pressed, with `<tab>` cycling to other modes), scrollable (no silent truncation past the terminal height), grouped by the same derived id-prefix grouping WhichKey uses, and filterable with `/` (reusing `palette_matches`' tiers over chord/id/description).
+  - No longer a dead end: `<enter>` on a row runs the action, `c` opens `:keys set <chord> <action>` pre-filled, `K` navigates to that action's manual page (task 103).
+- **verify:** `cargo nextest run -p rmail-cli tui::help` (mode-chain rendering per invoking mode, scroll past terminal height, filter tiers match palette's, row actions run/rebind/navigate correctly)
+
+## 103. Manual engine
+- [ ] status
+- **depends-on:** 88, 102
+- **parallel-safe:** no
+- **acceptance:**
+  - `Screen::Manual` (reusing `Mode::Help`) with a page registry of `include_str!`-compiled markdown (works with the daemon down and with no filesystem access), a deliberately tiny renderer (headings, bullets, fenced code, `[[anchor]]` links, `{{keys:…}}`/`{{cmd:…}}`/`{{capability:…}}` expansions — nothing else), a back/forward stack (`<c-o>`/`<c-i>`), in-page `/` search, and `:helpgrep <pattern>` opening a Report of cross-page hits.
+  - Generated sections (key reference, command index, capability footer, mode/layer diagram, unbound-actions list) read the live `Keymap`, the verb registry (task 88), and `parity::Command` — never stored as prose.
+  - Reconciliation tests: every registry verb has a page anchor; no dangling `[[anchor]]`; every `{{…}}` expansion resolves (fails the build, not the render, when it can't); every `Action::ALL` id is documented somewhere.
+- **verify:** `cargo nextest run -p rmail-cli tui::manual` (anchor/link/expansion reconciliation tests, back-stack navigation, helpgrep produces a Report, works with no daemon connection)
+
+## 104. Manual content
+- [ ] status
+- **depends-on:** 103
+- **parallel-safe:** yes
+- **acceptance:**
+  - ~40 pages authored under `rmail-cli/src/tui/manual/pages/`: getting-started (`start-here`, `tour`, `modes`, `daemon`, `offline`); concept pages (`search-vs-finder`, `saved-vs-smart`, `archive`, `grounded`, `ai-cost`, `privacy`, `index`, `undo`, `bulk`); ~7 worked-example transcripts (triage-by-selection, rule-from-mistake, halve-the-ai-bill, add-oauth-account, find-the-clause, digest-to-slack, recover-interrupted-rebuild); best-practice notes, each stating its one-sentence reason; reference pages (`keys`, `commands`, `modes`, `keys-toml`, `config-file`, `capabilities`, `troubleshooting`).
+  - Every capability with a TUI surface (per `parity::Command::actions()`) appears on at least one page — enforced by task 103's reconciliation tests, not manually tracked.
+- **verify:** `cargo nextest run -p rmail-cli tui::manual` (task 103's reconciliation suite passes against the full authored page set; zero unreferenced capabilities)
+
+## 105. Leader map, key vocabulary and migration
+- [ ] status
+- **depends-on:** 91, 95, 96, 97, 98, 99, 100
+- **parallel-safe:** no
+- **acceptance:**
+  - `<space>` installed as a leader in Normal/Viewer/Visual with the default group map (`<space>a` ai, `<space>t` tag, `<space>r` rule, `<space>d` daemon, `<space>c` config/settings, `<space>s` search/saved, `<space>o` outbox/send, `<space>x` extract/attach, `<space>n` note, `<space>g` goto, `<space>w` webhook/hook, `<space>h` help) — every group label still derived (task 91), not hand-written.
+  - `Key` extended with `Left`/`Right`/`Home`/`End`/`PageUp`/`PageDown`, including `named_key` spellings and the crossterm-to-`Key` conversion, which silently drops them today.
+  - `Keymap::shadowed_across_layers` (task 91) runs as a startup lint printing a warning for any hit, and is reachable as `:keys check`.
+  - No default binding already shipped is removed or rebound; `palette` remains a working alias of `command`; a migration note in the manual (task 104) covers anyone whose own `keys.toml` already binds `:` or `<space>`.
+- **verify:** `cargo nextest run -p rmail-core keymap::` · `cargo nextest run -p rmail-cli tui::model` (leader chords resolve to the right groups, new `Key` variants round-trip through parse/display, startup shadow-lint fires, no regression in existing default bindings)
 - **verify:** `cargo deny check` · `cargo audit` · `buf breaking --against proto/buf-baseline.binpb` (this repo has no `main` branch or remote for `.git#branch=main` to resolve against — see `scripts/update-buf-baseline.sh`) · `cargo bench -p rmail-core --no-run`
