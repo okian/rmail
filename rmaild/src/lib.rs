@@ -117,6 +117,7 @@ use rmail_core::outbox::{
 use rmail_core::query::QueryCompiler;
 use rmail_core::rank::l1::Weights;
 use rmail_core::rank::l2::{ClaudeReranker, L2Stage, Reranker as CoreReranker};
+use rmail_core::rank::train::{ActiveRanker, TrainError, TrainingParams};
 use rmail_core::rules::{
     ActionRunner, Classifier, ClaudeClassifier, RuleEngine, RuleEvaluator, RuleSynthesizer,
 };
@@ -169,6 +170,32 @@ use tonic::transport::Server;
 /// holds and one that is checked so often it costs more than it saves.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// How long after startup the ranker trainer makes its first attempt (task
+/// 65), before settling into `search.training.interval`.
+///
+/// Not zero, unlike the pruners above, and not the full interval either. The
+/// pruners run immediately because a daemon restarted more often than their
+/// interval would otherwise never prune at all, and unbounded disk growth is
+/// the failure. A trainer has the opposite risk profile — it reads the whole
+/// feedback log, fits a model and can change what every search returns — so
+/// firing it during startup, when the process is already contending with sync
+/// and index warmup, buys nothing. But waiting a full day would mean a laptop
+/// shut down every night never trains at all, which is the machine
+/// personalization is *for*. A few minutes in satisfies both.
+const TRAIN_STARTUP_DELAY: Duration = Duration::from_secs(5 * 60);
+
+/// Floor under `search.training.interval`.
+///
+/// `HumanDuration` parses `"0s"` quite happily, and a zero sleep in the loop
+/// below is not a fast schedule — it is a spin: back-to-back passes over the
+/// whole feedback log, each one occupying a blocking-pool thread for a fit,
+/// writing a `ranker_model` row, and (on an accepted swap) emptying the
+/// result cache. One minute is far below any sane setting and far above the
+/// cost of a pass, so it changes nothing an operator would actually choose
+/// and removes the footgun. `sync::idle` and `ai::queue` floor their own tick
+/// intervals for the same reason.
+const MIN_TRAIN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Errors returned while standing up or running the gRPC server.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -200,6 +227,31 @@ pub enum ServeError {
     /// silently reverting every request to the unmodified cold-start table.
     #[error("invalid search.rank_weights: {0}")]
     InvalidRankWeights(#[from] rmail_core::rank::l1::RankError),
+
+    /// `[search.training]` holds a value that cannot describe a training run
+    /// — a zero `holdout_percent`, a negative propensity exponent, an
+    /// `min_ndcg_gain` above 1.0 that no candidate could ever clear. Caught
+    /// before the socket is bound, for the reason `InvalidRankWeights` is:
+    /// the alternative is a nightly job that either never swaps or swaps on a
+    /// guardrail measuring nothing, and neither says anything at startup.
+    ///
+    /// Carries the message rather than the typed error so `ServeError` does
+    /// not gain a `From<rank::train::TrainError>` that would silently
+    /// re-label every future `?` on that type in this function.
+    #[error("invalid search.training: {0}")]
+    InvalidTraining(String),
+
+    /// The learned ranker model named by `ranker_model.active` could not be
+    /// read from the database at startup.
+    ///
+    /// Only a *storage* failure lands here. A model this build cannot decode
+    /// does not: `rank::train::Trainer::restore` warns, leaves the row alone
+    /// and leaves the deterministic cold-start scorer running, which is
+    /// prd.md's "always-available fallback" doing its job. A database this
+    /// daemon cannot read, on the other hand, is not one it can serve from,
+    /// so that one stops startup.
+    #[error("could not read the active ranker model: {0}")]
+    RankerModel(#[source] rmail_core::Error),
 
     /// `ai.policy` named an account that is not configured, or carries a
     /// malformed rule — caught here, before any socket is bound, for the
@@ -613,6 +665,12 @@ where
     // `rank::l1::Weights::from_config`'s own docs on why nothing validated
     // this automatically before `SearchService` existed to call it.
     let rank_weights = Weights::from_config(&config.search.rank_weights)?;
+    // Same argument, same place: `[search.training]` is validated before a
+    // socket exists, so a `holdout_percent = 0` (a guardrail with nothing to
+    // measure on) fails the daemon rather than being discovered by a nightly
+    // job at 3 a.m.
+    let training_params = TrainingParams::from_config(&config.search.training)
+        .map_err(|error| ServeError::InvalidTraining(error.to_string()))?;
     let path = socket_path.as_ref().to_path_buf();
 
     if let Some(parent) = path.parent() {
@@ -1024,10 +1082,16 @@ where
             )) as Arc<dyn CoreReranker>
         })
     });
+    // The hot-swap seam (task 65). Built here rather than inside `SearchApi`
+    // because the trained model has to be loaded into it *before* the handler
+    // starts serving, and because the nightly job below and the
+    // `TrainRanker`/`RollbackRanker` RPCs must swap the same slot the search
+    // path ranks through.
+    let active_ranker = ActiveRanker::deterministic(rank_weights);
     let search_api = SearchApi::new(
         db.clone(),
         Arc::clone(&embedder),
-        rank_weights,
+        active_ranker,
         config.search.clone(),
         &config.index.semantic,
         L2Stage::new(
@@ -1037,7 +1101,21 @@ where
             claude_reranker,
         ),
         stopping.clone(),
-    );
+    )
+    .with_ranker_training(training_params);
+    // Restore whichever model `ranker_model.active` names, so a restarted
+    // daemon comes back up on the model it was running rather than silently
+    // dropping to cold start. A model this build cannot decode is *not* a
+    // startup failure — `Trainer::restore` warns, leaves the row alone and
+    // leaves the deterministic scorer live, which is the degradation prd.md's
+    // "always-available fallback" describes. A storage failure is fatal,
+    // because a database this daemon cannot read is not one it can serve
+    // from.
+    match search_api.trainer().restore().await {
+        Ok(Some(model_id)) => tracing::info!(model_id, "learned ranker model is live"),
+        Ok(None) => tracing::debug!("no learned ranker model; using the deterministic scorer"),
+        Err(error) => return Err(ServeError::RankerModel(error)),
+    }
     // Stage 0's NL->plan compiler (task 58). Wired only when the AI subsystem
     // is genuinely active, for the reason the Claude reranker above is: with
     // `NullProvider` behind it, `CompileQuery` would run a redaction pass and
@@ -1096,6 +1174,60 @@ where
                 }
             }
         }
+    });
+
+    // prd.md's "nightly (or on-demand) local job" (task 65). Spawned only
+    // when `search.training.enabled`, unlike the pruners above, and the
+    // asymmetry is deliberate: retention has to run or the disk grows without
+    // bound, while training is a thing that *changes what search returns* and
+    // an operator who turned it off means it. `TrainRanker` still works on a
+    // daemon with the loop off — it is the on-demand half of the same
+    // sentence — so disabling this is "not unattended", not "not available".
+    //
+    // A run that finds too little feedback, or a held-out slice too thin to
+    // referee a swap, is the normal state of a young mailbox: logged at debug
+    // rather than warned about nightly. A refused *candidate* is not an error
+    // at all — `Trainer::train` reports it and writes it down.
+    let ranker_trainer = config.search.training.enabled.then(|| {
+        let trainer = search_api.trainer().clone();
+        let stopping = stopping.clone();
+        let configured = config.search.training.interval.as_duration();
+        let interval = configured.max(MIN_TRAIN_INTERVAL);
+        if interval != configured {
+            tracing::warn!(
+                configured = ?configured,
+                using = ?interval,
+                "search.training.interval is below the floor; a shorter one is a spin, \
+                 not a schedule"
+            );
+        }
+        tokio::spawn(async move {
+            let mut delay = TRAIN_STARTUP_DELAY.min(interval);
+            loop {
+                tokio::select! {
+                    () = stopping.cancelled() => return,
+                    () = tokio::time::sleep(delay) => {}
+                }
+                delay = interval;
+                match trainer.train(false, &stopping).await {
+                    Ok(report) => tracing::info!(
+                        accepted = report.accepted,
+                        verdict = %report.verdict,
+                        "nightly ranker training finished"
+                    ),
+                    Err(
+                        error @ (TrainError::InsufficientQueries { .. }
+                        | TrainError::InsufficientPairs { .. }
+                        | TrainError::DegenerateHoldout { .. }),
+                    ) => tracing::debug!(%error, "not enough feedback to train the ranker yet"),
+                    // Shutdown cancelled the run: the loop is about to exit on
+                    // the `select!` above, and a warning here would put a
+                    // scary line in the log of every clean stop.
+                    Err(TrainError::Cancelled) => return,
+                    Err(error) => tracing::warn!(%error, "ranker training failed"),
+                }
+            }
+        })
     });
 
     // The indexing subsystem (task 24): the pipeline that runs the stages, the
@@ -2000,6 +2132,9 @@ where
     stopping.cancel();
     let _ = pruner.await;
     let _ = feedback_pruner.await;
+    if let Some(handle) = ranker_trainer {
+        let _ = handle.await;
+    }
     if let Some(handle) = ai_dispatch_handle {
         let _ = handle.await;
     }

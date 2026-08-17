@@ -344,7 +344,20 @@ impl Default for Weights {
 /// too. `is_newsletter` stays penalized under Lookup — a promotional
 /// newsletter is not what "AWS bill" is asking for the way an automated
 /// billing notice is, so there is no equivalent argument for suppressing it.
-fn bulk_downweight_suppressed(name: FeatureName, intent: Intent) -> bool {
+///
+/// # Why this is crate-visible rather than private
+///
+/// Task 65's trainer has to apply the *identical* gate when it flattens a
+/// logged feature vector into the numbers it fits weights against — see
+/// [`crate::rank::train::labels::gated_values`]. A second, hand-copied
+/// predicate there would be a second definition of which features an intent
+/// suppresses, and nothing would reconcile the two: a model trained against
+/// an ungated `is_newsletter` fits a coefficient production then discards,
+/// and compensates for its absence by distorting every other weight.
+/// Exporting the one predicate is what makes "the trainer optimizes the
+/// function that actually serves" true by construction rather than by
+/// review.
+pub(crate) fn bulk_downweight_suppressed(name: FeatureName, intent: Intent) -> bool {
     match name {
         FeatureName::IsNewsletter => intent == Intent::Navigational,
         FeatureName::IsAutomated => matches!(intent, Intent::Navigational | Intent::Lookup),

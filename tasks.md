@@ -656,13 +656,13 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core feedback::` (impression/action logging, opt-out disables writes)
 
 ## 65. Offline training + model hot-swap
-- [ ] status
+- [x] status
 - **depends-on:** 64, 31, 37
 - **parallel-safe:** no
 - **acceptance:**
   - Local nightly/on-demand job turns clicks into position-bias-corrected pairwise labels, trains the L1 GBDT / updates linear weights (optimizing NDCG), evaluates on a held-out slice, and hot-swaps only on a measured NDCG win (`ranker_model.active`), keeping the old model for rollback.
   - Fully local; cold users fall back to the deterministic scorer.
-- **verify:** `cargo nextest run -p rmail-core rank::train` (label generation, propensity weighting, guardrail blocks a regression, rollback)
+- **verify:** `cargo nextest run -p rmail-core rank::train` (label generation, propensity weighting, guardrail blocks a regression, rollback) · `cargo nextest run -p rmaild --test search_service train` (train/list/rollback over gRPC)
 
 ## 66. Rules engine (+ NL synthesis + backtest)
 - [x] status

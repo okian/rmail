@@ -72,6 +72,7 @@
 
 pub mod l1;
 pub mod l2;
+pub mod train;
 
 use crate::features::CandidateFeatures;
 use crate::query::Intent;

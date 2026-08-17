@@ -163,6 +163,156 @@ service SearchService {
   // kind string no version of this code writes — a typo'd kind and a kind
   // with no entities are very different answers.
   rpc SearchEntities (SearchEntitiesRequest) returns (SearchEntitiesResponse);
+
+  // Distil the local feedback log into ranker weights, evaluate the result on
+  // a held-out slice, and hot-swap the model **only** on a measured NDCG@10
+  // win (prd.md, "Training"; task 65). The same job the nightly loop runs, on
+  // demand.
+  //
+  // The response is the whole verdict, including the two numbers it is a
+  // comparison of, because "nothing changed" has two very different causes —
+  // there was nothing to learn, or what was learned would have made search
+  // worse — and an operator has to be able to tell them apart.
+  //
+  // A candidate the guardrail *refuses* is a successful call, not an error:
+  // `accepted` is false, the live model is untouched, and the refused
+  // candidate is still written to `ranker_model` so the refusal is auditable
+  // through `ListRankerModels`.
+  //
+  // FAILED_PRECONDITION when there is too little feedback to train on, or
+  // when the held-out slice carries too little engagement for its verdict to
+  // mean anything — refusing to judge beats reporting a tie as a result.
+  //
+  // Nothing here leaves the machine: it reads the local log, fits weights in
+  // process, and writes a local row. There is deliberately no way to import
+  // or export a model.
+  rpc TrainRanker (TrainRankerRequest) returns (RankerTrainingReport);
+
+  // The model history — every training run's candidate, accepted or refused,
+  // with the held-out numbers that decided it, plus which model is actually
+  // live.
+  //
+  // Carries no weights and no queries: a weight table is a behavioural
+  // fingerprint of a mailbox, and this RPC exists so an operator can see
+  // *verdicts*, not so a model can be read off the machine.
+  rpc ListRankerModels (ListRankerModelsRequest) returns (ListRankerModelsResponse);
+
+  // Put an earlier model back — prd.md's "Old model kept for rollback."
+  //
+  // With no `model_id`, steps back to the newest accepted model older than
+  // whatever is live, and to the deterministic cold-start scorer when there
+  // is none; repeated calls therefore walk backwards through history and stop
+  // there rather than oscillating. With a `model_id`, goes straight to it.
+  //
+  // FAILED_PRECONDITION for a model the guardrail refused: an operator who
+  // could hand-activate a candidate measured worse would be able to undo the
+  // guardrail, and training again on more feedback is the way forward from a
+  // refused run. NOT_FOUND for an id with no row.
+  rpc RollbackRanker (RollbackRankerRequest) returns (RollbackRankerResponse);
+}
+
+message TrainRankerRequest {
+  // Run everything — read, label, fit, evaluate — and change nothing. The
+  // answer to "what would tonight's job do", and the only way to see a
+  // candidate's held-out numbers without risking the live model.
+  bool dry_run = 1;
+}
+
+// One training run's verdict.
+message RankerTrainingReport {
+  // Logged queries in the training slice, and the preference pairs derived
+  // from them. Both matter: a mailbox with many searches and few clicks
+  // produces the first number and not the second.
+  uint32 train_queries = 1;
+  uint32 train_pairs = 2;
+  // The held-out slice, and how many of its queries carried any engagement.
+  // The second number is what decides whether the comparison below says
+  // anything at all — NDCG over a slice nobody clicked in is 0.0 for every
+  // model.
+  uint32 holdout_queries = 3;
+  uint32 holdout_engaged = 4;
+  // Logged queries dropped as unreplayable (an intent this build does not
+  // know, an undecodable feature vector). Reported rather than swallowed: a
+  // run that silently ignored most of the corpus would still produce a model.
+  uint32 skipped_queries = 5;
+  // NDCG@10 over the held-out slice for the model that was live, and for the
+  // candidate — scored the same way, over the same impressions.
+  double baseline_ndcg_at_10 = 6;
+  double candidate_ndcg_at_10 = 7;
+  // The margin the candidate had to clear (`search.training.min_ndcg_gain`).
+  double min_gain = 8;
+  // Whether the swap happened — so always false for a dry run, even one whose
+  // candidate cleared the guardrail. A client asking "would tonight swap"
+  // computes it from the three fields above
+  // (`candidate_ndcg_at_10 - baseline_ndcg_at_10 >= min_gain`, and strictly
+  // positive) rather than reading this, which is deliberately the narrow
+  // question "did anything change" so nothing can mistake a measurement for
+  // an effect.
+  bool accepted = 9;
+  bool dry_run = 10;
+  // Propensity-weighted pairwise loss before and after fitting. "The loss went
+  // down" and "search got better" are different claims; only the second one
+  // swaps a model, and seeing both is how a run that learned nothing is told
+  // apart from one that learned the wrong thing.
+  double initial_loss = 11;
+  double final_loss = 12;
+  // The `ranker_model` row this run wrote; 0 when it wrote none (a dry run).
+  int64 model_id = 13;
+  // The model live after this call; 0 means the deterministic scorer.
+  int64 active_model_id = 14;
+  // One line a human can read without the numbers.
+  string verdict = 15;
+}
+
+message ListRankerModelsRequest {
+  // Rows to return, newest first. 0 = the daemon's default.
+  uint32 limit = 1;
+}
+
+// One stored candidate model. Never its weights — see `ListRankerModels`.
+message RankerModel {
+  int64 id = 1;
+  // Unix seconds.
+  int64 created_at = 2;
+  // Model family. `linear` for everything this build trains or runs.
+  string kind = 3;
+  // `accepted` — cleared the guardrail and may be made live.
+  // `rejected`  — did not, and can never be activated.
+  string status = 4;
+  // Whether this row carries the stored `active` flag. This can disagree with
+  // `ListRankerModelsResponse.active_model_id` in exactly one case: a stored
+  // model this build cannot decode leaves the flag on disk while the
+  // deterministic scorer runs. That is reported rather than hidden, and a
+  // rollback is the fix.
+  bool active = 5;
+  uint32 train_queries = 6;
+  uint32 train_pairs = 7;
+  uint32 eval_queries = 8;
+  uint32 eval_engaged = 9;
+  double baseline_ndcg_at_10 = 10;
+  double candidate_ndcg_at_10 = 11;
+  string note = 12;
+}
+
+message ListRankerModelsResponse {
+  // Newest first.
+  repeated RankerModel models = 1;
+  // What the live ranker is actually running; 0 means the deterministic
+  // cold-start scorer, which is what every mailbox with no accepted model
+  // runs.
+  int64 active_model_id = 2;
+}
+
+message RollbackRankerRequest {
+  // The model to make live. 0 means "step back one" — see `RollbackRanker`.
+  int64 model_id = 1;
+}
+
+message RollbackRankerResponse {
+  // The model live after the call; 0 means the deterministic scorer.
+  int64 active_model_id = 1;
+  // One line a human can read.
+  string detail = 2;
 }
 
 message SearchEntitiesRequest {

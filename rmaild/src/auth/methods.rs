@@ -731,6 +731,45 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.SearchService/SearchEntities",
         Requirement::Scope(Scope::MailRead),
     ),
+    // -- SearchService (task 65) ----------------------------------------------
+    // The learned-ranker trio is the only part of `SearchService` at `admin`,
+    // and it is a level above even `mail.write` for two independent reasons.
+    //
+    // The first is blast radius. `TrainRanker` and `RollbackRanker` change
+    // which Stage 4 model *every* future search runs, for every token on this
+    // daemon — not one message, not one mailbox. `mail.write` means "mutate
+    // mail"; nothing in this trio touches a message, and yet a bad swap
+    // degrades every search the machine will ever serve, which is a
+    // strictly larger authority than moving a message is.
+    //
+    // The second is what training reads. The feedback log is the one dataset
+    // `rmail_core::feedback` calls "a behavioural fingerprint of a mailbox",
+    // and its module docs state as an invariant that no RPC reads any of it
+    // back out. `TrainRanker` is the closest thing to an exception: it reads
+    // the whole log and returns aggregates over it (how many queries, how
+    // many clicks, how well a model orders them). Those aggregates disclose
+    // far less than `Search` already does about any individual message, but
+    // they are the shape of thing that should need an operator, not a
+    // read-scoped token handed to an agent.
+    //
+    // `ListRankerModels` is a pure read and still sits here rather than at
+    // `mail.read`. It carries no weights and no queries by design, but it is
+    // the operator console for the other two — a caller who can see the
+    // history is a caller deciding what to roll back to — and splitting the
+    // trio across two scopes would buy nothing but a surface where the read
+    // half is reachable by a token that cannot act on what it learns.
+    (
+        "/rmail.v1.SearchService/TrainRanker",
+        Requirement::Scope(Scope::Admin),
+    ),
+    (
+        "/rmail.v1.SearchService/ListRankerModels",
+        Requirement::Scope(Scope::Admin),
+    ),
+    (
+        "/rmail.v1.SearchService/RollbackRanker",
+        Requirement::Scope(Scope::Admin),
+    ),
     // -- AttachmentService (task 74) ------------------------------------------
     // `AskAttachment` needs both scopes for the reasons `AiService/AskMailbox`
     // gives at length below, and the second half is if anything stronger here.
@@ -2155,6 +2194,42 @@ mod tests {
                 !rmail_core::auth::satisfies(std::slice::from_ref(&read_only), required),
                 "{method} (requires {required:?}) must not be satisfied by mail.read alone"
             );
+        }
+    }
+
+    /// The learned-ranker trio (task 65) is an operator surface, not a search
+    /// one.
+    ///
+    /// Pinned literally rather than left to
+    /// `effect_and_scope_agree_about_what_each_capability_does`, which would
+    /// happily accept `mail.write` here: these three change which Stage 4
+    /// model *every* future search runs, for every token on this daemon, and
+    /// `TrainRanker` reads the whole implicit-feedback log to do it. The
+    /// failure mode this stops is a `mail.read`/`mail.write` token — the kind
+    /// prd.md describes handing to an agent — being able to retrain or roll
+    /// back the ranker unattended.
+    #[test]
+    fn the_learned_ranker_lifecycle_needs_admin() {
+        for method in [
+            "/rmail.v1.SearchService/TrainRanker",
+            "/rmail.v1.SearchService/ListRankerModels",
+            "/rmail.v1.SearchService/RollbackRanker",
+        ] {
+            let Some(Requirement::Scope(required)) = lookup(method) else {
+                unreachable!("{method} should require exactly one scope");
+            };
+            assert_eq!(required, &Scope::Admin, "{method} must sit at admin");
+            // Checked against `required` — what this table actually says for
+            // this method — rather than against a literal `Scope::Admin`,
+            // which would only re-test `auth::satisfies` and would keep
+            // passing if the row above were downgraded.
+            for granted in [Scope::MailRead, Scope::MailWrite, Scope::Automation] {
+                assert!(
+                    !rmail_core::auth::satisfies(std::slice::from_ref(&granted), required),
+                    "{method} (requires {required:?}) must not be reachable with \
+                     {granted:?} alone"
+                );
+            }
         }
     }
 }

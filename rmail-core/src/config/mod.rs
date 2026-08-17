@@ -597,6 +597,8 @@ pub struct SearchConfig {
     pub retrievers: RetrieversConfig,
     /// Implicit-feedback log retention (task 64).
     pub feedback: FeedbackConfig,
+    /// Offline training and the hot-swap guardrail (task 65).
+    pub training: TrainingConfig,
     /// Query/embedding/result cache settings (task 36).
     pub cache: CacheConfig,
 }
@@ -620,6 +622,7 @@ impl Default for SearchConfig {
             expansion: ExpansionConfig::default(),
             retrievers: RetrieversConfig::default(),
             feedback: FeedbackConfig::default(),
+            training: TrainingConfig::default(),
             cache: CacheConfig::default(),
         }
     }
@@ -740,6 +743,128 @@ impl Default for FeedbackConfig {
             // model is trained on what the mailbox looks like now.
             retention_days: 90,
             max_queries: 10_000,
+        }
+    }
+}
+
+/// The offline trainer and its hot-swap guardrail (task 65; prd.md,
+/// "Training").
+///
+/// Every knob here is a *bound on how much the ranker may change*, not a
+/// tuning dial for how good it gets. That framing is deliberate: this is the
+/// one subsystem in rmail that can make search worse without anybody typing
+/// anything, so the defaults are chosen so a mailbox left alone converges
+/// slowly and never regresses, rather than so a benchmark improves fast.
+///
+/// [`TrainingConfig::enabled`] gates only the *background* job. The
+/// `TrainRanker`/`ListRankerModels`/`RollbackRanker` RPCs work regardless, the
+/// same convention `[rules]`/`[hooks]` follow — an operator must be able to
+/// train once, look at the numbers, and roll back on a daemon that is not
+/// running the nightly loop.
+///
+/// See [`crate::rank::train`] for what each of these actually does; the
+/// numeric ones are validated by `TrainingParams::from_config` rather than
+/// clamped, so a nonsense value fails the daemon at startup instead of
+/// quietly training a model nobody asked for.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TrainingConfig {
+    /// Whether the background training job runs at all.
+    pub enabled: bool,
+    /// How often the background job trains. prd.md's "nightly".
+    pub interval: HumanDuration,
+    /// Fewest logged queries with usable labels before a run will train.
+    ///
+    /// Below this the run refuses rather than producing a model from a
+    /// handful of clicks — which is exactly the regime in which a candidate
+    /// can beat the incumbent on a held-out slice by luck.
+    pub min_queries: u32,
+    /// Fewest position-bias-corrected preference pairs before a run will
+    /// train.
+    pub min_pairs: u32,
+    /// Percentage of query *groups* held out from training and used only to
+    /// judge the candidate. See [`crate::rank::train`] on why the split is by
+    /// group rather than by logged query.
+    pub holdout_percent: u32,
+    /// Fewest held-out queries carrying at least one positive engagement
+    /// before the guardrail's verdict is trusted.
+    ///
+    /// NDCG over a slice nobody clicked in is `0.0` for every model, so a
+    /// too-small slice does not produce a wrong answer — it produces a tie,
+    /// which reads as "no improvement" and blocks the swap. This bound makes
+    /// that a stated refusal rather than an accident of arithmetic.
+    pub min_eval_queries: u32,
+    /// Newest logged queries one run reads. Bounds the trainer's memory:
+    /// each carries a page of serialized feature vectors.
+    pub max_training_queries: u32,
+    /// Examination-propensity exponent `eta` in `P(examine | rank p) = p^-eta`
+    /// — prd.md's "simple position-based click model".
+    ///
+    /// `0.0` disables the correction (every position equally examined), `1.0`
+    /// is the `1/p` model, higher values assume attention drops off faster and
+    /// therefore weight a deep click more. See [`crate::rank::train::labels`]
+    /// for what this assumes and what breaks if the assumption is wrong.
+    pub position_bias_eta: f64,
+    /// Ceiling on one pair's inverse-propensity weight.
+    ///
+    /// Inverse propensity weighting has unbounded variance without it: a
+    /// single click at rank 50 would otherwise carry fifty times the weight of
+    /// a click at rank 1 and dominate a small corpus. Standard IPS clipping —
+    /// it trades a little bias for a lot of variance.
+    pub max_propensity_weight: f64,
+    /// How much held-out NDCG@10 the candidate must gain over the live model
+    /// before it is allowed to go live.
+    ///
+    /// The guardrail. `0.0` would swap on an exact tie, which churns the model
+    /// history nightly for no measured benefit; the trainer additionally
+    /// requires a strictly positive improvement so a `0.0` here still cannot
+    /// promote a model that is merely not worse.
+    pub min_ndcg_gain: f64,
+    /// Full-batch gradient-descent passes over the pair set.
+    pub epochs: u32,
+    /// Gradient-descent step size, in standardized feature space.
+    pub learning_rate: f64,
+    /// L2 pull back toward the model that is already live.
+    ///
+    /// Regularizing toward the incumbent rather than toward zero is what makes
+    /// "not enough signal" mean "stay where you are" instead of "collapse to
+    /// the null ranker".
+    pub l2: f64,
+    /// How many model rows are kept. The live model is never pruned.
+    pub max_models: u32,
+}
+
+impl Default for TrainingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval: HumanDuration::new(std::time::Duration::from_secs(24 * 60 * 60)),
+            // A mailbox that has run fifty searches with clicks has enough
+            // shape for a held-out slice to mean something and few enough that
+            // the first trained model is a small nudge off cold start.
+            min_queries: 50,
+            min_pairs: 200,
+            // A quarter held out: enough queries for the guardrail to be more
+            // than a coin flip on a small corpus, small enough that most of
+            // the signal is still trained on.
+            holdout_percent: 25,
+            min_eval_queries: 10,
+            max_training_queries: 2_000,
+            // The `1/p` model. prd.md's own example — "a result clicked at
+            // position 8 is a stronger signal than one clicked at position 1"
+            // — is exactly what eta = 1 produces (weight 8 against weight 1).
+            position_bias_eta: 1.0,
+            // At eta = 1 this stops clipping at rank 10, so the whole of a
+            // default 25-result page still separates but its tail does not run
+            // away with the corpus.
+            max_propensity_weight: 10.0,
+            // Half a point of NDCG@10. Smaller than a real relevance win and
+            // larger than the noise of re-scoring the same slice.
+            min_ndcg_gain: 0.005,
+            epochs: 60,
+            learning_rate: 0.1,
+            l2: 0.01,
+            max_models: 20,
         }
     }
 }

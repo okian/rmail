@@ -144,8 +144,8 @@ use rmail_proto::v1::{
     ByteRange, CompileQueryRequest, EvalMetrics as WireEvalMetrics, EvalReport as WireEvalReport,
     EvaluateRequest, FeatureContribution, FullMessage, GetMessageRequest,
     GoldenQuery as WireGoldenQuery, Intent as ProtoIntent, Judgment as WireJudgment,
-    Mode as ProtoMode, QueryPlan, RankExplanation, Rerank as ProtoRerank, SearchHit, SearchRequest,
-    Snippet,
+    ListRankerModelsRequest, Mode as ProtoMode, QueryPlan, RankExplanation, Rerank as ProtoRerank,
+    RollbackRankerRequest, SearchHit, SearchRequest, Snippet, TrainRankerRequest,
 };
 use tokio_stream::StreamExt;
 
@@ -272,6 +272,50 @@ enum SearchAction {
     /// Score a golden set against the local corpus and report NDCG@10, MRR,
     /// Recall@50 and P@3 (`SearchService.Evaluate`).
     Eval(EvalArgs),
+    /// Train the L1 ranker on the local click log and hot-swap it only on a
+    /// measured NDCG@10 win (`SearchService.TrainRanker`; task 65).
+    Train(TrainArgs),
+    /// List trained ranker models, accepted and refused, with the held-out
+    /// numbers behind each verdict (`SearchService.ListRankerModels`).
+    Models(ModelsArgs),
+    /// Put an earlier ranker model back, or fall back to the deterministic
+    /// cold-start scorer (`SearchService.RollbackRanker`).
+    Rollback(RollbackArgs),
+}
+
+/// `mail search train` flags.
+#[derive(Debug, clap::Args)]
+pub struct TrainArgs {
+    /// Run everything and change nothing: read the log, build labels, fit a
+    /// candidate, evaluate it on the held-out slice, and report what would
+    /// have happened. The way to see a candidate's numbers without risking
+    /// the live model.
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+    /// Emit the report as a single JSON object instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+/// `mail search models` flags.
+#[derive(Debug, clap::Args)]
+pub struct ModelsArgs {
+    /// Rows to show, newest first. 0 = the daemon's default.
+    #[arg(long, default_value_t = 0)]
+    limit: u32,
+    /// Emit the history as a single JSON object instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+/// `mail search rollback` flags.
+#[derive(Debug, clap::Args)]
+pub struct RollbackArgs {
+    /// The model to make live. Omit to step back one: to the newest accepted
+    /// model older than the live one, or to the deterministic scorer when
+    /// there is none.
+    #[arg(long = "model")]
+    model: Option<i64>,
 }
 
 /// `mail search eval` flags.
@@ -370,8 +414,14 @@ impl RerankArg {
 /// the daemon (surfaced as a plain [`anyhow::Error`] — the CLI has no
 /// gRPC-status-aware caller to hand a typed error back to).
 pub async fn search(socket: &Path, args: SearchArgs) -> Result<()> {
-    if let Some(SearchAction::Eval(eval_args)) = args.action {
-        return eval(socket, eval_args).await;
+    match args.action {
+        Some(SearchAction::Eval(eval_args)) => return eval(socket, eval_args).await,
+        Some(SearchAction::Train(train_args)) => return train(socket, train_args).await,
+        Some(SearchAction::Models(models_args)) => return models(socket, models_args).await,
+        Some(SearchAction::Rollback(rollback_args)) => {
+            return rollback(socket, rollback_args).await
+        }
+        None => {}
     }
 
     let channel = rmail_core::connect_uds(socket)
@@ -674,6 +724,204 @@ fn print_eval_json(report: &WireEvalReport) -> Result<()> {
     serde_json::to_writer(&mut out, &value).context("serializing eval report")?;
     writeln!(out).context("writing eval report")?;
     Ok(())
+}
+
+/// `mail search train` — the on-demand half of prd.md's "nightly (or
+/// on-demand) local job" (task 65).
+///
+/// Prints the whole verdict, not just whether anything changed: "nothing
+/// happened" has two very different causes — there was nothing to learn, or
+/// what was learned would have made search worse — and only the two NDCG
+/// numbers tell them apart.
+///
+/// Exits non-zero on an RPC error, including the `FAILED_PRECONDITION` a
+/// mailbox with too little feedback gets. A candidate the guardrail *refuses*
+/// is not an error: the run did exactly what it was supposed to.
+///
+/// # Errors
+///
+/// Connection failure or a `TrainRanker` RPC error.
+async fn train(socket: &Path, args: TrainArgs) -> Result<()> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let mut client = SearchServiceClient::new(channel);
+
+    let report = client
+        .train_ranker(TrainRankerRequest {
+            dry_run: args.dry_run,
+        })
+        .await
+        .context("TrainRanker RPC failed")?
+        .into_inner();
+
+    if args.json {
+        let value = serde_json::json!({
+            "train_queries": report.train_queries,
+            "train_pairs": report.train_pairs,
+            "holdout_queries": report.holdout_queries,
+            "holdout_engaged": report.holdout_engaged,
+            "skipped_queries": report.skipped_queries,
+            "baseline_ndcg_at_10": report.baseline_ndcg_at_10,
+            "candidate_ndcg_at_10": report.candidate_ndcg_at_10,
+            "min_gain": report.min_gain,
+            "accepted": report.accepted,
+            "dry_run": report.dry_run,
+            "initial_loss": report.initial_loss,
+            "final_loss": report.final_loss,
+            "model_id": report.model_id,
+            "active_model_id": report.active_model_id,
+            "verdict": report.verdict,
+        });
+        let mut out = std::io::stdout().lock();
+        serde_json::to_writer(&mut out, &value).context("serializing training report")?;
+        writeln!(out).context("writing training report")?;
+        return Ok(());
+    }
+
+    println!(
+        "trained on {} queries / {} pairs; held out {} queries ({} engaged){}",
+        report.train_queries,
+        report.train_pairs,
+        report.holdout_queries,
+        report.holdout_engaged,
+        if report.skipped_queries > 0 {
+            format!("; {} unreplayable and skipped", report.skipped_queries)
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "pairwise loss {:.4} -> {:.4}",
+        report.initial_loss, report.final_loss
+    );
+    println!(
+        "held-out NDCG@10: live {:.4}  candidate {:.4}  ({:+.4}, guardrail needs {:+.4})",
+        report.baseline_ndcg_at_10,
+        report.candidate_ndcg_at_10,
+        report.candidate_ndcg_at_10 - report.baseline_ndcg_at_10,
+        report.min_gain,
+    );
+    println!("{}", report.verdict);
+    println!("{}", describe_active(report.active_model_id));
+    Ok(())
+}
+
+/// `mail search models` — the model history and what is live.
+///
+/// # Errors
+///
+/// Connection failure or a `ListRankerModels` RPC error.
+async fn models(socket: &Path, args: ModelsArgs) -> Result<()> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let mut client = SearchServiceClient::new(channel);
+
+    let response = client
+        .list_ranker_models(ListRankerModelsRequest { limit: args.limit })
+        .await
+        .context("ListRankerModels RPC failed")?
+        .into_inner();
+
+    if args.json {
+        let value = serde_json::json!({
+            "active_model_id": response.active_model_id,
+            "models": response
+                .models
+                .iter()
+                .map(|m| serde_json::json!({
+                    "id": m.id,
+                    "created_at": m.created_at,
+                    "kind": m.kind,
+                    "status": m.status,
+                    "active": m.active,
+                    "train_queries": m.train_queries,
+                    "train_pairs": m.train_pairs,
+                    "eval_queries": m.eval_queries,
+                    "eval_engaged": m.eval_engaged,
+                    "baseline_ndcg_at_10": m.baseline_ndcg_at_10,
+                    "candidate_ndcg_at_10": m.candidate_ndcg_at_10,
+                    "note": m.note,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let mut out = std::io::stdout().lock();
+        serde_json::to_writer(&mut out, &value).context("serializing model history")?;
+        writeln!(out).context("writing model history")?;
+        return Ok(());
+    }
+
+    println!("{}", describe_active(response.active_model_id));
+    if response.models.is_empty() {
+        println!("no trained models yet");
+        return Ok(());
+    }
+    println!(
+        "\n{:>6} {:<20} {:<9} {:>6} {:>9} {:>9} {:>7} {:>7}",
+        "id", "trained", "status", "live", "live-ndcg", "cand-ndcg", "pairs", "eval"
+    );
+    for model in &response.models {
+        let when = DateTime::<Utc>::from_timestamp(model.created_at, 0)
+            .map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .unwrap_or_else(|| model.created_at.to_string());
+        println!(
+            "{:>6} {:<20} {:<9} {:>6} {:>9.4} {:>9.4} {:>7} {:>7}",
+            model.id,
+            truncate(&when, 20),
+            truncate(&model.status, 9),
+            if model.active { "yes" } else { "" },
+            model.baseline_ndcg_at_10,
+            model.candidate_ndcg_at_10,
+            model.train_pairs,
+            model.eval_engaged,
+        );
+        if !model.note.is_empty() {
+            println!("       {}", model.note);
+        }
+        // The stored flag and the running model can disagree in exactly one
+        // case, and it is the one an operator most needs pointed out.
+        if model.active && response.active_model_id != model.id {
+            println!(
+                "       ! marked active but not running — this build cannot load it; roll back"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `mail search rollback` — prd.md's "Old model kept for rollback."
+///
+/// # Errors
+///
+/// Connection failure or a `RollbackRanker` RPC error, including the
+/// `FAILED_PRECONDITION` returned for a model the guardrail refused.
+async fn rollback(socket: &Path, args: RollbackArgs) -> Result<()> {
+    let channel = rmail_core::connect_uds(socket)
+        .await
+        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let mut client = SearchServiceClient::new(channel);
+
+    let response = client
+        .rollback_ranker(RollbackRankerRequest {
+            model_id: args.model.unwrap_or(0),
+        })
+        .await
+        .context("RollbackRanker RPC failed")?
+        .into_inner();
+
+    println!("{}", response.detail);
+    println!("{}", describe_active(response.active_model_id));
+    Ok(())
+}
+
+/// How the wire's `0` sentinel for "no learned model" reads to a human.
+fn describe_active(active_model_id: i64) -> String {
+    if active_model_id == 0 {
+        "live ranker: the deterministic cold-start scorer".to_owned()
+    } else {
+        format!("live ranker: learned model {active_model_id}")
+    }
 }
 
 fn metrics_json(m: Option<&WireEvalMetrics>) -> serde_json::Value {

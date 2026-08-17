@@ -575,6 +575,39 @@ commands! {
         actions: [],
         summary: "Search extracted entities — amounts, references, tracking numbers, IBANs — and return the mail behind each hit.",
     }
+    // -- SearchService (task 65) ----------------------------------------------
+    // The learned ranker's lifecycle. `Mutate` for the two that can change
+    // which model is live, and the reason is the broadest one in this table:
+    // they change what *every* future search on this daemon returns, for
+    // every caller. That is a larger effect than any single-message mutation
+    // above, even though nothing here touches a message.
+    //
+    // `rmaild::auth::methods` puts all three behind `admin`, including the
+    // read, and argues why at length there.
+    SearchTrainRanker {
+        rpc: "/rmail.v1.SearchService/TrainRanker",
+        tool: "train_ranker",
+        effect: Mutate,
+        cli: ["search train"],
+        actions: [],
+        summary: "Distil the local click log into ranker weights and hot-swap the model only on a measured NDCG win.",
+    }
+    SearchListRankerModels {
+        rpc: "/rmail.v1.SearchService/ListRankerModels",
+        tool: "list_ranker_models",
+        effect: Read,
+        cli: ["search models"],
+        actions: [],
+        summary: "List every trained ranker model, accepted or refused, with the held-out numbers that decided it.",
+    }
+    SearchRollbackRanker {
+        rpc: "/rmail.v1.SearchService/RollbackRanker",
+        tool: "rollback_ranker",
+        effect: Mutate,
+        cli: ["search rollback"],
+        actions: [],
+        summary: "Put an earlier ranker model back, or fall back to the deterministic cold-start scorer.",
+    }
 
     // -- AttachmentService (task 74) -------------------------------------------
     // `Mutate` for the reason `AiAskMailbox` is, and it is the same reason

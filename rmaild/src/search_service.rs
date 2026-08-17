@@ -158,8 +158,9 @@ use rmail_core::index::fts::FtsIndex;
 use rmail_core::index::semantic::SemanticIndex;
 use rmail_core::present::{PresentedResult, Presenter};
 use rmail_core::query::{Intent, QueryCompiler, QueryPlan, QueryPlanner};
-use rmail_core::rank::l1::{L1Ranker, Weights};
+use rmail_core::rank::l1::L1Ranker;
 use rmail_core::rank::l2::{L2Stage, SearchKind};
+use rmail_core::rank::train::{ActiveRanker, Trainer, TrainingParams};
 use rmail_core::rank::Ranker;
 use rmail_core::retrieve::{Candidate, DenseRetriever, Fanout, Source};
 use rmail_core::{present, repo, Database, Error as RmailError};
@@ -169,12 +170,14 @@ use rmail_proto::v1::{
     EntityMention as ProtoEntityMention, EvalMetrics as ProtoEvalMetrics,
     EvalReport as ProtoEvalReport, EvaluateRequest, ExplainRequest,
     FeatureContribution as ProtoFeatureContribution, FeedbackAction as ProtoFeedbackAction,
-    FeedbackRequest, Intent as ProtoIntent, Message as ProtoMessage, Mode as ProtoMode,
-    QueryEval as ProtoQueryEval, QueryPlan as ProtoQueryPlan,
-    RankExplanation as ProtoRankExplanation, Rerank as ProtoRerank,
-    ResultAction as ProtoResultAction, SearchAttachmentsRequest, SearchAttachmentsResponse,
+    FeedbackRequest, Intent as ProtoIntent, ListRankerModelsRequest, ListRankerModelsResponse,
+    Message as ProtoMessage, Mode as ProtoMode, QueryEval as ProtoQueryEval,
+    QueryPlan as ProtoQueryPlan, RankExplanation as ProtoRankExplanation,
+    RankerModel as ProtoRankerModel, RankerTrainingReport as ProtoRankerTrainingReport,
+    Rerank as ProtoRerank, ResultAction as ProtoResultAction, RollbackRankerRequest,
+    RollbackRankerResponse, SearchAttachmentsRequest, SearchAttachmentsResponse,
     SearchEntitiesRequest, SearchEntitiesResponse, SearchHit as ProtoSearchHit, SearchRequest,
-    Snippet as ProtoSnippet,
+    Snippet as ProtoSnippet, TrainRankerRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -562,7 +565,20 @@ pub struct SearchApi {
     planner: QueryPlanner,
     fuser: Fuser,
     feature_extractor: FeatureExtractor,
-    ranker: L1Ranker,
+    /// Stage 4's *live* model (task 65). A handle rather than a value: the
+    /// nightly trainer swaps what is behind it without restarting the daemon,
+    /// and every request takes one snapshot (`ActiveRanker::current`) so a
+    /// swap landing mid-page cannot make one response's hits come from two
+    /// models. With no accepted model it holds the deterministic cold-start
+    /// scorer, which is what every mailbox runs until personalization has
+    /// enough data — prd.md's "cold users fall back to the deterministic
+    /// scorer" as a value rather than a branch.
+    ranker: ActiveRanker,
+    /// The offline trainer, the model store, and the swap (task 65). Owns the
+    /// same `ActiveRanker` this handler ranks through and the same
+    /// `ResultCache` it serves pages from, so a model going live and the
+    /// cached rankings of the model it replaced cannot get out of step.
+    trainer: Trainer,
     /// Stage 5. Always present — a stage with no usable backend is a
     /// passthrough, not an absent one, so there is exactly one code path
     /// through ranking whether or not this daemon can rerank.
@@ -625,6 +641,16 @@ struct HitContext<'a> {
     query_id: Option<i64>,
     /// Per-message one-line rationale from an L2 reranker, when one ran.
     reasons: &'a BTreeMap<i64, String>,
+    /// The exact Stage 4 model this page was ranked by.
+    ///
+    /// Carried rather than re-read from [`SearchApi::ranker`], because a
+    /// task-65 hot-swap can land between ranking a page and describing it.
+    /// `RankExplanation`'s documented invariant is that its per-feature
+    /// contributions sum to its `score`; re-reading the live handle here would
+    /// break that — and would log an `l1_score` from a different model than
+    /// the one that chose the order — for any page unlucky enough to straddle
+    /// a swap. One snapshot per request makes the window not exist.
+    ranker: &'a L1Ranker,
 }
 
 impl SearchApi {
@@ -632,7 +658,7 @@ impl SearchApi {
     /// an already-validated ranker `weights` table, and the loaded `[search]`
     /// config.
     ///
-    /// `weights` is a parameter rather than derived here from
+    /// `ranker` is a parameter rather than derived here from
     /// `search.rank_weights` internally so validation happens exactly once,
     /// at the single call site (`rmaild::serve_uds_with_engine_and_mail_store`)
     /// that needs to fail the *daemon's* startup — before any socket is
@@ -641,6 +667,13 @@ impl SearchApi {
     /// this automatically before `SearchService` existed to call it. A
     /// fallible constructor here would just push that same `?` one frame
     /// later for no benefit.
+    ///
+    /// It arrives as an [`ActiveRanker`] rather than a bare `Weights` table
+    /// for a second reason: the same call site loads whichever task-65 model
+    /// `ranker_model.active` names into it before this handler exists, so a
+    /// daemon that restarts comes back up on the model it was running rather
+    /// than silently dropping to cold start. Handing this constructor a
+    /// weight table would make that restore something a caller could forget.
     ///
     /// `rerank` is likewise built by the caller: the Claude backend needs the
     /// daemon's single `ai::Provider` (one API-key resolution, one HTTP
@@ -652,7 +685,7 @@ impl SearchApi {
     pub fn new(
         db: Database,
         embedder: Arc<dyn Embedder>,
-        weights: Weights,
+        ranker: ActiveRanker,
         search: SearchConfig,
         semantic_config: &IndexSemanticConfig,
         rerank: L2Stage,
@@ -698,9 +731,19 @@ impl SearchApi {
             search.bm25_weights.clone(),
             search.retrievers.recency_half_life_days,
         );
-        let ranker = L1Ranker::new(weights);
         let presenter = Presenter::new(db.clone());
         let feedback = FeedbackStore::new(db.clone(), search.learning, search.feedback);
+        // Built from the *same* `ActiveRanker` and the *same* `ResultCache`
+        // this handler reads, never from second copies: a trainer swapping a
+        // model into a different handle, or purging a different cache, is
+        // exactly the shape of bug that would make personalization look like
+        // it was working while every search kept running the old model.
+        let trainer = Trainer::new(
+            db.clone(),
+            TrainingParams::default(),
+            ranker.clone(),
+            result_cache.clone(),
+        );
 
         Self {
             db,
@@ -712,6 +755,7 @@ impl SearchApi {
             fuser,
             feature_extractor,
             ranker,
+            trainer,
             rerank,
             presenter,
             feedback,
@@ -721,6 +765,35 @@ impl SearchApi {
             compiler: None,
             result_cache,
         }
+    }
+
+    /// Apply a validated `[search.training]` table.
+    ///
+    /// A builder rather than a constructor parameter for the same reason
+    /// `with_query_compiler` is one: [`TrainingParams::from_config`] is
+    /// fallible and belongs at the daemon's startup, where a nonsense value
+    /// can fail the process before a socket is bound, rather than inside an
+    /// infallible constructor. A handler built without it runs the shipped
+    /// defaults, which refuse to train a mailbox this small — see
+    /// `TrainingConfig`'s own docs.
+    #[must_use]
+    pub fn with_ranker_training(mut self, params: TrainingParams) -> Self {
+        self.trainer = Trainer::new(
+            self.db.clone(),
+            params,
+            self.ranker.clone(),
+            self.result_cache.clone(),
+        );
+        self
+    }
+
+    /// The trainer this handler swaps models through, so the daemon can drive
+    /// the nightly job and the startup restore against the *same* object the
+    /// `TrainRanker`/`RollbackRanker` RPCs use — and therefore against the
+    /// same live ranker and the same result cache.
+    #[must_use]
+    pub fn trainer(&self) -> &Trainer {
+        &self.trainer
     }
 
     /// Attach the natural-language query compiler `CompileQuery` serves from.
@@ -940,9 +1013,11 @@ impl SearchApi {
             .feature_extractor
             .extract_at(&fused, &plan, now, &cancel)
             .await;
-        let ranked = self
-            .ranker
-            .rank(&features, plan.intent, self.search.top_k_rerank as usize);
+        // One snapshot of the live Stage 4 model for the whole page — see
+        // `HitContext::ranker` for why re-reading the handle per use would be
+        // wrong rather than merely wasteful.
+        let ranker = self.ranker.current();
+        let ranked = ranker.rank(&features, plan.intent, self.search.top_k_rerank as usize);
         if ranked.is_empty() || cancel.is_cancelled() {
             return StreamOutcome::stopped(&cancel);
         }
@@ -1016,6 +1091,7 @@ impl SearchApi {
             explain: req.explain,
             query_id,
             reasons: &reasons,
+            ranker: &ranker,
         };
         let first_hits = self.build_hits(&first_presented, &hit_ctx).await;
         let mut sent: BTreeSet<i64> = BTreeSet::new();
@@ -1173,7 +1249,10 @@ impl SearchApi {
         // report the truncation as missing recall, so the rank cut is
         // widened to whatever this run actually asked for.
         let keep = self.search.top_k_rerank as usize;
-        let ranked = self.ranker.rank(&features, plan.intent, keep.max(limit));
+        let ranked = self
+            .ranker
+            .current()
+            .rank(&features, plan.intent, keep.max(limit));
         if ranked.is_empty() {
             return Ok(Vec::new());
         }
@@ -1371,6 +1450,7 @@ impl SearchApi {
             explain,
             query_id,
             reasons,
+            ranker,
         } = *ctx;
         if presented.is_empty() {
             return Vec::new();
@@ -1407,10 +1487,11 @@ impl SearchApi {
             // `score`. Only the recomputed value satisfies that; `p.score`
             // would make the breakdown fail to add up exactly when a rerank
             // ran.
-            let l1_score = cf.map_or(p.score, |cf| self.ranker.score(&cf.features, plan.intent));
+            let l1_score = cf.map_or(p.score, |cf| ranker.score(&cf.features, plan.intent));
             let why = if explain {
                 cf.map(|cf| {
-                    self.explanation(
+                    explanation(
+                        ranker,
                         cf,
                         plan.intent,
                         l1_score,
@@ -1506,44 +1587,6 @@ impl SearchApi {
                 (id, to_proto_message(&message, message_flags))
             })
             .collect()
-    }
-
-    /// Build a [`ProtoRankExplanation`] from `cf`'s own feature vector —
-    /// shared by the inline per-hit `why` (when `SearchRequest.explain` is
-    /// set) and the dedicated `Explain` RPC. `score` is taken from the
-    /// caller rather than recomputed here so both call sites can pass the
-    /// exact number their own pipeline already produced (`PresentedResult`'s
-    /// carried-through `RankedCandidate::score` for the inline case,
-    /// `L1Ranker::score` for the standalone `Explain` case) rather than a
-    /// third, independently-derived value that happens to agree.
-    fn explanation(
-        &self,
-        cf: &CandidateFeatures,
-        intent: Intent,
-        score: f64,
-        sources: Vec<String>,
-        matched: Option<ProtoSnippet>,
-        claude_reason: String,
-    ) -> ProtoRankExplanation {
-        let contributions = self.ranker.contributions(&cf.features, intent);
-        let features = contributions
-            .into_iter()
-            .map(
-                |(name, value, weight, weighted_contribution)| ProtoFeatureContribution {
-                    name: name.as_str().to_owned(),
-                    value,
-                    weight,
-                    weighted_contribution,
-                },
-            )
-            .collect();
-        ProtoRankExplanation {
-            features,
-            score,
-            sources,
-            matched,
-            claude_reason,
-        }
     }
 
     /// The matched span(s) for `message_id` against `plan.raw` — `Explain`'s
@@ -1794,6 +1837,51 @@ const fn search_kind(deep: bool) -> SearchKind {
     }
 }
 
+/// Build a [`ProtoRankExplanation`] from `cf`'s own feature vector — shared
+/// by the inline per-hit `why` (when `SearchRequest.explain` is set) and the
+/// dedicated `Explain` RPC. `score` is taken from the caller rather than
+/// recomputed here so both call sites can pass the exact number their own
+/// pipeline already produced (`PresentedResult`'s carried-through
+/// `RankedCandidate::score` for the inline case, `L1Ranker::score` for the
+/// standalone `Explain` case) rather than a third, independently-derived
+/// value that happens to agree.
+///
+/// A free function rather than a method, because since task 65 it reads
+/// nothing off `SearchApi`: `ranker` is the caller's own snapshot of the live
+/// model. That matters, not just for the argument count — the caller has
+/// already scored this candidate with one snapshot, and a breakdown derived
+/// from a *different* one would not sum to the `score` it is handed. See
+/// [`HitContext::ranker`].
+fn explanation(
+    ranker: &L1Ranker,
+    cf: &CandidateFeatures,
+    intent: Intent,
+    score: f64,
+    sources: Vec<String>,
+    matched: Option<ProtoSnippet>,
+    claude_reason: String,
+) -> ProtoRankExplanation {
+    let contributions = ranker.contributions(&cf.features, intent);
+    let features = contributions
+        .into_iter()
+        .map(
+            |(name, value, weight, weighted_contribution)| ProtoFeatureContribution {
+                name: name.as_str().to_owned(),
+                value,
+                weight,
+                weighted_contribution,
+            },
+        )
+        .collect();
+    ProtoRankExplanation {
+        features,
+        score,
+        sources,
+        matched,
+        claude_reason,
+    }
+}
+
 fn to_proto_metrics(metrics: &CoreMetrics) -> ProtoEvalMetrics {
     ProtoEvalMetrics {
         ndcg_at_10: metrics.ndcg_at_10,
@@ -2003,7 +2091,10 @@ impl SearchService for SearchApi {
             ))));
         };
 
-        let score = self.ranker.score(&cf.features, plan.intent);
+        // One snapshot for both the score and the breakdown that has to sum
+        // to it — see `HitContext::ranker`.
+        let ranker = self.ranker.current();
+        let score = ranker.score(&cf.features, plan.intent);
         let sources: Vec<String> = fused
             .iter()
             .find(|f| f.message_id == req.message_id)
@@ -2023,7 +2114,8 @@ impl SearchService for SearchApi {
         // beat the others it was ranked against — so synthesizing one here,
         // for a message explained on its own, would be inventing a
         // comparison that never happened.
-        Ok(Response::new(self.explanation(
+        Ok(Response::new(explanation(
+            &ranker,
             cf,
             plan.intent,
             score,
@@ -2161,6 +2253,144 @@ impl SearchService for SearchApi {
 
         Ok(Response::new(()))
     }
+
+    #[tracing::instrument(skip(self, request), fields(dry_run, accepted))]
+    async fn train_ranker(
+        &self,
+        request: Request<TrainRankerRequest>,
+    ) -> Result<Response<ProtoRankerTrainingReport>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("dry_run", req.dry_run);
+
+        // The run is driven from a spawned task, not from this future, and
+        // that is load-bearing rather than stylistic.
+        //
+        // tonic drops the handler future when a client hangs up or its
+        // deadline elapses. Training's expensive half is a `spawn_blocking`
+        // fit, and a `spawn_blocking` task **cannot be aborted** (see
+        // `rmail_core::storage::Database::read`'s own note) — so a run driven
+        // inline would keep burning a blocking thread with nobody waiting for
+        // its result, while its `Trainer` swap lock was already released for
+        // the next caller. Repeat that and a handful of cancelled calls
+        // leaves a pile of un-abortable full-log fits racing each other.
+        //
+        // Spawned, a dropped RPC leaves exactly one run still going, still
+        // holding the swap lock, still finishing the job the operator asked
+        // for. Which is also the honest reading of the request: "train the
+        // ranker" is not a query whose answer stops mattering when the
+        // caller looks away.
+        //
+        // The token is a child of the daemon's shutdown, so the run still
+        // unwinds cooperatively when the process stops.
+        let cancel = self.shutdown.child_token();
+        let trainer = self.trainer.clone();
+        let dry_run = req.dry_run;
+        let report = tokio::spawn(async move { trainer.train(dry_run, &cancel).await })
+            .await
+            .map_err(|error| {
+                Status::from(RmailError::internal(format!(
+                    "the ranker training task failed: {error}"
+                )))
+            })?
+            .map_err(RmailError::from)
+            .map_err(Status::from)?;
+        tracing::Span::current().record("accepted", report.accepted);
+
+        Ok(Response::new(ProtoRankerTrainingReport {
+            train_queries: clamp_u32(report.train_queries),
+            train_pairs: clamp_u32(report.train_pairs),
+            holdout_queries: clamp_u32(report.holdout_queries),
+            holdout_engaged: clamp_u32(report.holdout_engaged),
+            skipped_queries: clamp_u32(report.skipped_queries),
+            baseline_ndcg_at_10: report.baseline_ndcg_at_10,
+            candidate_ndcg_at_10: report.candidate_ndcg_at_10,
+            min_gain: report.min_gain,
+            accepted: report.accepted,
+            dry_run: report.dry_run,
+            initial_loss: report.initial_loss,
+            final_loss: report.final_loss,
+            model_id: report.model_id.unwrap_or(0),
+            active_model_id: report.active_model_id.unwrap_or(0),
+            verdict: report.verdict,
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(models))]
+    async fn list_ranker_models(
+        &self,
+        request: Request<ListRankerModelsRequest>,
+    ) -> Result<Response<ListRankerModelsResponse>, Status> {
+        let req = request.into_inner();
+        let limit = if req.limit == 0 {
+            DEFAULT_MODEL_HISTORY
+        } else {
+            req.limit as usize
+        };
+        let history = self.trainer.models(limit).await.map_err(Status::from)?;
+        tracing::Span::current().record("models", history.models.len());
+
+        Ok(Response::new(ListRankerModelsResponse {
+            models: history
+                .models
+                .into_iter()
+                .map(|model| ProtoRankerModel {
+                    id: model.id,
+                    created_at: model.created_at,
+                    kind: model.kind,
+                    status: model.status.as_str().to_owned(),
+                    active: model.active,
+                    train_queries: model.train_queries,
+                    train_pairs: model.train_pairs,
+                    eval_queries: model.eval_queries,
+                    eval_engaged: model.eval_engaged,
+                    baseline_ndcg_at_10: model.baseline_ndcg,
+                    candidate_ndcg_at_10: model.candidate_ndcg,
+                    note: model.note,
+                })
+                .collect(),
+            // What is *running*, which is not always what the `active` column
+            // says — see `ModelHistory::active_model_id`.
+            active_model_id: history.active_model_id.unwrap_or(0),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(model_id, active_model_id))]
+    async fn rollback_ranker(
+        &self,
+        request: Request<RollbackRankerRequest>,
+    ) -> Result<Response<RollbackRankerResponse>, Status> {
+        let req = request.into_inner();
+        tracing::Span::current().record("model_id", req.model_id);
+        // proto3 cannot tell an absent scalar from a zero one, and no model
+        // ever has id 0 (SQLite rowids start at 1), so 0 is "step back one".
+        let target = (req.model_id > 0).then_some(req.model_id);
+
+        let outcome = self
+            .trainer
+            .rollback(target)
+            .await
+            .map_err(RmailError::from)
+            .map_err(Status::from)?;
+        tracing::Span::current().record("active_model_id", outcome.active_model_id.unwrap_or(0));
+        tracing::info!(detail = %outcome.detail, "ranker rolled back");
+
+        Ok(Response::new(RollbackRankerResponse {
+            active_model_id: outcome.active_model_id.unwrap_or(0),
+            detail: outcome.detail,
+        }))
+    }
+}
+
+/// `ListRankerModels` page size when the request does not name one. Small on
+/// purpose: the history is a nightly ledger, and the interesting rows are the
+/// live model and the handful of runs around it.
+const DEFAULT_MODEL_HISTORY: usize = 20;
+
+/// Saturating `usize` -> `u32` for the wire counters. Every one of them is
+/// bounded far below `u32::MAX` by `search.training.max_training_queries`, so
+/// this is a total conversion rather than a real clamp.
+fn clamp_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Translate one wire action into the domain's own, rejecting anything
@@ -2395,6 +2625,32 @@ mod tests {
             // or `search_action`, so the feedback log stays unreadable over
             // the wire. It reaches no provider either.
             "SearchEntities",
+            // Task 65. `TrainRanker` is the sharpest case in this list and
+            // the only RPC on this service that *reads* the feedback log at
+            // all: `rank::train::data::load` selects from all three tables.
+            // It stays admissible because of what crosses the wire, which is
+            // strictly aggregate — how many queries and pairs it trained on,
+            // how many held-out queries carried engagement, two NDCG numbers,
+            // two loss numbers, and a sentence built from exactly those. No
+            // query text, no `message_id`, no position, and no feature vector
+            // is in `RankerTrainingReport`, and none is derivable from it: a
+            // count and a mean over hundreds of impressions identify no
+            // message. That is the line prd.md's "local telemetry, never
+            // transmitted" draws — the log itself never leaves, and a
+            // statistic about how well a model orders it is not the log.
+            //
+            // The other two never touch those tables at all. Both read and
+            // write only `ranker_model`, whose rows carry a weight table and
+            // the same aggregates; `ListRankerModels` deliberately does not
+            // return the weights (see its proto comment), so not even the
+            // model is readable off the machine.
+            //
+            // All three are `admin` in `rmaild::auth::methods`, which is the
+            // second half of the argument: this is an operator surface, not
+            // something a read-scoped token handed to an agent can sweep.
+            "TrainRanker",
+            "ListRankerModels",
+            "RollbackRanker",
         ];
 
         let set = prost_types::FileDescriptorSet::decode(rmail_proto::FILE_DESCRIPTOR_SET)

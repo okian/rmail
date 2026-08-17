@@ -244,6 +244,42 @@ keyed on them would keep parsing while silently scoring different mail.
 Grades are TREC-style 1–3 and default to 1. NDCG uses exponential gain
 (`2^g - 1`), so a 3 is worth seven times a 1 — grade deliberately.
 
+## Learned ranking, and the guardrail on it
+
+With `search.learning` on, every search records what it showed, at what
+position, ranked by which feature vector, and what you then did with it — all
+of it local, with no RPC that reads any of it back out. A nightly (or
+on-demand) job distils that into ranker weights: clicks become
+position-bias-corrected pairwise preferences, a linear model over the same 34
+features is fitted, and the candidate is scored on a **held-out slice of query
+groups the trainer never saw**.
+
+It goes live only on a measured NDCG@10 win over the model that is currently
+running. A candidate that does not clear `search.training.min_ndcg_gain` is
+recorded as *rejected*, nothing swaps, and it can never be activated by hand —
+the point of a guardrail is that there is no way around it. Until enough
+feedback accrues, and after a rollback runs out of accepted models, search
+runs the deterministic cold-start scorer.
+
+```sh
+mail search train --dry-run     # what would tonight's job do, changing nothing
+mail search train               # train, evaluate, and swap only on a measured win
+mail search models              # every candidate, accepted or refused, and its numbers
+mail search rollback            # step back one model; again to reach cold start
+mail search rollback --model 7  # go straight to an accepted model
+```
+
+Nothing here leaves the machine: the log is read in process, the weights are
+fitted in process, and there is deliberately no way to import or export a
+model.
+
+One consequence worth knowing: while a learned model is live it **replaces**
+the `[search.rank_weights]` table rather than layering on top of it, so
+editing those overrides changes nothing until you roll back. That is the right
+precedence — the hand-tuned prior is where personalization starts from, not
+something that keeps overriding what it learned — and `mail search rollback`
+is how you get the configured table back.
+
 The regression guard itself is `rmaild/tests/eval_service.rs`: it seeds the
 fixture corpus the golden set describes, runs the set over gRPC, and fails
 below the floor. It runs in the ordinary test suite and again as its own

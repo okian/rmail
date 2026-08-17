@@ -185,6 +185,19 @@ pub struct ShadowOutcome {
 /// [`Impression::shown`] are dropped (and counted into
 /// [`ShadowOutcome::unlabeled`]); shown ids it omits are simply absent from
 /// its ordering, which correctly costs it recall.
+///
+/// # Call contract
+///
+/// `reorder` is called **exactly once per impression, in `impressions`
+/// order**. That is part of this function's interface rather than an
+/// implementation detail: task 65's hot-swap guardrail precomputes one
+/// ordering per held-out query (it needs the query's intent and its logged
+/// feature vectors, neither of which an [`Impression`] carries) and feeds them
+/// through here as an iterator, which is only correct if the calls line up
+/// one-for-one with the slice. `rank::train::tests::
+/// shadow_calls_reorder_once_per_impression_in_slice_order` pins it, so a
+/// future rewrite that batches or reorders these calls fails there by name
+/// rather than silently scoring each candidate against the wrong query.
 pub fn shadow<F>(impressions: &[Impression], mut reorder: F) -> ShadowOutcome
 where
     F: FnMut(&Impression) -> Vec<i64>,

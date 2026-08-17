@@ -488,6 +488,47 @@ impl ResultCache {
             Err(error) => tracing::warn!(%error, "result cache write failed"),
         }
     }
+
+    /// Drop every cached page.
+    ///
+    /// # Why a learned-model swap needs this
+    ///
+    /// [`RankerFingerprint`] is computed once, at daemon construction, from
+    /// the `[search]` table and the live embedder — everything that decided
+    /// result order *when this cache was built*. Task 65 adds one more thing
+    /// that decides result order and that can change without a restart: the
+    /// hot-swapped [`crate::rank::train`] model. A fingerprint cannot cover it
+    /// (it is not a config value, and recomputing the digest per request to
+    /// chase a swap that happens once a night would be a hash on the hot path
+    /// for nothing), so the swap invalidates explicitly instead.
+    ///
+    /// `crate::rank::train::Trainer` calls this *after* installing the new
+    /// model, never before, and the order is load-bearing: a search that
+    /// starts between the purge and the install would write a page ranked by
+    /// the *old* model and the purge would already have passed it by. Install
+    /// first and every writer after the purge is using the new model, so the
+    /// only entries the purge can race are new-model ones — and deleting one
+    /// of those costs a cache miss, not a wrong answer.
+    ///
+    /// Returns how many pages were dropped.
+    ///
+    /// # Errors
+    ///
+    /// A mapped storage error. Unlike [`Self::store`], this one is surfaced:
+    /// a failed purge means the cache may serve orderings from a model that
+    /// is no longer live, and the caller — which has just changed which
+    /// ranker the daemon runs — is entitled to say so out loud.
+    #[tracing::instrument(skip(self), err)]
+    pub async fn purge(&self) -> Result<usize, crate::error::Error> {
+        let dropped = self
+            .db
+            .write(|conn| conn.execute("DELETE FROM search_result_cache", []))
+            .await?;
+        if dropped > 0 {
+            tracing::info!(dropped, "result cache purged");
+        }
+        Ok(dropped)
+    }
 }
 
 /// Ranked ids as little-endian `i64`s, in order.

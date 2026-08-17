@@ -26,8 +26,9 @@ use rmail_core::repo;
 use rmail_core::{Config, Database};
 use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::{
-    ExplainRequest, FeedbackAction, FeedbackRequest, Intent as ProtoIntent, ResultAction,
-    SearchHit, SearchRequest,
+    ExplainRequest, FeedbackAction, FeedbackRequest, Intent as ProtoIntent,
+    ListRankerModelsRequest, ResultAction, RollbackRankerRequest, SearchHit, SearchRequest,
+    TrainRankerRequest,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -1219,6 +1220,318 @@ async fn opting_out_of_learning_writes_no_feedback_rows_at_all() {
         .await
         .expect("LogFeedback is a no-op, not a failure, when learning is off");
     assert_eq!(feedback_counts(&server.db), (0, 0, 0));
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Offline training and the model hot-swap (task 65)
+// ---------------------------------------------------------------------------
+
+/// A feature vector that contributes nothing except the one field the caller
+/// sets, so the synthetic corpus below separates its two documents on exactly
+/// one axis.
+fn blank_vector() -> rmail_core::features::FeatureVector {
+    rmail_core::features::FeatureVector {
+        bm25_subject: 0.0,
+        bm25_body: 0.0,
+        bm25_from: 0.0,
+        bm25_attach: 0.0,
+        exact_phrase_hit: false,
+        term_coverage: 0.0,
+        proximity_min_span: None,
+        best_match_field: rmail_core::features::MatchField::None,
+        fuzzy_score: 0.0,
+        cos_max_chunk: 0.0,
+        cos_mean_chunk: 0.0,
+        rrf_score: 0.0,
+        num_sources_hit: 0,
+        best_source: rmail_core::retrieve::Source::Lexical,
+        sender_affinity: 0.0,
+        user_replied_thread: false,
+        prior_opens_from_sender: 0.0,
+        thread_activity: 0.0,
+        age_days: None,
+        recency_decay: 0.0,
+        matches_date_intent: false,
+        is_unread: false,
+        is_flagged: false,
+        is_pinned: false,
+        ai_priority: 0.0,
+        has_tag_match: false,
+        folder_prior: 0.0,
+        has_attachment_match: false,
+        is_thread_root: false,
+        thread_size: 0,
+        msg_length: 0,
+        sender_reputation: 0.0,
+        is_newsletter: false,
+        is_automated: false,
+    }
+}
+
+/// `[search.training]` small enough that a few dozen synthetic queries
+/// exercise the whole surface. The *shipped* bounds are asserted in
+/// `rmail_core::rank::train::tests`; what this file proves is that the
+/// capability is reachable over the wire at all.
+fn training_config() -> Config {
+    let mut config = Config::default();
+    config.index.semantic.enabled = false;
+    config.search.training.min_queries = 4;
+    config.search.training.min_pairs = 4;
+    config.search.training.min_eval_queries = 3;
+    config.search.training.epochs = 300;
+    config.search.training.learning_rate = 0.3;
+    config.search.training.l2 = 0.0;
+    // Every train in this file is an explicit RPC. The background loop is off
+    // so these assertions are not racing a daemon that trains on its own —
+    // and so the test is not silently proving the loop instead of the RPC.
+    config.search.training.enabled = false;
+    config
+}
+
+/// Write a synthetic click log straight through `FeedbackStore` into the
+/// daemon's own database: two results per query, always clicked on the
+/// second, so the trainer has a real preference against the cold-start
+/// ordering to learn from.
+///
+/// Stamped with the *current* time rather than a fixed constant, which is
+/// what the `rmail_core` unit tests can get away with and this cannot: a live
+/// daemon runs the feedback log's retention sweep (`[search.feedback]`,
+/// 90 days by default) on a loop, so a page dated to a fixed epoch is deleted
+/// out from under the very next `log_actions` call. That is retention working
+/// correctly; it just means an integration fixture has to write mail-age rows.
+async fn seed_click_log(db: &Database, queries: usize) {
+    let now = chrono::Utc::now().timestamp();
+    let store = rmail_core::feedback::FeedbackStore::new(
+        db.clone(),
+        true,
+        rmail_core::config::FeedbackConfig::default(),
+    );
+    let mut strong = blank_vector();
+    strong.bm25_subject = 1.0;
+    let mut weak = blank_vector();
+    weak.cos_max_chunk = 1.0;
+
+    for n in 0..queries {
+        let query_id = store.new_query_id().expect("learning is on");
+        store
+            .log_query(
+                rmail_core::feedback::QueryRecord {
+                    query_id,
+                    account_id: None,
+                    raw_query: format!("corpus query {n}"),
+                    intent: rmail_core::query::Intent::Lookup,
+                    issued_at: now,
+                },
+                vec![
+                    rmail_core::feedback::Impression {
+                        message_id: 10,
+                        position: 1,
+                        features: strong.clone(),
+                        l1_score: 1.0,
+                        l2_score: None,
+                    },
+                    rmail_core::feedback::Impression {
+                        message_id: 20,
+                        position: 2,
+                        features: weak.clone(),
+                        l1_score: 0.5,
+                        l2_score: None,
+                    },
+                ],
+            )
+            .await
+            .expect("log the page");
+        store
+            .log_actions(
+                query_id,
+                &[rmail_core::feedback::Action {
+                    message_id: 20,
+                    kind: rmail_core::feedback::ActionKind::Open,
+                    dwell_ms: None,
+                    at: now,
+                }],
+            )
+            .await
+            .expect("log the click");
+    }
+}
+
+/// One feature's weight as the live model reports it through `Explain` —
+/// which is the only way a client can observe *which* Stage 4 model is
+/// running.
+async fn explained_weight(
+    client: &mut SearchServiceClient<Channel>,
+    message_id: i64,
+    name: &str,
+) -> f64 {
+    client
+        .explain(ExplainRequest {
+            query: "budgetary".to_owned(),
+            message_id,
+            account_id: 0,
+            filter: String::new(),
+            intent: ProtoIntent::Unspecified as i32,
+            thread_collapse: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .features
+        .iter()
+        .find(|f| f.name == name)
+        .map(|f| f.weight)
+        .unwrap_or_default()
+}
+
+/// prd.md's "cold users fall back to the deterministic scorer" as the wire
+/// sees it, plus the honest answer to "train this" on a mailbox with nothing
+/// to train on.
+#[tokio::test]
+async fn a_cold_daemon_reports_the_deterministic_scorer_and_refuses_to_train() {
+    let server = TestServer::with_config(training_config()).await;
+    let mut client = server.client().await;
+
+    let history = client
+        .list_ranker_models(ListRankerModelsRequest { limit: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(history.active_model_id, 0, "0 is the deterministic scorer");
+    assert!(history.models.is_empty());
+
+    let status = client
+        .train_ranker(TrainRankerRequest { dry_run: false })
+        .await
+        .expect_err("nothing to train on");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+
+    // Rolling back a daemon already on cold start is a no-op rather than an
+    // error — and must not step *forward* into some model.
+    let rolled = client
+        .rollback_ranker(RollbackRankerRequest { model_id: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rolled.active_model_id, 0);
+    assert!(rolled.detail.contains("deterministic"), "{}", rolled.detail);
+
+    let status = client
+        .rollback_ranker(RollbackRankerRequest { model_id: 4_242 })
+        .await
+        .expect_err("no such model");
+    assert_eq!(status.code(), Code::NotFound, "{status:?}");
+
+    server.stop().await;
+}
+
+/// The whole operator loop over the wire: trigger a train, read the
+/// evaluation, watch the swap show up in what the daemon actually ranks
+/// with, and roll it back. A mechanism nobody outside `rmail-core` can reach
+/// is not a shipped capability.
+#[tokio::test]
+async fn an_operator_can_train_read_the_evaluation_and_roll_back_over_grpc() {
+    let server = TestServer::with_config(training_config()).await;
+    seed_click_log(&server.db, 40).await;
+    let message_id = server
+        .index(repo::NewMessage {
+            subject: Some("quarterly budgetary review".to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let mut client = server.client().await;
+
+    // The cold-start table weights `bm25_subject` (0.90) above
+    // `cos_max_chunk` (0.80); the seeded corpus teaches the opposite, so this
+    // pair is how the swap becomes observable from outside.
+    assert!(
+        explained_weight(&mut client, message_id, "bm25_subject").await
+            > explained_weight(&mut client, message_id, "cos_max_chunk").await
+    );
+
+    // A dry run measures everything and changes nothing.
+    let dry = client
+        .train_ranker(TrainRankerRequest { dry_run: true })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(dry.dry_run);
+    assert!(!dry.accepted, "a dry run never reports a swap");
+    assert!(dry.train_pairs > 0);
+    assert!(dry.holdout_engaged > 0);
+    assert_eq!(dry.model_id, 0);
+    assert_eq!(dry.active_model_id, 0);
+    assert!(
+        client
+            .list_ranker_models(ListRankerModelsRequest { limit: 0 })
+            .await
+            .unwrap()
+            .into_inner()
+            .models
+            .is_empty(),
+        "a dry run writes no model row"
+    );
+
+    // The real thing.
+    let report = client
+        .train_ranker(TrainRankerRequest { dry_run: false })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(report.accepted, "{}", report.verdict);
+    assert!(report.candidate_ndcg_at_10 > report.baseline_ndcg_at_10);
+    assert!(report.model_id > 0);
+    assert_eq!(report.active_model_id, report.model_id);
+
+    // The evaluation is readable afterwards, not only in the response that
+    // produced it.
+    let history = client
+        .list_ranker_models(ListRankerModelsRequest { limit: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(history.active_model_id, report.model_id);
+    assert_eq!(history.models.len(), 1);
+    assert_eq!(history.models[0].id, report.model_id);
+    assert_eq!(history.models[0].status, "accepted");
+    assert!(history.models[0].active);
+    assert!(history.models[0].candidate_ndcg_at_10 > history.models[0].baseline_ndcg_at_10);
+
+    // And the swap is live, not merely recorded: `Explain` re-derives its
+    // breakdown from whichever model the daemon is ranking with.
+    assert!(
+        explained_weight(&mut client, message_id, "cos_max_chunk").await
+            > explained_weight(&mut client, message_id, "bm25_subject").await,
+        "Explain must reflect the model that is actually live"
+    );
+
+    // Roll back, and the cold-start table is what ranks again.
+    let rolled = client
+        .rollback_ranker(RollbackRankerRequest { model_id: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rolled.active_model_id, 0, "{}", rolled.detail);
+    assert!(
+        explained_weight(&mut client, message_id, "bm25_subject").await
+            > explained_weight(&mut client, message_id, "cos_max_chunk").await,
+        "after a rollback Explain must report the cold-start table again"
+    );
+
+    // Naming an accepted model explicitly brings it back.
+    let back = client
+        .rollback_ranker(RollbackRankerRequest {
+            model_id: report.model_id,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(back.active_model_id, report.model_id);
+    assert!(
+        explained_weight(&mut client, message_id, "cos_max_chunk").await
+            > explained_weight(&mut client, message_id, "bm25_subject").await
+    );
 
     server.stop().await;
 }
