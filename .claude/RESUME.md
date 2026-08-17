@@ -6,20 +6,18 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**83 of 86 done, 3 remaining.** `tasks.md` is authoritative — count with
+**85 of 86 done, 1 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **4190/4190** on the full
+after merge, never on the agent's own report: currently **4292/4292** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: **42, 65, 69** — and **both 42 and 65 are `parallel-safe: no`**,
-so from here the tasks run one at a time. (An earlier revision of this file
-said only 42 was; that was wrong — check the flag in `tasks.md`, do not
-assume.) In flight: **69** (autonomous inbox agent), briefed hardest because
-it is the only feature that acts on a mailbox with no human in the loop.
+Remaining: **42** (CLI structured output + generic call) — in flight, and the
+last unchecked task in the file. When it lands the build is feature-complete.
 
-Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75, 58, 68, 73, 72, 36, 78. Every one verified on the
+Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75, 58, 68, 73, 72, 36, 78,
+69, 65. Every one verified on the
 *combined* tree, never on the agent's own count — the reports quoted a dozen
-different bases; the truth after merging all of them is 4190.
+different bases; the truth after merging all of them is 4292.
 
 **Three of the last five needed real work at merge, not just a cherry-pick:**
 
@@ -100,7 +98,9 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V53.** V47 -> 58, V48 -> 68, V49 -> 73, V50 -> 72,
+costs nothing. **Next free: V55.** V53 -> 69, V54 -> 65.
+
+Earlier: V47 -> 58, V48 -> 68, V49 -> 73, V50 -> 72,
 V51 -> 36, V52 -> 78.
 
 Previous: V43 went to 57, V44 to 80, V45 to 62,
@@ -493,3 +493,24 @@ So the productive review question on this codebase is not "is this correct"
 but **"does the doc-comment claim something stronger than the code
 enforces"** — and the fix is usually to make the code match the doc, because
 the doc is describing the guarantee someone will rely on.
+
+## The suite is now heavy enough to starve its own liveness tests
+
+After task 65 merged, the first full run failed
+`sync::idle::a_dropped_connection_reconnects_and_keeps_watching` on its **60
+second** deadline. It passes in 1.1s in isolation, and the failing run took
+84s wall against ~36s for the passing one. Task 65's training tests are
+CPU-bound, and under that load a spawned watch task lost more than a minute
+of scheduling — against a harness deadline whose own doc comment already
+calls itself deliberately generous.
+
+That is not a code defect and it is not "just flaky": it is the suite
+outgrowing an assumption. If it recurs, the fix is to bound the CPU-heavy
+tests' parallelism, not to raise the deadline again — a liveness assertion
+that waits several minutes stops distinguishing "slow" from "broken", which
+is the only thing it exists to do.
+
+Do not silently re-run a failure like this. Re-run it, yes — but record that
+you did, and what the wall-clock difference was. The finder-index race
+earlier in this build looked exactly like a flake and was a real data-loss
+bug; the only way to tell them apart is to write down what was observed.
