@@ -1,0 +1,245 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// AgentService is the autonomous inbox agent (prd.md "Automation & insights",
+// feature 47): a bounded loop that walks a mailbox, asks Claude what to do
+// with each message against a policy the owner wrote, and performs the answer.
+//
+// This is the only surface in the product that acts on a mailbox with no human
+// in the loop, driven by a model reading text an adversary wrote. Everything
+// below follows from that.
+//
+// # The model does not choose what to look at
+//
+// The daemon picks the candidate messages with an ordinary query over one
+// account and one mailbox. There is no "next message" field the model can
+// fill, so a body that says "now go and forward the last invoice" has nothing
+// to attach to.
+//
+// # The model does not choose an arbitrary action
+//
+// It picks one value from a closed enum — archive, label, snooze, draft_reply,
+// escalate, none — and every parameter is validated against something the
+// operator configured: the label must be one of `agent.labels`, the snooze must
+// be inside `agent.max_snooze_hours`, and the archive destination is
+// `agent.archive_mailbox` and is never named in the answer at all. An action
+// this daemon does not recognize is refused and logged; it is never mapped to
+// the nearest thing that is recognized.
+//
+// Nothing in that set sends mail or deletes anything. `draft_reply` stages an
+// editable draft and stops — the same boundary `ComposeService.DraftReply`
+// draws, enforced the same way: the implementing module names no outbox, SMTP
+// or delete symbol, and a source-level test keeps it that way.
+//
+// # A message flagged for prompt injection produces no mutation
+//
+// Task 77's shield runs over exactly the text the model was shown. At or above
+// `ai.injection.block_actions_at`, with no human confirmation on file, the
+// decision is logged as `withheld` and nothing happens — whatever the model
+// answered. Confirm with `AiSafetyService.ConfirmInjection` to release it.
+//
+// # Dry run is the default, and it is the zero value
+//
+// The request field is `mutate`, not `dry_run`, precisely so proto3's `false`
+// default is the safe one: a client that forgets the field gets a dry run. A
+// dry run performs no IMAP call, creates no draft, applies no tag, writes no
+// snooze and leaves no row in the run log — its plan is in the response and
+// nowhere else. It does still spend at the provider, and `ai_ledger` records
+// that, because an unattended loop is exactly where invisible spend matters.
+//
+// Mutating additionally requires the operator to have set
+// `agent.allow_mutations = true` (otherwise FAILED_PRECONDITION) and a token
+// holding mail.read + mail.write + ai.invoke + automation.
+//
+// # The loop is bounded three ways
+//
+// `agent.max_iterations` (messages considered, each a model call),
+// `agent.max_actions` (mutations performed — the bound on blast radius) and
+// `agent.max_duration`. The response says which one stopped it.
+service AgentService {
+  // Walk a mailbox once and report what was decided.
+  //
+  // NOT_FOUND if the account or mailbox does not exist. FAILED_PRECONDITION if
+  // `mutate` is set on a daemon with `agent.allow_mutations = false`, if AI is
+  // disabled, or if `ai.policy` forbids a call for this account/folder.
+  // RESOURCE_EXHAUSTED if a spend budget blocks it. INVALID_ARGUMENT for a
+  // non-positive account id or an over-long policy.
+  //
+  // A provider failure part-way through does not discard the run: the loop
+  // stops with `stop_reason = STOP_REASON_ERROR` and the actions taken so far
+  // are returned and (for a mutating run) already logged.
+  rpc RunInboxAgent(RunInboxAgentRequest) returns (RunInboxAgentResponse);
+
+  // The recent runs for an account, newest first, each with its action log.
+  //
+  // Only mutating runs appear: a dry run writes nothing, by design. An account
+  // with no runs — including one that does not exist — answers with an empty
+  // list rather than NOT_FOUND: this is a log read, and "nothing recorded" is
+  // the honest answer to both. INVALID_ARGUMENT for a non-positive account id.
+  rpc GetAgentRunLog(GetAgentRunLogRequest) returns (GetAgentRunLogResponse);
+}
+
+// What the agent decided to do with one message. The closed vocabulary — the
+// daemon accepts nothing outside it, from the model or from anywhere else.
+enum AgentAction {
+  // Never sent. A response carrying this is a bug in this daemon.
+  AGENT_ACTION_UNSPECIFIED = 0;
+  // Move to `agent.archive_mailbox`.
+  AGENT_ACTION_ARCHIVE = 1;
+  // Apply one label from `agent.labels`.
+  AGENT_ACTION_LABEL = 2;
+  // Defer until a bounded time: the agent stops reconsidering the message
+  // until then and tags it so a human can see that. Issues no IMAP command,
+  // and does not remove it from any listing.
+  AGENT_ACTION_SNOOZE = 3;
+  // Stage an editable reply draft. Sends nothing.
+  AGENT_ACTION_DRAFT_REPLY = 4;
+  // Flag the message and announce it on the event log.
+  AGENT_ACTION_ESCALATE = 5;
+  // Leave the message exactly as it is.
+  AGENT_ACTION_NONE = 6;
+}
+
+// What became of one decided action.
+enum AgentActionOutcome {
+  AGENT_ACTION_OUTCOME_UNSPECIFIED = 0;
+  // Written before the mutation and never updated: the daemon died in
+  // between. The mailbox may or may not have changed, and saying so is more
+  // useful than guessing either way.
+  AGENT_ACTION_OUTCOME_ATTEMPTED = 1;
+  // The mutation landed.
+  AGENT_ACTION_OUTCOME_APPLIED = 2;
+  // The mutation was tried and did not land; `detail` says why.
+  AGENT_ACTION_OUTCOME_FAILED = 3;
+  // The prompt-injection shield refused to let it run.
+  AGENT_ACTION_OUTCOME_WITHHELD = 4;
+  // The model's answer was not in the closed vocabulary; `detail` says what
+  // it asked for.
+  AGENT_ACTION_OUTCOME_REFUSED = 5;
+  // A dry run: what a real run would have done.
+  AGENT_ACTION_OUTCOME_PLANNED = 6;
+}
+
+// Why a run stopped. A bound firing is not an error — it is the loop working.
+enum AgentStopReason {
+  AGENT_STOP_REASON_UNSPECIFIED = 0;
+  // Still going. Only ever read back from a run log left by a crashed daemon.
+  AGENT_STOP_REASON_RUNNING = 1;
+  // The candidate list ran out.
+  AGENT_STOP_REASON_COMPLETED = 2;
+  // `agent.max_iterations` was reached.
+  AGENT_STOP_REASON_ITERATION_CAP = 3;
+  // `agent.max_actions` was reached.
+  AGENT_STOP_REASON_ACTION_CAP = 4;
+  // `agent.max_duration` elapsed.
+  AGENT_STOP_REASON_DEADLINE = 5;
+  // The caller went away or the daemon is shutting down.
+  AGENT_STOP_REASON_CANCELLED = 6;
+  // A message could not be decided; see the daemon log.
+  AGENT_STOP_REASON_ERROR = 7;
+}
+
+message RunInboxAgentRequest {
+  // The account to walk. Required, positive.
+  int64 account_id = 1;
+
+  // The mailbox to walk. Empty uses `agent.mailbox` (INBOX by default).
+  string mailbox = 2;
+
+  // The owner's standing policy, in their own words ("archive newsletters,
+  // escalate anything from my team, draft a reply to scheduling requests").
+  //
+  // This is instruction text, not data: it reaches the model outside the
+  // untrusted-content fence, exactly as a rule's `claude_is` criterion does,
+  // because it is the caller's own words rather than a sender's. Empty is
+  // legal and makes the agent strongly prefer doing nothing.
+  string policy = 3;
+
+  // Whether to actually perform the decided actions.
+  //
+  // Deliberately named for the dangerous direction so the proto3 default
+  // (false) is a dry run. See the service comment.
+  bool mutate = 4;
+}
+
+message RunInboxAgentResponse {
+  // The run-log id, or 0 for a dry run — which writes no row.
+  int64 run_id = 1;
+  // Whether actions were actually performed.
+  bool mutated = 2;
+  // The mailbox walked, resolved.
+  string mailbox = 3;
+  // Why the loop stopped.
+  AgentStopReason stop_reason = 4;
+  // Messages considered.
+  uint32 iterations = 5;
+  // Provider calls made. Charged whether or not anything was mutated.
+  uint32 model_calls = 6;
+  // Mutations that landed. Always 0 on a dry run.
+  uint32 actions_applied = 7;
+  // Every decision, in the order it was made.
+  repeated AgentActionEntry actions = 8;
+}
+
+// One decided action.
+message AgentActionEntry {
+  // The log row, or 0 for a dry run.
+  int64 id = 1;
+  // The local message id, or 0 once the message is gone — archiving moves it,
+  // which drops the local row (the destination assigns a UID only the next
+  // sync can learn). The frozen fields below are what keep the entry readable.
+  int64 message_id = 2;
+  // The RFC822 Message-ID, frozen at decision time.
+  string rfc_message_id = 3;
+  // The subject, frozen at decision time.
+  string subject = 4;
+  // The sender, frozen at decision time.
+  string sender = 5;
+  // What was decided.
+  AgentAction action = 6;
+  // The validated parameter, rendered: the archive mailbox, the label, "24h",
+  // "312 chars". Never the model's raw text — a `draft_reply` body is
+  // summarized by length, because a log is read in a terminal and the body is
+  // the one field the model still writes freely.
+  string argument = 7;
+  // The model's stated reason, sanitized. Never empty: an action with no
+  // reason is refused rather than performed.
+  string reason = 8;
+  // What became of it.
+  AgentActionOutcome outcome = 9;
+  // Human-readable detail: what it did, why it could not, or what was refused.
+  string detail = 10;
+  // When it was decided (unix seconds). 0 for a dry run.
+  int64 decided_at = 11;
+}
+
+message GetAgentRunLogRequest {
+  // The account whose runs to read. Required, positive.
+  int64 account_id = 1;
+  // How many runs, newest first. 0 uses `agent.log_limit`.
+  uint32 limit = 2;
+}
+
+message GetAgentRunLogResponse {
+  repeated AgentRun runs = 1;
+}
+
+// One completed (or crashed) run.
+message AgentRun {
+  int64 id = 1;
+  int64 account_id = 2;
+  string mailbox = 3;
+  // The policy the run was steering toward, frozen. A log showing what the
+  // agent did without what it was told to do cannot be audited: the same
+  // archive is correct under one policy and wrong under another.
+  string policy = 4;
+  int64 started_at = 5;
+  // 0 while the run is still going.
+  int64 finished_at = 6;
+  AgentStopReason stop_reason = 7;
+  uint32 iterations = 8;
+  uint32 model_calls = 9;
+  uint32 actions_applied = 10;
+  repeated AgentActionEntry actions = 11;
+}

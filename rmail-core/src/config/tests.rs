@@ -501,6 +501,11 @@ fn every_known_table_accepts_an_override() {
         jail.set_env("RMAIL_GRPC__ENABLED", "false");
         jail.set_env("RMAIL_HOOKS__MAX_CONCURRENCY", "9");
         jail.set_env("RMAIL_RULES__ARCHIVE_MAILBOX", "Deep Storage");
+        jail.set_env("RMAIL_WEBHOOKS__ENABLED", "true");
+        jail.set_env("RMAIL_NOTIFY__ENABLED", "true");
+        jail.set_env("RMAIL_DIGEST__MAX_CLUSTERS", "9");
+        jail.set_env("RMAIL_EXTRACT__MAX_TOKENS", "9");
+        jail.set_env("RMAIL_AGENT__ALLOW_MUTATIONS", "true");
 
         let cfg = Config::from_toml_str("").map_err(fe)?;
         assert!(!cfg.sync.idle);
@@ -514,8 +519,74 @@ fn every_known_table_accepts_an_override() {
         assert!(!cfg.grpc.enabled);
         assert_eq!(cfg.hooks.max_concurrency, 9);
         assert_eq!(cfg.rules.archive_mailbox, "Deep Storage");
+        assert!(cfg.webhooks.enabled);
+        assert!(cfg.notify.enabled);
+        assert_eq!(cfg.digest.max_clusters, 9);
+        assert_eq!(cfg.extract.max_tokens, 9);
+        assert!(cfg.agent.allow_mutations);
         Ok(())
     });
+}
+
+/// Every field of [`Config`] must appear in `KNOWN_TABLES`, or its
+/// `RMAIL_<TABLE>__*` overrides are silently dropped.
+///
+/// The test above exercises one override per table by hand and is therefore
+/// only as complete as whoever last edited it — `extract` had been missing
+/// from the list since task 75 landed and nothing said so, because a dropped
+/// override is indistinguishable from an unrelated `RMAIL_*` variable. This
+/// reconciles the list against the struct's *own source* instead, so a table
+/// added tomorrow fails by name.
+///
+/// Source-level rather than reflective: `serde` gives no field list at
+/// runtime, and the alternative — a second hand-written list — would prove
+/// only that somebody edited both. Same shape as
+/// `ai::injection`'s own fencing gate.
+#[test]
+fn every_config_table_is_known() {
+    let source = include_str!("mod.rs");
+    let start = source
+        .find("pub struct Config {")
+        .expect("the Config struct must be in this file");
+    let body = source
+        .get(start..)
+        .and_then(|rest| rest.find("\n}").map(|end| rest.get(..end)))
+        .flatten()
+        .expect("the Config struct must terminate");
+
+    let fields: Vec<&str> = body
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("pub ")?;
+            let (name, _) = rest.split_once(':')?;
+            Some(name.trim())
+        })
+        .collect();
+    assert!(
+        fields.len() > 10,
+        "the field scrape found only {fields:?}; the struct's shape must have changed"
+    );
+    let missing: Vec<&str> = fields
+        .iter()
+        .copied()
+        .filter(|f| !super::KNOWN_TABLES.contains(f))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these `Config` fields are not in KNOWN_TABLES, so `RMAIL_<TABLE>__*` overrides for \
+         them are silently dropped: {missing:?}"
+    );
+    // A stale entry is its own bug: it says a table exists when it does not,
+    // and the next person trusts the list.
+    let stale: Vec<&str> = super::KNOWN_TABLES
+        .iter()
+        .copied()
+        .filter(|t| !fields.contains(t))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "KNOWN_TABLES names tables `Config` does not have: {stale:?}"
+    );
 }
 
 #[test]

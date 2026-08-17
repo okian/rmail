@@ -1435,6 +1435,48 @@ commands! {
         summary: "Extract, deduplicate and rank a message's links, flagging targets that misrepresent themselves.",
     }
 
+    // -- AgentService (task 69) ------------------------------------------------
+    // The most consequential pair in this table. `RunInboxAgent` is the only
+    // capability in the product that mutates a mailbox with no human in the
+    // loop, driven by a model reading attacker-authored text.
+    //
+    // `Mutate` unconditionally, including for the dry run that is its default.
+    // Two independent reasons, and either alone would settle it:
+    //
+    //  - It spends at a provider on every iteration, which is the effect
+    //    outside this process that separates `AiService/AskMailbox` from
+    //    `SearchService/Search` in this enum's own doc comment. A dry run
+    //    spends exactly as much as a live one.
+    //  - `Effect` is what task 53 gates MCP tools by, and this row's whole job
+    //    is to make sure the projection never advertises "run the inbox agent"
+    //    as safe. A `Read` here would hand an agent a tool it could loop on —
+    //    unattended spend, and one `mutate: true` away from unattended
+    //    mutation.
+    //
+    // The scope table (`rmaild::auth::methods`) draws the finer line the
+    // effect enum cannot: `mail.read` + `mail.write` + `ai.invoke` +
+    // `automation`, all four, because this RPC exercises every one of those
+    // authorities at once.
+    AgentRunInboxAgent {
+        rpc: "/rmail.v1.AgentService/RunInboxAgent",
+        tool: "run_inbox_agent",
+        effect: Mutate,
+        cli: ["agent run"],
+        actions: [],
+        summary: "Walk a mailbox once, deciding one of archive/label/snooze/draft-reply/escalate per message; dry-run unless asked to mutate.",
+    }
+    // A read: it returns rows the agent already wrote, calls no model, and
+    // consumes no idempotency claim. The nearest neighbour is
+    // `AuditService`'s ledger read, which is on the same line.
+    AgentGetAgentRunLog {
+        rpc: "/rmail.v1.AgentService/GetAgentRunLog",
+        tool: "get_agent_run_log",
+        effect: Read,
+        cli: ["agent log"],
+        actions: [],
+        summary: "Read what the inbox agent did, run by run, with the reason it gave for each action.",
+    }
+
     // -- WebhookService (task 68) ----------------------------------------------
     WebhookRegister {
         rpc: "/rmail.v1.WebhookService/Register",

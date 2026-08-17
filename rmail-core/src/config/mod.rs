@@ -32,9 +32,17 @@ use serde::Deserialize;
 pub use duration::{parse_human_duration, HumanDuration};
 
 /// Top-level table names accepted from the environment overlay.
+///
+/// Every field of [`Config`] must appear here, or `RMAIL_<TABLE>__*` overrides
+/// for it are silently dropped by [`env_overlay`] — silently, because the
+/// filter exists to stop unrelated `RMAIL_*` vars hard-failing the load, so a
+/// missing entry looks exactly like an unrelated variable.
+/// `every_config_table_is_known` reconciles the two against the struct's own
+/// source and fails by name, which is how `extract` (task 75) turned up
+/// missing: it had been unreachable from the environment since it landed.
 const KNOWN_TABLES: &[&str] = &[
     "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc",
-    "hooks", "webhooks", "rules", "notify", "digest",
+    "hooks", "webhooks", "rules", "notify", "digest", "extract", "agent",
 ];
 
 /// Errors produced while loading or parsing configuration.
@@ -341,6 +349,8 @@ pub struct Config {
     pub digest: DigestConfig,
     /// Table/calendar/link extraction settings.
     pub extract: ExtractConfig,
+    /// Autonomous inbox-agent settings.
+    pub agent: AgentConfig,
 }
 
 impl Config {
@@ -3139,6 +3149,112 @@ impl Default for ExtractConfig {
             command_args: Vec::new(),
             webhook_url: String::new(),
         }
+    }
+}
+
+/// The autonomous inbox agent (`[agent]`, task 69, prd.md feature 47).
+///
+/// The one table in this file whose defaults are chosen for what happens when
+/// an operator *never reads it*. Every other subsystem's defaults trade
+/// usefulness against cost; this one trades usefulness against an unattended
+/// loop, driven by a model reading attacker-authored text, holding a mutation
+/// budget over somebody's mail. So the shipped defaults are: mutations off,
+/// no labels, a small archive-only vocabulary, and bounds tight enough that
+/// the worst a misconfiguration can do is spend a few Haiku calls.
+///
+/// What decides whether a model call may happen at all is
+/// `[ai.limits]`/`[ai.privacy]`/`[ai.policy]`'s business and is not restated
+/// here, the same way [`DigestConfig`] and [`ExtractConfig`] leave it alone.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AgentConfig {
+    /// Whether the agent may ever perform an action.
+    ///
+    /// **Off by default, and this is the switch that matters.** Scope and the
+    /// request's own `mutate` flag both gate mutation too (see
+    /// `rmail_core::agent`'s module docs), but those are the *caller's*
+    /// decisions and this one is the machine owner's: with it off, no token
+    /// and no request can make this daemon's agent touch mail. A
+    /// `RunInboxAgent` asking to mutate is refused with `FAILED_PRECONDITION`
+    /// naming this key; a dry run still answers, so the feature is explorable
+    /// before it is armed.
+    pub allow_mutations: bool,
+    /// The model that decides. Haiku: a per-message triage decision over text
+    /// already in front of it, run in a loop, is exactly what the cheap tier
+    /// is for — and a more capable model is not a safety improvement here,
+    /// because the controls that matter are the closed vocabulary and the
+    /// shield rather than the model's judgement.
+    pub model: String,
+    /// The mailbox a run walks when the request names none.
+    pub mailbox: String,
+    /// Where an `archive` action moves mail to. Operator configuration and
+    /// never the model's choice: a destination the model could name would be a
+    /// MOVE to anywhere in the account.
+    pub archive_mailbox: String,
+    /// The labels a `label` action may apply, exactly.
+    ///
+    /// Empty by default, which makes `label` unavailable — the action is not
+    /// offered to the model and any answer naming it is refused. That is
+    /// deliberate: `get_or_create_tag` downstream would happily mint whatever
+    /// string the model wrote, so an unconstrained label action is a
+    /// model-authored write into the user's tag namespace.
+    pub labels: Vec<String>,
+    /// The tag a `snooze` applies, so a deferred message is visible in the tag
+    /// surfaces a human already uses (`mail tags`, `tag:` in search, smart
+    /// folders). Operator configuration for the same reason `labels` is: an
+    /// unknown tag name is simply created, so a name the model could choose
+    /// would be a model-authored write into the user's tag namespace.
+    ///
+    /// A snooze does *not* remove the message from any listing — see
+    /// `rmail_core::agent::apply`'s `snooze` on why teaching `MailStore::list`
+    /// to honour it is a much larger decision than this feature gets to make.
+    pub snooze_tag: String,
+    /// The longest `snooze`, in hours. A request outside `1..=max` is refused
+    /// rather than clamped, so the log says what was actually asked for.
+    pub max_snooze_hours: u32,
+    /// How many messages one run considers. Each is a model call. Clamped to
+    /// `rmail_core::agent::MAX_ITERATIONS_CEILING`.
+    pub max_iterations: u32,
+    /// How many mutations one run performs — the bound on blast radius, and
+    /// the most mail one run can touch. `0` means "consider everything, change
+    /// nothing", a dry run an operator can force from configuration rather
+    /// than by trusting every caller to pass the flag.
+    pub max_actions: u32,
+    /// How long one run may take, wall clock. Clamped to
+    /// `rmail_core::agent::MAX_DURATION_CEILING`.
+    pub max_duration: HumanDuration,
+    /// How many runs `GetAgentRunLog` returns when the request asks for none.
+    pub log_limit: u32,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            allow_mutations: false,
+            model: "claude-haiku-4-5".to_owned(),
+            mailbox: "INBOX".to_owned(),
+            archive_mailbox: "Archive".to_owned(),
+            labels: Vec::new(),
+            snooze_tag: "snoozed".to_owned(),
+            max_snooze_hours: 24 * 7,
+            max_iterations: 25,
+            max_actions: 10,
+            max_duration: HumanDuration::new(secs(300)),
+            log_limit: 20,
+        }
+    }
+}
+
+impl AgentConfig {
+    /// The three bounds these settings describe, already clamped.
+    #[must_use]
+    pub fn limits(&self) -> crate::agent::AgentLimits {
+        crate::agent::AgentLimits {
+            max_iterations: self.max_iterations,
+            max_actions: self.max_actions,
+            max_duration: self.max_duration.as_duration(),
+        }
+        .clamped()
     }
 }
 

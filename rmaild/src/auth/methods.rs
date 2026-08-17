@@ -1456,6 +1456,58 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.RuleService/RecordCorrection",
         Requirement::AllOf(&[Scope::Automation, Scope::MailRead]),
     ),
+    // -- AgentService (task 69) -----------------------------------------------
+    // The widest `AllOf` in this table, and the RPC that most deserves one.
+    // `RunInboxAgent` is a loop that reads mail, asks a model what to do with
+    // it, and moves, flags, labels, hides and drafts replies to it, unattended.
+    // The four authorities it exercises are genuinely distinct and every one of
+    // them is exercised on every run, so taking any of them out under-gates it:
+    //
+    //  - `mail.read`: it reads bodies and sends them to a provider. This is the
+    //    scope every content-disclosing RPC in this table sits behind, and the
+    //    one `RuleService/RecordCorrection` cites for merely *copying* content.
+    //  - `mail.write`: it moves mail (`MailService/Move`), sets flags
+    //    (`MailService/SetFlags`), applies tags (`TagService/AddTag`) and
+    //    leaves drafts behind (`ComposeService/DraftReply`'s own reason: a
+    //    draft is a document a human later opens, reads as their own words and
+    //    sends).
+    //  - `ai.invoke`: every iteration is a provider call. An `automation` +
+    //    `mail.write` token minted deliberately *without* it — an automation
+    //    token that is not meant to spend — must not be able to force
+    //    unbounded provider spend by looping this.
+    //  - `automation`: it is the unattended-program surface this scope's own
+    //    doc comment names, alongside rules, hooks and webhooks. A token that
+    //    can write mail by hand is not thereby a token that may set a machine
+    //    writing mail on its own.
+    //
+    // Deliberately *not* `mail.send`, and that line is the point of the task:
+    // the closed action set contains nothing that transmits, `draft_reply`
+    // terminates at `DraftStore`, and the implementing module names no outbox
+    // or SMTP symbol at all.
+    //
+    // The row governs the dry run too, because this table is keyed by method
+    // and cannot see the request's `mutate` flag. Over-gating the safe
+    // direction is the right way to be wrong here — and it is not the only
+    // control: `agent.allow_mutations` (off by default) is the operator's own
+    // switch, refused inside the engine, and the request must additionally ask.
+    (
+        "/rmail.v1.AgentService/RunInboxAgent",
+        Requirement::AllOf(&[
+            Scope::MailRead,
+            Scope::MailWrite,
+            Scope::AiInvoke,
+            Scope::Automation,
+        ]),
+    ),
+    // The log is `mail.read` + `automation`: it carries subjects and senders
+    // (mail content, the same privilege every read in this table sits behind)
+    // *and* it is the record of an automation's behaviour, which is what
+    // `RuleService/ListRules` sits behind. It calls no model and mutates
+    // nothing, so it needs neither of the other two.
+    (
+        "/rmail.v1.AgentService/GetAgentRunLog",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
 ];
 
 /// The requirement for `method` (a full gRPC path like
@@ -1806,6 +1858,88 @@ mod tests {
             assert!(
                 required.contains(&Scope::AiInvoke),
                 "{method} can spend at a model provider and must require ai.invoke"
+            );
+        }
+    }
+
+    /// Running the inbox agent is four authorities at once, and no three of
+    /// them buy it.
+    ///
+    /// This is the widest `AllOf` in the table and the RPC that most deserves
+    /// one: an unattended loop that reads mail, spends at a provider, and
+    /// moves, flags, labels and drafts replies to that mail. Each scope is
+    /// checked to be individually insufficient *and* to be individually
+    /// necessary — the second half is what catches a future edit that quietly
+    /// drops one from the row, which no "does it contain X" assertion pair
+    /// would, since those keep passing while the conjunction rots around them.
+    ///
+    /// `mail.send` is asserted absent, because "the agent cannot transmit" is
+    /// the boundary the whole task is drawn on: `draft_reply` terminates at
+    /// `DraftStore` and `rmail_core::agent::apply` names no outbox symbol. A
+    /// row that acquired `mail.send` would be the first sign that boundary had
+    /// moved.
+    #[test]
+    fn running_the_inbox_agent_needs_all_four_authorities() {
+        let method = "/rmail.v1.AgentService/RunInboxAgent";
+        let Some(Requirement::AllOf(required)) = lookup(method) else {
+            unreachable!("{method} should require every one of a scope set");
+        };
+        let full = [
+            Scope::MailRead,
+            Scope::MailWrite,
+            Scope::AiInvoke,
+            Scope::Automation,
+        ];
+        for want in &full {
+            assert!(
+                required.contains(want),
+                "{method} exercises {want:?} on every run and must require it"
+            );
+        }
+        assert!(
+            !required.contains(&Scope::MailSend),
+            "the inbox agent must never require mail.send: nothing in its closed action set \
+             transmits, and a row that needed it would mean that had changed"
+        );
+
+        // The whole set is enough...
+        let granted: Vec<Scope> = required.to_vec();
+        assert!(
+            Requirement::AllOf(required).satisfied_by(&granted),
+            "the full scope set must admit {method}"
+        );
+        // ...and dropping any single one of them is not. This is the check
+        // that bites: it fails if the row loses a scope *and* if `AllOf` ever
+        // stops being a conjunction.
+        for missing in &full {
+            let short: Vec<Scope> = granted.iter().filter(|s| *s != missing).cloned().collect();
+            assert!(
+                !Requirement::AllOf(required).satisfied_by(&short),
+                "a token missing {missing:?} must be denied {method}"
+            );
+        }
+        // Admin still satisfies it, as it satisfies everything.
+        assert!(Requirement::AllOf(required).satisfied_by(&[Scope::Admin]));
+    }
+
+    /// The agent's run log discloses mail content and is an automation record,
+    /// and it is neither a model call nor a mutation.
+    #[test]
+    fn reading_the_agent_log_needs_mail_read_and_automation_and_nothing_more() {
+        let method = "/rmail.v1.AgentService/GetAgentRunLog";
+        let Some(Requirement::AllOf(required)) = lookup(method) else {
+            unreachable!("{method} should require every one of a scope set");
+        };
+        assert!(required.contains(&Scope::MailRead));
+        assert!(required.contains(&Scope::Automation));
+        assert!(
+            !required.contains(&Scope::AiInvoke) && !required.contains(&Scope::MailWrite),
+            "reading the log calls no model and mutates nothing"
+        );
+        for granted in [Scope::MailRead, Scope::Automation] {
+            assert!(
+                !Requirement::AllOf(required).satisfied_by(std::slice::from_ref(&granted)),
+                "{granted:?} alone must not be enough to read {method}"
             );
         }
     }

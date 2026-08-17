@@ -15,6 +15,7 @@
 
 mod account_service;
 mod admin_service;
+mod agent_service;
 mod ai_policy_service;
 mod ai_safety_service;
 mod ai_service;
@@ -46,6 +47,7 @@ mod webhook_service;
 
 pub use account_service::AccountApi;
 pub use admin_service::AdminApi;
+pub use agent_service::{AgentApi, MAX_POLICY_CHARS as MAX_AGENT_POLICY_CHARS};
 pub use ai_safety_service::AiSafetyApi;
 pub use ai_service::AiApi;
 pub use analytics_service::AnalyticsApi;
@@ -82,6 +84,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rmail_core::agent::{Decider as AgentDecider, Executor as AgentExecutor, InboxAgent};
 use rmail_core::ai::{
     self, AiDispatchLoop, AiPauseFlag, AiQueue, AiWorkerPool, AskRetriever, BatchClient,
     BatchCoordinator, DeepPassGate, DeepPassHandler, PassHandler, PolicyEngine,
@@ -128,6 +131,7 @@ use rmail_core::webhooks::WebhookDispatcher;
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
+use rmail_proto::v1::agent_service_server::AgentServiceServer;
 use rmail_proto::v1::ai_policy_service_server::AiPolicyServiceServer;
 use rmail_proto::v1::ai_safety_service_server::AiSafetyServiceServer;
 use rmail_proto::v1::ai_service_server::AiServiceServer;
@@ -758,6 +762,11 @@ where
     // a rule-applied tag honours the same per-tag sync mode.
     let rules_mail_store = mail_store.clone();
     let rules_tag_store = tag_store.clone();
+    // The inbox agent (task 69) mutates through the same stores, for the same
+    // reason: an agent-applied flag must honour the same IMAP reflection and
+    // an agent-applied tag the same per-tag sync mode as a hand-applied one.
+    let agent_mail_store = mail_store.clone();
+    let agent_tag_store = tag_store.clone();
     // The finder's `BatchAction` runs through the *same* store, so archiving
     // from a picker and archiving from `mail archive` are one operation with
     // one IMAP reconciliation and one event.
@@ -1716,6 +1725,59 @@ where
         None
     };
 
+    // The autonomous inbox agent (task 69). Registered unconditionally, for
+    // the reason every AI-backed service here is: reflection and the
+    // fail-closed scope table must see every RPC regardless of runtime config.
+    // What runtime config gates is what the engine will *do* — `ai.enabled`
+    // decides whether there is an engine at all (without one `RunInboxAgent`
+    // declines with FAILED_PRECONDITION and the run log still reads), and
+    // `agent.allow_mutations` decides whether it may act.
+    //
+    // It shares `ai_semaphore`/`ai_rate_limiter` with the AI worker pool, the
+    // rules engine and `AiApi`: a loop making a model call per message is
+    // exactly the workload `ai.limits` exists to bound, and a second
+    // independent budget would let the paths together exceed it (see
+    // `rmail_core::ai::gate`). It shares `mail_store`/`tag_store` for the
+    // reasons given where those were cloned, and `DraftStore` is the same
+    // terminal `compose::reply` uses — the agent can stage a draft and has no
+    // way to send one.
+    let agent_api = AgentApi::new(db.clone(), config.agent.log_limit, stopping.clone());
+    let agent_api = if ai_active {
+        agent_api.with_agent(
+            InboxAgent::new(
+                db.clone(),
+                AgentDecider::new(
+                    db.clone(),
+                    Arc::clone(&ai_provider),
+                    Arc::clone(&ai_policy),
+                    config.ai.privacy.clone(),
+                    config.ai.limits.clone(),
+                    config.agent.model.clone(),
+                    Arc::clone(&ai_semaphore),
+                    Arc::clone(&ai_rate_limiter),
+                ),
+                AgentExecutor::new(
+                    db.clone(),
+                    agent_mail_store,
+                    agent_tag_store,
+                    DraftStore::new(db.clone()),
+                    events.clone(),
+                    config.agent.archive_mailbox.clone(),
+                    config.agent.snooze_tag.clone(),
+                ),
+                config.agent.limits(),
+                config.agent.labels.clone(),
+                config.agent.max_snooze_hours,
+                config.agent.mailbox.clone(),
+                config.agent.allow_mutations,
+            )
+            .with_injection_config(config.ai.injection.clone()),
+        )
+    } else {
+        agent_api
+    };
+    let agent_service = AgentServiceServer::new(agent_api);
+
     // The priority notification engine (task 81). `NotificationService` is
     // always registered, for the same reason `HookService`/`RuleService` are:
     // reflection and the fail-closed scope table must see every RPC
@@ -1929,6 +1991,7 @@ where
         .add_service(ai_safety_service)
         .add_service(hook_service)
         .add_service(rule_service)
+        .add_service(agent_service)
         .add_service(notification_service)
         .add_service(webhook_service)
         .serve_with_incoming_shutdown(incoming, shutdown)

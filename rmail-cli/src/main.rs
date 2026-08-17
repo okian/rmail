@@ -1,5 +1,6 @@
 //! The `mail` CLI — a thin gRPC client for the rmail daemon.
 
+mod agent_cli;
 mod analytics_cli;
 mod digest_cli;
 mod export_cli;
@@ -155,6 +156,17 @@ enum Command {
     /// is written, in a deterministic order, with its raw RFC822 preserved
     /// byte for byte.
     Export(ExportArgs),
+    /// The autonomous inbox agent: walk a mailbox once, deciding one of
+    /// archive/label/snooze/draft-reply/escalate per message (`AgentService`).
+    ///
+    /// A dry run unless `--mutate` is given, and even then the daemon refuses
+    /// unless `agent.allow_mutations = true`. Nothing it can do sends mail or
+    /// deletes anything, and a message flagged for prompt injection produces
+    /// no action at all.
+    Agent {
+        #[command(subcommand)]
+        action: agent_cli::AgentCommand,
+    },
     /// Event hooks: config-driven shell commands on mail events
     /// (`HookService`; `add` edits the local config file directly — see
     /// `hook_cli`'s own module docs).
@@ -774,6 +786,7 @@ async fn main() -> Result<()> {
             extract_cli::ExtractAction::Data(args) => extract_cli::structured(&socket, args).await,
         },
         Command::Links(args) => extract_cli::links(&socket, args).await,
+        Command::Agent { action } => agent_cli::run(&socket, action).await,
         Command::Hook { action } => hook_cli::run(&socket, action).await,
         Command::Webhook { action } => webhook_cli::run(&socket, action).await,
         Command::Forward(args) => webhook_cli::forward(&socket, args).await,
