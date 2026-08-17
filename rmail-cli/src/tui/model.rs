@@ -60,6 +60,7 @@ use super::overlays::{
     FinderItem, FinderKind, FinderPane, Hit, OutboxPane, OutboxRow, PalettePane, QuickAction,
     QuickPane, SearchFocus, SearchPane, UndoToast,
 };
+use super::theme::Theme;
 pub use crate::keymap::Key;
 use crate::keymap::{Action, Keymap, Mode, Pending, Resolution};
 
@@ -751,6 +752,12 @@ pub struct Model {
     pub level: Level,
     /// Set once the user has asked to leave; the drive loop stops on it.
     pub quit: bool,
+    /// The active color/style theme. Lives here rather than as a parameter
+    /// `view::render` takes alongside `Model`, so `render` stays a pure
+    /// function of one argument — the module doc's own description of it —
+    /// and so a future `:set theme <name>` command is an ordinary state
+    /// mutation, not a second channel into the renderer.
+    pub theme: Theme,
 }
 
 impl Default for Model {
@@ -803,6 +810,7 @@ impl Model {
             status: "connecting…".to_owned(),
             level: Level::Info,
             quit: false,
+            theme: Theme::default(),
         }
     }
 
@@ -934,7 +942,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
 fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
         Msg::Boot => {
-            model.info("loading accounts…");
+            // An error already on the status line at boot — an unrecognized
+            // `--theme`/`$RMAIL_THEME`, say — is something the caller chose
+            // to set before the first message was even sent; overwriting it
+            // with "loading accounts…" a moment later would make the notice
+            // invisible for the one frame it might otherwise have shown.
+            if model.level != Level::Error {
+                model.info("loading accounts…");
+            }
             model.inflight += 1;
             vec![Cmd::LoadAccounts]
         }

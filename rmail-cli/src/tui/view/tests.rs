@@ -8,11 +8,13 @@
 #![allow(clippy::panic)]
 
 use ratatui::backend::TestBackend;
+use ratatui::style::Color;
 use ratatui::Terminal;
 
 use super::*;
 use crate::keymap::Key;
 use crate::tui::model::{update, Account, Folder, InputFor, MessageRow, Msg, OpenMessage, PickFor};
+use crate::tui::theme::ThemeName;
 
 /// Render `model` and flatten the buffer into one string per row.
 fn draw(model: &Model, width: u16, height: u16) -> Vec<String> {
@@ -663,4 +665,493 @@ fn hostile_text_reaching_the_status_line_is_neutralized() {
         );
     }
     assert!(screen.contains("550"), "and the real text survived");
+}
+
+// ---------------------------------------------------------------------------
+// task 87's theme — dark is behavior-preserving, mono carries no color-only
+// meaning, and every `Color::` literal lives in `theme.rs` and nowhere else.
+// ---------------------------------------------------------------------------
+
+/// Every character in the frame whose foreground, background and added
+/// modifiers this crate's tokens ever set are realized by that cell — the
+/// field-by-field check `a_snippet_highlight_is_styled_without_changing_the_text`
+/// established above, generalized so each theme assertion does not re-walk
+/// the buffer by hand.
+///
+/// A field `style` leaves unset (`None`, or the empty [`Modifier`] set) is
+/// treated as "no constraint," not "must be unset" — this checks that a
+/// token is *realized*, not that the cell carries nothing else:
+///
+/// - `Cell::style()` reconstructs an *every-buffer-cell* style from the
+///   cell's own always-concrete `fg`/`bg` (a cell that was never explicitly
+///   colored still reports `Some(Color::Reset)`, never `None`), so comparing
+///   `cell.style().bg == style.bg` for a token that never calls `.bg()`
+///   would compare `Some(Reset)` against `None` and always fail — nothing to
+///   do with whether the coloring this test actually cares about is present.
+/// - Modifiers compose across layers rather than replacing each other:
+///   `render_messages` sets `Modifier::BOLD` at the *row* level for an
+///   unread message, and `Style::patch` unions rather than overwrites, so
+///   that row's unread-marker glyph is genuinely `theme.unread` (its own
+///   token) **and** bold (the row's) at once. A token that itself carries no
+///   modifier is a claim about color, not a claim that nothing else styles
+///   the cell — so this checks `contains`, not equality, the same
+///   loosening `fg`/`bg` already get.
+///
+/// Never whole-`Style` equality either: a widget can set fields no token
+/// here touches at all (`underline_color`, `sub_modifier`).
+///
+/// Two more things this deliberately does *not* try to fix, so a caller does
+/// not mistake the looseness above for "matches anything close enough":
+///
+/// - `style` must set at least one of `fg`/`bg`/`add_modifier`, or every
+///   cell in the frame would match trivially (three of [`Theme::mono`]'s
+///   fields — `ok`, `unread`, `flagged`, `attachment` — are exactly
+///   [`Style::default()`] by design; asking this function for one of those
+///   is almost certainly not the check a caller meant to write).
+/// - Rows are newline-joined rather than concatenated flat, so a match
+///   spanning the tail of one row and the head of the next cannot be
+///   mistaken for one contiguous run — but a caller still cannot assume two
+///   *tokens* sharing a color (`warn` and `unread` are both plain yellow in
+///   `dark`) won't both satisfy the same query; picking assertions that
+///   land on a row/column no sibling token could plausibly reach is still
+///   the caller's job, the same way it already is for `screen()`.
+fn chars_matching(model: &Model, width: u16, height: u16, style: Style) -> String {
+    assert!(
+        style.fg.is_some() || style.bg.is_some() || !style.add_modifier.is_empty(),
+        "chars_matching(.., Style::default()) matches every cell in the frame; \
+         pass a style that actually constrains something"
+    );
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| render(model, frame)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let mut rows = Vec::with_capacity(usize::from(buffer.area.height));
+    for y in 0..buffer.area.height {
+        let mut row = String::new();
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            let cell_style = cell.style();
+            let fg_matches = style.fg.is_none() || cell_style.fg == style.fg;
+            let bg_matches = style.bg.is_none() || cell_style.bg == style.bg;
+            let modifier_matches = cell_style.add_modifier.contains(style.add_modifier);
+            if fg_matches && bg_matches && modifier_matches {
+                row.push_str(cell.symbol());
+            }
+        }
+        rows.push(row);
+    }
+    rows.join("\n")
+}
+
+#[test]
+fn dark_theme_pane_borders_match_the_historical_colors() {
+    let dark = Theme::dark();
+    let model = loaded(); // focus defaults to Focus::Messages
+    let rendered = draw(&model, 120, 30);
+    let screen = rendered.join("\n");
+
+    // The focused pane's border/title ("messages" is `render_messages`'s
+    // fallback title when no folder name is current — `loaded` opens folder
+    // 1, so the real title "INBOX" is what is actually focus-colored).
+    let focused = chars_matching(&model, 120, 30, dark.border_focus);
+    assert!(
+        focused.contains("INBOX"),
+        "the focused pane's border/title is not styled `border_focus`: {screen}"
+    );
+
+    let blurred = chars_matching(&model, 120, 30, dark.border_blur);
+    assert!(
+        blurred.contains("folders") && blurred.contains("preview"),
+        "the unfocused panes are not styled `border_blur`: {screen}"
+    );
+}
+
+#[test]
+fn dark_theme_message_marks_and_visual_selection_match_the_historical_colors() {
+    let dark = Theme::dark();
+    // Row 10 (index 0) is unread and has an attachment; row 11 (index 1) is
+    // flagged. `chars_matching` on each glyph's own token is what proves the
+    // three-span split (task 87's refactor) draws identically to the single
+    // combined span it replaced.
+    //
+    // The cursor's own row is excluded from each check: `List::highlight_style`
+    // (`theme.sel_focus`) legitimately overrides a row's own span styling for
+    // whichever row the cursor is on — that is what makes a highlighted row
+    // look highlighted — so this moves the cursor off the row a given
+    // assertion is about, rather than asserting through an overlay that is
+    // correctly there.
+    let mut cursor_on_row1 = loaded();
+    cursor_on_row1.message_idx = 1;
+    assert!(chars_matching(&cursor_on_row1, 120, 30, dark.unread).contains('●'));
+    assert!(chars_matching(&cursor_on_row1, 120, 30, dark.attachment).contains('@'));
+
+    let mut cursor_on_row0 = loaded();
+    cursor_on_row0.message_idx = 0;
+    assert!(chars_matching(&cursor_on_row0, 120, 30, dark.flagged).contains('★'));
+
+    // The visual selection spans rows 0..=1; row 0 is not the cursor here, so
+    // it is `sel_row` alone, unpatched by any highlight.
+    let mut selecting = loaded();
+    selecting.visual = Some(0);
+    selecting.message_idx = 1;
+    let selected_row = chars_matching(&selecting, 120, 30, dark.sel_row);
+    assert!(
+        selected_row.contains("Alice"),
+        "a visual selection must repaint every row it covers with `sel_row`, \
+         including the one the cursor is not on: {}",
+        screen(&selecting)
+    );
+}
+
+#[test]
+fn dark_theme_viewer_html_notice_matches_the_historical_color() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+    model.screen = Screen::Viewer;
+    model.open = Some(OpenMessage {
+        id: 10,
+        headers: vec![("From".to_owned(), "alice@example.com".to_owned())],
+        body: vec!["hello".to_owned()],
+        has_html: true,
+        attachments: Vec::new(),
+    });
+    let accented = chars_matching(&model, 120, 30, dark.accent);
+    assert!(
+        accented.contains("HTML"),
+        "the HTML-available notice is not styled `accent`: {}",
+        screen(&model)
+    );
+}
+
+#[test]
+fn dark_theme_status_line_matches_the_historical_colors_for_each_level() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+
+    model.level = Level::Info;
+    model.status = "synced".to_owned();
+    assert!(chars_matching(&model, 120, 30, dark.ok).contains("synced"));
+
+    model.level = Level::Error;
+    model.status = "disconnected".to_owned();
+    assert!(chars_matching(&model, 120, 30, dark.err).contains("disconnected"));
+
+    // Visual mode's `-- VISUAL --` indicator, and a half-typed `3g`.
+    model.visual = Some(model.message_idx);
+    let mode = chars_matching(&model, 120, 30, dark.mode_indicator);
+    assert!(mode.contains("VISUAL"), "{mode:?}");
+    model.pending.clear();
+    press(&mut model, Key::Char('3'));
+    press(&mut model, Key::Char('g'));
+    let pending = chars_matching(&model, 120, 30, dark.warn);
+    assert!(pending.contains("3g"), "{pending:?}");
+}
+
+#[test]
+fn dark_theme_help_overlay_matches_the_historical_colors() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+    model.overlay = Some(Overlay::Help);
+    let emphasized = chars_matching(&model, 120, 30, dark.emphasis);
+    // Every bound chord is rendered in `emphasis` — `a` (archive) is a
+    // built-in default binding, so it is always present.
+    assert!(emphasized.contains('a'), "{}", screen(&model));
+}
+
+#[test]
+fn dark_theme_pick_confirm_and_input_overlays_border_matches_the_historical_color() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+    // The messages pane behind every overlay here is *also* `border_focus`
+    // (its own border stays on screen, uncovered, around the small centered
+    // modal) — so each check below is on the overlay's own *title*, which
+    // only exists inside the overlay's border, rather than on
+    // `!chars_matching(border_focus).is_empty()`, which the ambient pane
+    // border would already satisfy regardless of how the overlay drew.
+    for (overlay, title) in [
+        (
+            Overlay::Pick {
+                what: PickFor::Move,
+                message_ids: vec![10],
+                idx: 0,
+            },
+            "move to which folder?",
+        ),
+        (
+            Overlay::Confirm {
+                prompt: "delete? [y/N]".to_owned(),
+                message_ids: vec![10],
+            },
+            "confirm",
+        ),
+        (
+            Overlay::Input {
+                prompt: "forward to".to_owned(),
+                buffer: String::new(),
+                what: InputFor::ForwardTo,
+                message_id: 10,
+            },
+            "forward to",
+        ),
+    ] {
+        model.overlay = Some(overlay);
+        // Every overlay border is drawn `focused` — an overlay is definitionally
+        // the thing with the keyboard's attention.
+        let border = chars_matching(&model, 120, 30, dark.border_focus);
+        assert!(
+            border.contains(title),
+            "expected {title:?} styled `border_focus`, got {border:?}: {}",
+            screen(&model)
+        );
+    }
+}
+
+#[test]
+fn dark_theme_finder_kind_label_matches_the_historical_color() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+    // Two items, cursor left on the first (default `cursor: 0`) — the
+    // *second* row's kind label is what this checks, so `List::highlight_style`
+    // patching the first row is beside the point.
+    model.overlay = Some(Overlay::Finder(Box::new(FinderPane {
+        query: ">arch".to_owned(),
+        items: vec![
+            overlays::FinderItem {
+                kind: overlays::FinderKind::Mailbox,
+                ref_id: 2,
+                primary: "Archive".to_owned(),
+                secondary: String::new(),
+                positions: Vec::new(),
+                mailbox_id: 0,
+            },
+            overlays::FinderItem {
+                kind: overlays::FinderKind::Mailbox,
+                ref_id: 1,
+                primary: "INBOX".to_owned(),
+                secondary: String::new(),
+                positions: Vec::new(),
+                mailbox_id: 0,
+            },
+        ],
+        complete: true,
+        ..FinderPane::default()
+    })));
+    let kind_label = chars_matching(&model, 120, 30, dark.finder_kind);
+    assert!(kind_label.contains("folder"), "{}", screen(&model));
+}
+
+#[test]
+fn dark_theme_palette_chords_match_the_historical_color() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+    press(&mut model, Key::ctrl('k'));
+    // "message" id-starts-with-matches every `message.*` action (archive,
+    // copy, delete, …), alphabetically tied-broken by id
+    // (`palette_matches`'s own rule) — so row 0 is `message.archive`
+    // (chord `a`) and row 1 is `message.copy` (chord `c`). Moving the
+    // cursor to row 1 leaves row 0 unaffected by `List::highlight_style`,
+    // so its chord column is genuinely `theme.warn`, not `theme.sel_focus`
+    // patched over it.
+    //
+    // `Overlay::Palette` is `Mode::Prompt` (`model.rs`'s `mode()`), whose
+    // chain is `[Prompt, Global]` — `Prompt` binds `<down>`/`<up>` to the
+    // cursor, but *not* `j`/`k`, which fall through as ordinary typed text
+    // (that is what lets a search contain the letter `j`). `Key::Down` is
+    // the binding that actually exists here; `Key::Char('j')` would have
+    // silently become part of the query instead of moving anything.
+    type_in(&mut model, "message");
+    press(&mut model, Key::Down);
+    // `warn` (plain yellow) is what the palette's chord column has always
+    // used — distinct from `match_hl` (yellow **and bold**), which is a
+    // fuzzy-match highlight, not a key binding.
+    let chords = chars_matching(&model, 120, 30, dark.warn);
+    assert!(
+        chords.contains('a'),
+        "expected message.archive's chord `a`, styled `warn`, got {chords:?}: {}",
+        screen(&model)
+    );
+}
+
+#[test]
+fn dark_theme_ask_pane_matches_the_historical_colors() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+    press(&mut model, Key::Char('A'));
+    let generation = generation(&{
+        type_in(&mut model, "who sent the invoice?");
+        update(&mut model, Msg::Key(Key::Enter))
+    });
+    // Two citations, cursor left on the first (default `cursor: 0`) — this
+    // checks the *second* citation's `[2]` label, so the cursor's own
+    // `highlight_style` overlay is not what is being measured.
+    for event in [
+        AskEvent::Token("Alice did [1], cc Bob [2].".to_owned()),
+        AskEvent::Cite(Box::new(Citation {
+            label: 1,
+            message_id: 10,
+            subject: "Quarterly invoice".to_owned(),
+            from_addr: "alice@example.com".to_owned(),
+            mailbox: "INBOX".to_owned(),
+            quote: "sending the invoice today".to_owned(),
+        })),
+        AskEvent::Cite(Box::new(Citation {
+            label: 2,
+            message_id: 11,
+            subject: "Lunch?".to_owned(),
+            from_addr: "bob@example.com".to_owned(),
+            mailbox: "INBOX".to_owned(),
+            quote: "I saw it too".to_owned(),
+        })),
+        AskEvent::Done {
+            grounded: true,
+            refusal: String::new(),
+        },
+    ] {
+        update(&mut model, Msg::Ask { generation, event });
+    }
+    let citation_label = chars_matching(&model, 120, 30, dark.warn);
+    assert!(citation_label.contains('['), "{}", screen(&model));
+}
+
+#[test]
+fn dark_theme_outbox_state_colors_match_the_historical_colors() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+    press(&mut model, Key::Char('O'));
+    update(
+        &mut model,
+        Msg::Outbox {
+            now: 1_000,
+            result: Ok(vec![
+                OutboxRow {
+                    id: 1,
+                    to: "bob@example.com".to_owned(),
+                    subject: "queued".to_owned(),
+                    state: "scheduled".to_owned(),
+                    send_at: 1_010,
+                    undo_deadline: None,
+                    last_error: None,
+                },
+                OutboxRow {
+                    id: 2,
+                    to: "carol@example.com".to_owned(),
+                    subject: "went out".to_owned(),
+                    state: "sent".to_owned(),
+                    send_at: 900,
+                    undo_deadline: None,
+                    last_error: None,
+                },
+                OutboxRow {
+                    id: 3,
+                    to: "dave@example.com".to_owned(),
+                    subject: "bounced".to_owned(),
+                    state: "failed".to_owned(),
+                    send_at: 800,
+                    undo_deadline: None,
+                    last_error: Some("550".to_owned()),
+                },
+            ]),
+        },
+    );
+    // The cursor starts on row 0 ("scheduled"); checked with the cursor moved
+    // to row 1 so `List::highlight_style` is not patched over the state this
+    // assertion is about ("sent"/"failed" are unaffected either way, since
+    // the cursor is never on them here).
+    assert!(chars_matching(&model, 120, 30, dark.ok).contains("sent"));
+    assert!(chars_matching(&model, 120, 30, dark.err).contains("failed"));
+    press(&mut model, Key::Char('j'));
+    assert!(
+        chars_matching(&model, 120, 30, dark.warn).contains("scheduled"),
+        "{}",
+        screen(&model)
+    );
+}
+
+#[test]
+fn dark_theme_undo_toast_matches_the_historical_colors() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+    model.toast = Some(UndoToast {
+        outbox_id: 1,
+        to: "bob@example.com".to_owned(),
+        deadline: 1_030,
+        remaining: 30,
+    });
+    let band = chars_matching(&model, 120, 30, dark.toast);
+    assert!(band.contains("bob@example.com"), "{}", screen(&model));
+    let hint = chars_matching(&model, 120, 30, dark.warn);
+    assert!(hint.contains("undoes"), "{}", screen(&model));
+}
+
+/// `Theme::mono` exists to prove every marker survives with no color at
+/// all — this is the render-level half of `theme::tests`'s field-level
+/// `mono_sets_no_foreground_or_background_anywhere`.
+#[test]
+fn mono_theme_still_shows_every_mail_marker_by_glyph_alone() {
+    let mut model = loaded();
+    model.theme = Theme::mono();
+    let rendered = screen(&model);
+    assert!(rendered.contains('●'), "unread glyph missing: {rendered}");
+    assert!(rendered.contains('★'), "flagged glyph missing: {rendered}");
+    assert!(
+        rendered.contains('@'),
+        "attachment glyph missing: {rendered}"
+    );
+}
+
+#[test]
+fn mono_theme_still_renders_without_panicking_for_every_overlay() {
+    // Not a style assertion — `Theme::mono`'s fields are exercised above and
+    // in `theme::tests`. This is the same "does it panic" backstop
+    // `a_terminal_far_too_small_for_an_overlay_still_renders` runs for size;
+    // here the axis is "every field present" rather than "every size".
+    let mut model = loaded();
+    model.theme = Theme::mono();
+    for overlay in [
+        Overlay::Help,
+        Overlay::Pick {
+            what: PickFor::Copy,
+            message_ids: vec![10],
+            idx: 0,
+        },
+        Overlay::Confirm {
+            prompt: "y/N".to_owned(),
+            message_ids: vec![10],
+        },
+    ] {
+        model.overlay = Some(overlay);
+        draw(&model, 120, 30);
+    }
+}
+
+#[test]
+fn a_theme_name_round_trips_through_a_loaded_model() {
+    // `ThemeName` is not yet wired to a `:set theme` command (task 89), but
+    // it is already the vocabulary the daemon-agnostic parts of that command
+    // will resolve against, and this pins the one property that matters:
+    // every built-in is reachable from its id.
+    for name in ThemeName::ALL {
+        let mut model = loaded();
+        model.theme = name.resolve();
+        // Only a panic-freedom check — the per-theme color values are
+        // `theme::tests`'s job, not `view`'s.
+        screen(&model);
+    }
+}
+
+/// The whole point of task 87: after this refactor, nothing outside
+/// `theme.rs` may name `ratatui::style::Color` directly. A call site that
+/// reached past the token system back to a literal is exactly the drift this
+/// module exists to prevent, and it is cheaper to catch here than to notice
+/// on a light terminal.
+#[test]
+fn no_color_literal_escapes_the_theme_module() {
+    for (path, source) in [
+        ("view.rs", include_str!("../view.rs")),
+        ("overlays.rs", include_str!("../overlays.rs")),
+    ] {
+        assert!(
+            !source.contains("Color::"),
+            "{path} names `Color::` directly — route it through `Theme` instead"
+        );
+    }
 }
