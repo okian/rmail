@@ -4,6 +4,7 @@ mod agent_cli;
 mod analytics_cli;
 mod api_call;
 mod api_cli;
+mod auth_cli;
 mod client;
 mod daemon_cli;
 mod digest_cli;
@@ -26,6 +27,7 @@ mod outbox_cli;
 mod parity;
 mod reply_cli;
 mod search_cli;
+mod session;
 mod stats_cli;
 mod tag_cli;
 mod tui;
@@ -194,6 +196,12 @@ enum Command {
     Token {
         #[command(subcommand)]
         action: TokenAction,
+    },
+    /// Password access to rmail's own API (`ClientAuthService`) — distinct
+    /// from `mail account`, which is IMAP/SMTP credentials.
+    Auth {
+        #[command(subcommand)]
+        action: auth_cli::AuthAction,
     },
     /// The terminal UI: folders, message list, preview (`tui`).
     Tui(tui::TuiArgs),
@@ -946,6 +954,7 @@ async fn run(cli: Cli, path: &str) -> Result<()> {
             TokenAction::List => token_list(&socket).await,
             TokenAction::Revoke { id } => token_revoke(&socket, id).await,
         },
+        Command::Auth { action } => auth_cli::run(&socket, action).await,
         Command::Tui(args) => tui::run(&socket, args).await,
         Command::Keys { action } => keys_cli::run(action),
         Command::Search(args) => search_cli::search(&socket, args).await,

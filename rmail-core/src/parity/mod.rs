@@ -320,7 +320,13 @@ commands! {
         rpc: "/rmail.v1.AdminService/RevokeToken",
         tool: "revoke_token",
         effect: Mutate,
-        cli: ["token revoke"],
+        // `mail auth logout` calls this same RPC — there is no
+        // `ClientAuthService.Logout` RPC of its own, since ending a session
+        // is exactly "revoke the token `LoginPassword` minted" plus
+        // forgetting the local cache (`rmail-cli::session`); a second RPC
+        // that did the same thing under a different name would be two ways
+        // to say one thing.
+        cli: ["token revoke", "auth logout"],
         actions: [],
         summary: "Revoke a capability token by id.",
     }
@@ -331,6 +337,51 @@ commands! {
         cli: ["token list"],
         actions: [],
         summary: "List capability tokens as metadata only — never the secret or its hash.",
+    }
+
+    // -- ClientAuthService --------------------------------------------------
+    // Gates access to rmail's own API, as distinct from AccountService
+    // (IMAP/SMTP credentials) or `crypto` (mail encryption) — see
+    // proto/rmail/v1/client_auth.proto's module comment. SetupPassword and
+    // ClearPassword sit behind `admin`, same as the AdminService rows above;
+    // LoginPassword is `Requirement::SelfAuthenticated` and AuthStatus is
+    // `Requirement::Public` in `rmaild::auth::methods` — both reachable with
+    // no prior credential (that is the point of a login endpoint, and of a
+    // status check run before deciding whether to log in), but not the same
+    // guarantee: see `Requirement::SelfAuthenticated`'s own docs for why
+    // LoginPassword — which mints a token, unlike AuthStatus — could not
+    // just be `Public` too.
+    ClientAuthSetupPassword {
+        rpc: "/rmail.v1.ClientAuthService/SetupPassword",
+        tool: "setup_password",
+        effect: Mutate,
+        cli: ["auth setup"],
+        actions: [],
+        summary: "Set or replace the password that gates access to rmail's own API.",
+    }
+    ClientAuthClearPassword {
+        rpc: "/rmail.v1.ClientAuthService/ClearPassword",
+        tool: "clear_password",
+        effect: Mutate,
+        cli: ["auth clear"],
+        actions: [],
+        summary: "Remove the password gate entirely.",
+    }
+    ClientAuthLoginPassword {
+        rpc: "/rmail.v1.ClientAuthService/LoginPassword",
+        tool: "login_password",
+        effect: Mutate,
+        cli: ["auth login"],
+        actions: [],
+        summary: "Prove the password and receive a session bearer token.",
+    }
+    ClientAuthAuthStatus {
+        rpc: "/rmail.v1.ClientAuthService/AuthStatus",
+        tool: "auth_status",
+        effect: Read,
+        cli: ["auth status"],
+        actions: [],
+        summary: "Report whether a password is configured and whether local callers must log in.",
     }
 
     // -- SyncService (task 15) -----------------------------------------------

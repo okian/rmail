@@ -259,10 +259,21 @@ fn an_admin_token_sees_every_tool() {
     let surface = ToolSurface::build().expect("surface");
     let visibility = scoped(vec![Scope::Admin]);
     let visible = visibility.list(&surface).count();
+    // Not quite the whole surface: `Tool::granted_by` refuses every
+    // `Requirement::SelfAuthenticated` tool unconditionally, admin included —
+    // see that method's own doc for why (it mints Admin on success, so
+    // listing it to an already-admin caller is the one case that's harmless,
+    // but the refusal is unconditional on purpose rather than carrying a
+    // scope-shaped exception for it).
+    let expected = surface
+        .tools()
+        .iter()
+        .filter(|tool| !matches!(tool.requirement(), Requirement::SelfAuthenticated))
+        .count();
     assert_eq!(
-        visible,
-        surface.tools().len(),
-        "admin satisfies every scope, so it must see the whole surface"
+        visible, expected,
+        "admin satisfies every scope, so it must see the whole surface minus the tools MCP \
+         refuses regardless of scope"
     );
 }
 

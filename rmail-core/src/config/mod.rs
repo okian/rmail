@@ -41,8 +41,25 @@ pub use duration::{parse_human_duration, HumanDuration};
 /// source and fails by name, which is how `extract` (task 75) turned up
 /// missing: it had been unreachable from the environment since it landed.
 const KNOWN_TABLES: &[&str] = &[
-    "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc",
-    "hooks", "webhooks", "rules", "notify", "digest", "extract", "agent", "crypto",
+    "accounts",
+    "sync",
+    "search",
+    "index",
+    "ai",
+    "tags",
+    "notes",
+    "send",
+    "finder",
+    "grpc",
+    "hooks",
+    "webhooks",
+    "rules",
+    "notify",
+    "digest",
+    "extract",
+    "agent",
+    "crypto",
+    "client_auth",
 ];
 
 /// Errors produced while loading or parsing configuration.
@@ -353,6 +370,8 @@ pub struct Config {
     pub agent: AgentConfig,
     /// OpenPGP auto-encryption and key-discovery settings.
     pub crypto: CryptoConfig,
+    /// The client-facing password/passkey gate (`ClientAuthService`).
+    pub client_auth: ClientAuthConfig,
 }
 
 impl Config {
@@ -3563,6 +3582,106 @@ impl Default for CryptoConfig {
             max_key_bytes: 256 * 1024,
             warn_on_key_change: true,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client auth
+// ---------------------------------------------------------------------------
+
+/// The client-facing password/passkey gate: `ClientAuthService`, and the
+/// `rmaild::auth` interceptor's optional local-peer gate.
+///
+/// # What this does and does not protect
+///
+/// This is not mail encryption ([`CryptoConfig`]) and it is not IMAP/SMTP
+/// credential handling ([`crate::credential`]) — it is the *third* kind of
+/// secret this daemon has, guarding whether a caller of `rmail`'s own gRPC
+/// API (CLI, TUI, a script hitting `mail api call`, an MCP agent) is let in
+/// at all, before any per-method scope check runs. See `rmail_core::auth`'s
+/// module docs for how `ClientAuthService.LoginPassword` fits alongside
+/// `AdminService.MintToken`: both ultimately mint the same kind of bearer
+/// token, and everything downstream of that mint (verification, scope
+/// enforcement) is unchanged code, unaware of which door was used to get in.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClientAuthConfig {
+    /// When `true`, a Unix-socket peer's kernel-verified uid match no longer
+    /// grants [`crate::auth::Scope::Admin`] by itself — every caller, local
+    /// or not, must present a bearer token (minted directly, or obtained via
+    /// `ClientAuthService.LoginPassword`).
+    ///
+    /// Defaults to `false`: unchanged from the daemon's behavior before this
+    /// feature existed, and the safe default — flipping this on before a
+    /// password (or passkey) is actually configured would lock out every
+    /// local client, including the one needed to configure either. The
+    /// daemon refuses to start with this `true` and nothing configured; see
+    /// `rmaild::serve_uds_injected`'s startup validation.
+    pub require_for_local: bool,
+    /// How long a token minted by `LoginPassword` lasts before it must be
+    /// obtained again.
+    ///
+    /// A month, the same default as [`CryptoConfig::key_ttl`] and for the
+    /// same reasoning: long enough that a day-to-day client is not
+    /// re-prompting for a password it already proved once, short enough that
+    /// a session cached somewhere (see `mail auth login`'s Keychain storage)
+    /// does not outlive its usefulness by years.
+    pub session_ttl: HumanDuration,
+    /// Consecutive failed `LoginPassword` attempts before lockout.
+    ///
+    /// The one rate limit standing between this feature and an offline
+    /// dictionary attack turning into an online one — see
+    /// `auth::password::verify_password`.
+    pub max_attempts: u32,
+    /// How long a lockout lasts once `max_attempts` is reached.
+    pub lockout: HumanDuration,
+}
+
+impl Default for ClientAuthConfig {
+    fn default() -> Self {
+        Self {
+            require_for_local: false,
+            session_ttl: HumanDuration::new(days(30)),
+            max_attempts: 5,
+            lockout: HumanDuration::new(secs(900)),
+        }
+    }
+}
+
+impl ClientAuthConfig {
+    /// Check the values that would otherwise fail in a confusing place, or
+    /// not at all, later.
+    ///
+    /// Not part of [`Deserialize`] (a `deny_unknown_fields` struct already
+    /// rejects a malformed *shape*; this is about values that parse fine but
+    /// do not mean what whoever wrote them probably intended) — called
+    /// explicitly, eagerly, before the daemon's socket is bound, for the
+    /// same reason `search.rank_weights`/`search.training` are: an operator
+    /// who typo'd a number should see it at startup, not discover it the
+    /// first time it matters.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the field, if `max_attempts` is `0` (every wrong
+    /// guess would trip a lockout on the very first attempt) or
+    /// `session_ttl` is zero (every successful `ClientAuthService.LoginPassword`
+    /// would then fail: [`crate::auth::mint`] refuses a non-positive TTL).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_attempts == 0 {
+            return Err(
+                "client_auth.max_attempts must be at least 1 (0 locks out on the very first \
+                 wrong guess)"
+                    .to_owned(),
+            );
+        }
+        if self.session_ttl.as_duration().is_zero() {
+            return Err(
+                "client_auth.session_ttl must be positive (a zero TTL would make every \
+                 successful login fail to mint a token)"
+                    .to_owned(),
+            );
+        }
+        Ok(())
     }
 }
 

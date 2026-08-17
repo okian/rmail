@@ -97,6 +97,13 @@ libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 r2d2_sqlite = "0.25"
 refinery = { version = "0.8", features = ["rusqlite"] }
 security-framework = "3"
+# `rmail-cli::auth_cli`'s masked terminal prompt for `mail auth setup/login`
+# (client_auth): a password must never echo to the terminal or land in shell
+# history/scrollback the way a `--password` flag would. A small,
+# single-purpose wrapper over termios (Unix) / the console mode API
+# (Windows) for exactly this one job, rather than hand-rolling raw-mode
+# toggling for one string field.
+rpassword = "7"
 # Apple Vision framework bindings for on-device OCR (index.extract.ocr's
 # default backend, macOS only — see rmail-core/src/attach/ocr.rs).
 # `default-features = false` everywhere here: each crate's default feature set

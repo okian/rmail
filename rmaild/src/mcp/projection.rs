@@ -154,12 +154,35 @@ impl Tool {
 
     /// Whether `granted` satisfies this tool's requirement.
     ///
-    /// Delegates to [`Requirement::satisfied_by`], which is the same
-    /// predicate `crate::auth`'s layer applies server-side — one definition of
-    /// "satisfied", so the list a caller sees and the calls the daemon accepts
-    /// cannot drift apart.
+    /// Delegates to [`Requirement::satisfied_by`] for every requirement
+    /// *except* [`Requirement::SelfAuthenticated`], which this always refuses
+    /// regardless of `granted` — MCP's one deliberate divergence from "one
+    /// definition of satisfied".
+    ///
+    /// `SelfAuthenticated` (`ClientAuthService/LoginPassword`, today) is
+    /// reachable with *no* granted scope at all by design — that is the
+    /// entire point of a login endpoint, and `authorize()` in `crate::auth`
+    /// correctly short-circuits it exactly like [`Requirement::Public`]. But
+    /// unlike `Public`, calling it *does* something: on success it mints a
+    /// fresh [`Scope::Admin`] token, unconditionally, regardless of what
+    /// scope the calling connection already held. Reusing `satisfied_by`
+    /// here would mean an MCP connection scoped to `mail.read` alone — the
+    /// exact caller a narrow token exists to restrict — sees and can invoke
+    /// a tool that mints itself full admin. That is not a mutation whose
+    /// authority the caller already had (the bar
+    /// `MUTATIONS_A_READ_TOKEN_REACHES` polices for every other exception);
+    /// it is privilege escalation, so it does not belong on that list either
+    /// — it is refused here, unconditionally, before any scope comparison.
+    ///
+    /// The daemon's own gRPC layer is untouched by this: `crate::auth::authorize`
+    /// calls [`Requirement::satisfied_by`] directly, never through this
+    /// method, so `mail auth login`/`LoginPassword` over plain gRPC is
+    /// unaffected — only MCP listing and dispatch refuse it.
     #[must_use]
     pub fn granted_by(&self, granted: &[Scope]) -> bool {
+        if matches!(self.requirement, Requirement::SelfAuthenticated) {
+            return false;
+        }
         self.requirement.satisfied_by(granted)
     }
 

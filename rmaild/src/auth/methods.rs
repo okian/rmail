@@ -68,6 +68,35 @@ pub enum Requirement {
     /// everything, which is why no row here uses one and
     /// `no_all_of_row_is_empty` asserts none ever does.
     AllOf(&'static [Scope]),
+    /// Reachable with no prior credential, like [`Requirement::Public`] —
+    /// but unlike it, this method has real authority (it mutates, or grants
+    /// something), which it checks itself, on the request body, by a
+    /// mechanism the scope table cannot see. `ClientAuthService/LoginPassword`
+    /// is the one row today: Argon2id against `client_password` plus a
+    /// lockout, not a bearer token or Unix-peer trust.
+    ///
+    /// A distinct variant rather than reusing `Public` for this, because the
+    /// two answer different questions. `Public` means "this reveals or
+    /// grants nothing, so it does not matter who calls it" — true of
+    /// health/reflection, and the premise `effect_and_scope_agree_...`
+    /// checks by asserting no `Public` row is ever `Effect::Mutate`.
+    /// `SelfAuthenticated` means "this *does* grant something, but the grant
+    /// is conditioned on a secret the caller must present in the request
+    /// itself" — a fundamentally different safety argument that would be
+    /// lost (and silently miscategorized as the first kind) if both used
+    /// `Public`. Treat this exactly like `Public` for the daemon's own
+    /// gRPC-layer gate (see `rmaild::auth::authorize`'s short-circuit) and
+    /// for [`Requirement::satisfied_by`] — a plain gRPC/CLI caller with no
+    /// credential reaches it the same way either would.
+    ///
+    /// MCP is the one place this variant is *not* treated like `Public`:
+    /// `mcp::projection::Tool::granted_by` refuses every `SelfAuthenticated`
+    /// row unconditionally, for every caller, regardless of scope — see that
+    /// method's own docs for why "this method already grants nothing to
+    /// anyone" (`Public`'s premise) does not hold once the method mints
+    /// `Scope::Admin` on success. `satisfied_by` itself is untouched by
+    /// that; `granted_by` is a separate, MCP-only predicate layered on top.
+    SelfAuthenticated,
 }
 
 impl Requirement {
@@ -86,7 +115,7 @@ impl Requirement {
     #[must_use]
     pub fn satisfied_by(&self, granted: &[Scope]) -> bool {
         match self {
-            Requirement::Public => true,
+            Requirement::Public | Requirement::SelfAuthenticated => true,
             Requirement::Scope(scope) => rmail_core::auth::satisfies(granted, scope),
             Requirement::AnyOf(scopes) => scopes
                 .iter()
@@ -121,6 +150,7 @@ impl Requirement {
         }
         match self {
             Requirement::Public => "no scope".to_owned(),
+            Requirement::SelfAuthenticated => "no scope (authenticates itself)".to_owned(),
             Requirement::Scope(scope) => format!("scope {scope}"),
             Requirement::AnyOf(scopes) => format!("scope {}", join(scopes, " or ")),
             Requirement::AllOf(scopes) => format!("scope {}", join(scopes, " and ")),
@@ -236,6 +266,40 @@ const TABLE: &[(&str, Requirement)] = &[
     (
         "/rmail.v1.AdminService/ListTokens",
         Requirement::Scope(Scope::Admin),
+    ),
+    // -- ClientAuthService ----------------------------------------------------
+    // Setup/Clear change what LoginPassword accepts, so they need the same
+    // `admin` bar as minting a token — see AdminService above.
+    //
+    // LoginPassword is reachable with no prior credential by definition — a
+    // login endpoint nothing could ever call otherwise — but it *mints a
+    // token*, i.e. it mutates and grants authority, so it is
+    // `Requirement::SelfAuthenticated`, not `Requirement::Public`: see that
+    // variant's own docs for why the two must not be conflated, and
+    // `effect_and_scope_agree_about_what_each_capability_does` for the check
+    // that would fail if they were. AuthStatus reveals only two booleans and
+    // grants nothing, so plain `Public` (like health/reflection) is correct
+    // for it — including being MCP-visible to any caller, which LoginPassword
+    // is deliberately not: `mcp::projection::Tool::granted_by` refuses every
+    // `SelfAuthenticated` row unconditionally, so it never becomes a listed
+    // or callable MCP tool, on any scope. This row's gRPC-level reachability
+    // is unaffected — `mail auth login` still works — only the MCP surface
+    // excludes it. See proto/rmail/v1/client_auth.proto's module comment.
+    (
+        "/rmail.v1.ClientAuthService/SetupPassword",
+        Requirement::Scope(Scope::Admin),
+    ),
+    (
+        "/rmail.v1.ClientAuthService/ClearPassword",
+        Requirement::Scope(Scope::Admin),
+    ),
+    (
+        "/rmail.v1.ClientAuthService/LoginPassword",
+        Requirement::SelfAuthenticated,
+    ),
+    (
+        "/rmail.v1.ClientAuthService/AuthStatus",
+        Requirement::Public,
     ),
     // -- AuditService (task 45) ----------------------------------------------
     // The ledger is the record of what was sent to a model provider, including
@@ -1690,6 +1754,25 @@ mod tests {
         }
     }
 
+    /// RPCs [`effect_and_scope_agree_about_what_each_capability_does`]
+    /// accepts as a deliberate, reviewed exception to "mutates ⇒ needs a
+    /// real scope" — mirrors `mcp::projection::MUTATIONS_A_READ_TOKEN_REACHES`'s
+    /// role for its own invariant: a named allowlist, not a blanket
+    /// exemption for the whole `Requirement::SelfAuthenticated` variant, so
+    /// a *second* row adopting the variant is caught by that test and has to
+    /// make its own case rather than silently inheriting `LoginPassword`'s.
+    ///
+    /// `LoginPassword` mints `Scope::Admin` regardless of the caller's own
+    /// scope — unavoidable for a login endpoint, which by definition has no
+    /// prior scope to check — but it is safe *only* because
+    /// `mcp::projection::Tool::granted_by` separately refuses every
+    /// `SelfAuthenticated` row unconditionally, so this gRPC-level
+    /// reachability never becomes an MCP-callable tool. A future
+    /// `SelfAuthenticated` row added here without that same MCP-side refusal
+    /// in mind would not have this argument available to it.
+    const SELF_AUTHENTICATED_ROWS_ARE_REVIEWED: &[&str] =
+        &["/rmail.v1.ClientAuthService/LoginPassword"];
+
     /// The two tables' independent judgments about the same RPC agree.
     ///
     /// `rmail_core::parity::Effect` and this table's `Requirement` are decided
@@ -1722,16 +1805,39 @@ mod tests {
                 // properly; skipping keeps the two failures from overlapping.
                 continue;
             };
-            let required: Vec<&Scope> = match requirement {
-                Requirement::Public => Vec::new(),
-                Requirement::Scope(scope) => vec![scope],
-                Requirement::AnyOf(scopes) | Requirement::AllOf(scopes) => scopes.iter().collect(),
+            let (required, self_authenticated): (Vec<&Scope>, bool) = match requirement {
+                Requirement::Public => (Vec::new(), false),
+                // The one documented exception to "mutates => needs a
+                // non-empty `required`" below: by definition this is
+                // reachable with no scope at all *and* it may mutate
+                // (`ClientAuthService/LoginPassword` mints a token) — its own
+                // docs are the safety argument this very check exists to
+                // enforce for every other row, so it is exempted from the
+                // conclusion rather than from the check. Named, not blanket
+                // (`SELF_AUTHENTICATED_ROWS_ARE_REVIEWED` below), so a second
+                // row adopting the variant fails by name here rather than
+                // silently inheriting the exemption on the strength of the
+                // first one's argument.
+                Requirement::SelfAuthenticated => (
+                    Vec::new(),
+                    SELF_AUTHENTICATED_ROWS_ARE_REVIEWED.contains(&command.rpc()),
+                ),
+                Requirement::Scope(scope) => (vec![scope], false),
+                Requirement::AnyOf(scopes) | Requirement::AllOf(scopes) => {
+                    (scopes.iter().collect(), false)
+                }
             };
 
             if command.effect().is_mutating() {
                 assert!(
-                    !required.is_empty(),
-                    "{} mutates and requires no scope at all",
+                    !required.is_empty() || self_authenticated,
+                    "{} mutates and requires no scope at all. If it is `Requirement::Public`, \
+                     that is not allowed to mutate — give it a real scope. If it is \
+                     `Requirement::SelfAuthenticated`, add it to \
+                     SELF_AUTHENTICATED_ROWS_ARE_REVIEWED with an argument for why granting \
+                     authority with no scope check is safe here, the way LoginPassword's own \
+                     docs do (and confirm mcp::projection::Tool::granted_by still refuses it \
+                     regardless of scope, which is what actually makes it safe)",
                     command.rpc()
                 );
             } else {

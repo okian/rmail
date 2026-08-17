@@ -116,16 +116,28 @@ async fn real_peer_cred() -> tokio::net::unix::UCred {
     cred
 }
 
-/// Run `req` through a fresh `AuthLayer(admin_uid) -> CountingInner`, and
-/// return the response plus the call counter.
+/// Run `req` through a fresh `AuthLayer(admin_uid) -> CountingInner`, with
+/// `client_auth.require_for_local` at its default (`false`) — i.e. every
+/// test in this file except the ones specifically about that flag, which use
+/// [`run_with_local_gate`] instead.
 async fn run(
     db: &Database,
     admin_uid: u32,
     req: http::Request<BoxBody>,
 ) -> (http::Response<BoxBody>, Arc<AtomicUsize>) {
+    run_with_local_gate(db, admin_uid, false, req).await
+}
+
+/// [`run`], with `require_login_for_peer` given explicitly.
+async fn run_with_local_gate(
+    db: &Database,
+    admin_uid: u32,
+    require_login_for_peer: bool,
+    req: http::Request<BoxBody>,
+) -> (http::Response<BoxBody>, Arc<AtomicUsize>) {
     let counting = CountingInner::default();
     let calls = Arc::clone(&counting.calls);
-    let layer = AuthLayer::new(db.clone(), admin_uid);
+    let layer = AuthLayer::new(db.clone(), admin_uid, require_login_for_peer);
     let mut svc = layer.layer(counting);
     let response = svc
         .call(req)
@@ -199,6 +211,49 @@ async fn a_mismatched_peer_uid_does_not_get_implicit_admin() {
     let status = status_of(&response).expect("should be a gRPC error");
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn require_login_for_peer_denies_a_matching_uid_with_no_token() {
+    let tmp = TempDb::open();
+    let cred = real_peer_cred().await;
+    let req = with_uds_peer(synthetic_request("/rmail.v1.AdminService/MintToken"), cred);
+    // Same matching peer uid as `a_trusted_unix_peer_gets_implicit_admin`, but
+    // with the local shortcut turned off: kernel-level trust is no longer
+    // enough on its own.
+    let (response, calls) = run_with_local_gate(&tmp.db, cred.uid(), true, req).await;
+
+    let status = status_of(&response).expect("should be a gRPC error");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn require_login_for_peer_still_accepts_a_valid_bearer_token_from_that_peer() {
+    let tmp = TempDb::open();
+    let minted = mint(
+        &tmp.db,
+        NewToken {
+            name: "local-session".to_owned(),
+            scopes: vec![Scope::Admin],
+            ttl_secs: None,
+        },
+    )
+    .await
+    .expect("mint a token");
+    let cred = real_peer_cred().await;
+    let req = with_bearer(
+        with_uds_peer(synthetic_request("/rmail.v1.AdminService/MintToken"), cred),
+        &minted.secret,
+    );
+    let (response, calls) = run_with_local_gate(&tmp.db, cred.uid(), true, req).await;
+
+    assert!(
+        status_of(&response).is_none(),
+        "a valid bearer token must still work even though the peer's own \
+         kernel-level trust does not count here"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
