@@ -6,20 +6,19 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**79 of 86 done, 7 remaining.** `tasks.md` is authoritative — count with
+**81 of 86 done, 5 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **3890/3890** on the full
+after merge, never on the agent's own report: currently **4117/4117** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: 36, 42, 65, 69, 78. All ready; all but 42 are `parallel-safe:
-yes`. In flight: **73** (invoice/receipt extraction) and **72** (contact
-insights). **69 (autonomous inbox agent) is the one to dispatch last and
-brief hardest** — it is the only remaining task that acts on the mailbox
-without a human in the loop.
+Remaining: 42, 65, 69. In flight: **36** (caching/incrementality) and **78**
+(local-only model path). **42 is the only `parallel-safe: no` task** — run it
+alone, last. **69 (autonomous inbox agent)** is the one that acts on the
+mailbox without a human in the loop; brief it hardest.
 
-Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75, 58, 68. Every one verified on the
-*combined* tree, never on the agent's own count — the reports quoted ten
-different bases; the truth after merging all of them is 3890.
+Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75, 58, 68, 73, 72. Every one verified on the
+*combined* tree, never on the agent's own count — the reports quoted a dozen
+different bases; the truth after merging all of them is 4117.
 
 **Three of the last five needed real work at merge, not just a cherry-pick:**
 
@@ -100,7 +99,7 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V49.** V47 went to 58, V48 to 68.
+costs nothing. **Next free: V51.** V47 -> 58, V48 -> 68, V49 -> 73, V50 -> 72.
 
 Previous: V43 went to 57, V44 to 80, V45 to 62,
 V46 to 75 (renumbered from its own V45 — the second collision, again from two
@@ -437,3 +436,29 @@ to `test-signing-key-not-a-secret` rather than allowlisted — an allowlist
 entry for something shaped like a credential is exactly the entry that hides
 the next real one. Fixtures should be *named* so they cannot trip the
 scanner.
+
+## Two agents in a row died *just before* fixing a confirmed P0
+
+Task 72's agent hit its session limit on the message "Now let me fix
+everything the reviewer found, starting with the P0" — so its branch held a
+reviewer-confirmed **remote OOM** and a half-applied refactor that did not
+compile. Task 80's had never compiled at all. Neither was safe to merge on
+its report.
+
+The lesson is not "distrust agents" — their reviewers found these, and their
+reports were honest. It is that **an agent's last message is not its
+conclusion**, and the branch state at the moment it stopped can be strictly
+worse than the state it described. Always: cherry-pick, build, run the suite,
+and read the reviewer's findings out of the transcript before believing a
+branch is done. The findings survive in the task output file:
+
+    python3 -c "..." <task-output.jsonl>   # filter tool_result blocks for 'P0'
+
+## The `ai.enabled` fixture trap has now bitten three tasks
+
+`AiConfig::default()` has `enabled: true`, and constructing a Claude client
+does **not** validate its key. So a test harness that means "a daemon with no
+AI subsystem" but only omits a provider gets one anyway, and its model-backed
+RPCs decline with `UNAUTHENTICATED` (key resolution failed) rather than
+`FAILED_PRECONDITION` (no subsystem). Tasks 80, 72 and one earlier suite all
+shipped that. A harness that wants no AI must say `config.ai.enabled = false`.
