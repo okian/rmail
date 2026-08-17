@@ -1415,6 +1415,185 @@ async fn a_found_outcome_is_cached_with_the_configured_ttl() {
 }
 
 // ---------------------------------------------------------------------------
+// The send seam
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn seal_for_send_encrypts_when_every_recipient_has_a_key() {
+    let (database, _path) = db().await;
+    let alice = usable("alice@example.com", KeySource::Wkd);
+    database
+        .with_write(|conn| {
+            cache::put_found(conn, &alice, NOW, 30 * DAY)?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .expect("write");
+
+    database
+        .with_read(|conn| {
+            let (sealed, status) = encrypt::seal_for_send(
+                conn,
+                &rendered_message(),
+                &["alice@example.com".to_owned()],
+                &[],
+                &config(),
+                NOW,
+            )
+            .expect("seal");
+            assert!(status.will_encrypt(), "{status:?}");
+            let text = String::from_utf8_lossy(&sealed);
+            assert!(text.contains("multipart/encrypted"));
+            assert!(!text.contains("meet me at one"), "plaintext survived");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .expect("read");
+}
+
+#[tokio::test]
+async fn seal_for_send_passes_the_plaintext_through_when_no_key_is_known() {
+    // The default policy never blocks a send. The bytes must come back
+    // untouched — not "mostly untouched" — because anything else means the
+    // unencrypted path is quietly rewriting mail.
+    let (database, _path) = db().await;
+    database
+        .with_write(|conn| {
+            cache::put_absent(conn, "nokey@example.com", NOW, 30 * DAY)?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .expect("write");
+
+    let original = rendered_message();
+    database
+        .with_read(|conn| {
+            let (out, status) = encrypt::seal_for_send(
+                conn,
+                &original,
+                &["nokey@example.com".to_owned()],
+                &[],
+                &config(),
+                NOW,
+            )
+            .expect("seal");
+            assert!(!status.will_encrypt());
+            assert_eq!(status.code(), "no_key");
+            assert_eq!(out, original, "the plaintext path must be byte-identical");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .expect("read");
+}
+
+#[tokio::test]
+async fn seal_for_send_refuses_rather_than_downgrading_under_always() {
+    let (database, _path) = db().await;
+    database
+        .with_write(|conn| {
+            cache::put_absent(conn, "nokey@example.com", NOW, 30 * DAY)?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .expect("write");
+
+    let mut cfg = config();
+    cfg.policy = EncryptPolicy::Always;
+
+    database
+        .with_read(|conn| {
+            let err = encrypt::seal_for_send(
+                conn,
+                &rendered_message(),
+                &["nokey@example.com".to_owned()],
+                &[],
+                &cfg,
+                NOW,
+            )
+            .expect_err("Always must refuse, not fall back to cleartext");
+            assert!(matches!(err, crate::error::Error::FailedPrecondition(_)));
+            Ok::<_, rusqlite::Error>(())
+        })
+        .expect("read");
+}
+
+#[test]
+fn a_bcc_recipients_key_id_is_not_exposed_to_the_other_recipients() {
+    // Bcc exists to hide a recipient. An encrypted message names the key it
+    // was encrypted to in each session-key packet, so the naive
+    // implementation puts the Bcc'd party's fingerprint into the copy every
+    // other recipient receives -- turning the privacy feature inside out.
+    let alice = usable("alice@example.com", KeySource::Wkd);
+    let secret = usable("secret@example.com", KeySource::Wkd);
+
+    let sealed = encrypt::encrypt_rendered_split(
+        &rendered_message(),
+        std::slice::from_ref(&alice),
+        std::slice::from_ref(&secret),
+    )
+    .expect("encrypt");
+    let armored = String::from_utf8_lossy(&sealed);
+
+    // The armored payload is base64, so a fingerprint is not greppable as
+    // text -- decode it and look for the raw key id bytes instead.
+    use base64::Engine as _;
+    let body: String = armored
+        .split("-----BEGIN PGP MESSAGE-----")
+        .nth(1)
+        .and_then(|rest| rest.split("-----END PGP MESSAGE-----").next())
+        .expect("an armored block")
+        .lines()
+        .filter(|l| !l.contains(':') && !l.starts_with('='))
+        .collect::<Vec<_>>()
+        .join("");
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .expect("decode armor");
+
+    // The session-key packet names the *encryption subkey*, not the primary
+    // key -- and depending on packet version it carries either the full
+    // fingerprint or its trailing 8 bytes (the key id). Searching for the
+    // primary's fingerprint found nothing for either recipient, which the
+    // control assertion below caught: an "absent" result is only evidence if
+    // the same search finds the recipient who is supposed to be named.
+    let hidden_ids = encryption_key_ids(&secret);
+    let visible_ids = encryption_key_ids(&alice);
+
+    assert!(
+        visible_ids.iter().any(|id| contains_subslice(&raw, id)),
+        "a To recipient must be addressed normally; if this fails the test is \
+         not looking at the right bytes and the assertion below proves nothing"
+    );
+    assert!(
+        !hidden_ids.iter().any(|id| contains_subslice(&raw, id)),
+        "the Bcc recipient's key id is in the message every other recipient gets"
+    );
+}
+
+/// Every byte string that could identify a key's encryption subkey in a
+/// session-key packet: the full fingerprint, and its trailing 8 bytes.
+fn encryption_key_ids(key: &UsableKey) -> Vec<Vec<u8>> {
+    use pgp::types::KeyDetails as _;
+    let parsed = key.parsed().expect("stored key parses");
+    let mut out = Vec::new();
+    for sub in &parsed.public_subkeys {
+        let fingerprint = sub.key.fingerprint();
+        let bytes = fingerprint.as_bytes().to_vec();
+        if bytes.len() >= 8 {
+            out.push(bytes[bytes.len() - 8..].to_vec());
+        }
+        out.push(bytes);
+    }
+    assert!(
+        !out.is_empty(),
+        "the generated key has an encryption subkey"
+    );
+    out
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+// ---------------------------------------------------------------------------
 // Status presentation
 // ---------------------------------------------------------------------------
 

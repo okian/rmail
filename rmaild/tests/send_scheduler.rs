@@ -1113,3 +1113,127 @@ async fn reusing_a_send_key_with_a_different_message_is_already_exists() {
 
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Auto-encryption
+//
+// These assert on what `ScheduleSend` *stored*, not on what it returned. The
+// outbox freezes `raw_mime` and transmits those exact octets on every attempt,
+// so the stored bytes are the message — a response that said "encrypted"
+// while the row held plaintext would be the failure worth catching.
+// ---------------------------------------------------------------------------
+
+/// Mint a real OpenPGP key for `address` and put it in the discovery cache,
+/// as though background discovery had found it.
+async fn seed_key(server: &TestServer, address: &str) {
+    use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
+
+    let mut params = SecretKeyParamsBuilder::default();
+    params
+        .key_type(KeyType::Ed25519Legacy)
+        .can_certify(true)
+        .can_sign(true)
+        .primary_user_id(format!("Test <{address}>"))
+        .subkey(
+            SubkeyParamsBuilder::default()
+                .key_type(KeyType::ECDH(
+                    pgp::crypto::ecc_curve::ECCCurve::Curve25519Legacy,
+                ))
+                .can_encrypt(EncryptionCaps::All)
+                .build()
+                .unwrap(),
+        );
+    let armored = params
+        .build()
+        .unwrap()
+        .generate(rand::thread_rng())
+        .unwrap()
+        .to_public_key()
+        .to_armored_bytes(Default::default())
+        .unwrap();
+
+    let now = chrono::Utc::now().timestamp();
+    let key = rmail_core::crypto::key::parse(
+        &armored,
+        address,
+        rmail_core::crypto::KeySource::Wkd,
+        now,
+        1 << 20,
+    )
+    .expect("the generated key is usable");
+
+    server
+        .db
+        .write(move |conn| rmail_core::crypto::cache::put_found(conn, &key, now, 30 * 86_400))
+        .await
+        .unwrap();
+}
+
+/// The octets the outbox froze for a scheduled row.
+async fn stored_mime(server: &TestServer, id: i64) -> String {
+    String::from_utf8_lossy(&server.store.raw_mime(id).await.unwrap()).into_owned()
+}
+
+#[tokio::test]
+async fn a_recipient_with_a_known_key_gets_ciphertext_in_the_outbox() {
+    let server = TestServer::start().await;
+    seed_key(&server, "bob@example.net").await;
+    let mut client = server.client().await;
+
+    let entry = client
+        .schedule_send(ScheduleSendRequest {
+            idempotency_key: "crypto-1".to_owned(),
+            body: Some("the merger closes on friday".to_owned()),
+            ..server.request()
+        })
+        .await
+        .expect("scheduling must succeed")
+        .into_inner();
+
+    let mime = stored_mime(&server, entry.id).await;
+    assert!(
+        mime.contains("multipart/encrypted"),
+        "the stored message is not a PGP/MIME envelope:\n{mime}"
+    );
+    assert!(
+        mime.contains("-----BEGIN PGP MESSAGE-----"),
+        "no armored payload:\n{mime}"
+    );
+    assert!(
+        !mime.contains("the merger closes on friday"),
+        "the plaintext body was frozen into the outbox"
+    );
+    // Routing headers have to survive, or SMTP cannot deliver it and the
+    // at-most-once fence has no Message-ID to match on.
+    assert!(mime.contains("Message-ID:"), "no Message-ID:\n{mime}");
+    assert!(mime.contains("bob@example.net"), "no recipient:\n{mime}");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_recipient_with_no_key_is_still_sent_in_the_clear() {
+    // The default policy never blocks a send. This is the case that must not
+    // regress into a refusal when someone tightens the crypto path.
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let entry = client
+        .schedule_send(ScheduleSendRequest {
+            idempotency_key: "crypto-2".to_owned(),
+            body: Some("Shall we say noon?".to_owned()),
+            ..server.request()
+        })
+        .await
+        .expect("a recipient with no key must not block the send")
+        .into_inner();
+
+    let mime = stored_mime(&server, entry.id).await;
+    assert!(
+        mime.contains("Shall we say noon?"),
+        "the body should be readable when nothing could be encrypted to:\n{mime}"
+    );
+    assert!(!mime.contains("multipart/encrypted"));
+
+    server.stop().await;
+}

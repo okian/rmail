@@ -218,7 +218,43 @@ pub struct PgpMime {
 /// "encrypted to nobody" message is a message anyone can read, and producing
 /// one silently is the worst failure this module has.
 pub fn encrypt_mime(body: &str, keys: &[UsableKey]) -> Result<PgpMime, Error> {
-    if keys.is_empty() {
+    encrypt_mime_split(body, keys, &[])
+}
+
+/// As [`encrypt_mime`], but with a second set of recipients whose key IDs are
+/// withheld from the message.
+///
+/// # Why Bcc needs its own arm
+///
+/// An OpenPGP encrypted message carries one Public-Key Encrypted Session Key
+/// packet per recipient, and each names the key it was encrypted to. Encrypt a
+/// message to a Bcc'd recipient the ordinary way and their key — which is to
+/// say their identity — is sitting in the message every *other* recipient
+/// receives. Bcc exists precisely to prevent that, and this module's whole
+/// purpose is to make mail more private rather than less, so getting it
+/// backwards here would be worse than not encrypting at all.
+///
+/// `hidden` recipients therefore get `encrypt_to_key_anonymous`, which blanks
+/// the recipient field. The cost is real but small and lands on the right
+/// party: a hidden recipient's client cannot tell which packet is theirs and
+/// must try its keys against each one.
+///
+/// Visible recipients (To/Cc) are *not* anonymised. They are already named in
+/// headers the message carries in the clear, so hiding their key IDs would buy
+/// nothing and would make every recipient do the trial decryption.
+///
+/// # Errors
+///
+/// As [`encrypt_mime`]. An empty `visible` set is still refused even when
+/// `hidden` is non-empty — a message with no To or Cc is not a shape this
+/// send path produces, and treating it as encryptable would mean guessing.
+pub fn encrypt_mime_split(
+    body: &str,
+    visible: &[UsableKey],
+    hidden: &[UsableKey],
+) -> Result<PgpMime, Error> {
+    let keys = visible;
+    if keys.is_empty() && hidden.is_empty() {
         return Err(Error::InvalidArgument(
             "cannot encrypt to an empty recipient set".to_owned(),
         ));
@@ -253,6 +289,29 @@ pub fn encrypt_mime(body: &str, keys: &[UsableKey]) -> Result<PgpMime, Error> {
                 .map_err(|e| Error::Internal(format!("encrypt to {}: {e}", key.fingerprint)))?,
             None => builder
                 .encrypt_to_key(&mut rng, &parsed.primary_key)
+                .map_err(|e| Error::Internal(format!("encrypt to {}: {e}", key.fingerprint)))?,
+        };
+    }
+
+    for key in hidden {
+        let parsed = key.parsed().map_err(|e| {
+            Error::Internal(format!("stored key {} is unusable: {e}", key.fingerprint))
+        })?;
+        let target = parsed
+            .public_subkeys
+            .iter()
+            .find(|sub| {
+                sub.signatures
+                    .iter()
+                    .any(|sig| sig.key_flags().encrypt_comms() || sig.key_flags().encrypt_storage())
+            })
+            .map(|sub| &sub.key);
+        match target {
+            Some(subkey) => builder
+                .encrypt_to_key_anonymous(&mut rng, subkey)
+                .map_err(|e| Error::Internal(format!("encrypt to {}: {e}", key.fingerprint)))?,
+            None => builder
+                .encrypt_to_key_anonymous(&mut rng, &parsed.primary_key)
                 .map_err(|e| Error::Internal(format!("encrypt to {}: {e}", key.fingerprint)))?,
         };
     }
@@ -341,6 +400,19 @@ const OUTER_HEADERS: &[&str] = &[
 /// separator, which would mean the renderer produced something that is not a
 /// message. Otherwise as [`encrypt_mime`].
 pub fn encrypt_rendered(rendered: &[u8], keys: &[UsableKey]) -> Result<Vec<u8>, Error> {
+    encrypt_rendered_split(rendered, keys, &[])
+}
+
+/// As [`encrypt_rendered`], with Bcc recipients encrypted to anonymously.
+///
+/// # Errors
+///
+/// As [`encrypt_rendered`].
+pub fn encrypt_rendered_split(
+    rendered: &[u8],
+    visible: &[UsableKey],
+    hidden: &[UsableKey],
+) -> Result<Vec<u8>, Error> {
     let text = std::str::from_utf8(rendered)
         .map_err(|e| Error::Internal(format!("rendered message is not utf-8: {e}")))?;
 
@@ -368,7 +440,7 @@ pub fn encrypt_rendered(rendered: &[u8], keys: &[UsableKey]) -> Result<Vec<u8>, 
     }
 
     let protected = format!("{inner}\r\n{body}");
-    let encrypted = encrypt_mime(&protected, keys)?;
+    let encrypted = encrypt_mime_split(&protected, visible, hidden)?;
 
     let mut out = String::with_capacity(outer.len() + encrypted.body.len() + 256);
     out.push_str(&outer);
@@ -417,4 +489,66 @@ fn unfold(headers: &str) -> Vec<String> {
         out.push(line.to_owned());
     }
     out
+}
+
+/// The one call the send path makes: encrypt a rendered message if policy and
+/// discovery allow, or hand back the plaintext and say why not.
+///
+/// # Why this returns bytes *and* a status
+///
+/// The caller needs both, and deriving one from the other is where this would
+/// go wrong. A caller given only bytes cannot tell whether it is holding
+/// ciphertext, so it cannot log honestly or set a flag on the outbox row; a
+/// caller given only a status has to re-run the encryption to get the octets.
+/// Returning the pair means "what was sent" and "what we say was sent" are
+/// produced together and cannot drift.
+///
+/// # Where this is called from, and why not later
+///
+/// The outbox freezes `raw_mime` when a send is scheduled and transmits those
+/// exact octets on every attempt (see [`crate::outbox`]). Encrypting here —
+/// before the freeze — means a retry re-sends byte-identical ciphertext, the
+/// at-most-once `Message-ID` fence still matches, and the undo window still
+/// shows the user the message they composed. Encrypting at transmit time
+/// instead would produce different bytes on every attempt, which is the one
+/// thing that path is built not to do.
+///
+/// `bcc` recipients are encrypted to anonymously; see [`encrypt_mime_split`].
+///
+/// # Errors
+///
+/// [`Error::FailedPrecondition`] when the policy is
+/// [`EncryptPolicy::Always`] and some recipient has no usable key — the send
+/// is refused rather than downgraded. Otherwise as [`encrypt_rendered`].
+pub fn seal_for_send(
+    conn: &Connection,
+    rendered: &[u8],
+    visible: &[String],
+    bcc: &[String],
+    config: &CryptoConfig,
+    now: i64,
+) -> Result<(Vec<u8>, EncryptionStatus), Error> {
+    let mut all: Vec<String> = visible.to_vec();
+    all.extend_from_slice(bcc);
+
+    let status = resolve(conn, &all, config, now)
+        .map_err(|e| Error::Internal(format!("resolving encryption status: {e}")))?;
+
+    if status.blocks() {
+        return Err(Error::FailedPrecondition(format!(
+            "encryption is required for this recipient but no key is known: {status}"
+        )));
+    }
+    if !status.will_encrypt() {
+        // Every remaining non-encrypting state — no key, still looking, a
+        // changed fingerprint, disabled — sends in the clear. The status says
+        // which, and the caller is expected to surface it rather than treat
+        // "not encrypted" as one undifferentiated outcome.
+        return Ok((rendered.to_vec(), status));
+    }
+
+    let visible_keys = keys_for(conn, visible, now)?;
+    let hidden_keys = keys_for(conn, bcc, now)?;
+    let sealed = encrypt_rendered_split(rendered, &visible_keys, &hidden_keys)?;
+    Ok((sealed, status))
 }

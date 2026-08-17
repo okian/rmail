@@ -96,3 +96,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # Only used by the AuditService integration test, to verify a ledger entry's
 # `payload_sha256` against an independently computed hash.
 sha2.workspace = true
+# The auto-encrypt integration test mints a real OpenPGP key so it can assert
+# that `ScheduleSend` stores ciphertext. A hand-rolled fixture would prove the
+# parser accepts one captured blob; generating proves the whole seal path.
+# Both crates are already in the tree via `rmail-core`, so this adds no new
+# third-party code.
+pgp.workspace = true
+rand.workspace = true

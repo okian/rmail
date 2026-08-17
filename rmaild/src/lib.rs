@@ -1716,7 +1716,8 @@ where
         config.send.clone(),
         idempotency.clone(),
         stopping.clone(),
-    );
+    )
+    .with_crypto(config.crypto.clone());
     if ai_active {
         send_scheduler_api = send_scheduler_api
             .with_guardian(PreflightGuardian::new(

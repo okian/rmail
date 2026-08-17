@@ -36,7 +36,7 @@
 use std::pin::Pin;
 
 use rmail_core::compose::{Draft, Mailbox};
-use rmail_core::config::SendConfig;
+use rmail_core::config::{CryptoConfig, SendConfig};
 use rmail_core::idempotency::IdempotencyStore;
 use rmail_core::outbox::followup::track::{FollowupTracker, SentMessage};
 use rmail_core::outbox::followup::{
@@ -89,6 +89,10 @@ pub struct SendSchedulerApi {
     followups: FollowupStore,
     db: Database,
     config: SendConfig,
+    /// Auto-encryption settings. Defaulted rather than required by `new` so
+    /// every existing construction site keeps working; `with_crypto` is how a
+    /// daemon passes the operator's real configuration.
+    crypto: CryptoConfig,
     policy: SendPolicy,
     /// The replay fence behind `ScheduleSend.idempotency_key`.
     idempotency: IdempotencyStore,
@@ -129,12 +133,69 @@ impl SendSchedulerApi {
             followups,
             db,
             config,
+            crypto: CryptoConfig::default(),
             policy,
             idempotency,
             guardian: None,
             tracker: None,
             shutdown,
         }
+    }
+
+    /// Encrypt a rendered message when auto-encryption applies, returning the
+    /// octets the outbox should freeze.
+    ///
+    /// # Why this is not allowed to fail open quietly
+    ///
+    /// Two outcomes are possible and both are reported. Under
+    /// `EncryptPolicy::Always` a recipient with no key makes this return
+    /// `FAILED_PRECONDITION` and the send does not happen — that policy is a
+    /// promise the mail is never readable in transit, and honouring it means
+    /// accepting a refused send. Under the default policy a missing key sends
+    /// in the clear, and the *reason* goes to the log at `info` rather than
+    /// being discarded, because "not encrypted" covers a still-running lookup,
+    /// an absent key and a changed fingerprint, and an operator asking why
+    /// their mail went out unencrypted needs to know which.
+    ///
+    /// The work runs on `Database::read`'s blocking thread. Encryption is a
+    /// public-key operation per recipient plus a symmetric pass over the whole
+    /// body — CPU with no await point in it, exactly like `render`, and left
+    /// inline it would stall every other RPC on the worker.
+    async fn seal(&self, rendered: &Rendered) -> Result<Vec<u8>, Status> {
+        let raw = rendered.raw_mime.clone();
+        let mut visible = rendered.to.clone();
+        visible.extend(rendered.cc.iter().cloned());
+        let bcc = rendered.bcc.clone();
+        let crypto = self.crypto.clone();
+        let now = chrono::Utc::now().timestamp();
+
+        // The closure hands back a `Result` inside the `rusqlite::Result` the
+        // pool requires, so a domain error from the crypto layer survives the
+        // trip without being flattened into a storage error.
+        let outcome = self
+            .db
+            .read(move |conn| {
+                Ok(rmail_core::crypto::encrypt::seal_for_send(
+                    conn, &raw, &visible, &bcc, &crypto, now,
+                ))
+            })
+            .await
+            .map_err(|error| Status::internal(format!("sealing the message: {error}")))?;
+
+        let (sealed, status) = outcome.map_err(Status::from)?;
+        if status.will_encrypt() {
+            tracing::info!(encryption = status.code(), "message encrypted");
+        } else {
+            tracing::info!(encryption = status.code(), %status, "message sent in the clear");
+        }
+        Ok(sealed)
+    }
+
+    /// Give this handler the operator's auto-encryption settings.
+    #[must_use]
+    pub fn with_crypto(mut self, crypto: CryptoConfig) -> Self {
+        self.crypto = crypto;
+        self
     }
 
     /// Give this handler a pre-send guardian.
@@ -515,7 +576,12 @@ impl SendSchedulerService for SendSchedulerApi {
                 );
 
                 let rendered = self.render(&req).await?;
+                // Preflight before encryption, not after: the guardian reads
+                // the message looking for secrets and tone, and it cannot read
+                // ciphertext. Sealing first would leave every send silently
+                // unreviewed.
                 self.guard_send(&req, &rendered).await?;
+                let raw_mime = self.seal(&rendered).await?;
                 let entry = self
                     .store
                     .schedule(NewSend {
@@ -526,7 +592,7 @@ impl SendSchedulerService for SendSchedulerApi {
                         cc: rendered.cc,
                         bcc: rendered.bcc,
                         subject: rendered.subject,
-                        raw_mime: rendered.raw_mime,
+                        raw_mime,
                         body_preview: rendered.body_preview,
                         in_reply_to: rendered.in_reply_to,
                         thread_id: None,
