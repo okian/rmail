@@ -6,18 +6,20 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**77 of 86 done, 9 remaining.** `tasks.md` is authoritative — count with
+**79 of 86 done, 7 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **3778/3778** on the full
+after merge, never on the agent's own report: currently **3890/3890** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: 36, 42, 65, 69, 72, 73, 78. All ready; all but 42 are
-`parallel-safe: yes`. In flight: **58** (NL smart folders) and **68**
-(outbound webhooks).
+Remaining: 36, 42, 65, 69, 78. All ready; all but 42 are `parallel-safe:
+yes`. In flight: **73** (invoice/receipt extraction) and **72** (contact
+insights). **69 (autonomous inbox agent) is the one to dispatch last and
+brief hardest** — it is the only remaining task that acts on the mailbox
+without a human in the loop.
 
-Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75. Every one verified on the
-*combined* tree, never on the agent's own count — the reports quoted eight
-different bases; the truth after merging all of them is 3778.
+Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75, 58, 68. Every one verified on the
+*combined* tree, never on the agent's own count — the reports quoted ten
+different bases; the truth after merging all of them is 3890.
 
 **Three of the last five needed real work at merge, not just a cherry-pick:**
 
@@ -98,7 +100,9 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V47.** V43 went to 57, V44 to 80, V45 to 62,
+costs nothing. **Next free: V49.** V47 went to 58, V48 to 68.
+
+Previous: V43 went to 57, V44 to 80, V45 to 62,
 V46 to 75 (renumbered from its own V45 — the second collision, again from two
 agents dispatched with different numbers). (81 took V40, 70 took V41, 63 took V42;
 71, 79 and 82 needed none.)
@@ -417,3 +421,19 @@ container (`docker wait <name>`) rather than retrying into the same wall —
 and note the `Stop` hook runs the gate itself, so **never leave a background
 build running when a turn ends**: the hook's build and yours will collide and
 both die.
+
+## gitleaks: scan the branch, not the repo
+
+A full `gitleaks detect` reports findings from **every reachable ref**,
+including `worktree-agent-*` branches whose commits were cherry-picked rather
+than merged — so a fixture fixed on `docs/tasks-breakdown` still shows up
+against the agent's original commit. Scan what would ship:
+
+    gitleaks detect --log-opts="docs/tasks-breakdown"
+
+Task 68 did trip it for real, on `docs/tasks-breakdown`: a test fixture named
+`s3cret-signing-key`, which is a fake key but reads like a real one. Renamed
+to `test-signing-key-not-a-secret` rather than allowlisted — an allowlist
+entry for something shaped like a credential is exactly the entry that hides
+the next real one. Fixtures should be *named* so they cannot trip the
+scanner.
