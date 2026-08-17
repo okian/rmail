@@ -52,6 +52,81 @@ service AnalyticsService {
   // sourced line is not a thinner briefing, it is an unusable one, and it is
   // not stored.
   rpc GenerateDigest(GenerateDigestRequest) returns (GenerateDigestResponse);
+
+  // Everything one correspondence looks like: volume, direction, response
+  // symmetry, cadence, recurring topics, a decay report — and, unless
+  // `metrics_only`, a one-paragraph Claude briefing with suggested next
+  // actions (prd.md feature 59).
+  //
+  // The numbers are arithmetic over headers. The paragraph is a model call, so
+  // this RPC carries `ai.invoke` alongside `mail.read` even though
+  // `metrics_only = true` spends nothing: the scope table gates the RPC, not
+  // one field of one request.
+  //
+  // FAILED_PRECONDITION on a daemon whose AI subsystem is off, unless
+  // `metrics_only`. INVALID_ARGUMENT for a blank address, a window that does
+  // not end after it starts, or a briefing asked for on a correspondence
+  // spanning several accounts without `account_id` naming one — AI policy and
+  // budget are per account, and guessing which to charge would run a call
+  // somebody may have switched off. RESOURCE_EXHAUSTED when the window covers
+  // more mail than one report may materialize, or when a spend cap refuses the
+  // briefing.
+  rpc GetContactInsight(GetContactInsightRequest) returns (GetContactInsightResponse);
+
+  // Which senders are broadcasting at you, how much of it you read, and which
+  // are worth leaving (prd.md feature 60).
+  //
+  // # rmail will not unsubscribe you
+  //
+  // A detected `List-Unsubscribe` is reported as a **proposal** and nothing
+  // more. This daemon does not fetch the URL, does not follow a redirect, does
+  // not send the `mailto:`, and exposes no RPC that would. The header is
+  // written by the sender — it is attacker-authored text — and a one-click
+  // request issued by the user's own daemon confirms the address is live at
+  // best and is an SSRF at worst. `Unsubscribe.one_click` reports that the
+  // sender advertises RFC 8058; it enables nothing.
+  //
+  // Classification is headers first (`List-Unsubscribe`, `List-Id`,
+  // `Precedence`, `Auto-Submitted`, campaign headers), then behaviour (volume,
+  // cadence, read-rate, and whether you have ever replied — a sender you
+  // answer is not a subscription whatever its headers say), and only then
+  // Claude, for the senders neither could classify. That last step is opt-in
+  // per request (`classify_unknown`) and is the only thing here that spends,
+  // which is why the RPC carries `ai.invoke`.
+  //
+  // INVALID_ARGUMENT for a window that does not end after it starts, or when
+  // `classify_unknown` is set on senders spanning several accounts without
+  // `account_id`. FAILED_PRECONDITION when `classify_unknown` is set on a
+  // daemon whose AI subsystem is off. RESOURCE_EXHAUSTED when the window holds
+  // more distinct senders than one report may materialize.
+  rpc ListSubscriptions(ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
+
+  // A plain-English analytics question, answered with rows and a short
+  // narrative (prd.md feature 61).
+  //
+  // Claude writes read-only SQLite against six whitelisted views
+  // (`analytics_messages`, `analytics_senders`, `analytics_daily`,
+  // `analytics_threads`, `analytics_mailboxes`, `analytics_contacts`), and the
+  // statement runs inside a SQLite **authorizer** that denies every action
+  // except a read reaching one of those views and a call to a fixed function
+  // list. The confinement is enforced by SQLite's own name resolution, not by
+  // inspecting the string, so a query naming any other table fails at prepare
+  // time. Values are bound parameters, never interpolated. Nothing the views
+  // project is a message body, a raw octet, a credential or a token.
+  //
+  // The SQL that ran comes back in the response. A number produced by SQL
+  // nobody can see is a number nobody can check.
+  //
+  // Two model calls when `narrate` is set (one to write the query, one to
+  // describe its result), one otherwise. Nothing is cached: the answer depends
+  // on data that changes.
+  //
+  // INVALID_ARGUMENT for an empty or over-long question, for SQL the sandbox
+  // refuses (the message names what it tried to reach), for a parameter that
+  // does not parse as its declared type, or when several accounts are
+  // configured and none is named. FAILED_PRECONDITION on a daemon whose AI
+  // subsystem is off. RESOURCE_EXHAUSTED when a spend cap refuses the call.
+  rpc AskAnalytics(AskAnalyticsRequest) returns (AskAnalyticsResponse);
 }
 
 // Which dimension a response-time report is grouped along.
@@ -340,4 +415,348 @@ message GenerateDigestResponse {
   // same five-section document with every section empty, and — deliberately —
   // no model call at all.
   bool empty = 15;
+}
+
+// ---------------------------------------------------------------------------
+// GetContactInsight (prd.md feature 59, task 72)
+// ---------------------------------------------------------------------------
+
+message GetContactInsightRequest {
+  // Restrict to one account. 0 covers every configured account.
+  //
+  // Naming one is also how a briefing picks whose AI policy and budget to
+  // charge. Left at 0, the daemon uses the single account the correspondence
+  // was found in, and refuses with INVALID_ARGUMENT when there is more than
+  // one — see the RPC comment.
+  int64 account_id = 1;
+
+  // The counterparty, as an email address. Lowercased and trimmed before
+  // anything else happens, so the report for `Ada@Example.COM` and the report
+  // for `ada@example.com` are the same report.
+  string address = 2;
+
+  // Window bounds in unix seconds, half-open: `since <= t < until`.
+  //
+  // 0 means "since = until - 365 days" and "until = now". A year rather than
+  // the response-time report's ninety days, because "is this going quiet" is a
+  // question a quarter cannot answer.
+  int64 since = 3;
+  int64 until = 4;
+
+  // Maximum topics returned. 0 means 8; larger values are clamped to 50.
+  uint32 topic_limit = 5;
+
+  // Skip the model call. The response then carries every number and an empty
+  // `briefing`, and costs nothing. `mail contact <addr>` sets it; `mail
+  // contact <addr> --insight` does not.
+  bool metrics_only = 6;
+}
+
+// How much mail went each way.
+message ContactVolume {
+  uint64 inbound = 1;
+  uint64 outbound = 2;
+  // Distinct threads the two of you share inside the window.
+  uint64 threads = 3;
+  // Outbound as a share of the total, in [0, 1]. 0 when there is no mail at
+  // all — check `inbound + outbound` before reading it.
+  double direction_ratio = 4;
+  // 0 when unknown.
+  int64 first_seen = 5;
+  int64 last_inbound = 6;
+  int64 last_outbound = 7;
+}
+
+// How often the two of you exchange mail.
+message ContactCadence {
+  // Median gap between consecutive messages either way. 0 with fewer than two
+  // messages, where a gap does not exist.
+  int64 median_gap_seconds = 1;
+  int64 longest_gap_seconds = 2;
+  // Messages either way per seven days, scaled by the *window* rather than by
+  // the observed span — so a contact who wrote twice on one day a year ago
+  // does not read as a daily correspondent.
+  double messages_per_week = 3;
+}
+
+// Whether the relationship is going quiet.
+message ContactDecay {
+  // Seconds since the most recent message either way. 0 when there was none.
+  int64 silence_seconds = 1;
+  // How long a silence must run to count as dormant here: three times this
+  // pair's own median cadence, floored at 30 days. Reported because "dormant"
+  // means something different for a daily correspondent than for an annual
+  // one, and a flag whose threshold is invisible cannot be argued with.
+  int64 dormant_after_seconds = 2;
+  // Messages in the later and earlier halves of the window.
+  uint64 recent_messages = 3;
+  uint64 prior_messages = 4;
+  // recent / prior. 0 when the earlier half was empty — a correspondence that
+  // started inside the window has no trend yet, and reporting "infinite
+  // growth" would be worse than reporting nothing.
+  double change_ratio = 5;
+  bool dormant = 6;
+  // The recent half is under half the earlier half.
+  bool declining = 7;
+}
+
+// One recurring subject term.
+message ContactTopic {
+  string term = 1;
+  // Messages in the window whose subject carried it. Counted per message, so a
+  // subject repeating a word six times contributes one.
+  uint64 messages = 2;
+}
+
+message GetContactInsightResponse {
+  string address = 1;
+  // The most recent display name seen for them; empty when none.
+  string name = 2;
+  // The resolved window.
+  int64 since = 3;
+  int64 until = 4;
+
+  ContactVolume volume = 5;
+  // Response-time percentiles for this correspondence, computed by exactly the
+  // rules `GetResponseTimes` uses — same pairing, same direction test, same
+  // nearest-rank percentiles.
+  ResponseStats ours = 6;
+  ResponseStats theirs = 7;
+  // theirs.p50 / ours.p50: above 1 means they are slower than you, below 1
+  // means you are slower than them. 0 unless both sides have an observation.
+  double symmetry = 8;
+
+  // Messages of theirs with no later message of yours in the same thread, and
+  // the subset that has waited longer than you normally take with this person.
+  uint64 awaiting_reply = 9;
+  uint64 overdue = 10;
+
+  ContactCadence cadence = 11;
+  ContactDecay decay = 12;
+  repeated ContactTopic topics = 13;
+
+  // Claude's paragraph. Empty when `metrics_only` was set, and also when the
+  // window held no mail at all — there is nothing to brief and no account to
+  // charge, so no call is made.
+  string briefing = 14;
+  // Suggested next actions, at most 5. Often empty, deliberately: the prompt
+  // says an empty list is a valid answer.
+  repeated string next_actions = 15;
+  // The model that wrote the briefing, after any budget downgrade. Empty when
+  // none was called.
+  string model = 16;
+
+  // The accounts this correspondence was found in. Reported because "no mail
+  // at all" and "mail in two accounts" are different answers to an empty
+  // briefing, and the second is what INVALID_ARGUMENT asks you to resolve.
+  repeated int64 accounts = 17;
+}
+
+// ---------------------------------------------------------------------------
+// ListSubscriptions (prd.md feature 60, task 72)
+// ---------------------------------------------------------------------------
+
+message ListSubscriptionsRequest {
+  // Restrict to one account. 0 covers every configured account, and is also
+  // how `classify_unknown` picks whose budget to charge — see the RPC comment.
+  int64 account_id = 1;
+
+  // Window bounds in unix seconds, half-open. 0 means "since = until - 180
+  // days" and "until = now".
+  int64 since = 2;
+  int64 until = 3;
+
+  // Maximum senders returned. 0 means 50; larger values are clamped to 500.
+  uint32 limit = 4;
+
+  // Return only senders flagged as unsubscribe candidates.
+  bool candidates_only = 5;
+
+  // Ask Claude about senders headers and behaviour could not classify. Costs
+  // one provider call; the only field here that spends anything.
+  bool classify_unknown = 6;
+}
+
+// What a sender is.
+enum SubscriptionClass {
+  SUBSCRIPTION_CLASS_UNSPECIFIED = 0;
+  // Bulk mail you subscribed to: a newsletter, a digest, a mailing list.
+  SUBSCRIPTION_CLASS_NEWSLETTER = 1;
+  // Machine mail about one thing you did: a receipt, a reset, a delivery.
+  // Split from NEWSLETTER because leaving it is usually neither possible nor
+  // desirable.
+  SUBSCRIPTION_CLASS_TRANSACTIONAL = 2;
+  // Machine mail that is neither: monitoring, build results, no-reply
+  // broadcasts.
+  SUBSCRIPTION_CLASS_AUTOMATED = 3;
+  // A human writing to you.
+  SUBSCRIPTION_CLASS_PERSONAL = 4;
+  // Not enough signal. The only class Claude is ever asked about.
+  SUBSCRIPTION_CLASS_UNKNOWN = 5;
+}
+
+// Where a classification came from.
+enum SubscriptionSource {
+  SUBSCRIPTION_SOURCE_UNSPECIFIED = 0;
+  // A List-*/Precedence/Auto-Submitted header said so.
+  SUBSCRIPTION_SOURCE_HEADER = 1;
+  // Volume, cadence, read-rate or a reply of yours said so.
+  SUBSCRIPTION_SOURCE_HEURISTIC = 2;
+  // Claude was asked, because the other two had nothing.
+  SUBSCRIPTION_SOURCE_MODEL = 3;
+}
+
+// What the sender says leaving involves.
+//
+// A **proposal**, never an action. rmail does not fetch `http_url`, does not
+// follow a redirect and does not send to `mailto` — see the RPC comment.
+message Unsubscribe {
+  // An `https:` URL the sender advertises; empty when it offered none.
+  //
+  // Plain `http:` is deliberately dropped rather than reported: a cleartext
+  // unsubscribe is a tracking beacon with a downgrade attack attached, and
+  // handing one to a human as "the method" would be endorsing it.
+  string http_url = 1;
+  // A `mailto:` address, with the sender-chosen `?subject=`/`?body=` stripped
+  // — those describe a message the sender wants sent *from the user's
+  // address*, and they are not carried.
+  string mailto = 2;
+  // The sender advertises RFC 8058 one-click
+  // (`List-Unsubscribe-Post: List-Unsubscribe=One-Click`). Reported so a human
+  // knows leaving should take one step rather than a login. It enables
+  // nothing.
+  bool one_click = 3;
+}
+
+// One sender.
+message SubscriptionSender {
+  int64 account_id = 1;
+  string address = 2;
+  // Most recent display name; empty when none.
+  string name = 3;
+
+  uint64 messages = 4;
+  uint64 read_messages = 5;
+  // read_messages / messages, in [0, 1].
+  double read_rate = 6;
+  // 0 when unknown.
+  int64 first_seen = 7;
+  int64 last_seen = 8;
+  // Median gap between consecutive messages. 0 with fewer than two.
+  int64 median_gap_seconds = 9;
+
+  // Messages of yours in this sender's threads. A sender you answer is not a
+  // subscription whatever its headers say, and this is the signal that says so.
+  uint64 your_replies = 10;
+
+  SubscriptionClass sender_class = 11;
+  SubscriptionSource source = 12;
+  // The named signals behind the verdict (`list-unsubscribe`, `list-id`,
+  // `precedence-bulk`, `auto-submitted`, `campaign-header`, `no-reply-sender`,
+  // `you-have-replied`, `regular-cadence`, `mostly-unread`, `model`), so a
+  // classification can be interrogated rather than trusted.
+  repeated string signals = 13;
+
+  // What the sender says leaving involves. Absent when it says nothing, and
+  // also when its headers were never read.
+  Unsubscribe unsubscribe = 14;
+  // Whether a header block was actually read for this sender. False past the
+  // probe cap — and "no unsubscribe header" and "we did not look" are
+  // different facts.
+  bool headers_read = 15;
+
+  // Worth leaving: a newsletter or automated class, a read-rate at or below
+  // 0.2 over at least 5 messages, no replies of yours, and an unsubscribe
+  // method a human could act on.
+  bool candidate = 16;
+}
+
+message ListSubscriptionsResponse {
+  // The resolved window.
+  int64 since = 1;
+  int64 until = 2;
+
+  // Senders, candidates first and then by unread volume, with the address and
+  // account as final tie-breaks so a truncated report is reproducible.
+  repeated SubscriptionSender senders = 3;
+  // Senders before `limit` truncation.
+  uint32 total_senders = 4;
+  // How many header blocks were read. Below `total_senders` past the probe
+  // cap.
+  uint32 headers_read = 5;
+  // How many senders Claude classified. 0 unless `classify_unknown` was set.
+  uint32 model_classified = 6;
+  // The model that answered, after any budget downgrade. Empty when none was
+  // called.
+  string model = 7;
+}
+
+// ---------------------------------------------------------------------------
+// AskAnalytics (prd.md feature 61, task 72)
+// ---------------------------------------------------------------------------
+
+message AskAnalyticsRequest {
+  // Restrict to one account. 0 asks across every configured account.
+  //
+  // A filter, not a boundary: `mail.read` is not per-account anywhere in this
+  // daemon, and claiming otherwise here would invent a guarantee the auth
+  // layer does not make. It is also what picks whose AI budget the call is
+  // charged to; left at 0 with several accounts configured, the RPC refuses
+  // rather than guessing.
+  int64 account_id = 1;
+
+  // The question, in plain English. At most 500 characters.
+  string question = 2;
+
+  // Also write a short narrative over the rows. Costs a second model call.
+  // `mail ask --json` leaves it off.
+  bool narrate = 3;
+}
+
+// One value from a result row.
+//
+// A oneof rather than a string, so a client can format a count as a count and
+// a timestamp as a date without re-parsing. `unsupported` is what a column
+// this surface does not carry (today, only a blob) comes back as — none of the
+// whitelisted views project one, so it should never be seen.
+message AnalyticsCell {
+  oneof value {
+    bool null_value = 1;
+    int64 integer_value = 2;
+    double real_value = 3;
+    string text_value = 4;
+    bool unsupported = 5;
+  }
+}
+
+message AnalyticsRow {
+  repeated AnalyticsCell cells = 1;
+}
+
+message AskAnalyticsResponse {
+  // The question as asked, trimmed.
+  string question = 1;
+  // The SQL that ran, with `?` placeholders. Returned because a number
+  // produced by SQL nobody can see is a number nobody can check.
+  string sql = 2;
+  // The bound parameters, rendered as `kind:value` in placeholder order.
+  repeated string params = 3;
+  // The model's one-line note about what it understood, for a human to read
+  // next to the numbers.
+  string notes = 4;
+
+  repeated string columns = 5;
+  repeated AnalyticsRow rows = 6;
+  // Whether the row cap stopped the statement short. A narrative written over
+  // a truncated result is told so and says so.
+  bool truncated = 7;
+
+  // The narrative. Empty when `narrate` was not set.
+  string narrative = 8;
+  // How many rows the narrating call was actually shown — below `rows` for a
+  // large result, so "the top few" can be checked against what it saw.
+  uint32 narrative_rows = 9;
+
+  // The model that answered, after any budget downgrade.
+  string model = 10;
 }

@@ -40,19 +40,36 @@
 //! `CANCELLED`, never as an empty report — see the core module's `scan`.
 #![allow(clippy::result_large_err)] // see mail_service.rs's note on `Result<_, Status>`
 
+use rmail_core::analytics::contacts::{
+    self, Briefing, Cadence, ContactBriefer, ContactInsight, ContactInsightQuery, Decay, Topic,
+    Volume,
+};
+use rmail_core::analytics::nl::{AnalyticsAnswer, AnalyticsAsker, AnalyticsQuestion};
 use rmail_core::analytics::response_time::{
     self, GroupBy, ResponseGroup, ResponseTimeQuery, ResponseTimes, Stats, TrendPoint,
+};
+use rmail_core::analytics::sql::Cell;
+use rmail_core::analytics::subscriptions::{
+    self, Class, Source, Subscription, SubscriptionClassifier, SubscriptionQuery,
+    SubscriptionReport, Unsubscribe,
 };
 use rmail_core::digest::{
     schedule, DigestEngine, DigestReport, DigestRequest, Period, StoredSource,
 };
 use rmail_core::{Database, Error};
+use rmail_proto::v1::analytics_cell::Value as ProtoCellValue;
 use rmail_proto::v1::analytics_service_server::AnalyticsService;
 use rmail_proto::v1::{
-    DigestLine as ProtoLine, DigestSection as ProtoSection, DigestSource as ProtoSource,
-    GenerateDigestRequest, GenerateDigestResponse, GetResponseTimesRequest,
-    GetResponseTimesResponse, ResponseStats, ResponseTimeGroup as ProtoGroup,
-    ResponseTimeGroupBy as ProtoGroupBy, ResponseTrendPoint as ProtoTrendPoint,
+    AnalyticsCell, AnalyticsRow, AskAnalyticsRequest, AskAnalyticsResponse,
+    ContactCadence as ProtoCadence, ContactDecay as ProtoDecay, ContactTopic as ProtoTopic,
+    ContactVolume as ProtoVolume, DigestLine as ProtoLine, DigestSection as ProtoSection,
+    DigestSource as ProtoSource, GenerateDigestRequest, GenerateDigestResponse,
+    GetContactInsightRequest, GetContactInsightResponse, GetResponseTimesRequest,
+    GetResponseTimesResponse, ListSubscriptionsRequest, ListSubscriptionsResponse, ResponseStats,
+    ResponseTimeGroup as ProtoGroup, ResponseTimeGroupBy as ProtoGroupBy,
+    ResponseTrendPoint as ProtoTrendPoint, SubscriptionClass as ProtoClass,
+    SubscriptionSender as ProtoSender, SubscriptionSource as ProtoSource2,
+    Unsubscribe as ProtoUnsubscribe,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -70,19 +87,35 @@ pub struct AnalyticsApi {
     /// fail-closed scope table must see every RPC regardless of runtime
     /// config, the convention `AiService`/`HookService` established.
     digest: Option<DigestEngine>,
+    /// The contact briefer, `None` on a daemon whose AI subsystem is off.
+    ///
+    /// Unlike the digest, half of `GetContactInsight` still works without one:
+    /// `metrics_only` is pure arithmetic and is served straight off the
+    /// database. Only the briefing declines.
+    briefer: Option<ContactBriefer>,
+    /// The subscription classifier's model fallback, `None` when AI is off.
+    /// Detection itself never needs it.
+    classifier: Option<SubscriptionClassifier>,
+    /// The natural-language analytics asker, `None` when AI is off. There is
+    /// no model-free half of this one: without a model there is no SQL.
+    asker: Option<AnalyticsAsker>,
     /// Cancelled when the daemon shuts down, so an in-flight report stops
     /// with it rather than holding shutdown open.
     shutdown: CancellationToken,
 }
 
 impl AnalyticsApi {
-    /// Create a handler over the given database, with no digest engine —
-    /// `GenerateDigest` declines. Use [`Self::with_digest`] to wire one.
+    /// Create a handler over the given database, with no AI engines — the
+    /// briefing, the model fallback and `AskAnalytics` all decline. Use the
+    /// `with_*` builders to wire them.
     #[must_use]
     pub fn new(db: Database, shutdown: CancellationToken) -> Self {
         Self {
             db,
             digest: None,
+            briefer: None,
+            classifier: None,
+            asker: None,
             shutdown,
         }
     }
@@ -91,6 +124,27 @@ impl AnalyticsApi {
     #[must_use]
     pub fn with_digest(mut self, engine: DigestEngine) -> Self {
         self.digest = Some(engine);
+        self
+    }
+
+    /// Serve `GetContactInsight`'s briefing from `briefer`.
+    #[must_use]
+    pub fn with_contact_briefer(mut self, briefer: ContactBriefer) -> Self {
+        self.briefer = Some(briefer);
+        self
+    }
+
+    /// Serve `ListSubscriptions`' model fallback from `classifier`.
+    #[must_use]
+    pub fn with_subscription_classifier(mut self, classifier: SubscriptionClassifier) -> Self {
+        self.classifier = Some(classifier);
+        self
+    }
+
+    /// Serve `AskAnalytics` from `asker`.
+    #[must_use]
+    pub fn with_analytics_asker(mut self, asker: AnalyticsAsker) -> Self {
+        self.asker = Some(asker);
         self
     }
 }
@@ -148,6 +202,332 @@ impl AnalyticsService for AnalyticsApi {
             .await?;
         Ok(Response::new(digest_to_proto(&digest)))
     }
+
+    async fn get_contact_insight(
+        &self,
+        request: Request<GetContactInsightRequest>,
+    ) -> Result<Response<GetContactInsightResponse>, Status> {
+        let req = request.into_inner();
+        if req.account_id != 0 {
+            tracing::Span::current().record(rmail_core::telemetry::FIELD_ACCOUNT, req.account_id);
+        }
+        let query = contact_query_from_proto(&req, now()?)?;
+        let cancel = self.shutdown.child_token();
+        // Two paths, and the split is not just an optimization: the numbers
+        // are reachable on a daemon with no provider at all, so declining the
+        // whole RPC because the briefing half cannot run would take a working
+        // report away over a feature the caller did not ask for.
+        let insight = if query.metrics_only {
+            contacts::metrics(&self.db, &cancel, query).await?
+        } else {
+            let Some(briefer) = self.briefer.as_ref() else {
+                return Err(Status::from(Error::failed_precondition(
+                    "the AI subsystem is not available on this daemon, so no contact briefing \
+                     can be written (check `ai.enabled` and the configured provider); ask with \
+                     metrics_only for the numbers alone",
+                )));
+            };
+            briefer.insight(&cancel, query).await?
+        };
+        Ok(Response::new(contact_to_proto(&insight)))
+    }
+
+    async fn list_subscriptions(
+        &self,
+        request: Request<ListSubscriptionsRequest>,
+    ) -> Result<Response<ListSubscriptionsResponse>, Status> {
+        let req = request.into_inner();
+        if req.account_id != 0 {
+            tracing::Span::current().record(rmail_core::telemetry::FIELD_ACCOUNT, req.account_id);
+        }
+        let query = subscription_query_from_proto(&req, now()?)?;
+        let cancel = self.shutdown.child_token();
+        let report = if query.classify_unknown {
+            let Some(classifier) = self.classifier.as_ref() else {
+                return Err(Status::from(Error::failed_precondition(
+                    "the AI subsystem is not available on this daemon, so unclassified senders \
+                     cannot be classified (check `ai.enabled` and the configured provider); ask \
+                     without classify_unknown for the header and behaviour verdicts alone",
+                )));
+            };
+            classifier.list(&cancel, query).await?
+        } else {
+            subscriptions::detect(&self.db, &cancel, query).await?
+        };
+        Ok(Response::new(subscriptions_to_proto(&report)))
+    }
+
+    async fn ask_analytics(
+        &self,
+        request: Request<AskAnalyticsRequest>,
+    ) -> Result<Response<AskAnalyticsResponse>, Status> {
+        let req = request.into_inner();
+        if req.account_id != 0 {
+            tracing::Span::current().record(rmail_core::telemetry::FIELD_ACCOUNT, req.account_id);
+        }
+        if req.account_id < 0 {
+            return Err(Status::from(Error::invalid_argument(
+                "account_id must not be negative",
+            )));
+        }
+        let Some(asker) = self.asker.as_ref() else {
+            return Err(Status::from(Error::failed_precondition(
+                "the AI subsystem is not available on this daemon, so a plain-English \
+                 analytics question cannot be compiled (check `ai.enabled` and the configured \
+                 provider)",
+            )));
+        };
+        let cancel = self.shutdown.child_token();
+        let answer = asker
+            .ask(
+                &cancel,
+                AnalyticsQuestion {
+                    account_id: (req.account_id != 0).then_some(req.account_id),
+                    question: req.question,
+                    narrate: req.narrate,
+                },
+                now()?,
+            )
+            .await?;
+        Ok(Response::new(answer_to_proto(&answer)))
+    }
+}
+
+/// Decode a contact-insight request, resolving every "0 means default" field.
+fn contact_query_from_proto(
+    req: &GetContactInsightRequest,
+    now: i64,
+) -> Result<ContactInsightQuery, Status> {
+    for (name, value) in [
+        ("account_id", req.account_id),
+        ("since", req.since),
+        ("until", req.until),
+    ] {
+        if value < 0 {
+            return Err(Status::from(Error::invalid_argument(format!(
+                "{name} must not be negative"
+            ))));
+        }
+    }
+    let until = if req.until == 0 { now } else { req.until };
+    let since = if req.since == 0 {
+        until.saturating_sub(contacts::DEFAULT_RANGE_SECONDS)
+    } else {
+        req.since
+    };
+    Ok(ContactInsightQuery {
+        account_id: (req.account_id != 0).then_some(req.account_id),
+        address: req.address.clone(),
+        since,
+        until,
+        topic_limit: if req.topic_limit == 0 {
+            contacts::DEFAULT_TOPIC_LIMIT
+        } else {
+            usize::try_from(req.topic_limit).unwrap_or(contacts::MAX_TOPIC_LIMIT)
+        },
+        metrics_only: req.metrics_only,
+    })
+}
+
+/// Decode a subscription request, resolving every "0 means default" field.
+fn subscription_query_from_proto(
+    req: &ListSubscriptionsRequest,
+    now: i64,
+) -> Result<SubscriptionQuery, Status> {
+    for (name, value) in [
+        ("account_id", req.account_id),
+        ("since", req.since),
+        ("until", req.until),
+    ] {
+        if value < 0 {
+            return Err(Status::from(Error::invalid_argument(format!(
+                "{name} must not be negative"
+            ))));
+        }
+    }
+    let until = if req.until == 0 { now } else { req.until };
+    let since = if req.since == 0 {
+        until.saturating_sub(subscriptions::DEFAULT_RANGE_SECONDS)
+    } else {
+        req.since
+    };
+    Ok(SubscriptionQuery {
+        account_id: (req.account_id != 0).then_some(req.account_id),
+        since,
+        until,
+        limit: if req.limit == 0 {
+            subscriptions::DEFAULT_LIMIT
+        } else {
+            usize::try_from(req.limit).unwrap_or(subscriptions::MAX_LIMIT)
+        },
+        candidates_only: req.candidates_only,
+        classify_unknown: req.classify_unknown,
+    })
+}
+
+/// Project a contact insight onto the wire.
+fn contact_to_proto(insight: &ContactInsight) -> GetContactInsightResponse {
+    let Briefing {
+        summary,
+        next_actions,
+        model,
+    } = &insight.briefing;
+    GetContactInsightResponse {
+        address: insight.address.clone(),
+        name: insight.name.clone().unwrap_or_default(),
+        since: insight.since,
+        until: insight.until,
+        volume: Some(volume_to_proto(&insight.volume)),
+        ours: Some(stats_to_proto(insight.ours)),
+        theirs: Some(stats_to_proto(insight.theirs)),
+        symmetry: insight.symmetry.unwrap_or(0.0),
+        awaiting_reply: insight.awaiting_reply,
+        overdue: insight.overdue,
+        cadence: Some(cadence_to_proto(insight.cadence)),
+        decay: Some(decay_to_proto(insight.decay)),
+        topics: insight.topics.iter().map(topic_to_proto).collect(),
+        briefing: summary.clone(),
+        next_actions: next_actions.clone(),
+        model: model.clone(),
+        accounts: insight.accounts.clone(),
+    }
+}
+
+fn volume_to_proto(volume: &Volume) -> ProtoVolume {
+    ProtoVolume {
+        inbound: volume.inbound,
+        outbound: volume.outbound,
+        threads: volume.threads,
+        direction_ratio: volume.direction_ratio().unwrap_or(0.0),
+        first_seen: volume.first_seen.unwrap_or(0),
+        last_inbound: volume.last_inbound.unwrap_or(0),
+        last_outbound: volume.last_outbound.unwrap_or(0),
+    }
+}
+
+fn cadence_to_proto(cadence: Cadence) -> ProtoCadence {
+    ProtoCadence {
+        median_gap_seconds: cadence.median_gap_seconds.unwrap_or(0),
+        longest_gap_seconds: cadence.longest_gap_seconds.unwrap_or(0),
+        messages_per_week: cadence.messages_per_week,
+    }
+}
+
+fn decay_to_proto(decay: Decay) -> ProtoDecay {
+    ProtoDecay {
+        silence_seconds: decay.silence_seconds.unwrap_or(0),
+        dormant_after_seconds: decay.dormant_after_seconds,
+        recent_messages: decay.recent_messages,
+        prior_messages: decay.prior_messages,
+        change_ratio: decay.change_ratio.unwrap_or(0.0),
+        dormant: decay.dormant,
+        declining: decay.declining,
+    }
+}
+
+fn topic_to_proto(topic: &Topic) -> ProtoTopic {
+    ProtoTopic {
+        term: topic.term.clone(),
+        messages: topic.messages,
+    }
+}
+
+/// Project a subscription report onto the wire.
+fn subscriptions_to_proto(report: &SubscriptionReport) -> ListSubscriptionsResponse {
+    ListSubscriptionsResponse {
+        since: report.since,
+        until: report.until,
+        senders: report.senders.iter().map(sender_to_proto).collect(),
+        total_senders: u32::try_from(report.total_senders).unwrap_or(u32::MAX),
+        headers_read: u32::try_from(report.headers_read).unwrap_or(u32::MAX),
+        model_classified: u32::try_from(report.model_classified).unwrap_or(u32::MAX),
+        model: report.model.clone(),
+    }
+}
+
+fn sender_to_proto(sender: &Subscription) -> ProtoSender {
+    ProtoSender {
+        account_id: sender.account_id,
+        address: sender.address.clone(),
+        name: sender.name.clone().unwrap_or_default(),
+        messages: sender.messages,
+        read_messages: sender.read_messages,
+        read_rate: sender.read_rate,
+        first_seen: sender.first_seen.unwrap_or(0),
+        last_seen: sender.last_seen.unwrap_or(0),
+        median_gap_seconds: sender.median_gap_seconds.unwrap_or(0),
+        your_replies: sender.your_replies,
+        sender_class: class_to_proto(sender.class) as i32,
+        source: source_to_proto_enum(sender.source) as i32,
+        signals: sender.signals.clone(),
+        unsubscribe: sender.unsubscribe.as_ref().map(unsubscribe_to_proto),
+        headers_read: sender.headers_read,
+        candidate: sender.candidate,
+    }
+}
+
+fn class_to_proto(class: Class) -> ProtoClass {
+    match class {
+        Class::Newsletter => ProtoClass::Newsletter,
+        Class::Transactional => ProtoClass::Transactional,
+        Class::Automated => ProtoClass::Automated,
+        Class::Personal => ProtoClass::Personal,
+        Class::Unknown => ProtoClass::Unknown,
+    }
+}
+
+fn source_to_proto_enum(source: Source) -> ProtoSource2 {
+    match source {
+        Source::Header => ProtoSource2::Header,
+        Source::Heuristic => ProtoSource2::Heuristic,
+        Source::Model => ProtoSource2::Model,
+    }
+}
+
+fn unsubscribe_to_proto(unsubscribe: &Unsubscribe) -> ProtoUnsubscribe {
+    ProtoUnsubscribe {
+        http_url: unsubscribe.http_url.clone().unwrap_or_default(),
+        mailto: unsubscribe.mailto.clone().unwrap_or_default(),
+        one_click: unsubscribe.one_click,
+    }
+}
+
+/// Project an analytics answer onto the wire.
+fn answer_to_proto(answer: &AnalyticsAnswer) -> AskAnalyticsResponse {
+    AskAnalyticsResponse {
+        question: answer.question.clone(),
+        sql: answer.sql.clone(),
+        params: answer.params.clone(),
+        notes: answer.notes.clone(),
+        columns: answer.columns.clone(),
+        rows: answer
+            .rows
+            .iter()
+            .map(|row| AnalyticsRow {
+                cells: row.iter().map(cell_to_proto).collect(),
+            })
+            .collect(),
+        truncated: answer.truncated,
+        narrative: answer.narrative.clone(),
+        narrative_rows: u32::try_from(answer.narrative_rows).unwrap_or(u32::MAX),
+        model: answer.model.clone(),
+    }
+}
+
+/// One cell.
+///
+/// `null_value`/`unsupported` are set to `true` rather than to `false`: proto3
+/// treats a `false` inside a `oneof` as present, so either spelling works on
+/// the wire, and `true` is the one that does not read as "null is false".
+fn cell_to_proto(cell: &Cell) -> AnalyticsCell {
+    let value = match cell {
+        Cell::Null => ProtoCellValue::NullValue(true),
+        Cell::Integer(v) => ProtoCellValue::IntegerValue(*v),
+        Cell::Real(v) => ProtoCellValue::RealValue(*v),
+        Cell::Text(v) => ProtoCellValue::TextValue(v.clone()),
+        Cell::Unsupported => ProtoCellValue::Unsupported(true),
+    };
+    AnalyticsCell { value: Some(value) }
 }
 
 /// Resolve the requested window, applying the "0 means the last completed

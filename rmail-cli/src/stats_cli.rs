@@ -61,6 +61,13 @@ pub enum StatsAction {
     /// bottleneck (`AnalyticsService.GetResponseTimes`).
     #[command(name = "response-time")]
     ResponseTime(ResponseTimeArgs),
+    /// Answer a plain-English question about the mailbox with rows and a short
+    /// narrative (`AnalyticsService.AskAnalytics`).
+    ///
+    /// Here rather than at `mail ask`, which feature 43 already uses for
+    /// questions about message *contents* — see `analytics_cli`'s own module
+    /// docs.
+    Ask(crate::analytics_cli::AskArgs),
 }
 
 /// `mail stats response-time [flags]`.
@@ -140,6 +147,7 @@ impl ByArg {
 pub async fn run(socket: &Path, action: StatsAction) -> Result<()> {
     match action {
         StatsAction::ResponseTime(args) => response_time(socket, args).await,
+        StatsAction::Ask(args) => crate::analytics_cli::ask(socket, args).await,
     }
 }
 

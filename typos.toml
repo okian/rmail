@@ -90,3 +90,7 @@ abd = "abd"
 # The slug fixture's expected *output*: `slug("Who's chasing me?")` is
 # "whos-chasing-me", apostrophe removed. That is the function working.
 whos = "whos"
+
+# SQLite's own ternary function, on `analytics::sql`'s allow-list. Renaming it
+# would remove a real function from the sandbox's vocabulary.
+iif = "iif"

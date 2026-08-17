@@ -792,6 +792,51 @@ commands! {
         summary: "Brief one window of mail as ranked markdown, clustered by topic and sender, every line citing its message-ids.",
     }
 
+    // -- AnalyticsService (task 72) -------------------------------------------
+    // All three are `Mutate`, and none of them writes a row. The line this
+    // enum is drawn on is *authority*, and spend at a model provider is an
+    // effect an observer outside this process sees — the same reason
+    // `AiAskMailbox` and `AnalyticsGenerateDigest` above are `Mutate` while
+    // `SearchSearch` is not. The clamp argument that keeps `SearchSearch` at
+    // `Read` is unavailable here: the caller, not the operator, chooses
+    // whether a call happens (`metrics_only`, `classify_unknown`, `narrate`),
+    // and a window or a question the caller picks decides how large it is.
+    //
+    // `GetContactInsight` is the closest call of the three, because
+    // `metrics_only = true` genuinely spends nothing. It is still `Mutate`:
+    // this table annotates the *RPC*, an MCP client picks a tool before it
+    // picks a field, and a "safe" tool whose safety depends on one boolean is
+    // worse than an honest `Mutate`.
+    AnalyticsGetContactInsight {
+        rpc: "/rmail.v1.AnalyticsService/GetContactInsight",
+        tool: "contact_insight",
+        effect: Mutate,
+        cli: ["contact"],
+        actions: [],
+        summary: "Volume, direction, response symmetry, cadence, topics and a decay report for one correspondent, with a Claude relationship briefing.",
+    }
+    AnalyticsListSubscriptions {
+        rpc: "/rmail.v1.AnalyticsService/ListSubscriptions",
+        tool: "list_subscriptions",
+        effect: Mutate,
+        cli: ["subs"],
+        actions: [],
+        summary: "Classify senders as newsletters, transactional or automated mail with read-rates, and report unsubscribe candidates. Never unsubscribes anything.",
+    }
+    AnalyticsAskAnalytics {
+        rpc: "/rmail.v1.AnalyticsService/AskAnalytics",
+        tool: "ask_analytics",
+        effect: Mutate,
+        // `mail stats ask`, not prd.md's `mail ask`: that verb was taken by
+        // feature 43 (`AiService/AskMailbox`), which answers a question about
+        // the *contents* of messages. Two verbs spelled the same that reach
+        // different services is worse than one of them living in the `stats`
+        // namespace `stats_cli` was created to hold exactly this.
+        cli: ["stats ask"],
+        actions: [],
+        summary: "Answer a plain-English question about the mailbox with rows and a short narrative, via read-only SQL over whitelisted analytics views.",
+    }
+
     // -- IndexService (task 24) -----------------------------------------------
     IndexStatus {
         rpc: "/rmail.v1.IndexService/Status",

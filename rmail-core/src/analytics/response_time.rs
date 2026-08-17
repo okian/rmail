@@ -203,7 +203,7 @@ const MAX_SELF_ADDRESSES: usize = 256;
 /// How many `message_id`s one parent-lookup statement binds at a time. Well
 /// under SQLite's variable limit, and large enough that the round trips are
 /// not what costs.
-const ID_CHUNK: usize = 400;
+pub(crate) const ID_CHUNK: usize = 400;
 
 /// Which dimension a report is grouped along.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -519,6 +519,26 @@ pub async fn response_times(
     Ok(report)
 }
 
+/// The addresses this build treats as *you*, per account — the same set
+/// [`response_times`] decides every pair's direction with.
+///
+/// Exposed for the neighbouring reports (task 72) that need the identical
+/// answer to "who am I". A second derivation of it would be a second way for
+/// direction to be wrong, and direction being wrong is not a small error here:
+/// see [`self_addresses`] on what an empty or over-wide set does to a report.
+///
+/// # Errors
+///
+/// [`Error::Cancelled`] if `cancel` fires mid-scan, or a mapped storage error.
+pub async fn account_identities(
+    db: &Database,
+    cancel: &CancellationToken,
+    account_id: Option<i64>,
+) -> Result<HashMap<i64, HashSet<String>>, Error> {
+    let mailboxes = load_mailboxes(db, cancel, account_id).await?;
+    self_addresses(db, cancel, account_id, &mailboxes).await
+}
+
 // ---------------------------------------------------------------------------
 // Row shapes
 // ---------------------------------------------------------------------------
@@ -528,27 +548,28 @@ pub async fn response_times(
 /// `body_html`, and a report over ninety days of mail must not pull three
 /// bodies per row into memory to compute a subtraction.
 #[derive(Debug, Clone)]
-struct MessageRow {
-    id: i64,
-    account_id: i64,
-    mailbox_id: i64,
-    thread_id: Option<i64>,
-    message_id: Option<String>,
-    in_reply_to: Option<String>,
-    references_hdr: Option<String>,
+pub(crate) struct MessageRow {
+    pub(crate) id: i64,
+    pub(crate) account_id: i64,
+    pub(crate) mailbox_id: i64,
+    pub(crate) thread_id: Option<i64>,
+    pub(crate) message_id: Option<String>,
+    pub(crate) in_reply_to: Option<String>,
+    pub(crate) references_hdr: Option<String>,
     /// Lowercased and trimmed; `None` when the header was absent or blank.
-    from_addr: Option<String>,
-    from_name: Option<String>,
+    pub(crate) from_addr: Option<String>,
+    pub(crate) from_name: Option<String>,
     /// `COALESCE(date, internaldate)`; `None` when the message has neither.
-    at: Option<i64>,
+    pub(crate) at: Option<i64>,
 }
 
-const MESSAGE_SELECT: &str = "SELECT id, account_id, mailbox_id, thread_id, message_id, \
+pub(crate) const MESSAGE_SELECT: &str =
+    "SELECT id, account_id, mailbox_id, thread_id, message_id, \
      in_reply_to, references_hdr, from_addr, from_name, \
      COALESCE(date, internaldate) AS at FROM messages";
 
 impl MessageRow {
-    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let from_addr: Option<String> = row.get("from_addr")?;
         Ok(Self {
             id: row.get("id")?,
@@ -570,39 +591,39 @@ impl MessageRow {
 
 /// A reply matched to the message it answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Pair {
+pub(crate) struct Pair {
     /// Lowercased address of whichever side is not you.
-    counterparty: String,
+    pub(crate) counterparty: String,
     /// That side's display name, if the message carried one.
-    counterparty_name: Option<String>,
+    pub(crate) counterparty_name: Option<String>,
     /// The folder the *inbound* message of the pair lives in.
-    mailbox_id: i64,
+    pub(crate) mailbox_id: i64,
     /// Reply timestamp minus original timestamp; never negative.
-    latency: i64,
+    pub(crate) latency: i64,
     /// When the reply was sent — what the window and the trend key on.
-    responded_at: i64,
+    pub(crate) responded_at: i64,
     /// When the *inbound* side of the pair was sent. Distinct from
     /// `responded_at` for an `ours` pair, and it is the right clock for
     /// anything read off the inbound message (its display name): a stale name
     /// on a promptly-answered message must not beat a current one on a
     /// message that took a week.
-    inbound_at: i64,
+    pub(crate) inbound_at: i64,
     /// Whether *you* wrote the reply.
-    ours: bool,
+    pub(crate) ours: bool,
 }
 
 /// The outcome of matching replies to originals.
 #[derive(Debug, Default)]
-struct Paired {
-    pairs: Vec<Pair>,
-    skipped_out_of_order: u64,
+pub(crate) struct Paired {
+    pub(crate) pairs: Vec<Pair>,
+    pub(crate) skipped_out_of_order: u64,
 }
 
 /// A folder, as this module needs it.
 #[derive(Debug, Clone)]
-struct MailboxRow {
-    id: i64,
-    name: String,
+pub(crate) struct MailboxRow {
+    pub(crate) id: i64,
+    pub(crate) name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -616,7 +637,7 @@ struct MailboxRow {
 /// which for a retriever legitimately reads as "no candidates from this
 /// source". For a report it does not: a half-read mailbox summarized as if it
 /// were the whole one is a wrong answer presented as a right one.
-async fn scan<F, T>(
+pub(crate) async fn scan<F, T>(
     db: &Database,
     cancel: &CancellationToken,
     stage: &'static str,
@@ -640,7 +661,7 @@ where
 /// least one more exists. Erroring rather than truncating is the whole point:
 /// a report over the first quarter-million rows of a window, labelled as a
 /// report over the window, is a wrong answer that looks like a right one.
-fn within_cap<T>(rows: Vec<T>, stage: &str) -> Result<Vec<T>, Error> {
+pub(crate) fn within_cap<T>(rows: Vec<T>, stage: &str) -> Result<Vec<T>, Error> {
     if rows.len() > MAX_SCAN_ROWS {
         return Err(Error::resource_exhausted(format!(
             "this window covers more than {MAX_SCAN_ROWS} {stage} rows; narrow `since`/`until` \
@@ -651,7 +672,7 @@ fn within_cap<T>(rows: Vec<T>, stage: &str) -> Result<Vec<T>, Error> {
 }
 
 /// The rows of `mailboxes` whose names match `candidates`, as ids.
-fn folder_ids(mailboxes: &[MailboxRow], candidates: &[&str]) -> Vec<i64> {
+pub(crate) fn folder_ids(mailboxes: &[MailboxRow], candidates: &[&str]) -> Vec<i64> {
     mailboxes
         .iter()
         .filter(|mailbox| folder_is(&mailbox.name, candidates))
@@ -660,7 +681,7 @@ fn folder_ids(mailboxes: &[MailboxRow], candidates: &[&str]) -> Vec<i64> {
 }
 
 /// `AND col NOT IN (?, ?, …)`, or nothing at all for an empty exclusion set.
-fn not_in_clause(column: &str, ids: &[i64]) -> String {
+pub(crate) fn not_in_clause(column: &str, ids: &[i64]) -> String {
     if ids.is_empty() {
         return String::new();
     }
@@ -669,14 +690,14 @@ fn not_in_clause(column: &str, ids: &[i64]) -> String {
 }
 
 /// `col IN (?, ?, …)`.
-fn in_clause(column: &str, len: usize) -> String {
+pub(crate) fn in_clause(column: &str, len: usize) -> String {
     let placeholders = vec!["?"; len].join(", ");
     format!("{column} IN ({placeholders})")
 }
 
 /// Every folder in scope, for the mailbox grouping's labels and for finding
 /// the Sent/Drafts/Trash folders.
-async fn load_mailboxes(
+pub(crate) async fn load_mailboxes(
     db: &Database,
     cancel: &CancellationToken,
     account_id: Option<i64>,
@@ -713,7 +734,7 @@ async fn load_mailboxes(
 /// small error — an empty set makes the whole report empty, which is why
 /// [`ResponseTimes::self_addresses`] hands it back to the caller instead of
 /// keeping it private.
-async fn self_addresses(
+pub(crate) async fn self_addresses(
     db: &Database,
     cancel: &CancellationToken,
     account_id: Option<i64>,
@@ -831,7 +852,7 @@ async fn load_replies(
 }
 
 /// [`MAX_SCAN_ROWS`] plus the one extra row that reveals there are more.
-fn scan_limit() -> i64 {
+pub(crate) fn scan_limit() -> i64 {
     i64::try_from(MAX_SCAN_ROWS.saturating_add(1)).unwrap_or(i64::MAX)
 }
 
@@ -842,7 +863,7 @@ fn scan_limit() -> i64 {
 /// earliest timestamp wins, tie-broken on the lowest id, so a latency is
 /// measured from when the mail first arrived rather than from when a copy of
 /// it happened to be made.
-async fn load_parents(
+pub(crate) async fn load_parents(
     db: &Database,
     cancel: &CancellationToken,
     account_id: Option<i64>,
@@ -913,7 +934,7 @@ async fn load_parents(
 /// from the shared address read as the user's own, which is the same
 /// direction mistake [`pair_up`] avoids by looking each address up under the
 /// account whose message it is.
-async fn load_last_ours_per_thread(
+pub(crate) async fn load_last_ours_per_thread(
     db: &Database,
     cancel: &CancellationToken,
     self_addrs: &HashMap<i64, HashSet<String>>,
@@ -1035,7 +1056,7 @@ async fn load_inbound(
 ///
 /// `replies` is already restricted to the window by [`load_replies`]; the
 /// direction rules and the negative-latency guard are what live here.
-fn pair_up(
+pub(crate) fn pair_up(
     replies: &[MessageRow],
     parents: &HashMap<(i64, String), MessageRow>,
     self_addrs: &HashMap<i64, HashSet<String>>,
@@ -1329,7 +1350,10 @@ fn inbound_key(
 }
 
 /// Whether anything of yours in the same thread is newer than `message`.
-fn answered_in_thread(message: &MessageRow, last_ours_in_thread: &HashMap<i64, i64>) -> bool {
+pub(crate) fn answered_in_thread(
+    message: &MessageRow,
+    last_ours_in_thread: &HashMap<i64, i64>,
+) -> bool {
     let (Some(thread_id), Some(at)) = (message.thread_id, message.at) else {
         return false;
     };
@@ -1430,14 +1454,15 @@ fn rolling_trend(query: &ResponseTimeQuery, ours: &[(i64, i64)]) -> Vec<TrendPoi
 /// that a thread was answered is the difference between "I have replied" and
 /// "I have started to reply", and only the first discharges an obligation —
 /// so [`load_last_ours_per_thread`] excludes these.
-const DRAFT_FOLDER_NAMES: &[&str] = &["drafts", "draft", "inbox.drafts", "[gmail]/drafts"];
+pub(crate) const DRAFT_FOLDER_NAMES: &[&str] =
+    &["drafts", "draft", "inbox.drafts", "[gmail]/drafts"];
 
 /// Folder names that hold mail the user has already disposed of.
 ///
 /// Deleting or junking a message *is* a way of handling it, so mail in these
 /// folders is not counted as inbound awaiting a reply. Without this a spam
 /// folder is the single largest source of "overdue" mail in any mailbox.
-const DISPOSED_FOLDER_NAMES: &[&str] = &[
+pub(crate) const DISPOSED_FOLDER_NAMES: &[&str] = &[
     "trash",
     "deleted",
     "deleted items",
@@ -1460,7 +1485,7 @@ const DISPOSED_FOLDER_NAMES: &[&str] = &[
 /// [`looks_like_sent`] gives: `imap::folders::list_folders` records only
 /// selectability today. When that changes, all three lists should move
 /// together.
-fn folder_is(name: &str, candidates: &[&str]) -> bool {
+pub(crate) fn folder_is(name: &str, candidates: &[&str]) -> bool {
     let lower = name.to_ascii_lowercase();
     candidates.contains(&lower.as_str())
 }
@@ -1514,7 +1539,7 @@ fn bare(value: &str) -> Option<String> {
 /// The cost is that two Unicode-case spellings of one non-ASCII address are
 /// two groups. That is a cosmetic split; a normalization that disagrees with
 /// the query it feeds is a wrong answer.
-fn normalize_address(value: &str) -> Option<String> {
+pub(crate) fn normalize_address(value: &str) -> Option<String> {
     let trimmed = value.trim_matches(' ').to_ascii_lowercase();
     if trimmed.is_empty() {
         None
@@ -1556,7 +1581,7 @@ fn better_original(existing: &MessageRow, candidate: &MessageRow) -> bool {
 }
 
 /// Collapse rows that are the same mail filed in more than one folder.
-fn dedupe_by_message_id(rows: Vec<MessageRow>) -> Vec<MessageRow> {
+pub(crate) fn dedupe_by_message_id(rows: Vec<MessageRow>) -> Vec<MessageRow> {
     let mut seen: HashSet<(i64, String)> = HashSet::new();
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {

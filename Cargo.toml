@@ -75,7 +75,11 @@ toml = "0.8"
 # `sqlite3_interrupt()` cancellation observable — a custom `tick()` function
 # is the row counter that proves a cancelled scan was genuinely interrupted
 # mid-flight rather than merely abandoned by its caller.
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+# `hooks` is `analytics::sql`'s sandbox (task 72): a SQLite authorizer is what
+# confines a model-written statement to the read-only `analytics_*` views, and
+# it is enforced by SQLite's own name resolution rather than by a regex over a
+# string — which is the only version of that check worth having.
+rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
 r2d2 = "0.8"
 sqlite-vec = "0.1"
 # For `sqlite3_auto_extension`. Version-locked to whatever `rusqlite` resolves

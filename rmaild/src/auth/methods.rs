@@ -527,6 +527,44 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AnalyticsService/GenerateDigest",
         Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
     ),
+    // -- AnalyticsService (task 72) ------------------------------------------
+    // All three sit with `GenerateDigest` rather than with `GetResponseTimes`,
+    // and for the same pair of reasons.
+    //
+    // `mail.read`, because each one restates mail: a contact insight reports
+    // subject terms and per-correspondent volumes, a subscription report
+    // enumerates who writes to you and how much of it you opened, and
+    // `AskAnalytics` returns rows that carry subjects, addresses and folder
+    // names. Anything that can read that much of a mailbox needs what reading
+    // a mailbox needs.
+    //
+    // `ai.invoke`, because each one can reach the provider on a path the
+    // *caller* chooses. There is no clamp-to-configured-backend argument
+    // available of the kind that keeps `SearchService/Search` at `mail.read`:
+    // the caller decides whether the briefing is written, whether the
+    // unclassified senders are sent to a model, and whether a narrative is
+    // produced, and the caller's window or question decides how large the call
+    // is. `AllOf`, not `AnyOf` — either scope alone under-gates it.
+    //
+    // `GetContactInsight` and `ListSubscriptions` both have a model-free mode
+    // (`metrics_only`, and `classify_unknown = false`). They still carry
+    // `ai.invoke`, because this table gates a *method*: a token that could
+    // call the RPC at all could set the other field. Gating on a request field
+    // would put the authorization decision inside the handler, which is
+    // exactly the per-handler cross-cutting concern the interceptor exists to
+    // prevent.
+    (
+        "/rmail.v1.AnalyticsService/GetContactInsight",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
+    ),
+    (
+        "/rmail.v1.AnalyticsService/ListSubscriptions",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
+    ),
+    (
+        "/rmail.v1.AnalyticsService/AskAnalytics",
+        Requirement::AllOf(&[Scope::MailRead, Scope::AiInvoke]),
+    ),
     // -- IndexService (task 24) -----------------------------------------------
     // The index is a derived artifact over mail the caller can already read, so
     // the read-only RPCs sit at `mail.read` for the same reason `SearchService`'s

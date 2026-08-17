@@ -1,5 +1,6 @@
 //! The `mail` CLI — a thin gRPC client for the rmail daemon.
 
+mod analytics_cli;
 mod digest_cli;
 mod export_cli;
 mod extract_cli;
@@ -276,12 +277,23 @@ enum Command {
         #[command(subcommand)]
         action: notify_cli::NotifyAction,
     },
-    /// Mailbox analytics: response-time percentiles, trend and bottlenecks
-    /// (`AnalyticsService`).
+    /// Mailbox analytics: response-time percentiles, trend and bottlenecks,
+    /// and plain-English questions (`AnalyticsService`).
     Stats {
         #[command(subcommand)]
         action: stats_cli::StatsAction,
     },
+    /// Everything one correspondence looks like — volume, direction, response
+    /// symmetry, cadence, topics and a decay report — plus, with `--insight`,
+    /// a Claude relationship briefing (`AnalyticsService.GetContactInsight`).
+    Contact(analytics_cli::ContactArgs),
+    /// Which senders are broadcasting at you, how much you read, and which are
+    /// worth leaving (`AnalyticsService.ListSubscriptions`).
+    ///
+    /// Reports what each sender's own `List-Unsubscribe` header says and stops
+    /// there: rmail never opens the URL and never sends the mail. See
+    /// `analytics_cli`'s module docs.
+    Subs(analytics_cli::SubsArgs),
     /// A ranked markdown briefing over one window of mail, every line citing
     /// the messages it came from (`AnalyticsService.GenerateDigest`). Reads
     /// back an existing briefing for the same window rather than paying for a
@@ -741,6 +753,8 @@ async fn main() -> Result<()> {
         Command::Outbox(args) => outbox_cli::outbox(&socket, args).await,
         Command::Followup { action } => outbox_cli::followup(&socket, action).await,
         Command::Stats { action } => stats_cli::run(&socket, action).await,
+        Command::Contact(args) => analytics_cli::contact(&socket, args).await,
+        Command::Subs(args) => analytics_cli::subs(&socket, args).await,
         Command::Digest(args) => digest_cli::run(&socket, args).await,
         Command::Mcp { action } => mcp_cli::run(&socket, action).await,
         Command::AcceptTags { message_tag_ids } => {

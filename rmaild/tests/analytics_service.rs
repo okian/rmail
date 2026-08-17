@@ -11,7 +11,11 @@ use std::time::Duration;
 
 use rmail_core::repo;
 use rmail_proto::v1::analytics_service_client::AnalyticsServiceClient;
-use rmail_proto::v1::{GetResponseTimesRequest, ResponseTimeGroup, ResponseTimeGroupBy};
+use rmail_proto::v1::{
+    AskAnalyticsRequest, GetContactInsightRequest, GetResponseTimesRequest,
+    ListSubscriptionsRequest, ResponseTimeGroup, ResponseTimeGroupBy, SubscriptionClass,
+    SubscriptionSource,
+};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
@@ -78,7 +82,18 @@ impl TestServer {
         let server_socket = socket.clone();
         let server_db = db.clone();
         let handle = tokio::spawn(async move {
-            rmaild::serve_uds(&server_socket, server_db, async move {
+            let mut config = rmail_core::Config::default();
+            config.index.semantic.enabled = false;
+            // No provider for this suite, said explicitly rather than assumed.
+            // `ai.enabled` defaults *on* and building a Claude client does not
+            // validate its key, so a daemon left at the default constructs a
+            // provider that only fails when it is used — and the model-backed
+            // RPCs then decline with `UNAUTHENTICATED` (an accurate statement
+            // about that daemon) instead of the `FAILED_PRECONDITION` these
+            // tests are about (an accurate statement about a daemon with no
+            // AI subsystem at all).
+            config.ai.enabled = false;
+            rmaild::serve_uds_with_config(&server_socket, server_db, config, async move {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -147,17 +162,85 @@ impl TestServer {
             .unwrap();
     }
 
+    /// Seed a message *with* its raw header block, which is what subscription
+    /// detection reads. Separate from [`Self::seed`] because the response-time
+    /// suite deliberately stores no `raw` — that module never reads one, and a
+    /// fixture carrying octets nobody looks at would suggest it did.
+    fn seed_raw(&mut self, message_id: &str, from: &str, at: i64, headers: &str) {
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        let raw = format!("From: {from}\r\n{headers}\r\n\r\nBody.\r\n").into_bytes();
+        let new = repo::NewMessage {
+            account_id: self.account_id,
+            mailbox_id: self.inbox,
+            uid,
+            uidvalidity: 1,
+            message_id: Some(message_id.to_owned()),
+            subject: Some("This week".to_owned()),
+            from_addr: Some(from.to_owned()),
+            date: Some(at),
+            raw: Some(raw),
+            ..Default::default()
+        };
+        self.db
+            .with_write(|c| {
+                let id = repo::insert_message(c, &new)?;
+                rmail_core::thread::assign_thread(c, id)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     /// A thread they open and we answer `after` seconds later.
     fn exchange(&mut self, tag: &str, them: &str, at: i64, after: i64) {
         let inbound = format!("{tag}-in@x");
         self.seed(&inbound, them, at, None, None);
-        self.seed(
+        // The reply carries `To:`. Response-time analysis pairs on
+        // `In-Reply-To` and never reads a recipient, so this fixture used to
+        // leave `to_addrs` null — but contact insight counts an outbound
+        // message *to a contact*, which is a claim about recipients, and a
+        // reply with no `To:` is not a message anyone could have sent.
+        self.seed_to(
             &format!("{tag}-out@x"),
             ME,
+            Some(them),
             at + after,
             Some(&inbound),
-            None,
         );
+    }
+
+    /// [`Self::seed`] with a `To:` recipient list.
+    fn seed_to(
+        &mut self,
+        message_id: &str,
+        from: &str,
+        to: Option<&str>,
+        at: i64,
+        parent: Option<&str>,
+    ) {
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        let mailbox_id = if from == ME { self.sent } else { self.inbox };
+        let new = repo::NewMessage {
+            account_id: self.account_id,
+            mailbox_id,
+            uid,
+            uidvalidity: 1,
+            message_id: Some(message_id.to_owned()),
+            in_reply_to: parent.map(str::to_owned),
+            subject: Some(message_id.to_owned()),
+            from_addr: Some(from.to_owned()),
+            to_addrs: to.map(str::to_owned),
+            date: Some(at),
+            ..Default::default()
+        };
+        self.db
+            .with_write(|c| {
+                let id = repo::insert_message(c, &new)?;
+                rmail_core::thread::assign_thread(c, id)?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn request(&self) -> GetResponseTimesRequest {
@@ -437,5 +520,274 @@ async fn a_ratio_below_one_comes_back_as_invalid_argument() {
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
     assert!(status.message().contains("bottleneck_ratio"));
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Task 72: contact insight, subscriptions, NL analytics
+// ---------------------------------------------------------------------------
+//
+// This harness runs the daemon with `ai.enabled = false` — a daemon with no
+// AI subsystem at all — so every one of these exercises the *model-free* half of the
+// three new RPCs end to end, plus the `FAILED_PRECONDITION` the model-backed
+// halves decline with. That split is the point: two of the three are usable
+// on a daemon with no provider at all, and a suite that could only test them
+// with one would not have proven it.
+
+/// The full deterministic report, over the wire, with the zero-means-default
+/// fields resolved by the handler rather than by the caller.
+#[tokio::test]
+async fn contact_insight_reports_the_numbers_without_a_model() {
+    let mut server = TestServer::start().await;
+    // Three exchanges: they open, we answer an hour later each time.
+    for (i, at) in [T0 + DAY, T0 + 3 * DAY, T0 + 5 * DAY]
+        .into_iter()
+        .enumerate()
+    {
+        server.exchange(&format!("c{i}"), "ada@example.com", at, HOUR);
+    }
+    // ... and one of theirs we never answered.
+    server.seed("orphan@x", "ada@example.com", T0 + 6 * DAY, None, None);
+
+    let insight = server
+        .client()
+        .await
+        .get_contact_insight(GetContactInsightRequest {
+            account_id: server.account_id,
+            address: "Ada@Example.COM".to_owned(),
+            since: T0,
+            until: T0 + 30 * DAY,
+            topic_limit: 0,
+            metrics_only: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(insight.address, "ada@example.com", "normalized by the core");
+    assert_eq!(insight.since, T0);
+    assert_eq!(insight.until, T0 + 30 * DAY);
+    let volume = insight.volume.unwrap();
+    assert_eq!(volume.inbound, 4);
+    assert_eq!(volume.outbound, 3);
+    let ours = insight.ours.unwrap();
+    assert_eq!(ours.samples, 3);
+    assert_eq!(ours.p50_seconds, HOUR);
+    assert_eq!(insight.awaiting_reply, 1);
+    assert_eq!(insight.accounts, vec![server.account_id]);
+    assert!(
+        insight.briefing.is_empty() && insight.model.is_empty(),
+        "metrics_only must not have called a model"
+    );
+    assert!(insight.cadence.is_some() && insight.decay.is_some());
+    server.stop().await;
+}
+
+/// The briefing declines on a daemon with no provider — and says which
+/// switch, and that the numbers are still reachable.
+#[tokio::test]
+async fn a_contact_briefing_declines_without_an_ai_subsystem() {
+    let server = TestServer::start().await;
+    let status = server
+        .client()
+        .await
+        .get_contact_insight(GetContactInsightRequest {
+            account_id: server.account_id,
+            address: "ada@example.com".to_owned(),
+            metrics_only: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(status.message().contains("ai.enabled"), "{status:?}");
+    assert!(status.message().contains("metrics_only"), "{status:?}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_blank_contact_address_comes_back_as_invalid_argument() {
+    let server = TestServer::start().await;
+    let status = server
+        .client()
+        .await
+        .get_contact_insight(GetContactInsightRequest {
+            account_id: server.account_id,
+            address: "   ".to_owned(),
+            metrics_only: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+    server.stop().await;
+}
+
+/// Header detection end to end, and the assertion that matters most in this
+/// file: the unsubscribe method comes back as a *proposal*, with nothing
+/// having been fetched or sent.
+#[tokio::test]
+async fn subscriptions_detect_a_newsletter_and_only_propose_leaving_it() {
+    let mut server = TestServer::start().await;
+    for week in 0..8 {
+        server.seed_raw(
+            &format!("n{week}@x"),
+            "news@example.com",
+            T0 + week * 7 * DAY,
+            "List-Id: Weekly <weekly.example.com>\r\n\
+             List-Unsubscribe: <https://example.com/u/1>\r\n\
+             List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+             Precedence: bulk",
+        );
+    }
+
+    let report = server
+        .client()
+        .await
+        .list_subscriptions(ListSubscriptionsRequest {
+            account_id: server.account_id,
+            since: T0,
+            until: T0 + 180 * DAY,
+            limit: 0,
+            candidates_only: true,
+            classify_unknown: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(report.senders.len(), 1, "{:?}", report.senders);
+    let sender = &report.senders[0];
+    assert_eq!(sender.address, "news@example.com");
+    assert_eq!(sender.sender_class, SubscriptionClass::Newsletter as i32);
+    assert_eq!(sender.source, SubscriptionSource::Header as i32);
+    assert_eq!(sender.messages, 8);
+    assert_eq!(sender.read_messages, 0);
+    assert!(sender.candidate);
+    assert!(sender.headers_read);
+    assert_eq!(report.headers_read, 1);
+    assert_eq!(report.model_classified, 0);
+    assert!(report.model.is_empty(), "no model was called");
+
+    let unsubscribe = sender.unsubscribe.clone().unwrap();
+    assert_eq!(unsubscribe.http_url, "https://example.com/u/1");
+    assert!(unsubscribe.one_click);
+    assert!(unsubscribe.mailto.is_empty());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn classifying_unknown_senders_declines_without_an_ai_subsystem() {
+    let server = TestServer::start().await;
+    let status = server
+        .client()
+        .await
+        .list_subscriptions(ListSubscriptionsRequest {
+            account_id: server.account_id,
+            classify_unknown: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(status.message().contains("classify_unknown"), "{status:?}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_inverted_subscription_window_comes_back_as_invalid_argument() {
+    let server = TestServer::start().await;
+    let status = server
+        .client()
+        .await
+        .list_subscriptions(ListSubscriptionsRequest {
+            account_id: server.account_id,
+            since: T0 + DAY,
+            until: T0,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+    server.stop().await;
+}
+
+/// `AskAnalytics` has no model-free half: without a provider there is no SQL
+/// to run, and `UNIMPLEMENTED`-shaped silence would be less useful than saying
+/// which switch is off.
+#[tokio::test]
+async fn ask_analytics_declines_without_an_ai_subsystem() {
+    let server = TestServer::start().await;
+    let status = server
+        .client()
+        .await
+        .ask_analytics(AskAnalyticsRequest {
+            account_id: server.account_id,
+            question: "who writes to me the most?".to_owned(),
+            narrate: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(status.message().contains("ai.enabled"), "{status:?}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_negative_account_on_ask_analytics_comes_back_as_invalid_argument() {
+    let server = TestServer::start().await;
+    let status = server
+        .client()
+        .await
+        .ask_analytics(AskAnalyticsRequest {
+            account_id: -1,
+            question: "anything".to_owned(),
+            narrate: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(status.message().contains("must not be negative"));
+    server.stop().await;
+}
+
+/// The views the sandbox reads must exist on a freshly migrated database, and
+/// must be readable through the ordinary read pool. A migration that created
+/// a view referencing a column that had been renamed would otherwise only fail
+/// the first time somebody asked a question.
+#[tokio::test]
+async fn the_analytics_views_exist_and_are_queryable_after_migration() {
+    let mut server = TestServer::start().await;
+    server.seed("v1@x", "ada@example.com", T0 + DAY, None, None);
+    server.seed("v2@x", ME, T0 + 2 * DAY, Some("v1@x"), None);
+
+    for view in [
+        "analytics_messages",
+        "analytics_senders",
+        "analytics_daily",
+        "analytics_threads",
+        "analytics_mailboxes",
+        "analytics_contacts",
+    ] {
+        let sql = format!("SELECT count(*) FROM {view}");
+        let count: i64 = server
+            .db
+            .with_read(move |conn| conn.query_row(&sql, [], |row| row.get(0)))
+            .unwrap_or_else(|error| panic!("{view} is not queryable: {error}"));
+        assert!(count >= 0);
+    }
+
+    // The `direction` heuristic really does split the two folders.
+    let outbound: i64 = server
+        .db
+        .with_read(|conn| {
+            conn.query_row(
+                "SELECT count(*) FROM analytics_messages WHERE direction = 'outbound'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(outbound, 1, "the Sent folder message was not outbound");
     server.stop().await;
 }

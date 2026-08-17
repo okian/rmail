@@ -697,13 +697,16 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core analytics::response_time` (pairing, percentile math, bottleneck flag)
 
 ## 72. Contact insights, subscriptions & NL analytics
-- [ ] status
+- [x] status
 - **depends-on:** 43, 9
 - **parallel-safe:** yes
 - **acceptance:**
   - Contact relationship insight (volume/direction/symmetry/cadence/topics → one-paragraph Claude briefing + decay report); newsletter/subscription detector (List-Unsubscribe + heuristics + Claude fallback, read-rate, unsubscribe-candidates + one-click); NL analytics (Claude → safe parameterized read-only SQL over whitelisted views + narrative).
   - `AnalyticsService.GetContactInsight/ListSubscriptions/AskAnalytics`.
-- **verify:** `cargo nextest run -p rmail-core analytics::` (subscription classification, SQL whitelist guard rejects writes)
+- **verify:** `cargo nextest run -p rmail-core analytics::` (129 tests: subscription classification, the SQL whitelist guard rejecting writes, and the degenerate shapes — empty range, one message, never-replied, zero denominators) · `cargo nextest run -p rmaild --test analytics_service` (the three RPCs end to end) · `cargo nextest run -p rmail-cli analytics_cli` (nothing mail- or model-authored reaches the terminal unsanitized)
+- **note:** `mail ask` was already feature 43's (`AiService/AskMailbox`, a question about message *contents*), so prd.md's NL-analytics verb is **`mail stats ask`** — the namespace `stats_cli` was created for. `mail contact` and `mail subs` are prd.md's own spelling.
+- **note:** *nothing here unsubscribes anything.* A detected `List-Unsubscribe` is reported as a proposal — scheme-restricted to `https:`/`mailto:`, with the sender-chosen `mailto` query stripped — and no code path fetches it, follows a redirect or sends mail. `one_click` reports that the sender advertises RFC 8058; it enables nothing. A test asserts the module names no HTTP or SMTP type.
+- **note:** `AskAnalytics` runs model-written SQL inside a SQLite **authorizer** (`analytics::sql`) that denies every action but a read reaching one of six `analytics_*` views (`V50`) and a call to a fixed function list. Enforcement is SQLite's own name resolution, not a regex — a CTE aliased to a view name, a subquery, `ATTACH`, `PRAGMA` and every write all fail at prepare time.
 
 ## 73. Structured invoice/receipt & data extraction
 - [x] status

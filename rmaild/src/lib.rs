@@ -1722,10 +1722,58 @@ where
             Arc::clone(&digest_ai_rate_limiter),
         )
     });
-    let analytics_service = AnalyticsServiceServer::new(match digest_engine.clone() {
-        Some(engine) => analytics_api.with_digest(engine),
-        None => analytics_api,
-    });
+    // The three model-backed analytics reports (task 72). Gated on
+    // `ai_active` for the reason the digest engine above is: with
+    // `NullProvider` behind them each would scan the mailbox and then fail at
+    // the provider, and `FAILED_PRECONDITION` up front is the honest answer.
+    //
+    // `GetContactInsight`'s numbers and `ListSubscriptions`' header/behaviour
+    // verdicts do *not* depend on any of this — the handler serves those
+    // straight off the database whether or not an engine is attached, and
+    // declines only the halves that would call a model.
+    //
+    // `ai.models.deep` on all three, and the same
+    // semaphore/rate-limiter pair as every other ad-hoc call site: these are
+    // one-off reasoning jobs answering a human who is waiting, exactly the
+    // shape `QueryCompiler` and `RuleService/SynthesizeRule` already use.
+    let mut analytics_api = analytics_api;
+    if let Some(engine) = digest_engine.clone() {
+        analytics_api = analytics_api.with_digest(engine);
+    }
+    if ai_active {
+        analytics_api = analytics_api
+            .with_contact_briefer(rmail_core::analytics::ContactBriefer::new(
+                db.clone(),
+                Arc::clone(&ai_provider),
+                Arc::clone(&ai_policy),
+                config.ai.privacy.clone(),
+                config.ai.limits.clone(),
+                config.ai.models.deep.clone(),
+                Arc::clone(&ai_semaphore),
+                Arc::clone(&ai_rate_limiter),
+            ))
+            .with_subscription_classifier(rmail_core::analytics::SubscriptionClassifier::new(
+                db.clone(),
+                Arc::clone(&ai_provider),
+                Arc::clone(&ai_policy),
+                config.ai.privacy.clone(),
+                config.ai.limits.clone(),
+                config.ai.models.deep.clone(),
+                Arc::clone(&ai_semaphore),
+                Arc::clone(&ai_rate_limiter),
+            ))
+            .with_analytics_asker(rmail_core::analytics::AnalyticsAsker::new(
+                db.clone(),
+                Arc::clone(&ai_provider),
+                Arc::clone(&ai_policy),
+                config.ai.privacy.clone(),
+                config.ai.limits.clone(),
+                config.ai.models.deep.clone(),
+                Arc::clone(&ai_semaphore),
+                Arc::clone(&ai_rate_limiter),
+            ));
+    }
+    let analytics_service = AnalyticsServiceServer::new(analytics_api);
 
     // Account autoconfiguration (task 80). The engine is built whenever its
     // HTTP client can be; only the *model fallback* depends on `ai_active`,
