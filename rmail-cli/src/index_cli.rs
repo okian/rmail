@@ -100,7 +100,22 @@ pub enum IndexAction {
     /// nothing (`IndexService.Verify`).
     Verify,
     /// Delete index rows whose parent is gone (`IndexService.Gc`).
-    Gc,
+    ///
+    /// Always sweeps the search caches back to their configured bounds too;
+    /// every row that removes is expired or unreachable.
+    Gc {
+        /// Additionally drop *every* cached row, including compiled
+        /// natural-language query plans.
+        ///
+        /// Not needed in normal operation — the search caches invalidate
+        /// structurally, so new mail or a retuned ranker already moves the key
+        /// rather than leaving a stale answer readable. Use it when you want a
+        /// clean slate: a restored backup, or ruling a cache out of a bug.
+        /// Each discarded query plan is a paid Claude call that will be paid
+        /// again.
+        #[arg(long)]
+        purge_caches: bool,
+    },
     /// Embedding maintenance (`IndexService.Reindex` in backfill mode).
     Embed {
         /// Re-embed every already-chunked message whose vectors are missing,
@@ -223,7 +238,7 @@ pub async fn run(socket: &Path, action: IndexAction) -> Result<()> {
             max_jobs,
         } => rebuild(socket, all, &wanted, yes, max_jobs).await,
         IndexAction::Verify => verify(socket).await,
-        IndexAction::Gc => gc(socket).await,
+        IndexAction::Gc { purge_caches } => gc(socket, purge_caches).await,
         IndexAction::Embed { backfill, max_jobs } => {
             if !backfill {
                 bail!("`mail index embed` needs --backfill; it has no other mode yet");
@@ -281,7 +296,50 @@ async fn status(socket: &Path) -> Result<()> {
         })
         .collect();
     println!("Lag           {}", lag.join("   "));
+    if let Some(cache) = status.cache {
+        // `corpus_version` first because it is the number that explains the
+        // rest: every cached result page is keyed on it, so an operator asking
+        // "why is search still returning the old ordering" reads this line and
+        // knows whether anything could still be served from before the change.
+        println!(
+            "Corpus        version {}   changed {}",
+            cache.corpus_version,
+            ago(cache.corpus_changed_at)
+        );
+        println!(
+            "Caches        {} plans ({} hits)   {} query vectors ({} hits)   {} results ({} \
+             hits{})",
+            cache.query_plans,
+            cache.query_plan_uses,
+            cache.embeddings,
+            cache.embedding_uses,
+            cache.results,
+            cache.result_uses,
+            if cache.stale_results > 0 {
+                format!(", {} stale", cache.stale_results)
+            } else {
+                String::new()
+            }
+        );
+    }
     Ok(())
+}
+
+/// A unix timestamp as "12s ago", for a status line a human reads.
+fn ago(timestamp: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let seconds = now.saturating_sub(timestamp);
+    if seconds < 0 {
+        // A clock that moved backwards. Reporting a negative age would read as
+        // a bug in this line rather than in the clock.
+        return "just now".to_owned();
+    }
+    match seconds {
+        0..=59 => format!("{seconds}s ago"),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
 }
 
 /// One stage's coverage cell, with the reason it is zero when there is one.
@@ -467,22 +525,33 @@ async fn verify(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn gc(socket: &Path) -> Result<()> {
+async fn gc(socket: &Path, purge_caches: bool) -> Result<()> {
     let report = client(socket)
         .await?
-        .gc(IndexGcRequest {})
+        .gc(IndexGcRequest {
+            purge_search_caches: purge_caches,
+        })
         .await
         .context("index gc RPC failed")?
         .into_inner();
-    let total = report.entities + report.vectors + report.lexical_rows + report.content_rows;
-    if total == 0 {
+    let index_rows = report.entities + report.vectors + report.lexical_rows + report.content_rows;
+    let cache_rows = report.cache_results + report.cache_embeddings + report.cache_query_plans;
+    if index_rows == 0 && cache_rows == 0 {
         println!("nothing to collect");
         return Ok(());
     }
-    println!(
-        "removed {} orphaned entities, {} vectors, {} lexical rows, {} content rows",
-        report.entities, report.vectors, report.lexical_rows, report.content_rows
-    );
+    if index_rows > 0 {
+        println!(
+            "removed {} orphaned entities, {} vectors, {} lexical rows, {} content rows",
+            report.entities, report.vectors, report.lexical_rows, report.content_rows
+        );
+    }
+    if cache_rows > 0 {
+        println!(
+            "search caches: {} result pages, {} query vectors, {} query plans",
+            report.cache_results, report.cache_embeddings, report.cache_query_plans
+        );
+    }
     Ok(())
 }
 

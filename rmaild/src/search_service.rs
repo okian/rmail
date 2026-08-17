@@ -141,6 +141,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use chrono::Utc;
 use rmail_core::ai::AskRetriever;
 use rmail_core::attach::search::{AttachmentQuery, AttachmentSearch};
+use rmail_core::cache::{CachingEmbedder, Lookup, RankerFingerprint, ResultCache, ResultKeyParts};
 use rmail_core::config::{IndexSemanticConfig, Rerank, RetrieversConfig, SearchConfig, SearchMode};
 use rmail_core::embed::Embedder;
 use rmail_core::eval::{
@@ -349,7 +350,11 @@ fn finish_page(page: Option<LoggedPage>, cancel: &CancellationToken) -> Option<L
 /// unspecified). `Semantic` (the dense-only RPC) never goes through this —
 /// it always uses [`SearchApi::dense_only_candidates`] directly, regardless
 /// of what `mode` a caller happened to set.
-#[derive(Clone, Copy)]
+/// `Debug` is load-bearing, not diagnostic: the derived rendering is what
+/// [`SearchApi::ranked_page`] hashes into the result-cache key, so a variant
+/// added here changes that key automatically instead of quietly sharing an
+/// existing variant's cached page.
+#[derive(Clone, Copy, Debug)]
 enum WireMode {
     Lexical,
     Semantic,
@@ -582,6 +587,24 @@ pub struct SearchApi {
     /// this file growing a second constructor. `rmaild::serve_*` always sets
     /// it — the capability would otherwise have no surface at all.
     compiler: Option<QueryCompiler>,
+    /// prd.md's result cache (task 36): `(query, filter, corpus_version)` →
+    /// ranked ids.
+    ///
+    /// Consulted by [`Self::ranked_page`] — the collected counterpart of
+    /// `run_stream`, and the path `Evaluate` and `AskMailbox` take. It is
+    /// deliberately *not* on the interactive streaming path: `run_stream`'s
+    /// whole contract is that the first hit leaves the daemon before the rest
+    /// of the page is even presented, and its output is a `SearchHit` carrying
+    /// snippets, highlight offsets, per-feature explanations and a feedback
+    /// `query_id` — none of which "ranked ids" can reconstitute. Caching ids
+    /// there would still have to run presentation, feature extraction and
+    /// fusion to rebuild the frames, so it would skip nothing that costs
+    /// anything and would put a stale-ordering risk on the one path a human
+    /// watches. The collected path, by contrast, returns exactly the ids the
+    /// cache stores, and its callers re-ask the identical question routinely:
+    /// an eval replay sweeps one golden set repeatedly, and `AskMailbox`
+    /// retrieves the same context for every follow-up in a conversation.
+    result_cache: ResultCache,
 }
 
 /// The half of [`SearchApi::build_hits`]' inputs that does not change between
@@ -636,13 +659,39 @@ impl SearchApi {
         shutdown: CancellationToken,
     ) -> Self {
         let fts = FtsIndex::new(db.clone(), search.bm25_weights.clone());
+        // The **unwrapped** embedder indexes documents: chunk vectors already
+        // have a content-hash-keyed home in `chunk_embeddings`, and routing
+        // them through the query cache as well would evict the query vectors
+        // it exists for with text that was already cached elsewhere. See
+        // `rmail_core::cache::embed`'s module docs.
         let semantic_index = SemanticIndex::new(db.clone(), Arc::clone(&embedder), semantic_config);
         let dense = search
             .retrievers
             .dense
             .then(|| DenseRetriever::new(db.clone(), &semantic_index));
-        let attachments = AttachmentSearch::new(db.clone(), Arc::clone(&embedder), &search);
-        let planner = QueryPlanner::new(db.clone(), embedder, search.expansion.clone());
+        // Every path that embeds a *query* shares one caching decorator, so a
+        // re-search of the same text costs one lookup rather than one model
+        // run (or, on a hosted backend, one paid round trip) per keystroke.
+        // `model()`/`dim()` delegate, so the `chunk_embeddings` join the dense
+        // retriever runs still matches what the indexer wrote.
+        let query_embedder: Arc<dyn Embedder> = if search.cache.enabled {
+            Arc::new(CachingEmbedder::new(
+                db.clone(),
+                Arc::clone(&embedder),
+                search.cache.max_embeddings,
+            ))
+        } else {
+            Arc::clone(&embedder)
+        };
+        let fingerprint = RankerFingerprint::new(
+            &search,
+            semantic_config,
+            query_embedder.model(),
+            query_embedder.dim(),
+        );
+        let result_cache = ResultCache::new(db.clone(), search.cache, fingerprint);
+        let attachments = AttachmentSearch::new(db.clone(), Arc::clone(&query_embedder), &search);
+        let planner = QueryPlanner::new(db.clone(), query_embedder, search.expansion.clone());
         let fuser = Fuser::new(db.clone());
         let feature_extractor = FeatureExtractor::new(
             db.clone(),
@@ -670,6 +719,7 @@ impl SearchApi {
             shutdown,
             generation: Generation::default(),
             compiler: None,
+            result_cache,
         }
     }
 
@@ -1012,6 +1062,68 @@ impl SearchApi {
     /// best first — the collected counterpart of [`Self::run_stream`], and
     /// what `Evaluate` and `AskMailbox` both need.
     ///
+    /// Answers from the result cache when it can (task 36). The cache is
+    /// consulted *before* account resolution and planning, so a hit costs one
+    /// indexed lookup and skips retrieval, fusion, feature extraction, L1, the
+    /// L2 rerank — which for `SearchKind::Deep` is a paid Claude call — and
+    /// presentation entirely. A miss returns a lease that
+    /// [`rmail_core::cache::ResultCache::store`] refuses to honor if mail
+    /// landed while the pipeline ran; a bypass returns no lease at all. See
+    /// that module for why those are three outcomes and not two.
+    ///
+    /// # Errors
+    ///
+    /// [`Status`] from account resolution or query planning, exactly as the
+    /// uncached path does — a cache hit cannot fail, and a cache failure
+    /// degrades to running the pipeline rather than failing the search.
+    async fn ranked_page(&self, req: &PageRequest<'_>) -> Result<Vec<i64>, Status> {
+        // Debug renderings, not wire strings: these are enum discriminants
+        // hashed into an opaque key, never parsed or displayed, and deriving
+        // them keeps a newly-added variant from silently sharing another
+        // variant's cache entry the way a hand-written `as_str` arm would.
+        let mode = format!("{:?}", req.mode);
+        let rerank = format!("{:?}", req.rerank);
+        let kind = format!("{:?}", req.kind);
+        let parts = ResultKeyParts {
+            query: req.query,
+            filter: req.filter,
+            account_id: req.account_id,
+            mode: &mode,
+            // `usize` at the call site, `u32` in the key: a limit past
+            // `u32::MAX` is not reachable (list RPCs cap `page_size` at 500),
+            // and saturating keeps two absurd limits sharing one entry rather
+            // than wrapping two sane ones onto each other.
+            limit: u32::try_from(req.limit).unwrap_or(u32::MAX),
+            rerank: &rerank,
+            kind: &kind,
+        };
+
+        let lease = match self.result_cache.lookup(&parts).await {
+            Lookup::Hit(ids) => {
+                tracing::debug!(hits = ids.len(), "search served from the result cache");
+                return Ok(ids);
+            }
+            Lookup::Miss(lease) => Some(lease),
+            Lookup::Bypass(reason) => {
+                tracing::debug!(reason = reason.as_str(), "result cache bypassed");
+                None
+            }
+        };
+
+        let ids = self.ranked_page_uncached(req).await?;
+        if let Some(lease) = lease {
+            self.result_cache.store(lease, &ids).await;
+        }
+        Ok(ids)
+    }
+
+    /// The pipeline itself, with no cache in front of it.
+    ///
+    /// Split out so the cache wraps one call rather than being threaded
+    /// through the body: every early return below would otherwise need to
+    /// decide whether it is a cacheable answer, and the one that got it wrong
+    /// would cache a partial page.
+    ///
     /// Deliberately measured *after* `present`, not after `rank`: MMR
     /// diversification and thread collapsing reorder and drop results, and
     /// what the metrics have to score is the page a user would actually see.
@@ -1024,7 +1136,7 @@ impl SearchApi {
     /// [`Status`] from account resolution or query planning. Candidate
     /// generation degrades to an empty result rather than erroring, matching
     /// the streaming path.
-    async fn ranked_page(&self, req: &PageRequest<'_>) -> Result<Vec<i64>, Status> {
+    async fn ranked_page_uncached(&self, req: &PageRequest<'_>) -> Result<Vec<i64>, Status> {
         let PageRequest {
             query,
             filter,

@@ -11,6 +11,7 @@ pub mod analytics;
 pub mod attach;
 pub mod auth;
 pub mod autoconfig;
+pub mod cache;
 pub mod compose;
 pub mod config;
 pub mod credential;

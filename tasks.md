@@ -371,12 +371,31 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core saved_search:: smart_folder::` · `cargo nextest run -p rmaild --test saved_search_service`
 
 ## 36. Query/embedding/result caching & incrementality
-- [ ] status
+- [x] status
 - **depends-on:** 33
 - **parallel-safe:** yes
 - **acceptance:**
   - Query-plan cache (normalized hash), embedding cache (persist doc/query vectors, re-embed on content_hash change), and result cache keyed by `(query, filter, corpus_version)` invalidated on corpus bump/ranker change; freshly-synced mail bypasses the result cache.
-- **verify:** `cargo nextest run -p rmail-core cache::` (hit/miss, corpus-version invalidation, fresh-mail bypass)
+- **as built:** two of the three caches already existed and were left alone —
+  `query_plan_cache` (V47, task 58) is the query-plan cache, and
+  `chunk_embeddings.content_hash` (task 24) is the *document* half of the
+  embedding cache. This task added the **query** half (`embedding_cache`, via a
+  `CachingEmbedder` decorator wrapping only the query-embedding paths — the
+  indexer keeps the raw embedder so chunk vectors do not evict query vectors),
+  the **result cache** (`search_result_cache`), and the `corpus_version` both
+  are keyed against. That version is a single global counter maintained by SQL
+  **triggers** on `messages`/`flags`/`message_tags`/`index_content`, not by a
+  `bump()` any write path has to remember; global rather than per-account
+  because over-invalidation costs a recomputed search while
+  under-invalidation is a wrong one. Nothing is invalidated by deleting rows:
+  the corpus version and a digest of the whole `[search]` table plus the
+  embedding model are *inside* each result key, so new mail or any retuned
+  knob moves the key. `ResultCache::lookup` returns Hit/Miss(Lease)/Bypass —
+  a bypass (fresh corpus, or an unreadable version) yields no lease, and
+  `store` re-reads the version and declines if mail landed mid-search.
+  Operator surface: cache counters on `IndexService.Status`, sweep plus opt-in
+  `purge_search_caches` on `IndexService.Gc`, `mail index gc --purge-caches`.
+- **verify:** `cargo nextest run -p rmail-core --lib cache::` (32 tests: hit/miss counted with a counting embedder, corpus-version/ranker/model invalidation, fresh-mail bypass, mid-search corpus move, LRU and TTL bounds) · `cargo nextest run -p rmaild --test index_service status_reports_the_search_caches` (operator surface end to end)
 
 ## 37. Evaluation harness + CI regression guard
 - [x] status

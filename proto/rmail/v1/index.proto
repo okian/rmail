@@ -161,6 +161,40 @@ message IndexStatusResponse {
   bool paused = 11;
   // Whether semantic indexing is enabled in config.
   bool semantic_enabled = 12;
+  // What the search caches hold. Reported here rather than behind a new RPC
+  // because the question an operator actually asks is "what does the daemon
+  // know, and how fresh is it" — and the corpus version is the number that
+  // answers both, for the index and for every cached search result keyed on
+  // it.
+  SearchCacheStatus cache = 13;
+}
+
+// The search caches (prd.md "Caching & Incrementality"), as an operator sees
+// them.
+message SearchCacheStatus {
+  // The current corpus version: a counter SQL triggers bump on every change
+  // to mail, flags, tags, or extracted text. Every cached result page is
+  // keyed on it, so a page stamped with an older value can never be served.
+  int64 corpus_version = 1;
+  // Unix seconds at the last corpus change. Within
+  // `search.cache.fresh_window_secs` of now, the result cache is bypassed
+  // outright so freshly-synced mail cannot be hidden behind an answer
+  // computed a moment before it landed.
+  int64 corpus_changed_at = 2;
+  // Compiled natural-language query plans held, and reads they served without
+  // a provider call.
+  int64 query_plans = 3;
+  int64 query_plan_uses = 4;
+  // Query vectors held, and reads they served without running the embedder.
+  int64 embeddings = 5;
+  int64 embedding_uses = 6;
+  // Result pages held, and reads they served without running the pipeline.
+  int64 results = 7;
+  int64 result_uses = 8;
+  // Result pages stamped with a superseded corpus version — entries no lookup
+  // can address again, waiting for the next Gc. A number that only grows is
+  // the visible symptom of a sweep that is not running.
+  int64 stale_results = 9;
 }
 
 // What a Reindex pass should do before it drains.
@@ -270,9 +304,25 @@ message IndexDrift {
   bool clean = 13;
 }
 
-message IndexGcRequest {}
+message IndexGcRequest {
+  // Also drop *every* cached row — compiled query plans, query vectors, and
+  // cached result pages — rather than only the unreachable ones.
+  //
+  // Off by default, and not needed in normal operation: the search caches
+  // invalidate structurally (a cached result page is keyed on the corpus
+  // version and a digest of the whole `[search]` config, so new mail or a
+  // retuned ranker moves the key rather than leaving a stale row readable).
+  // This is the operator's "I do not trust what is in there" switch — a
+  // database restored from backup, or a bug being ruled out.
+  //
+  // It is not free: `query_plan_cache` holds compiled natural-language
+  // queries, and every one of those was a paid Claude call that will be paid
+  // again. The report says how many were dropped for exactly that reason.
+  bool purge_search_caches = 1;
+}
 
-// What Gc deleted. Every count is rows whose parent was already gone.
+// What Gc deleted. Every count is rows whose parent was already gone, except
+// the `cache_*` fields below.
 message IndexGcReport {
   // Entities with no remaining mention.
   int64 entities = 1;
@@ -284,6 +334,17 @@ message IndexGcReport {
   int64 lexical_rows = 3;
   // `index_content` rows for messages that no longer exist.
   int64 content_rows = 4;
+  // Cached result pages dropped: expired by TTL, stranded by a corpus-version
+  // bump, or coldest past the configured bound. Always swept, purge or not —
+  // none of these could have been read again.
+  int64 cache_results = 5;
+  // Cached query vectors dropped for being coldest past the bound. Always
+  // swept.
+  int64 cache_embeddings = 6;
+  // Compiled query plans dropped. Zero unless `purge_search_caches` was set:
+  // a plan is never unreachable, only unused, and dropping one costs a
+  // provider call to rebuild.
+  int64 cache_query_plans = 7;
 }
 
 message SetIndexPausedRequest {

@@ -559,6 +559,8 @@ pub struct SearchConfig {
     pub retrievers: RetrieversConfig,
     /// Implicit-feedback log retention (task 64).
     pub feedback: FeedbackConfig,
+    /// Query/embedding/result cache settings (task 36).
+    pub cache: CacheConfig,
 }
 
 impl Default for SearchConfig {
@@ -580,6 +582,82 @@ impl Default for SearchConfig {
             expansion: ExpansionConfig::default(),
             retrievers: RetrieversConfig::default(),
             feedback: FeedbackConfig::default(),
+            cache: CacheConfig::default(),
+        }
+    }
+}
+
+/// Query/embedding/result caching (task 36; prd.md "Caching &
+/// Incrementality").
+///
+/// Every knob here is a *bound*, not an invalidation policy. The caches in
+/// [`crate::cache`] invalidate structurally — the corpus version and a digest
+/// of this very table are inside each result-cache key — so nothing below can
+/// make a cache serve a stale answer. What they decide is how much disk the
+/// caches may use and how eagerly a freshly-changed corpus is distrusted.
+///
+/// # Why this table is inside `[search]` and not beside it
+///
+/// It is deliberate that changing any field here changes
+/// [`crate::cache::RankerFingerprint`] and therefore invalidates every cached
+/// result page. Halving `max_results` should not leave the surviving entries
+/// answering under the old bound, and — more to the point — a fingerprint
+/// computed over "`[search]` except the parts I decided do not matter" is a
+/// judgement call that has to be re-made correctly every time a field is
+/// added. Being inside `[search]` makes it automatic.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CacheConfig {
+    /// Master switch for the result cache and the query-embedding cache.
+    ///
+    /// `false` means neither is read *or written* — not that they are written
+    /// and ignored. The query-plan cache (task 58) is unaffected: it caches
+    /// paid Claude calls and is not this table's to switch off.
+    pub enabled: bool,
+    /// How long a cached result page may be served, in seconds.
+    ///
+    /// Belt to the corpus version's braces. The version already invalidates
+    /// on every message, flag, tag and re-extraction change; the TTL bounds
+    /// staleness for anything those triggers do not observe, and keeps a
+    /// mailbox that never changes from serving one ranking for ever. `0`
+    /// disables the result cache by expiring every entry immediately.
+    pub result_ttl_secs: u32,
+    /// Hard ceiling on cached result pages; coldest evicted first. `0`
+    /// disables the result cache.
+    pub max_results: u32,
+    /// Hard ceiling on cached query vectors; coldest evicted first. `0`
+    /// disables the query-embedding cache.
+    pub max_embeddings: u32,
+    /// Seconds after a corpus change during which the result cache is not
+    /// consulted at all — prd.md's "newly-synced mail can bypass the cache so
+    /// fresh mail is never hidden by a stale cached result."
+    ///
+    /// `0` switches the bypass off, which is what a deterministic test (or an
+    /// operator measuring hit rate) needs: with a nonzero window, a search run
+    /// immediately after any write is a bypass by definition and the hit path
+    /// is unobservable.
+    pub fresh_window_secs: u32,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Five minutes. Long enough to cover the burst this cache exists
+            // for — a user paging, re-running a saved search, an eval replay,
+            // `AskMailbox` retrieving the same context twice — and short
+            // enough that no ranking survives a coffee break.
+            result_ttl_secs: 300,
+            // A few hundred kilobytes at a full page of ids apiece.
+            max_results: 512,
+            // 384 f32s is 1.5 kB, so this is ~6 MB of query vectors: far more
+            // distinct queries than one person types between restarts, and
+            // still small next to the vector index itself.
+            max_embeddings: 4_096,
+            // Longer than one sync's write burst, so a search issued while
+            // mail is still landing recomputes rather than caching a partial
+            // view of it.
+            fresh_window_secs: 30,
         }
     }
 }

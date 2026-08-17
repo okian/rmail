@@ -120,7 +120,12 @@ impl TestServer {
             pipeline.pause_flag(),
         );
         let shutdown_cancel = CancellationToken::new();
-        let api = rmaild::IndexApi::new(admin, pipeline.clone(), shutdown_cancel.clone());
+        let api = rmaild::IndexApi::new(
+            admin,
+            pipeline.clone(),
+            shutdown_cancel.clone(),
+            config.search.cache,
+        );
 
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let incoming = UnixListenerStream::new(listener);
@@ -790,7 +795,13 @@ async fn gc_removes_orphans_and_leaves_live_rows_alone() {
         .unwrap();
 
     let mut client = server.client().await;
-    let report = client.gc(IndexGcRequest {}).await.unwrap().into_inner();
+    let report = client
+        .gc(IndexGcRequest {
+            purge_search_caches: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
     assert!(
         report.vectors > 0,
         "the deleted message left vectors behind"
@@ -840,7 +851,13 @@ async fn gc_removes_orphans_and_leaves_live_rows_alone() {
     assert!(drift.clean, "gc left a clean index: {drift:?}");
 
     // And a second run finds nothing to do.
-    let again = client.gc(IndexGcRequest {}).await.unwrap().into_inner();
+    let again = client
+        .gc(IndexGcRequest {
+            purge_search_caches: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(
         (
             again.entities,
@@ -1040,6 +1057,143 @@ async fn entities_are_listed_by_kind_and_an_unknown_kind_is_an_error() {
         status.message().contains("tracking_no"),
         "and it says what the real kinds are: {}",
         status.message()
+    );
+
+    server.stop().await;
+}
+
+/// The operator surface for task 36's caches: `Status` reports what they hold
+/// and `Gc` is the way to clear them.
+///
+/// A cache nobody outside `rmail-core` can inspect or clear is a capability
+/// with no surface, and the person who needs both is an operator asking "why
+/// is search still returning the old ordering" — the corpus version is the
+/// number that answers it.
+#[tokio::test]
+async fn status_reports_the_search_caches_and_gc_clears_them() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let before = client
+        .status(IndexStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .cache
+        .expect("Status must carry the cache block");
+
+    // Mail is what moves the corpus version, and a moved version is what makes
+    // every result page cached before it unreadable.
+    server.message("hello", "a body").await;
+    let after = client
+        .status(IndexStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .cache
+        .expect("cache block");
+    assert!(
+        after.corpus_version > before.corpus_version,
+        "new mail must move the corpus version an operator can see: \
+         {} -> {}",
+        before.corpus_version,
+        after.corpus_version
+    );
+
+    // Seed one row in each cache with raw SQL — this test is about the
+    // operator surface, not about how the search path fills them.
+    let account_id = server.account_id;
+    // Stamped with the version *before* the message above landed, which is
+    // what a page cached a moment earlier would carry. Derived rather than
+    // hardcoded: the fixture's starting version is not this test's to assume,
+    // and a literal that happened to equal the current version would make the
+    // "stale" assertion below vacuously test nothing.
+    let superseded = after.corpus_version - 1;
+    server
+        .db
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO query_plan_cache
+                     (account_id, query_hash, raw, compiled, intent, notes, model)
+                 VALUES (?1, 'abc123', 'who owes me', 'invoice', 'lookup', '', 'test')",
+                rusqlite::params![account_id],
+            )?;
+            c.execute(
+                "INSERT INTO embedding_cache (model, dim, text_hash, vector)
+                 VALUES ('test', 2, X'aa', X'0000000000000000')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO search_result_cache
+                     (cache_key, corpus_version, ranker_fingerprint, message_ids)
+                 VALUES (X'bb', ?1, X'cc', X'0100000000000000')",
+                rusqlite::params![superseded],
+            )
+        })
+        .await
+        .unwrap();
+
+    let seeded = client
+        .status(IndexStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .cache
+        .expect("cache block");
+    assert_eq!(seeded.query_plans, 1);
+    assert_eq!(seeded.embeddings, 1);
+    assert_eq!(seeded.results, 1);
+    assert_eq!(
+        seeded.stale_results, 1,
+        "the seeded page is stamped with a superseded version, so no lookup \
+         can address it again — and an operator can see that"
+    );
+
+    // A plain Gc sweeps what is already unreachable and leaves the paid
+    // artifacts alone.
+    let swept = client
+        .gc(IndexGcRequest {
+            purge_search_caches: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(swept.cache_results, 1, "the stranded page goes");
+    assert_eq!(
+        swept.cache_query_plans, 0,
+        "a compiled plan costs a provider call to rebuild, so a routine gc \
+         must never discard one"
+    );
+    let after_sweep = client
+        .status(IndexStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .cache
+        .expect("cache block");
+    assert_eq!(after_sweep.query_plans, 1, "still there");
+    assert_eq!(after_sweep.results, 0);
+
+    // The purge is the opt-in half, and it does say what it cost.
+    let purged = client
+        .gc(IndexGcRequest {
+            purge_search_caches: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(purged.cache_query_plans, 1);
+    assert_eq!(purged.cache_embeddings, 1);
+    let empty = client
+        .status(IndexStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .cache
+        .expect("cache block");
+    assert_eq!(
+        (empty.query_plans, empty.embeddings, empty.results),
+        (0, 0, 0)
     );
 
     server.stop().await;

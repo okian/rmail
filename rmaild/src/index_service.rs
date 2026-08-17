@@ -50,6 +50,8 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use rmail_core::cache::CacheStats;
+use rmail_core::config::CacheConfig;
 use rmail_core::index::{
     IndexAdmin, IndexKind as CoreKind, IndexPauseFlag, IndexPipeline, Selection,
 };
@@ -58,8 +60,9 @@ use rmail_proto::v1::index_service_server::IndexService;
 use rmail_proto::v1::{
     IndexDrift, IndexEntity, IndexGcReport, IndexGcRequest, IndexKind as ProtoKind,
     IndexKindStatus, IndexProgress, IndexStatusRequest, IndexStatusResponse, ListEntitiesRequest,
-    ListEntitiesResponse, RebuildRequest, ReindexMode, ReindexRequest, SetIndexPausedRequest,
-    SetIndexPausedResponse, VerifyIndexRequest,
+    ListEntitiesResponse, RebuildRequest, ReindexMode, ReindexRequest,
+    SearchCacheStatus as ProtoCacheStatus, SetIndexPausedRequest, SetIndexPausedResponse,
+    VerifyIndexRequest,
 };
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
@@ -104,6 +107,13 @@ pub struct IndexApi {
     /// Cancelled when the daemon shuts down, so an open drain stops with it
     /// rather than holding shutdown open.
     shutdown: CancellationToken,
+    /// The bounds `Gc` sweeps the search caches back to (task 36).
+    ///
+    /// The daemon's own `[search.cache]`, not a default assembled here: a
+    /// sweep run against different bounds from the ones the search path
+    /// writes under would fight it, evicting entries a live search had just
+    /// decided were worth keeping.
+    cache: CacheConfig,
 }
 
 impl IndexApi {
@@ -123,8 +133,14 @@ impl IndexApi {
     /// that call themselves the same thing and lets a stalled drain finish work
     /// that was reaped out from under it.
     #[must_use]
-    pub fn new(admin: IndexAdmin, pipeline: IndexPipeline, shutdown: CancellationToken) -> Self {
+    pub fn new(
+        admin: IndexAdmin,
+        pipeline: IndexPipeline,
+        shutdown: CancellationToken,
+        cache: CacheConfig,
+    ) -> Self {
         Self {
+            cache,
             paused: pipeline.pause_flag(),
             pipeline: pipeline.with_worker(format!(
                 "rmaild-index-rpc-{}-{}",
@@ -186,6 +202,7 @@ impl IndexService for IndexApi {
             vectors: status.vectors,
             paused: status.paused,
             semantic_enabled: status.semantic_enabled,
+            cache: Some(to_proto_cache(self.admin.cache_stats().await?)),
         }))
     }
 
@@ -352,17 +369,30 @@ impl IndexService for IndexApi {
 
     async fn gc(
         &self,
-        _request: Request<IndexGcRequest>,
+        request: Request<IndexGcRequest>,
     ) -> Result<Response<IndexGcReport>, Status> {
         // Batched deletes over the whole store; same reasoning as `verify`,
         // with the extra note that stopping between batches is safe — each one
         // commits on its own and only ever removes rows whose parent is gone.
         let report = stoppable(&self.shutdown, self.admin.gc()).await?;
+        // The cache sweep runs unconditionally: every row it drops is expired,
+        // stranded by a corpus bump, or past a bound, so none of them could
+        // have been read again. The purge is the opt-in half, because it also
+        // discards compiled query plans that cost money to rebuild.
+        let swept = stoppable(&self.shutdown, self.admin.sweep_caches(self.cache)).await?;
+        let purged = if request.into_inner().purge_search_caches {
+            stoppable(&self.shutdown, self.admin.purge_caches()).await?
+        } else {
+            rmail_core::cache::PurgeReport::default()
+        };
         Ok(Response::new(IndexGcReport {
             entities: cast(report.entities),
             vectors: cast(report.vectors),
             lexical_rows: cast(report.lexical_rows),
             content_rows: cast(report.content_rows),
+            cache_results: cast(swept.results + purged.results),
+            cache_embeddings: cast(swept.embeddings + purged.embeddings),
+            cache_query_plans: cast(purged.query_plans),
         }))
     }
 
@@ -583,4 +613,19 @@ fn non_negative(field: &str, value: i64) -> Result<u64, Status> {
 /// large is already a bug and wrapping it would hide one.
 fn cast(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// One [`CacheStats`] on the wire.
+fn to_proto_cache(stats: CacheStats) -> ProtoCacheStatus {
+    ProtoCacheStatus {
+        corpus_version: stats.corpus_version,
+        corpus_changed_at: stats.corpus_changed_at,
+        query_plans: stats.query_plans,
+        query_plan_uses: stats.query_plan_uses,
+        embeddings: stats.embeddings,
+        embedding_uses: stats.embedding_uses,
+        results: stats.results,
+        result_uses: stats.result_uses,
+        stale_results: stats.stale_results,
+    }
 }

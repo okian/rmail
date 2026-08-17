@@ -1135,6 +1135,7 @@ where
         index_admin,
         index_pipeline.clone(),
         stopping.clone(),
+        config.search.cache,
     ));
     // `index.workers` sizes the batch, not a thread pool, and the distinction
     // is worth stating: every stage writes through SQLite's single writer

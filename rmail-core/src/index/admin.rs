@@ -545,6 +545,61 @@ impl IndexAdmin {
         Ok(report)
     }
 
+    /// What the search caches hold (task 36) — the read behind
+    /// `IndexService.Status`'s `cache` field.
+    ///
+    /// Lives on the index admin surface rather than behind a cache-specific
+    /// RPC because the corpus version answers both questions an operator has
+    /// at once: how far the index has got, and which cached search results are
+    /// still addressable.
+    ///
+    /// # Errors
+    ///
+    /// [`Error`] if the read fails.
+    pub async fn cache_stats(&self) -> Result<crate::cache::CacheStats, Error> {
+        self.db.read(crate::cache::stats).await.map_err(Error::from)
+    }
+
+    /// Garbage-collect the search caches: result pages that are expired or
+    /// stranded by a corpus bump, then whatever is past each bound.
+    ///
+    /// Not invalidation — every row this removes is already unreachable or
+    /// already a miss. It exists so the tables stay bounded without a search
+    /// paying for eviction on the hot path.
+    ///
+    /// # Errors
+    ///
+    /// [`Error`] if the write fails.
+    pub async fn sweep_caches(
+        &self,
+        config: crate::config::CacheConfig,
+    ) -> Result<crate::cache::SweepReport, Error> {
+        let now = chrono::Utc::now().timestamp();
+        self.db
+            .write(move |conn| crate::cache::sweep(conn, &config, now))
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Drop every cached row, including compiled query plans.
+    ///
+    /// Destructive in the only way a cache can be: `query_plan_cache` rows
+    /// each cost a paid provider call to rebuild. Nothing in normal operation
+    /// calls this — see [`crate::cache::purge`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error`] if the write fails.
+    pub async fn purge_caches(&self) -> Result<crate::cache::PurgeReport, Error> {
+        let report = self
+            .db
+            .write(crate::cache::purge)
+            .await
+            .map_err(Error::from)?;
+        tracing::info!(?report, "search caches purged");
+        Ok(report)
+    }
+
     /// Enqueue the selected stages for the selected messages.
     ///
     /// Returns how many jobs were actually queued. Work already done against
