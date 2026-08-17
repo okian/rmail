@@ -22,6 +22,7 @@ mod search_cli;
 mod stats_cli;
 mod tag_cli;
 mod tui;
+mod webhook_cli;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -160,6 +161,25 @@ enum Command {
         #[command(subcommand)]
         action: hook_cli::HookAction,
     },
+    /// Outbound webhooks: register, list, inspect and replay deliveries
+    /// (`WebhookService`).
+    ///
+    /// The only surface in `mail` that puts your mail on somebody else's
+    /// server. Nothing is sent until a destination exists and
+    /// `webhooks.enabled` is on; the default payload is sender, subject and a
+    /// deep link, never the body, unless that destination was registered with
+    /// `--include-body`.
+    Webhook {
+        #[command(subcommand)]
+        action: webhook_cli::WebhookAction,
+    },
+    /// Post one message to a registered webhook destination as a summary +
+    /// action items + deep link (`WebhookService.Forward`).
+    ///
+    /// Not a mail forward: nothing is transmitted to a mail recipient. This
+    /// queues a notification to a chat channel or a ticketing endpoint the
+    /// operator registered.
+    Forward(webhook_cli::ForwardArgs),
     /// Index maintenance: coverage, drain, verify, gc, rebuild
     /// (`IndexService`).
     Index {
@@ -689,6 +709,8 @@ async fn main() -> Result<()> {
         },
         Command::Links(args) => extract_cli::links(&socket, args).await,
         Command::Hook { action } => hook_cli::run(&socket, action).await,
+        Command::Webhook { action } => webhook_cli::run(&socket, action).await,
+        Command::Forward(args) => webhook_cli::forward(&socket, args).await,
         Command::Notify { action } => notify_cli::run(&socket, action).await,
         Command::Index { action } => index_cli::run(&socket, action).await,
         Command::Entities(args) => index_cli::entities(&socket, args).await,

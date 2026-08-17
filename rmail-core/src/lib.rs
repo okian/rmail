@@ -53,6 +53,7 @@ pub mod tags;
 pub mod telemetry;
 pub mod thread;
 pub mod transport;
+pub mod webhooks;
 
 pub use config::{Config, ConfigError};
 pub use credential::{CredentialSource, Secret};

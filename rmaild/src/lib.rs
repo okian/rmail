@@ -42,6 +42,7 @@ mod stream;
 mod sync_service;
 mod tag_service;
 mod trace;
+mod webhook_service;
 
 pub use account_service::AccountApi;
 pub use admin_service::AdminApi;
@@ -73,6 +74,7 @@ pub use send_scheduler_service::SendSchedulerApi;
 pub use sync_service::SyncApi;
 pub use tag_service::TagApi;
 pub use trace::RequestTraceLayer;
+pub use webhook_service::WebhookApi;
 
 use std::future::Future;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -122,6 +124,7 @@ use rmail_core::smart_folder::{SmartFolderEvaluator, SmartFolderStore};
 use rmail_core::sync::{SyncEngine, SyncOptions};
 use rmail_core::tags::ai::{SuggestTagsPassHandler, SuggestionEngine};
 use rmail_core::tags::TagStore;
+use rmail_core::webhooks::WebhookDispatcher;
 use rmail_core::{Config, Database};
 use rmail_proto::v1::account_service_server::AccountServiceServer;
 use rmail_proto::v1::admin_service_server::AdminServiceServer;
@@ -148,6 +151,7 @@ use rmail_proto::v1::search_service_server::SearchServiceServer;
 use rmail_proto::v1::send_scheduler_service_server::SendSchedulerServiceServer;
 use rmail_proto::v1::sync_service_server::SyncServiceServer;
 use rmail_proto::v1::tag_service_server::TagServiceServer;
+use rmail_proto::v1::webhook_service_server::WebhookServiceServer;
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -869,6 +873,44 @@ where
             enabled = config.hooks.enabled,
             hooks = hook_dispatcher.hook_count(),
             "the hook dispatch loop is not running on this daemon"
+        );
+        None
+    };
+
+    // `WebhookService` is always registered, for the reason `HookService`
+    // above gives — reflection and the auth scope table must see every RPC
+    // regardless of runtime config — and here it matters more than usual:
+    // `webhooks.enabled` defaults to *false*, so on a stock daemon this
+    // service is the only way an operator can register, list and remove
+    // destinations, and a service that vanished with the dispatcher would
+    // make the feature unconfigurable until somebody first enabled it blind.
+    // What `enabled` gates is the sending.
+    let webhook_service = WebhookServiceServer::new(WebhookApi::new(
+        db.clone(),
+        config.ai.privacy.clone(),
+        config.webhooks.enabled,
+    ));
+    let webhook_dispatch_handle = if config.webhooks.enabled {
+        match WebhookDispatcher::new(
+            db.clone(),
+            events.clone(),
+            &config.webhooks,
+            config.ai.privacy.clone(),
+        ) {
+            Ok(dispatcher) => Some(dispatcher.spawn(stopping.clone()).await),
+            Err(error) => {
+                // A client that cannot be built is a TLS/transport problem,
+                // not a reason to refuse to boot: every other surface still
+                // works, and the queue simply does not drain until it is
+                // fixed. Loud, and not fatal.
+                tracing::error!(%error, "the outbound webhook dispatcher could not start");
+                None
+            }
+        }
+    } else {
+        tracing::info!(
+            "the outbound webhook dispatch loop is not running on this daemon \
+             (webhooks.enabled is false); destinations can still be registered and listed"
         );
         None
     };
@@ -1784,6 +1826,7 @@ where
         .add_service(hook_service)
         .add_service(rule_service)
         .add_service(notification_service)
+        .add_service(webhook_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
@@ -1794,6 +1837,9 @@ where
         let _ = handle.await;
     }
     if let Some(handle) = hook_dispatch_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = webhook_dispatch_handle {
         let _ = handle.await;
     }
     if let Some(handle) = rule_evaluator_handle {

@@ -1320,6 +1320,69 @@ commands! {
         summary: "Extract, deduplicate and rank a message's links, flagging targets that misrepresent themselves.",
     }
 
+    // -- WebhookService (task 68) ----------------------------------------------
+    WebhookRegister {
+        rpc: "/rmail.v1.WebhookService/Register",
+        tool: "register_webhook",
+        effect: Mutate,
+        cli: ["webhook add"],
+        actions: [],
+        summary: "Register an outbound endpoint that receives HMAC-signed JSON about mail events.",
+    }
+    WebhookList {
+        rpc: "/rmail.v1.WebhookService/List",
+        tool: "list_webhooks",
+        effect: Read,
+        cli: ["webhook list"],
+        actions: [],
+        summary: "List the registered outbound destinations (never their signing keys).",
+    }
+    WebhookRemove {
+        rpc: "/rmail.v1.WebhookService/Remove",
+        tool: "remove_webhook",
+        effect: Mutate,
+        cli: ["webhook rm"],
+        actions: [],
+        summary: "Remove an outbound destination and its delivery history.",
+    }
+    WebhookSetEnabled {
+        rpc: "/rmail.v1.WebhookService/SetEnabled",
+        tool: "set_webhook_enabled",
+        effect: Mutate,
+        cli: ["webhook enable", "webhook disable"],
+        actions: [],
+        summary: "Stop or resume sending to an outbound destination, keeping it and its history.",
+    }
+    WebhookListDeliveries {
+        rpc: "/rmail.v1.WebhookService/ListDeliveries",
+        tool: "list_webhook_deliveries",
+        effect: Read,
+        cli: ["webhook deliveries"],
+        actions: [],
+        summary: "Inspect the outbound delivery queue: what was sent, what is retrying, what gave up.",
+    }
+    WebhookReplayDelivery {
+        rpc: "/rmail.v1.WebhookService/ReplayDelivery",
+        tool: "replay_webhook_delivery",
+        // Mutating on the strongest reading of `Effect`: it causes the same
+        // mail content to be POSTed to a third party again. That the row it
+        // edits is a queue entry is beside the point — the authority here is
+        // egress, which is why this sits behind the same scopes `Forward`
+        // does rather than the read scopes `ListDeliveries` needs.
+        effect: Mutate,
+        cli: ["webhook replay"],
+        actions: [],
+        summary: "Re-arm one outbound delivery for another attempt, resending the frozen body.",
+    }
+    WebhookForward {
+        rpc: "/rmail.v1.WebhookService/Forward",
+        tool: "forward_message",
+        effect: Mutate,
+        cli: ["forward"],
+        actions: [],
+        summary: "Queue one message to a named destination as a summary + action items + deep link.",
+    }
+
     // -- AuditService (task 45) ------------------------------------------------
     AuditQueryAiCalls {
         rpc: "/rmail.v1.AuditService/QueryAiCalls",

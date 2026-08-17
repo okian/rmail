@@ -663,7 +663,7 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core hooks::` · `cargo nextest run -p rmaild --test hook_service` (event→stdin JSON, timeout kill, bounded concurrency)
 
 ## 68. Outbound webhooks + Slack forward
-- [ ] status
+- [x] status
 - **depends-on:** 14, 43
 - **parallel-safe:** yes
 - **acceptance:**

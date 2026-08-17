@@ -758,6 +758,66 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.LinkService/ExtractLinks",
         Requirement::Scope(Scope::MailRead),
     ),
+    // -- WebhookService (task 68) ---------------------------------------------
+    // This is the only service in the API whose whole job is to put mail
+    // content on somebody else's server, so every row here is `AllOf` and
+    // every one of them names `mail.read` alongside `automation`.
+    //
+    // `automation` is the obvious half: registering a destination is arranging
+    // for an operator-authored endpoint to be contacted, which is the same
+    // authority `HookService/TestHook` and `ExtractService/ExtractEvents` sit
+    // behind. `mail.read` is the half that is easy to leave off and must not
+    // be. Registering does not itself read a message — but it is the act that
+    // causes every future matching message's sender, subject and (if the
+    // destination is registered for it) body to be read and shipped to an
+    // address the caller chose. A token forbidden from reading a single
+    // message must not be able to arrange for all of them to be read on its
+    // behalf, which is exactly what `automation` alone would permit.
+    //
+    // `List` and `ListDeliveries` are the same pair for the mirror reason:
+    // `ListDeliveries` can return the frozen payload — the subject, the
+    // summary, and for a body-enabled destination the body — so it discloses
+    // message content, and `List` discloses the destination set that says
+    // where all of it goes. Neither is a `mail.read`-only read, because the
+    // set of registered endpoints is itself automation configuration.
+    (
+        "/rmail.v1.WebhookService/Register",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
+    (
+        "/rmail.v1.WebhookService/List",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
+    (
+        "/rmail.v1.WebhookService/Remove",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
+    (
+        "/rmail.v1.WebhookService/SetEnabled",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
+    (
+        "/rmail.v1.WebhookService/ListDeliveries",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
+    // Replaying causes the same mail content to be POSTed again, which is
+    // egress with the caller's authority behind it — not the queue read
+    // `ListDeliveries` is.
+    (
+        "/rmail.v1.WebhookService/ReplayDelivery",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
+    // `Forward` reads a named message and ships it. Deliberately *not*
+    // `mail.send`: nothing here puts octets into the mail system, and
+    // conflating "post a summary to a chat channel" with "transmit a message
+    // as this user" would let a forwarding token be minted with the authority
+    // to send mail. Deliberately not `ai.invoke` either — the summary it
+    // carries is read from `ai_summaries`, never computed, so a forward
+    // cannot spend at a provider (see `rmail_core::webhooks::payload`).
+    (
+        "/rmail.v1.WebhookService/Forward",
+        Requirement::AllOf(&[Scope::MailRead, Scope::Automation]),
+    ),
     // -- SendSchedulerService (task 61) ----------------------------------------------
     // Replaces the provisional `OutboxService/Send` row this table carried
     // until task 61 landed the real `proto/rmail/v1/send_scheduler.proto` —
@@ -1312,6 +1372,34 @@ mod tests {
     #[test]
     fn an_unregistered_method_is_not_found_which_callers_must_deny() {
         assert_eq!(lookup("/rmail.v1.DoesNotExist/Method"), None);
+    }
+
+    /// Every `WebhookService` method needs both `mail.read` and `automation`.
+    ///
+    /// `every_rpc_in_the_descriptor_set_has_a_scope_row` already proves none
+    /// of them is *missing*; this pins what they are gated on, because
+    /// "registered but under-gated" is precisely the failure the fail-closed
+    /// default cannot catch. This is the one service whose whole job is to put
+    /// mail on a third party's server, so a row here quietly widening to
+    /// `automation` alone — which reads plausibly, since registering an
+    /// endpoint *is* automation — would let a token forbidden from reading a
+    /// single message arrange for every message to be shipped somewhere it
+    /// can read.
+    #[test]
+    fn every_webhook_rpc_needs_both_mail_read_and_automation() {
+        let expected = Requirement::AllOf(&[Scope::MailRead, Scope::Automation]);
+        let mut found = 0;
+        for (path, requirement) in TABLE {
+            if !path.starts_with("/rmail.v1.WebhookService/") {
+                continue;
+            }
+            found += 1;
+            assert_eq!(requirement, &expected, "{path}");
+        }
+        assert_eq!(
+            found, 7,
+            "WebhookService has seven RPCs; a new one needs its own row here"
+        );
     }
 
     /// Every method the server actually exposes has a row.

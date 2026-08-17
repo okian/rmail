@@ -81,3 +81,12 @@ ment = "ment"
 # A spreadsheet column, not a word: `extract::tables` maps column index 52 to
 # the A1 reference "BA1", and the test pins the Z -> AA -> BA carry.
 BA = "BA"
+
+# Deliberately one letter off: `webhooks::sign`'s test asserts
+# `constant_time_eq(b"abc", b"abd")` is false. Correcting it would make the
+# test compare a value with itself.
+abd = "abd"
+
+# The slug fixture's expected *output*: `slug("Who's chasing me?")` is
+# "whos-chasing-me", apostrophe removed. That is the function working.
+whos = "whos"

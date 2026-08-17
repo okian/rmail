@@ -34,7 +34,7 @@ pub use duration::{parse_human_duration, HumanDuration};
 /// Top-level table names accepted from the environment overlay.
 const KNOWN_TABLES: &[&str] = &[
     "accounts", "sync", "search", "index", "ai", "tags", "notes", "send", "finder", "grpc",
-    "hooks", "rules", "notify", "digest",
+    "hooks", "webhooks", "rules", "notify", "digest",
 ];
 
 /// Errors produced while loading or parsing configuration.
@@ -303,6 +303,8 @@ pub struct Config {
     pub grpc: GrpcConfig,
     /// Event-hook dispatcher settings.
     pub hooks: HooksConfig,
+    /// Outbound-webhook dispatcher settings.
+    pub webhooks: WebhooksConfig,
     /// Rules-engine settings.
     pub rules: RulesConfig,
     /// Priority-notification engine settings.
@@ -1867,6 +1869,70 @@ impl Default for HooksConfig {
             tick_interval: HumanDuration::new(crate::hooks::DEFAULT_TICK_INTERVAL),
             max_output_bytes: 64 * 1024,
             hooks: Vec::new(),
+        }
+    }
+}
+
+/// Outbound-webhook settings (`[webhooks]`, task 68, prd.md #49 and #64).
+///
+/// The destinations themselves are deliberately **not** here, which is the
+/// one structural difference from [`HooksConfig`] above. A hook is a command
+/// on this machine and belongs in the same file as every other local setting;
+/// a webhook destination is a live registry an operator adds to and removes
+/// from while the daemon runs (`WebhookService/Register`, `mail webhook add`),
+/// and it carries per-destination state — an event subscription, a delivery
+/// history — that a TOML file cannot hold. So destinations live in
+/// `webhook_destinations` (V48) and this table is only the dispatcher's own
+/// dials.
+///
+/// `enabled` is `false` by default. That is the second of the two switches
+/// that have to be thrown before anything leaves the machine: this one, and a
+/// destination existing at all. Neither has a value that makes the other
+/// unnecessary.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct WebhooksConfig {
+    /// Whether the outbound dispatcher runs at all.
+    ///
+    /// Off by default, unlike `hooks.enabled`, and the asymmetry is the
+    /// point: a hook's blast radius is this machine, a webhook's is the
+    /// internet. A disabled dispatcher still registers `WebhookService` (the
+    /// convention `AiService`/`HookService` established, so reflection and the
+    /// auth scope table see every RPC regardless of runtime config) and still
+    /// lets an operator register, list and remove destinations — what stops
+    /// is the sending.
+    pub enabled: bool,
+    /// Maximum deliveries in flight at once, across every destination. `0` is
+    /// coerced up to `1`.
+    pub max_concurrency: u32,
+    /// How often the dispatcher re-reads the event log and drains the queue.
+    /// This is the upper bound on delivery latency, for the same reason
+    /// `hooks.tick_interval` is for hooks.
+    pub tick_interval: HumanDuration,
+    /// Per-attempt HTTP timeout. Also sets the lease a claimed delivery holds,
+    /// so a process that dies mid-attempt frees the row rather than wedging
+    /// it.
+    pub delivery_timeout: HumanDuration,
+    /// First retry delay. Doubles per attempt up to `backoff_max`.
+    pub backoff_base: HumanDuration,
+    /// Ceiling on the retry delay.
+    pub backoff_max: HumanDuration,
+    /// How many deliveries one tick queues and how many it drains — the bound
+    /// that keeps a large sync's worth of new mail from turning into one
+    /// unbounded burst of outbound requests.
+    pub max_batch: u32,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_concurrency: 4,
+            tick_interval: HumanDuration::new(crate::webhooks::DEFAULT_TICK_INTERVAL),
+            delivery_timeout: HumanDuration::new(secs(15)),
+            backoff_base: HumanDuration::new(secs(30)),
+            backoff_max: HumanDuration::new(mins(30)),
+            max_batch: 100,
         }
     }
 }

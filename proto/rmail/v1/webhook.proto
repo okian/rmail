@@ -1,0 +1,282 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// WebhookService is rmail's only outbound-network surface for mail content
+// (prd.md features 49 and 64; `rmail_core::webhooks`).
+//
+// Everything else in this API either stays on the machine (HookService runs a
+// local command, NotificationService pings the local desktop) or talks to a
+// model provider under `[ai.privacy]`'s firewall. This service POSTs the
+// operator's own mail — minimized, redacted and signed — to a third party.
+// The whole design follows from that, and three properties are worth stating
+// on the wire rather than only in the daemon:
+//
+// # Opt-in per destination, off by default
+//
+// `webhooks.enabled` is false by default and there is no default destination.
+// Register creates one, explicitly, with its own event subscription; a
+// destination that subscribes to nothing still receives an explicit Forward
+// and no firehose. Remove deletes it and its history.
+//
+// # The default payload is a notification, not the mail
+//
+// Sender, subject, message id, deep link, account/mailbox, date — and nothing
+// else. Not the body, not attachments, not recipients, not headers.
+// `include_body` is a property of the *destination* an operator registered,
+// never of a request: a caller cannot ask for more of a message than the
+// destination was configured to receive. Everything derived from message
+// content is put through the same redaction firewall that governs text sent
+// to a model provider. See `rmail_core::webhooks::payload`'s module docs for
+// the field-by-field statement.
+//
+// # Delivery is queued, idempotent, retried and terminal
+//
+// One row per (destination, event), so a redelivered sync or an overlapping
+// dispatch tick cannot produce two POSTs. Each row carries its frozen body,
+// its attempt count and its cap; failures back off exponentially and a row
+// whose attempts are spent moves to FAILED and stops. ReplayDelivery is the
+// only way back out, and it is deliberately something a human does.
+service WebhookService {
+  // Register an outbound destination. INVALID_ARGUMENT for a URL this daemon
+  // will not POST to (https required, plaintext only for loopback, no
+  // userinfo) or an empty name; ALREADY_EXISTS if the name is taken.
+  rpc Register(RegisterWebhookRequest) returns (RegisterWebhookResponse);
+
+  // Every registered destination. Never returns a signing key — only the
+  // *source* it is resolved from, which is all the daemon itself stores.
+  rpc List(ListWebhooksRequest) returns (ListWebhooksResponse);
+
+  // Remove a destination and, with it, its delivery history.
+  rpc Remove(RemoveWebhookRequest) returns (RemoveWebhookResponse);
+
+  // Stop (or resume) sending to a destination without forgetting where it
+  // pointed. Queued deliveries for a disabled destination stay queued and stop
+  // being claimed, so re-enabling resumes rather than replays. NOT_FOUND for
+  // an unknown destination.
+  rpc SetEnabled(SetWebhookEnabledRequest) returns (SetWebhookEnabledResponse);
+
+  // The delivery queue: what was sent, what is waiting, what gave up and why.
+  rpc ListDeliveries(ListDeliveriesRequest) returns (ListDeliveriesResponse);
+
+  // Re-arm one delivery for another attempt — the only way out of the
+  // terminal FAILED state, and the way to resend one a receiver lost. Resends
+  // the *frozen* bytes under the same X-Rmail-Delivery id, not a fresh render
+  // of a mailbox that has since changed. NOT_FOUND for an unknown delivery.
+  rpc ReplayDelivery(ReplayDeliveryRequest) returns (ReplayDeliveryResponse);
+
+  // Queue one message to one named destination now — `mail forward <id> --to
+  // slack:eng-alerts`. Queued rather than sent inline so it gets the same
+  // retry, backoff, attempt cap and durable record every other delivery has.
+  // NOT_FOUND for an unknown destination or message; FAILED_PRECONDITION for
+  // a disabled destination.
+  rpc Forward(ForwardMessageRequest) returns (ForwardMessageResponse);
+}
+
+// How a destination's payload is rendered.
+enum WebhookTemplate {
+  // Treated as GENERIC.
+  WEBHOOK_TEMPLATE_UNSPECIFIED = 0;
+  // A JSON document with the facts as named fields.
+  WEBHOOK_TEMPLATE_GENERIC = 1;
+  // Slack's incoming-webhook shape: a rendered mrkdwn `text` field (with
+  // &, < and > escaped, so a hostile subject cannot render as a link that
+  // lies about where it points) plus the same structured object alongside.
+  WEBHOOK_TEMPLATE_SLACK = 2;
+}
+
+// The event vocabulary a destination subscribes to. Deliberately the same set
+// HookService uses — a webhook and a hook subscribe to the same things
+// happening, and two spellings would mean an operator has to know which
+// surface they are on.
+enum WebhookEvent {
+  WEBHOOK_EVENT_UNSPECIFIED = 0;
+  WEBHOOK_EVENT_ON_NEW_MESSAGE = 1;
+  WEBHOOK_EVENT_ON_LABEL = 2;
+  WEBHOOK_EVENT_ON_MOVE = 3;
+  WEBHOOK_EVENT_ON_RULE_MATCH = 4;
+  WEBHOOK_EVENT_ON_SYNC_ERROR = 5;
+}
+
+// Where a delivery has got to.
+enum WebhookDeliveryState {
+  WEBHOOK_DELIVERY_STATE_UNSPECIFIED = 0;
+  // Queued, or waiting out a backoff.
+  WEBHOOK_DELIVERY_STATE_PENDING = 1;
+  // The endpoint answered 2xx.
+  WEBHOOK_DELIVERY_STATE_DELIVERED = 2;
+  // Attempts spent, or a refusal there is no point repeating.
+  WEBHOOK_DELIVERY_STATE_FAILED = 3;
+}
+
+// Where a destination's HMAC signing key is resolved from. The daemon stores
+// this reference and never the key itself — the same handling accounts get
+// for passwords.
+enum WebhookSecretSource {
+  // Unsigned. Honest about what the receiver can verify rather than
+  // pretending a constant is a signature.
+  WEBHOOK_SECRET_SOURCE_UNSPECIFIED = 0;
+  WEBHOOK_SECRET_SOURCE_ENV = 1;
+  WEBHOOK_SECRET_SOURCE_COMMAND = 2;
+  WEBHOOK_SECRET_SOURCE_KEYCHAIN = 3;
+}
+
+// One registered destination, as List reports it.
+message WebhookDestination {
+  int64 id = 1;
+  string name = 2;
+  // The destination URL, reduced to scheme://host[:port] unless the request
+  // asked to reveal it.
+  //
+  // Redacted by default because a webhook URL is frequently the credential
+  // itself: anyone holding `https://hooks.slack.com/services/T…/B…/…` can post
+  // to that channel. `Register` echoes the full URL back (the caller just
+  // supplied it); `List` redacts unless `reveal_url` is set, so the routine
+  // listing — and the MCP tool projected from it, whose result lands in a
+  // model's context — does not hand that credential to whoever is looking.
+  // Same shape as `credential_ref` on AccountService: a reference by default,
+  // the secret only on request.
+  string url = 3;
+  WebhookTemplate template = 4;
+  repeated WebhookEvent events = 5;
+  // Whether this destination is entitled to message bodies. See the service
+  // docs.
+  bool include_body = 6;
+  bool enabled = 7;
+  WebhookSecretSource secret_source = 8;
+  // The env var name / command / keychain service the key is resolved from —
+  // a reference, never the key.
+  string secret_reference = 9;
+  int64 max_attempts = 10;
+}
+
+// One row of the delivery queue.
+message WebhookDelivery {
+  int64 id = 1;
+  int64 destination_id = 2;
+  string destination_name = 3;
+  // The idempotency key: `event:<seq>` for a dispatched event,
+  // `forward:<message_id>:<unix seconds>` for a manual forward.
+  string event_key = 4;
+  // The event wire string, or `forward`.
+  string event = 5;
+  // 0 when the local copy of the message has since been expunged — the
+  // record of what left this machine deliberately outlives it.
+  int64 message_id = 6;
+  WebhookDeliveryState state = 7;
+  int64 attempts = 8;
+  int64 max_attempts = 9;
+  // Unix seconds before which it will not be attempted. 0 for "now" or for a
+  // terminal row.
+  int64 next_attempt_at = 10;
+  // The last HTTP status seen. 0 when the peer never answered at all — a
+  // different operational fact from a 500, and not to be read as one.
+  int32 last_status = 11;
+  // The last failure, as a short daemon-authored string. Never a response
+  // body verbatim.
+  string last_error = 12;
+  int64 created_at = 13;
+  // Unix seconds when it was accepted, 0 while it has not been.
+  int64 delivered_at = 14;
+  // The exact JSON body that is (or was) POSTed, only when the request asked
+  // for it. Off by default because a listing is frequently pasted into a
+  // ticket, and this field is the mail content the rest of the queue view
+  // deliberately does not restate.
+  string payload = 15;
+}
+
+message RegisterWebhookRequest {
+  string name = 1;
+  string url = 2;
+  WebhookTemplate template = 3;
+  // Subscribed events. Empty registers a destination that only ever receives
+  // an explicit Forward.
+  repeated WebhookEvent events = 4;
+  // Opt this destination in to receiving message bodies. Off unless set.
+  bool include_body = 5;
+  // Register it disabled — listed and forwardable-to only once enabled.
+  bool disabled = 6;
+  WebhookSecretSource secret_source = 7;
+  // The env var name / command / keychain service holding the signing key.
+  // Required unless secret_source is unspecified.
+  string secret_reference = 8;
+  // Attempt cap for this destination's deliveries. 0 takes the default (5).
+  int64 max_attempts = 9;
+}
+
+message RegisterWebhookResponse {
+  WebhookDestination destination = 1;
+}
+
+message ListWebhooksRequest {
+  // Return each destination's full URL rather than just its authority. Off by
+  // default — see WebhookDestination.url.
+  bool reveal_url = 1;
+}
+
+message ListWebhooksResponse {
+  repeated WebhookDestination destinations = 1;
+}
+
+message RemoveWebhookRequest {
+  string name = 1;
+}
+
+message SetWebhookEnabledRequest {
+  string name = 1;
+  bool enabled = 2;
+}
+
+message SetWebhookEnabledResponse {
+  WebhookDestination destination = 1;
+}
+
+message RemoveWebhookResponse {
+  // False when no destination had that name — removal is idempotent rather
+  // than an error, so a script can converge on "gone".
+  bool removed = 1;
+}
+
+message ListDeliveriesRequest {
+  // Restrict to one destination by name. Empty lists every destination's.
+  string destination = 1;
+  // Newest first. 0 takes the default (50); clamped to 1000.
+  int64 limit = 2;
+  // Include the frozen request body on each row. See WebhookDelivery.payload.
+  bool include_payload = 3;
+}
+
+message ListDeliveriesResponse {
+  repeated WebhookDelivery deliveries = 1;
+}
+
+message ReplayDeliveryRequest {
+  int64 delivery_id = 1;
+}
+
+message ReplayDeliveryResponse {
+  WebhookDelivery delivery = 1;
+}
+
+message ForwardMessageRequest {
+  int64 message_id = 1;
+  // The destination's name. `mail forward <id> --to slack:eng-alerts` strips
+  // the `slack:` prefix before it gets here — the prefix is CLI sugar naming
+  // the kind of destination, and the destination's own template is what
+  // actually decides the rendering.
+  string destination = 2;
+}
+
+message ForwardMessageResponse {
+  // The queued delivery. It has not been sent yet — the dispatcher sends it
+  // on its next tick, with the same retry and attempt cap as any other.
+  WebhookDelivery delivery = 1;
+  // Whether a dispatcher is actually running on this daemon
+  // (`webhooks.enabled`). False means the delivery is durably queued and goes
+  // out whenever the dispatcher is switched on — *not* that it was sent.
+  // Reported rather than refused: queuing is what the caller asked for and the
+  // row is visible in ListDeliveries either way. A client that said "sent" on
+  // a daemon with no dispatcher would be the lie, which is why this field
+  // exists rather than being left for the caller to infer.
+  bool dispatcher_running = 2;
+}
