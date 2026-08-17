@@ -1147,6 +1147,31 @@ const TABLE: &[(&str, Requirement)] = &[
         "/rmail.v1.AiPolicyService/GetSpend",
         Requirement::Scope(Scope::Admin),
     ),
+    // -- AiPolicyService, backend routing (task 78) ----------------------------
+    // `admin`, for the same "mutates shared, global state" reason SetBudget
+    // carries, plus one specific to this RPC: the direction that matters is
+    // *away* from local. Moving an account on-device is the safe direction and
+    // could arguably sit lower, but the same RPC moves it back — an
+    // AI_PROVIDER_KIND_CLAUDE override is a token saying "this account's mail
+    // may now be sent to a hosted model", which is precisely the decision
+    // `ai.policy` exists to keep in an operator's hands. Splitting the two
+    // directions into separate scopes would let a token that may only "narrow"
+    // still flip an account that a *policy* rule had not already pinned, so
+    // both sit at `admin` and the narrowing case pays the same price.
+    (
+        "/rmail.v1.AiPolicyService/SetAiProvider",
+        Requirement::Scope(Scope::Admin),
+    ),
+    // `admin` rather than a read scope: this reports the daemon's configured
+    // backend, whether a network provider exists in the process at all, and
+    // the filesystem path the local weights are expected at. That is
+    // deployment shape, not mail — the same class of thing `AiService/GetUsage`
+    // keeps behind `admin` — and a token minted to summarize a message has no
+    // business enumerating it.
+    (
+        "/rmail.v1.AiPolicyService/GetAiProvider",
+        Requirement::Scope(Scope::Admin),
+    ),
     // -- AiSafetyService (task 77) --------------------------------------------
     // The two RPCs of the prompt-injection shield sit at very different
     // privileges, and the gap between them is the point of splitting them.

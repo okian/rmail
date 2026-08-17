@@ -286,6 +286,21 @@ fn per_million(usd_per_million: f64) -> f64 {
 /// answer on a promotion's end date is worse than one that is a few cents
 /// conservative during it.
 fn pricing_for(model: &str) -> Option<ModelPricing> {
+    // On-device inference has no per-token price, and saying so explicitly is
+    // not the same as having no entry. An unpriced model logs a warning on
+    // every call and reads as a *gap* in this table — something a budget
+    // dashboard should flag — where a local call costing nothing is the
+    // correct, permanent answer. It also keeps `is_priced` honest: a
+    // downgrade to a local model does not stop a dollar cap from counting,
+    // because there is nothing to count.
+    if model.starts_with(crate::ai::local::LOCAL_MODEL_PREFIX) {
+        return Some(ModelPricing {
+            input: 0.0,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        });
+    }
     let (input_per_million, output_per_million) = match model {
         "claude-haiku-4-5" => (1.00, 5.00),
         "claude-sonnet-5" => (3.00, 15.00),

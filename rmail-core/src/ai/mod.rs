@@ -51,14 +51,18 @@
 //!
 //! # Why a trait at all
 //!
-//! [`AiProvider::Local`](crate::config::AiProvider::Local) is in the config
-//! schema already — a fully on-device inference path is a stated requirement
-//! (mail that never leaves the machine still gets triage and summaries, just
-//! from a smaller model). [`provider::Provider`] is the seam that path plugs
-//! into later without every caller of a `Provider` needing to change.
-//! [`provider::build`] is where that switch already lives: it matches on the
-//! configured backend today, and a local implementation is a second arm away
-//! from wiring in, not a redesign.
+//! [`AiProvider::Local`](crate::config::AiProvider::Local) was in the config
+//! schema long before anything implemented it — a fully on-device inference
+//! path is a stated requirement (mail that never leaves the machine still gets
+//! triage and summaries, just from a smaller model). [`provider::Provider`] is
+//! the seam that path plugs into, and [`local`] (task 78) is the arm that
+//! plugs in: `provider::build` now returns a [`local::LocalProvider`] under
+//! `ai.provider = "local"`, so every existing caller of a `Provider` reaches
+//! on-device inference without one of them changing. That is also the
+//! strongest form of the local-only guarantee — a local-configured daemon
+//! constructs no HTTP client for AI at all — and [`local`]'s module docs are
+//! precise about which parts of that guarantee are structural and which are
+//! checked.
 
 pub mod audit;
 pub mod budget;
@@ -66,6 +70,7 @@ pub mod deep;
 pub mod dispatch;
 pub mod gate;
 pub mod injection;
+pub mod local;
 pub mod policy;
 pub mod provider;
 pub mod queue;
@@ -98,6 +103,10 @@ pub use provider::{
 // says what it does on its own, `untrusted_block(...)` needs the
 // `injection::` prefix to.
 
+pub use local::{
+    hosted_clients_permitted, resolve_egress, Egress, LocalEngine, LocalProvider, LocalReadiness,
+    LOCAL_MODEL_PREFIX,
+};
 pub use policy::{
     AiPolicyMode, PolicyDecision, PolicyEngine, PolicyExplanation, PolicyTarget, PolicyTier,
     RuleMatch,

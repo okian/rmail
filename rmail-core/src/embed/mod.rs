@@ -42,6 +42,42 @@ pub mod hash;
 pub mod local;
 pub mod voyage;
 
+/// The environment variable that relocates *every* on-device model this
+/// daemon loads.
+///
+/// Lives here, outside the `onnx` feature gate, because three unrelated
+/// subsystems now provision out of the same directory — the local embedder
+/// ([`local`]), the local cross-encoder reranker
+/// ([`crate::rank::l2::cross_encoder`]), and local generation
+/// ([`crate::ai::local`]) — and only the first two are gated on `onnx`. One
+/// variable for every local model is the point: an operator who populated the
+/// cache for search should not have to discover a second one for the AI path,
+/// and a `--no-default-features` build must still be able to name it.
+pub const MODEL_CACHE_ENV: &str = "RMAIL_MODEL_CACHE";
+
+/// Where on-device weights are cached, honoring [`MODEL_CACHE_ENV`] and then
+/// `XDG_CACHE_HOME`, with a `$HOME`-relative default.
+#[must_use]
+pub fn model_cache_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+
+    if let Ok(dir) = std::env::var(MODEL_CACHE_ENV) {
+        return PathBuf::from(dir);
+    }
+    if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
+        return PathBuf::from(dir).join("rmail").join("models");
+    }
+    std::env::var("HOME").map_or_else(
+        |_| PathBuf::from(".rmail-models"),
+        |home| {
+            PathBuf::from(home)
+                .join(".cache")
+                .join("rmail")
+                .join("models")
+        },
+    )
+}
+
 /// Largest batch handed to a backend in one call.
 ///
 /// Batching is the difference between one model invocation and a thousand, but

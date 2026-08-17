@@ -31,6 +31,22 @@ service AiPolicyService {
   // actually in force — stored if an operator set them, derived from
   // `ai.limits` otherwise. The RPC behind `mail ai budget status`.
   rpc GetSpend(GetSpendRequest) returns (GetSpendResponse);
+
+  // Route one account's AI calls to a specific backend, or clear the routing
+  // and inherit again. Idempotent, and takes effect on the next job rather
+  // than at the next restart — the dispatch path reads the override per call.
+  //
+  // This can only narrow. `ai.policy` is resolved first, and a `local_only`
+  // folder stays on-device with an AI_PROVIDER_KIND_CLAUDE override sitting
+  // right there; a `forbidden` one is refused outright. Setting LOCAL is
+  // therefore always honored, while setting CLAUDE is a *permission to use*
+  // the hosted backend where policy already allows it, never a grant.
+  rpc SetAiProvider(SetAiProviderRequest) returns (SetAiProviderResponse);
+
+  // What backend an account's calls actually use, why, and — for the local
+  // path — whether this host could serve one right now. The RPC behind
+  // `mail ai provider status`.
+  rpc GetAiProvider(GetAiProviderRequest) returns (GetAiProviderResponse);
 }
 
 // Which calls a budget governs.
@@ -122,4 +138,70 @@ message GetSpendResponse {
   ClassSpend all = 4;
   // Bulk calls in this scope.
   ClassSpend bulk = 5;
+}
+
+// Which inference backend serves a call.
+enum AiProviderKind {
+  // No opinion. On SetAiProvider this *clears* a stored override; in a
+  // response it means no override is stored, which is not the same as an
+  // override that happens to match the configured default.
+  AI_PROVIDER_KIND_UNSPECIFIED = 0;
+  // Anthropic Claude via the hosted Messages API. The only backend that can
+  // leave the machine.
+  AI_PROVIDER_KIND_CLAUDE = 1;
+  // Fully on-device inference (`ai.local`). Zero egress.
+  AI_PROVIDER_KIND_LOCAL = 2;
+}
+
+message SetAiProviderRequest {
+  // 0 = the daemon-wide override (every account with no override of its own);
+  // otherwise an account id from AccountService.List.
+  int64 account_id = 1;
+  // AI_PROVIDER_KIND_UNSPECIFIED clears the override for this scope.
+  AiProviderKind provider = 2;
+}
+
+message SetAiProviderResponse {
+  int64 account_id = 1;
+  // The override as stored, echoed back so a client sees what took effect.
+  AiProviderKind provider = 2;
+  // What a call for this account would use right now, after the daemon
+  // default and the stored override are combined. Policy can still force an
+  // individual message on-device — that is per folder, not per account, so it
+  // cannot be reported here; see GetAiProviderResponse.policy_mode.
+  AiProviderKind effective = 3;
+}
+
+message GetAiProviderRequest {
+  // 0 = the daemon-wide scope; otherwise an account id.
+  int64 account_id = 1;
+}
+
+message GetAiProviderResponse {
+  int64 account_id = 1;
+  // The config file's `ai.provider` — what every account uses unless
+  // overridden.
+  AiProviderKind configured = 2;
+  // This account's own stored override, if it has one. UNSPECIFIED means it
+  // has none of its own (it may still inherit the daemon-wide one).
+  AiProviderKind account_override = 3;
+  // The backend a call for this account would use.
+  AiProviderKind effective = 4;
+  // The account-wide `ai.policy` mode: "allowed", "local_only" or
+  // "forbidden". A local_only account is forced on-device whatever the
+  // override says, and a per-folder rule can force an individual message
+  // on-device even when this says "allowed".
+  string policy_mode = 5;
+  // Whether this daemon holds a network-capable provider *at all*. False
+  // under `ai.provider = "local"`, where none is ever constructed — the
+  // structural half of the local-only guarantee, reported so an operator can
+  // verify it from outside the process.
+  bool network_provider_built = 6;
+  // The local model id, e.g. "local/qwen2.5-3b-instruct-q4_k_m".
+  string local_model = 7;
+  // Whether the local path could serve a call right now.
+  bool local_ready = 8;
+  // One line an operator can act on: where the weights are, or what is
+  // missing and how to fix it. Populated whether or not local_ready is set.
+  string local_detail = 9;
 }

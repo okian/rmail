@@ -365,20 +365,37 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
 
 /// Build the configured provider.
 ///
+/// # This function is the local-only guarantee
+///
+/// The two arms are mutually exclusive, and that is not merely how a `match`
+/// works — it is the property. Under `ai.provider = "local"` the
+/// [`ClaudeProvider`] arm is *not taken*: no [`reqwest::Client`], no endpoint,
+/// no API key command is run, and the one `Arc<dyn Provider>` this daemon
+/// shares with every pass, RPC and queue worker is
+/// [`crate::ai::local::LocalProvider`], which holds no networking of any kind.
+/// Every existing caller inherits "this cannot leave the machine" without
+/// checking anything, because there is nothing in the process to reach.
+/// `local_configuration_builds_no_network_client` in `ai::local`'s tests is
+/// the probe that keeps it true.
+///
 /// # Errors
 ///
 /// [`Error::FailedPrecondition`] if the configured backend cannot be built at
-/// all — no `api_key_command`, or the local backend, which is not
-/// implemented yet — caught here, at daemon start, rather than on the first
-/// AI call hours later.
+/// all — no `api_key_command` for the hosted backend, or a local backend with
+/// no runtime configured — caught here, at daemon start, rather than on the
+/// first AI call hours later. Note the deliberate asymmetry within the local
+/// arm: *configuration* is validated here, while *provisioning* (the weights
+/// actually being on disk) is checked per call, because an operator who drops
+/// a model into place should not have to restart the daemon for it to be seen.
 pub fn build(config: &AiConfig) -> Result<Arc<dyn Provider>, Error> {
     match config.provider {
         AiProvider::Claude => Ok(Arc::new(ClaudeProvider::new(config)?)),
-        AiProvider::Local => Err(Error::failed_precondition(
-            "the local AI provider is not implemented yet; set `ai.provider = \"claude\"` \
-             or `ai.enabled = false`"
-                .to_owned(),
-        )),
+        AiProvider::Local => {
+            crate::ai::local::check_config(&config.local)?;
+            Ok(Arc::new(crate::ai::local::LocalProvider::new(
+                &config.local,
+            )))
+        }
     }
 }
 

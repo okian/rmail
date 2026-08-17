@@ -1309,6 +1309,32 @@ where
     };
     let tag_service = TagServiceServer::new(tag_api);
 
+    // The on-device backend, when one is configured *alongside* a hosted
+    // default. Under `ai.provider = "local"` this is `None` and correctly so:
+    // `ai_provider` above already is the local backend, and a second handle
+    // would be a second copy of the same thing.
+    let ai_local: Option<Arc<dyn AiProvider>> = if config.ai.local.runtime_command.is_empty()
+        || !ai::local::hosted_clients_permitted(&config.ai)
+    {
+        None
+    } else {
+        match ai::local::check_config(&config.ai.local) {
+            Ok(()) => Some(Arc::new(ai::local::LocalProvider::new(&config.ai.local))),
+            Err(error) => {
+                // Not fatal: a hosted daemon with a broken `ai.local`
+                // section is fully functional for everything except
+                // local-only mail, which keeps the pre-task-78 behavior of
+                // being refused rather than silently sent to the network.
+                tracing::warn!(
+                    %error,
+                    "ai.local is configured but unusable; local_only mail will be refused \
+                     rather than served on-device"
+                );
+                None
+            }
+        }
+    };
+
     let ai_worker_pool = AiWorkerPool::new(
         db.clone(),
         ai_queue.clone(),
@@ -1322,7 +1348,10 @@ where
     )
     // The pair built above, shared rather than a second one of this pool's
     // own — see its own comment and `AiWorkerPool::with_capacity`'s docs.
-    .with_capacity(Arc::clone(&ai_semaphore), Arc::clone(&ai_rate_limiter));
+    .with_capacity(Arc::clone(&ai_semaphore), Arc::clone(&ai_rate_limiter))
+    // What makes `local_only` mail get on-device triage and summaries rather
+    // than be dropped — see `AiWorkerPool::with_local_path`.
+    .with_local_path(ai_local, config.ai.provider);
     // The rules engine draws from the same two, for the identical reason —
     // see `rmail_core::rules::gate`. Cloned from the pair built above rather
     // than read back off the pool: task 51 moved their construction ahead of
@@ -1432,6 +1461,19 @@ where
     let ai_policy_service = AiPolicyServiceServer::new(ai_policy_service::AiPolicyApi::new(
         db.clone(),
         config.ai.limits.clone(),
+        config.ai.clone(),
+        Arc::clone(&ai_policy),
+        // Whether this process holds a network-capable AI provider at all.
+        // Three independent ways for the answer to be no: `ai.provider =
+        // "local"` builds neither a hosted provider (`provider::build`) nor a
+        // batch client (gated on the same predicate below); and an inactive AI
+        // subsystem holds the `NullProvider`, which dials nothing either. A
+        // caller-injected provider counts as network-capable because this
+        // process cannot know what it was handed, which is the conservative
+        // direction for a field an operator reads as "could anything here dial
+        // out for AI?".
+        ai_active
+            && (injected.ai_provider.is_some() || ai::local::hosted_clients_permitted(&config.ai)),
     ));
 
     // The prompt-injection shield's read-and-confirm surface. Also
@@ -1455,7 +1497,20 @@ where
             .with_pause_flag(ai_pause)
             .with_notify_pass(config.notify.enabled)
             .with_suggest_tags_pass(config.tags.ai.enabled && config.tags.ai.suggest_on_new_mail);
-        if config.ai.batching.enabled {
+        // Gated on the *configured backend*, not merely on `ai.enabled`. The
+        // Batches API is a second, independent egress — its own HTTP client,
+        // its own key resolution, never an `Arc<dyn Provider>` — so
+        // `provider::build` returning a local backend does not constrain it in
+        // the slightest. Without this check a daemon on `ai.provider =
+        // "local"` went on submitting message content to Anthropic the moment
+        // the queue passed the batch threshold, while `GetAiProvider` reported
+        // that nothing here could dial out.
+        if config.ai.batching.enabled && !ai::local::hosted_clients_permitted(&config.ai) {
+            tracing::info!(
+                "ai.batching is enabled but ai.provider is not a hosted backend; the batch \
+                 coordinator is not built (the Batches API has no on-device equivalent)"
+            );
+        } else if config.ai.batching.enabled {
             match BatchClient::new() {
                 Ok(client) => match BatchCoordinator::new(
                     db.clone(),

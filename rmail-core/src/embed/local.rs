@@ -41,7 +41,13 @@ use crate::error::Error;
 /// and names it in the same "how to fix this" error message. One env var for
 /// every local model is the point — an operator who populated the cache for
 /// the embedder should not have to discover a second one for the reranker.
-pub(crate) const CACHE_ENV: &str = "RMAIL_MODEL_CACHE";
+///
+/// The definition itself moved up to [`crate::embed::MODEL_CACHE_ENV`] when
+/// local *generation* ([`crate::ai::local`]) became a third consumer: that
+/// path is not gated on the `onnx` feature, and a second literal spelling of
+/// the same variable is exactly how two subsystems end up reading different
+/// directories.
+pub(crate) const CACHE_ENV: &str = crate::embed::MODEL_CACHE_ENV;
 
 /// The local ONNX embedder.
 ///
@@ -270,23 +276,10 @@ pub(crate) fn cached(cache: &Path, model: &str) -> bool {
     })
 }
 
-/// Where weights are cached.
+/// Where weights are cached — [`crate::embed::model_cache_dir`], which every
+/// on-device model in the daemon resolves through.
 pub(crate) fn cache_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var(CACHE_ENV) {
-        return PathBuf::from(dir);
-    }
-    if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("rmail").join("models");
-    }
-    std::env::var("HOME").map_or_else(
-        |_| PathBuf::from(".rmail-models"),
-        |home| {
-            PathBuf::from(home)
-                .join(".cache")
-                .join("rmail")
-                .join("models")
-        },
-    )
+    crate::embed::model_cache_dir()
 }
 
 /// Map a configured model id onto one this build can actually load.

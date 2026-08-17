@@ -772,12 +772,12 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core ai::injection` · `cargo nextest run -p rmaild --test ai_safety_service` (pattern/zero-width detection, action-gating on flagged mail)
 
 ## 78. Local-only model path
-- [ ] status
+- [x] status
 - **depends-on:** 20, 43
 - **parallel-safe:** yes
 - **acceptance:**
   - Fully on-device inference route (candle/llama.cpp generation + local embeddings) exposing the same summarize/embed/draft verbs; forced by policy for local-only mail; outputs labeled locally-generated with zero egress; `mail ai provider set <account> local`.
-- **verify:** `cargo nextest run -p rmail-core ai::local` (no outbound network under local provider, same verb surface)
+- **verify:** `cargo nextest run -p rmail-core ai::local` (no outbound network under local provider, same verb surface; includes the workspace-wide source gate that fails by name on a new network client) · `cargo nextest run -p rmail-core ai::queue::tests::local_only_mail_is_served_on_device_rather_than_dropped ai::queue::tests::an_account_override_routes_otherwise_allowed_mail_on_device` (policy and the per-account override actually route the dispatch path)
 
 ## 79. OAuth2 broker (Gmail/Outlook)
 - [x] status

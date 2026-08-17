@@ -102,10 +102,38 @@ pub enum Rerank {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiProvider {
-    /// Anthropic Claude via the Messages API.
+    /// Anthropic Claude via the Messages API. The only backend that can leave
+    /// this machine.
     Claude,
-    /// Fully-local on-device inference.
+    /// Fully-local on-device inference ([`crate::ai::local`]).
     Local,
+}
+
+impl AiProvider {
+    /// The spelling used in configuration, on the wire, and in
+    /// `ai_provider_overrides.provider`. One function rather than three
+    /// `match`es: a backend stored under one spelling and read back under
+    /// another is a routing decision that silently changes on a round trip.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Local => "local",
+        }
+    }
+
+    /// [`Self::as_str`] in reverse. `None` for anything else — a caller
+    /// reading an unrecognized backend out of storage or off the wire must
+    /// decide what to do about it rather than being handed a guess (see
+    /// `V52__ai_provider_override.sql` on why every guess is wrong).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claude" => Some(Self::Claude),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
 }
 
 /// Embedding backend.
@@ -1306,6 +1334,8 @@ pub struct AiConfig {
     pub injection: AiInjection,
     /// Data-residency / per-account/folder/pattern AI eligibility rules.
     pub policy: AiPolicyConfig,
+    /// The fully on-device inference path.
+    pub local: AiLocal,
 }
 
 impl Default for AiConfig {
@@ -1324,6 +1354,85 @@ impl Default for AiConfig {
             privacy: AiPrivacy::default(),
             injection: AiInjection::default(),
             policy: AiPolicyConfig::default(),
+            local: AiLocal::default(),
+        }
+    }
+}
+
+/// The fully on-device generation path ([`crate::ai::local`], task 78).
+///
+/// Embeddings already had a local backend before this section existed
+/// (`index.semantic.backend = "local"`, [`crate::embed::local`]); this is its
+/// counterpart for *generation*, and the two deliberately share one model
+/// cache directory (`RMAIL_MODEL_CACHE`) so an operator provisioning an
+/// air-gapped host has one place to put weights rather than two.
+///
+/// # Why the runtime is a command rather than a linked library
+///
+/// Generation needs a GGUF/ONNX execution engine. Linking one (llama.cpp's
+/// C++, or candle) into this binary would put a multi-minute, multi-gigabyte
+/// build — and a second unrelated crash surface — into every build of the
+/// daemon, including the ones on hosts that will never run a local model.
+/// Spawning the runtime the operator already has (`llama-cli`, `llama-server`
+/// in one-shot mode, `mlx_lm.generate`, a wrapper script) keeps this process
+/// free of both, and is the same shape as `ai.api_key_command` and the hook
+/// runner: rmail owns the policy, the operator owns the executable.
+/// [`crate::ai::local::LocalEngine`] is the seam a linked engine would
+/// implement instead, without any caller changing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AiLocal {
+    /// The model's identifier, recorded verbatim on every output it produces
+    /// (`ai_ledger.model`, `ai_summaries.model`) prefixed with
+    /// [`crate::ai::local::LOCAL_MODEL_PREFIX`], which is what makes a locally
+    /// generated row distinguishable from a hosted one after the fact.
+    pub model: String,
+    /// The weights, absolute or relative to the model cache directory
+    /// (`RMAIL_MODEL_CACHE`, shared with the local embedder).
+    ///
+    /// Checked for existence — and against [`Self::min_model_bytes`] — before
+    /// the runtime is spawned, so an unprovisioned or half-downloaded host
+    /// reports a precondition naming the fix rather than whatever the runtime
+    /// prints when it cannot mmap a file.
+    pub model_file: String,
+    /// The on-device runtime's argv. The prompt is written to its stdin and
+    /// the completion is read from its stdout.
+    ///
+    /// `%model%` in any argument is replaced with the resolved
+    /// [`Self::model_file`] path, and `%max_tokens%` with the request's output
+    /// cap, so the same command serves every call without the caller building
+    /// argv.
+    ///
+    /// Empty (the default) means the local path is not configured: selecting
+    /// it fails with a precondition naming this field.
+    pub runtime_command: Vec<String>,
+    /// Wall-clock ceiling for one generation, in seconds. A local model on a
+    /// small machine is slow, not broken, so this is generous — but it is not
+    /// unbounded, because a wedged runtime would otherwise hold an AI worker
+    /// permit forever.
+    pub timeout_secs: u64,
+    /// The most stdout/stderr to read back from the runtime, in bytes.
+    pub max_output_bytes: usize,
+    /// The most prompt to hand the runtime, in bytes. Beyond this the prompt
+    /// is refused rather than silently truncated — a truncated prompt loses
+    /// the *end* of the transcript, which is where the actual instruction is.
+    pub max_prompt_bytes: usize,
+    /// The smallest a weights file can plausibly be. Anything smaller is
+    /// treated as an interrupted download, the same distinction
+    /// [`crate::embed::local`] draws for the embedding cache.
+    pub min_model_bytes: u64,
+}
+
+impl Default for AiLocal {
+    fn default() -> Self {
+        Self {
+            model: "qwen2.5-3b-instruct-q4_k_m".to_owned(),
+            model_file: "qwen2.5-3b-instruct-q4_k_m.gguf".to_owned(),
+            runtime_command: Vec::new(),
+            timeout_secs: 300,
+            max_output_bytes: 1024 * 1024,
+            max_prompt_bytes: 256 * 1024,
+            min_model_bytes: 1024 * 1024,
         }
     }
 }

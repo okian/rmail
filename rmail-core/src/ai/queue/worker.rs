@@ -138,6 +138,12 @@ pub struct AiWorkerPool {
     db: Database,
     queue: AiQueue,
     provider: Arc<dyn Provider>,
+    /// The on-device backend, when this daemon has one *in addition to*
+    /// `provider` — see [`AiWorkerPool::with_local_path`].
+    local: Option<Arc<dyn Provider>>,
+    /// The config file's `ai.provider`, against which a per-account override
+    /// is resolved.
+    default_provider: crate::config::AiProvider,
     policy: Arc<PolicyEngine>,
     limits: AiLimits,
     privacy: AiPrivacy,
@@ -182,6 +188,11 @@ impl AiWorkerPool {
             db,
             queue,
             provider,
+            // A pool with no local path refuses local-only work exactly as it
+            // did before that path existed; `with_local_path` is what changes
+            // the answer from "refused" to "served on-device".
+            local: None,
+            default_provider: crate::config::AiProvider::Claude,
             policy,
             limits,
             privacy,
@@ -230,6 +241,32 @@ impl AiWorkerPool {
     ) -> Self {
         self.semaphore = semaphore;
         self.rate_limiter = rate_limiter;
+        self
+    }
+
+    /// Give this pool an on-device backend to route local-only work to, and
+    /// tell it which backend the daemon defaults to.
+    ///
+    /// Without this, a job whose policy resolves `local_only` is *terminated*
+    /// — which is safe but is not what the requirement asks for: mail that
+    /// never leaves the machine is supposed to still get triage and summaries,
+    /// from a smaller model. With it, that job is served by `local` instead,
+    /// and only work that policy *and* the account's stored override both
+    /// permit reaches `provider`.
+    ///
+    /// `default_provider` is the config file's `ai.provider`. It matters even
+    /// when `local` is `None`: under `ai.provider = "local"` the pool's main
+    /// `provider` already *is* the local backend (see
+    /// [`crate::ai::provider::build`]), so local-routed work is served by it
+    /// rather than refused for want of a second handle.
+    #[must_use]
+    pub fn with_local_path(
+        mut self,
+        local: Option<Arc<dyn Provider>>,
+        default_provider: crate::config::AiProvider,
+    ) -> Self {
+        self.local = local;
+        self.default_provider = default_provider;
         self
     }
 
@@ -362,17 +399,49 @@ impl AiWorkerPool {
         let decision = self
             .policy
             .resolve(&PolicyTarget::account(account_name).mailbox(mailbox_name));
-        if !decision.is_visible() || !decision.permits_network() {
-            return self
-                .terminate_outcome(
-                    &lease,
-                    format!(
-                        "ai policy resolved {:?} for this account/folder; no network call is permitted",
-                        decision.mode
-                    ),
-                )
-                .await;
-        }
+        // Which backend this job may use — policy first, then the account's
+        // stored override, in that order and never the reverse (see
+        // `ai::local::resolve_egress`). A storage failure reading the override
+        // is retried rather than terminated: it says nothing about whether
+        // this job is eligible, only that the database was momentarily
+        // unavailable.
+        let account_override =
+            match crate::ai::local::resolve_override(&self.db, lease.account_id).await {
+                Ok(account_override) => account_override,
+                Err(e) => return self.fail_outcome(&lease, e.to_string()).await,
+            };
+        let provider = match crate::ai::local::resolve_egress(
+            self.default_provider,
+            account_override,
+            &decision,
+        ) {
+            // Forbidden — not eligible for AI at all, on-device or otherwise.
+            Err(e) => return self.terminate_outcome(&lease, e.to_string()).await,
+            Ok(crate::ai::local::Egress::Network) => Arc::clone(&self.provider),
+            Ok(crate::ai::local::Egress::Local) => match self.local.as_ref() {
+                Some(local) => Arc::clone(local),
+                // Under `ai.provider = "local"` the pool's own provider is
+                // already the on-device one, so there is nothing to switch to.
+                None if matches!(self.default_provider, crate::config::AiProvider::Local) => {
+                    Arc::clone(&self.provider)
+                }
+                // No local backend on this daemon: the pre-task-78 behavior,
+                // with the pre-task-78 wording, because it is the same
+                // outcome for the same reason.
+                None => {
+                    return self
+                        .terminate_outcome(
+                            &lease,
+                            format!(
+                                "ai policy resolved {:?} for this account/folder; no network \
+                                 call is permitted",
+                                decision.mode
+                            ),
+                        )
+                        .await
+                }
+            },
+        };
 
         // 2. Assemble. A message deleted between lease and here
         // (`Error::NotFound`) is exactly the never-succeeds-on-retry case
@@ -498,7 +567,9 @@ impl AiWorkerPool {
         // 6. Provider, then audit — with the redacted payload, at the live
         // (unmultiplied) price, charged to the class the budget check used.
         let start = Instant::now();
-        let result = self.provider.complete(&redacted_request, cancel).await;
+        // `provider`, not `self.provider`: the backend policy and the
+        // account's override selected back at step 1.
+        let result = provider.complete(&redacted_request, cancel).await;
         let latency = start.elapsed();
         finish_call(
             &self.db,

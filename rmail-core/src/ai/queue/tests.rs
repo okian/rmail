@@ -1094,6 +1094,107 @@ async fn redacted_skip_terminates_without_calling_provider() {
     assert_eq!(stats.error, 1);
 }
 
+/// `local_only` mail is *served on-device*, not dropped.
+///
+/// This is the acceptance criterion task 78 exists for, and it is the one the
+/// pre-existing `!permits_network()` check could not meet: refusing and
+/// downgrading are not the same outcome, and the requirement is explicitly
+/// that mail which never leaves the machine still gets triage and summaries.
+/// Proved by counting calls into two distinct providers rather than by
+/// inspecting a decision — the hosted mock must be untouched.
+#[tokio::test]
+async fn local_only_mail_is_served_on_device_rather_than_dropped() {
+    let fx = Fixture::open().await;
+    let id = fx.message("an ordinary message about an invoice").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(id, fx.account_id, "triage")])
+        .await
+        .unwrap();
+
+    let (network, network_handle) = MockProvider::new(vec![MockReply::Ok("hosted".to_owned())]);
+    let (local, local_handle) = MockProvider::new(vec![MockReply::Ok("on-device".to_owned())]);
+    let policy = PolicyEngine::new(Vec::new(), AiPolicyMode::LocalOnly, "on-device").unwrap();
+    let pool = AiWorkerPool::new(
+        fx.db.clone(),
+        fx.queue.clone(),
+        Arc::new(network) as Arc<dyn Provider>,
+        Arc::new(policy),
+        high_rpm_limits(),
+        AiPrivacy::default(),
+        vec![triage_handler()],
+        "test-worker",
+        fx.events.clone(),
+    )
+    .with_local_path(
+        Some(Arc::new(local) as Arc<dyn Provider>),
+        crate::config::AiProvider::Claude,
+    );
+
+    pool.dispatch_pending(10, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        network_handle.call_count(),
+        0,
+        "local_only mail must never reach the hosted backend"
+    );
+    assert_eq!(
+        local_handle.call_count(),
+        1,
+        "local_only mail must be served on-device, not silently dropped"
+    );
+}
+
+/// A stored per-account override actually changes where a job is dispatched.
+///
+/// Without this the whole operator surface — `AiPolicyService.SetAiProvider`,
+/// `mail ai provider set`, the `ai_provider_overrides` table — would be a
+/// setting nothing reads, which is worse than not shipping it.
+#[tokio::test]
+async fn an_account_override_routes_otherwise_allowed_mail_on_device() {
+    let fx = Fixture::open().await;
+    let id = fx.message("an ordinary message about an invoice").await;
+    fx.queue
+        .enqueue(vec![NewAiJob::new(id, fx.account_id, "triage")])
+        .await
+        .unwrap();
+    crate::ai::local::set_override(
+        &fx.db,
+        fx.account_id,
+        Some(crate::config::AiProvider::Local),
+    )
+    .await
+    .unwrap();
+
+    let (network, network_handle) = MockProvider::new(vec![MockReply::Ok("hosted".to_owned())]);
+    let (local, local_handle) = MockProvider::new(vec![MockReply::Ok("on-device".to_owned())]);
+    // Policy says `allowed` — the folder is not local-only. Only the override
+    // moves this job on-device.
+    let pool = AiWorkerPool::new(
+        fx.db.clone(),
+        fx.queue.clone(),
+        Arc::new(network) as Arc<dyn Provider>,
+        Arc::new(open_policy()),
+        high_rpm_limits(),
+        AiPrivacy::default(),
+        vec![triage_handler()],
+        "test-worker",
+        fx.events.clone(),
+    )
+    .with_local_path(
+        Some(Arc::new(local) as Arc<dyn Provider>),
+        crate::config::AiProvider::Claude,
+    );
+
+    pool.dispatch_pending(10, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(local_handle.call_count(), 1, "the override must be honored");
+    assert_eq!(network_handle.call_count(), 0);
+}
+
 #[tokio::test]
 async fn policy_forbidden_terminates_without_calling_provider() {
     let fx = Fixture::open().await;

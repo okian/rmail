@@ -39,17 +39,22 @@
 // reason.
 #![allow(clippy::result_large_err)]
 
+use std::sync::Arc;
+
 use rmail_core::ai::budget::{
     self, Budget, BudgetCaps as CoreBudgetCaps, BudgetClass as CoreBudgetClass, ClassReport,
     WindowCaps, GLOBAL_ACCOUNT_ID,
 };
-use rmail_core::config::AiLimits;
+use rmail_core::ai::local::{self, LocalProvider};
+use rmail_core::ai::{PolicyEngine, PolicyTarget};
+use rmail_core::config::{AiConfig, AiLimits, AiProvider as CoreAiProvider};
 use rmail_core::storage::Database;
 use rmail_core::Error;
 use rmail_proto::v1::ai_policy_service_server::AiPolicyService;
 use rmail_proto::v1::{
-    BudgetCaps, BudgetClass, BudgetSpend, BudgetWindowCaps, ClassSpend, GetSpendRequest,
-    GetSpendResponse, SetBudgetRequest, SetBudgetResponse,
+    AiProviderKind, BudgetCaps, BudgetClass, BudgetSpend, BudgetWindowCaps, ClassSpend,
+    GetAiProviderRequest, GetAiProviderResponse, GetSpendRequest, GetSpendResponse,
+    SetAiProviderRequest, SetAiProviderResponse, SetBudgetRequest, SetBudgetResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -61,14 +66,55 @@ pub struct AiPolicyApi {
     /// same `AiLimits` the enforcer resolves against, so `GetSpend` reports
     /// the caps that will actually be applied rather than a second opinion.
     limits: AiLimits,
+    /// The AI section as configured, for the backend-routing RPCs: the
+    /// daemon-wide default an account with no override inherits, and the
+    /// `ai.local` settings a readiness check reads.
+    ai: AiConfig,
+    /// The same engine the dispatch path resolves against, so
+    /// `GetAiProvider`'s `policy_mode` is the policy actually in force rather
+    /// than a second reading of the config file.
+    policy: Arc<PolicyEngine>,
+    /// Whether this process holds a network-capable provider at all — see
+    /// `rmail_core::ai::local`'s module docs. Passed in rather than derived,
+    /// because only the wiring that built (or declined to build) the provider
+    /// knows the answer, including the injected-provider case.
+    network_provider_built: bool,
 }
 
 impl AiPolicyApi {
+    /// The account's name, or `None` for the daemon-wide scope.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] if `account_id` names no account — a scope that
+    /// does not exist is never a scope a routing row may be written for.
+    async fn require_account(&self, account_id: i64) -> Result<Option<String>, Status> {
+        if account_id == GLOBAL_ACCOUNT_ID {
+            return Ok(None);
+        }
+        let name = rmail_core::rules::repo::account_name(&self.db, account_id)
+            .await
+            .map_err(Status::from)?
+            .ok_or_else(|| Status::from(Error::not_found(format!("account {account_id}"))))?;
+        Ok(Some(name))
+    }
+
     /// Build a handler over `db`, reporting `limits` as the configured
-    /// fallback.
+    /// fallback and `ai`/`policy` as the routing context.
     #[must_use]
-    pub fn new(db: Database, limits: AiLimits) -> Self {
-        Self { db, limits }
+    pub fn new(
+        db: Database,
+        limits: AiLimits,
+        ai: AiConfig,
+        policy: Arc<PolicyEngine>,
+        network_provider_built: bool,
+    ) -> Self {
+        Self {
+            db,
+            limits,
+            ai,
+            policy,
+            network_provider_built,
+        }
     }
 }
 
@@ -128,6 +174,132 @@ impl AiPolicyService for AiPolicyApi {
             all: Some(encode_class_spend(CoreBudgetClass::All, &report.all)),
             bulk: Some(encode_class_spend(CoreBudgetClass::Bulk, &report.bulk)),
         }))
+    }
+
+    #[tracing::instrument(skip(self, request))]
+    async fn set_ai_provider(
+        &self,
+        request: Request<SetAiProviderRequest>,
+    ) -> Result<Response<SetAiProviderResponse>, Status> {
+        let request = request.into_inner();
+        check_scope(request.account_id)?;
+        // Checked here as well as in `GetAiProvider`, and for a sharper
+        // reason: `accounts.id` is a rowid alias SQLite reuses, so a row
+        // written for an account that does not exist is a routing decision
+        // waiting to attach itself to whatever account is created next — and
+        // V52's delete trigger cannot clean up a row whose account never
+        // existed to be deleted. In the `claude` direction that is a silent
+        // widening of egress for an account nobody set it for.
+        self.require_account(request.account_id).await?;
+        let provider = decode_provider(request.provider)?;
+
+        // Configuration, not provisioning. Routing an account to a backend
+        // this daemon could not build under any circumstances is a mistake
+        // worth catching at the moment it is made — the alternative is every
+        // subsequent message failing with the same precondition. Missing
+        // *weights* are deliberately not checked: an operator may legitimately
+        // set the routing first and provision after, which is why
+        // `GetAiProvider` reports readiness separately.
+        if provider == Some(CoreAiProvider::Local) {
+            local::check_config(&self.ai.local).map_err(Status::from)?;
+        }
+
+        local::set_override(&self.db, request.account_id, provider)
+            .await
+            .map_err(Status::from)?;
+        let effective = local::effective_provider(&self.db, request.account_id, self.ai.provider)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(SetAiProviderResponse {
+            // Echoed from what was decoded and stored, not from the request's
+            // raw enum value, so a client sees exactly what took effect.
+            provider: encode_provider(provider).into(),
+            account_id: request.account_id,
+            effective: encode_provider(Some(effective)).into(),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request))]
+    async fn get_ai_provider(
+        &self,
+        request: Request<GetAiProviderRequest>,
+    ) -> Result<Response<GetAiProviderResponse>, Status> {
+        let account_id = request.into_inner().account_id;
+        check_scope(account_id)?;
+
+        let account_override = local::stored_override(&self.db, account_id)
+            .await
+            .map_err(Status::from)?;
+        let effective = local::effective_provider(&self.db, account_id, self.ai.provider)
+            .await
+            .map_err(Status::from)?;
+
+        // The daemon-wide scope names no account, so it is resolved against
+        // the empty target: no rule can match it, which reports exactly the
+        // `ai.policy.default_mode` an account with no rules of its own would
+        // get. That is the honest answer for a scope that is not an account.
+        let name = self.require_account(account_id).await?.unwrap_or_default();
+        let policy_mode = self
+            .policy
+            .resolve(&PolicyTarget::account(name))
+            .mode
+            .as_str()
+            .to_owned();
+
+        // Cheap: constructing the local provider does no I/O, and the
+        // readiness check is a `stat` on a blocking thread.
+        let readiness = LocalProvider::new(&self.ai.local).readiness().await;
+
+        Ok(Response::new(GetAiProviderResponse {
+            account_id,
+            configured: encode_provider(Some(self.ai.provider)).into(),
+            account_override: encode_provider(account_override).into(),
+            effective: encode_provider(Some(effective)).into(),
+            policy_mode,
+            network_provider_built: self.network_provider_built,
+            local_model: format!("{}{}", local::LOCAL_MODEL_PREFIX, readiness.model),
+            local_ready: readiness.ready,
+            local_detail: readiness.detail,
+        }))
+    }
+}
+
+/// Both routing RPCs take the same scope, with the same sentinel.
+fn check_scope(account_id: i64) -> Result<(), Status> {
+    if account_id < 0 {
+        return Err(Status::from(Error::invalid_argument(format!(
+            "account_id must be {GLOBAL_ACCOUNT_ID} (daemon-wide) or a real account id, got \
+             {account_id}"
+        ))));
+    }
+    Ok(())
+}
+
+/// Map the wire enum onto the domain one, `None` for "clear the override".
+///
+/// `UNSPECIFIED` means *clear* here, where `BudgetClass::Unspecified` is
+/// rejected — the two are not inconsistent. A budget's class picks which of
+/// two rows to overwrite, so guessing loses data; an override is a single
+/// nullable setting, and "unset" is a value a client legitimately needs to
+/// send. There is no other way to express it: the field is a plain enum, and
+/// a second "clear" RPC for one field would be a worse surface.
+fn decode_provider(value: i32) -> Result<Option<CoreAiProvider>, Status> {
+    match AiProviderKind::try_from(value) {
+        Ok(AiProviderKind::Unspecified) => Ok(None),
+        Ok(AiProviderKind::Claude) => Ok(Some(CoreAiProvider::Claude)),
+        Ok(AiProviderKind::Local) => Ok(Some(CoreAiProvider::Local)),
+        Err(_) => Err(Status::from(Error::invalid_argument(format!(
+            "unknown AiProviderKind {value}; expected UNSPECIFIED (clear), CLAUDE or LOCAL"
+        )))),
+    }
+}
+
+fn encode_provider(provider: Option<CoreAiProvider>) -> AiProviderKind {
+    match provider {
+        None => AiProviderKind::Unspecified,
+        Some(CoreAiProvider::Claude) => AiProviderKind::Claude,
+        Some(CoreAiProvider::Local) => AiProviderKind::Local,
     }
 }
 

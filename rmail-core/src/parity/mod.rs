@@ -1347,6 +1347,23 @@ commands! {
         actions: [],
         summary: "Report spend so far today and this month against the caps in force.",
     }
+    // -- AiPolicyService, backend routing (task 78) ----------------------------
+    AiPolicySetAiProvider {
+        rpc: "/rmail.v1.AiPolicyService/SetAiProvider",
+        tool: "set_ai_provider",
+        effect: Mutate,
+        cli: ["ai provider set"],
+        actions: [],
+        summary: "Route one account's AI calls to the on-device backend or the hosted one.",
+    }
+    AiPolicyGetAiProvider {
+        rpc: "/rmail.v1.AiPolicyService/GetAiProvider",
+        tool: "get_ai_provider",
+        effect: Read,
+        cli: ["ai provider status"],
+        actions: [],
+        summary: "Report which AI backend an account uses and whether the local model is ready.",
+    }
 
     // -- AiSafetyService (task 77) ---------------------------------------------
     AiSafetyScanInjection {

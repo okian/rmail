@@ -42,13 +42,13 @@ use rmail_proto::v1::ai_safety_service_client::AiSafetyServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
-    analyze_event, ask_chunk, AnalyzeMessageRequest, AskRequest, BeginOAuthRequest, BudgetCaps,
-    BudgetClass, BudgetWindowCaps, Citation, ClassSpend, CompleteOAuthRequest,
-    ConfirmInjectionRequest, EventKind, GetSpendRequest, GetSummaryRequest, GetUsageRequest,
-    InjectionSeverity, ListTokensRequest, MintTokenRequest, RefreshTokenRequest,
+    analyze_event, ask_chunk, AiProviderKind, AnalyzeMessageRequest, AskRequest, BeginOAuthRequest,
+    BudgetCaps, BudgetClass, BudgetWindowCaps, Citation, ClassSpend, CompleteOAuthRequest,
+    ConfirmInjectionRequest, EventKind, GetAiProviderRequest, GetSpendRequest, GetSummaryRequest,
+    GetUsageRequest, InjectionSeverity, ListTokensRequest, MintTokenRequest, RefreshTokenRequest,
     RetryFailedRequest, RevokeTokenRequest, ScanInjectionRequest, ScanInjectionResponse,
-    SetBudgetRequest, SetPausedRequest, SuggestReplyRequest, Summary, SyncFolderRequest, SyncMode,
-    WatchEventsRequest,
+    SetAiProviderRequest, SetBudgetRequest, SetPausedRequest, SuggestReplyRequest, Summary,
+    SyncFolderRequest, SyncMode, WatchEventsRequest,
 };
 use search_cli::{SearchArgs, SimilarArgs};
 use tag_cli::{TagArgs, TagsArgs, UntagArgs};
@@ -408,6 +408,12 @@ enum AiAction {
         #[command(subcommand)]
         action: BudgetAction,
     },
+    /// Which inference backend an account's AI calls use
+    /// (`AiPolicyService.SetAiProvider`/`GetAiProvider`).
+    Provider {
+        #[command(subcommand)]
+        action: ProviderAction,
+    },
     /// Scan one message for prompt-injection signals, exactly as the AI
     /// pipeline sees it (`AiSafetyService.ScanInjection`). Makes no model
     /// call and costs nothing.
@@ -431,6 +437,42 @@ enum AiAction {
         #[arg(long, conflicts_with = "confirm")]
         revoke: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderAction {
+    /// Route one account's AI calls to a backend
+    /// (`AiPolicyService.SetAiProvider`).
+    ///
+    /// `local` is always honored. `claude` only permits the hosted backend
+    /// where `ai.policy` already allows it — a `local_only` folder stays
+    /// on-device regardless, and a `forbidden` one is not processed at all.
+    /// `inherit` clears the override so the account follows the daemon-wide
+    /// setting again.
+    Set {
+        /// Account id from `mail account list`, or 0 for every account with
+        /// no override of its own.
+        account: i64,
+        /// `local`, `claude`, or `inherit` to clear the override.
+        backend: BackendArg,
+    },
+    /// Which backend an account uses, and whether the local model is ready
+    /// (`AiPolicyService.GetAiProvider`).
+    Status {
+        /// Account id, or 0 for the daemon-wide scope.
+        #[arg(default_value_t = 0)]
+        account: i64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum BackendArg {
+    /// Fully on-device inference. Nothing leaves the machine.
+    Local,
+    /// The hosted Claude Messages API.
+    Claude,
+    /// Clear the override and follow the daemon-wide `ai.provider`.
+    Inherit,
 }
 
 #[derive(Debug, Subcommand)]
@@ -710,6 +752,7 @@ async fn main() -> Result<()> {
             AiAction::Resume => ai_set_paused(&socket, false).await,
             AiAction::Cost { month } => ai_cost(&socket, month).await,
             AiAction::Budget { action } => ai_budget(&socket, action).await,
+            AiAction::Provider { action } => ai_provider(&socket, action).await,
             AiAction::ScanInjection {
                 message_id,
                 confirm,
@@ -1829,6 +1872,100 @@ fn scope_label(account_id: i64) -> String {
         "global budget".to_owned()
     } else {
         format!("account {account_id}")
+    }
+}
+
+/// `mail ai provider set|status` — the operator surface for the local-only
+/// model path (task 78).
+async fn ai_provider(socket: &Path, action: ProviderAction) -> Result<()> {
+    match action {
+        ProviderAction::Set { account, backend } => {
+            let response = ai_policy_client(socket)
+                .await?
+                .set_ai_provider(SetAiProviderRequest {
+                    account_id: account,
+                    provider: AiProviderKind::from(backend).into(),
+                })
+                .await
+                .context("SetAiProvider RPC failed")?
+                .into_inner();
+            println!(
+                "{}: override {} → calls now use {}",
+                provider_scope_label(response.account_id),
+                backend_label(response.provider()),
+                backend_label(response.effective()),
+            );
+        }
+        ProviderAction::Status { account } => {
+            let response = ai_policy_client(socket)
+                .await?
+                .get_ai_provider(GetAiProviderRequest {
+                    account_id: account,
+                })
+                .await
+                .context("GetAiProvider RPC failed")?
+                .into_inner();
+            println!("{}", provider_scope_label(response.account_id));
+            println!(
+                "  configured (ai.provider): {}",
+                backend_label(response.configured())
+            );
+            println!(
+                "  override:                 {}",
+                backend_label(response.account_override())
+            );
+            println!(
+                "  effective:                {}",
+                backend_label(response.effective())
+            );
+            println!("  ai.policy mode:           {}", response.policy_mode);
+            // The structural half of the guarantee, reported so an operator
+            // can confirm it from outside the daemon rather than taking the
+            // config file's word for it.
+            println!(
+                "  network provider built:   {}",
+                if response.network_provider_built {
+                    "yes"
+                } else {
+                    "no (nothing in this daemon can dial out for AI)"
+                }
+            );
+            println!("  local model:              {}", response.local_model);
+            println!(
+                "  local ready:              {}",
+                if response.local_ready { "yes" } else { "no" }
+            );
+            // Printed whether or not the path is ready: when it is, this says
+            // where the weights were found; when it is not, it is the fix.
+            println!("  {}", response.local_detail);
+        }
+    }
+    Ok(())
+}
+
+fn provider_scope_label(account_id: i64) -> String {
+    if account_id == 0 {
+        "daemon-wide (every account with no override of its own)".to_owned()
+    } else {
+        format!("account {account_id}")
+    }
+}
+
+impl From<BackendArg> for AiProviderKind {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Local => Self::Local,
+            BackendArg::Claude => Self::Claude,
+            BackendArg::Inherit => Self::Unspecified,
+        }
+    }
+}
+
+fn backend_label(kind: AiProviderKind) -> &'static str {
+    match kind {
+        AiProviderKind::Local => "local (on-device, zero egress)",
+        AiProviderKind::Claude => "claude (hosted)",
+        AiProviderKind::Unspecified => "none (inherits the daemon-wide setting)",
     }
 }
 
