@@ -29,7 +29,6 @@ use rmail_proto::v1::{
     ListOutboxRequest, OutboxEntry, OutboxState, RescheduleRequest, ScheduleSendRequest,
     SendOrigin, SuggestSendTimeRequest, UpdateBodyRequest,
 };
-use tonic::transport::Channel;
 
 /// `mail send …`
 #[derive(Debug, Args)]
@@ -386,7 +385,7 @@ pub async fn outbox(socket: &Path, args: OutboxArgs) -> Result<()> {
 /// server's cap so the answer is "no such entry" rather than "not in the first
 /// fifty" for anything but an outbox of five hundred queued messages.
 async fn one(
-    client: &mut SendSchedulerServiceClient<Channel>,
+    client: &mut SendSchedulerServiceClient<crate::client::Client>,
     account_id: Option<i64>,
     id: i64,
 ) -> Result<OutboxEntry> {
@@ -473,10 +472,8 @@ pub async fn followup(socket: &Path, action: FollowupAction) -> Result<()> {
 // Plumbing
 // ---------------------------------------------------------------------------
 
-async fn client(socket: &Path) -> Result<SendSchedulerServiceClient<Channel>> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+async fn client(socket: &Path) -> Result<SendSchedulerServiceClient<crate::client::Client>> {
+    let channel = crate::client::connect(socket).await?;
     Ok(SendSchedulerServiceClient::new(channel))
 }
 

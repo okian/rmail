@@ -31,7 +31,16 @@ rmail-core = { path = "rmail-core", default-features = false }
 # line — which quietly re-enabled `onnx` for the whole workspace.
 rmaild = { path = "rmaild", default-features = false }
 
-tonic = "0.12"
+# `tls-webpki-roots` (which implies `tls`) for the CLI's `--addr`/`--tls-*`
+# global flags (task 42): a gRPC client that can reach a TCP endpoint needs a
+# TLS stack, and `mail --addr` without one could only ever speak plaintext.
+# It selects `tokio-rustls` with `default-features = false` and `ring` — the
+# same single provider the `tokio-rustls` declaration below pins — so this adds
+# no second crypto provider and no cmake build; the only crate it introduces is
+# `rustls-pemfile`, the PEM parser from the rustls project. `webpki-roots` is
+# already a direct dependency here, so the default trust anchors cost nothing
+# new either.
+tonic = { version = "0.12", features = ["tls-webpki-roots"] }
 tonic-types = "0.12"
 tonic-health = "0.12"
 tonic-reflection = "0.12"

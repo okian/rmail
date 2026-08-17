@@ -100,11 +100,16 @@
 //! reuses this exact shape, so the fewer "is this key here" special cases a
 //! consumer has to carry forward, the better.
 //!
-//! Output is one JSON object per line (newline-delimited, not a wrapping
-//! `[ ... ]` array): the streaming property above only survives serialization
-//! if each hit can be written the moment it arrives — a single JSON array
-//! cannot be closed until the stream ends, which would put this flag back to
-//! buffering everything, the exact thing streaming was supposed to avoid.
+//! Under `--json` (and `--format ndjson`, which is the spelling task 42
+//! documents and which this flag is now an alias for) the output is one JSON
+//! object per line: the streaming property above only survives serialization
+//! if each hit can be written the moment it arrives.
+//!
+//! `--format json` wraps those same objects in an array, written *incrementally*
+//! by `crate::format::JsonSeq` — the `[` goes out with the first hit, not after
+//! the last — so it is one valid document without buffering anything. The
+//! objects inside are byte-for-byte the objects `--json` emits; only the
+//! separators differ.
 //!
 //! # Terminal safety: highlights render as ANSI, never as unescaped bytes
 //!
@@ -424,9 +429,7 @@ pub async fn search(socket: &Path, args: SearchArgs) -> Result<()> {
         None => {}
     }
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = SearchServiceClient::new(channel);
 
     // `required = true` on the arg; clap rejects a plain `mail search` with
@@ -483,16 +486,35 @@ pub async fn search(socket: &Path, args: SearchArgs) -> Result<()> {
         .into_inner();
 
     let styled = std::io::stdout().is_terminal();
+    // `--json` is the historical spelling of `--format ndjson` and still
+    // selects the same renderer; the global flag is the one documented now.
+    // An explicit `--format json` wins over the legacy flag: `--json` means
+    // ndjson only when nothing more specific was asked for, otherwise
+    // `--json --format json` would silently give the caller ndjson.
+    let mut seq = if args.json && !crate::format::current().is_structured() {
+        crate::format::JsonSeq::ndjson()
+    } else {
+        crate::format::JsonSeq::open()
+    };
+    // The loop's result is held rather than propagated, so `finish` runs even
+    // when the stream failed halfway: `--format json` opens a `[` with the
+    // first hit, and returning early would leave stdout holding an
+    // unterminated array that no consumer can parse.
     let mut shown = 0usize;
-    while let Some(item) = stream.next().await {
-        let hit = item.context("search stream item failed")?;
-        print_hit(&hit, args.json, styled)?;
-        shown += 1;
+    let outcome = async {
+        while let Some(item) = stream.next().await {
+            let hit = item.context("search stream item failed")?;
+            print_hit(&hit, &mut seq, styled)?;
+            shown += 1;
+        }
+        Ok::<(), anyhow::Error>(())
     }
-    if shown == 0 && !args.json {
+    .await;
+    if shown == 0 && !seq.is_structured() && outcome.is_ok() {
         println!("no results");
     }
-    Ok(())
+    seq.finish()?;
+    outcome
 }
 
 /// Print a compiled plan for a human to confirm, on stderr — see [`search`].
@@ -544,9 +566,7 @@ async fn eval(socket: &Path, args: EvalArgs) -> Result<()> {
     let set = GoldenSet::load(&args.golden)
         .with_context(|| format!("loading golden set {}", args.golden.display()))?;
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = SearchServiceClient::new(channel);
 
     let request = EvaluateRequest {
@@ -580,7 +600,7 @@ async fn eval(socket: &Path, args: EvalArgs) -> Result<()> {
         .context("Evaluate RPC failed")?
         .into_inner();
 
-    if args.json {
+    if crate::format::wants_json(args.json) {
         print_eval_json(&report)?;
     } else {
         print_eval_table(&report);
@@ -720,9 +740,12 @@ fn print_eval_json(report: &WireEvalReport) -> Result<()> {
             }))
             .collect::<Vec<_>>(),
     });
-    let mut out = std::io::stdout().lock();
-    serde_json::to_writer(&mut out, &value).context("serializing eval report")?;
-    writeln!(out).context("writing eval report")?;
+    // Through `crate::format`, not `serde_json` directly: this document can
+    // carry a model-authored string, and the safe writer escapes anything a
+    // terminal would act on without changing what a parser recovers.
+    // `to_line`, not `to_document`: see the note in `train`. One report has
+    // always been one line.
+    println!("{}", crate::format::to_line(&value)?);
     Ok(())
 }
 
@@ -742,9 +765,7 @@ fn print_eval_json(report: &WireEvalReport) -> Result<()> {
 ///
 /// Connection failure or a `TrainRanker` RPC error.
 async fn train(socket: &Path, args: TrainArgs) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = SearchServiceClient::new(channel);
 
     let report = client
@@ -755,7 +776,7 @@ async fn train(socket: &Path, args: TrainArgs) -> Result<()> {
         .context("TrainRanker RPC failed")?
         .into_inner();
 
-    if args.json {
+    if crate::format::wants_json(args.json) {
         let value = serde_json::json!({
             "train_queries": report.train_queries,
             "train_pairs": report.train_pairs,
@@ -773,9 +794,13 @@ async fn train(socket: &Path, args: TrainArgs) -> Result<()> {
             "active_model_id": report.active_model_id,
             "verdict": report.verdict,
         });
-        let mut out = std::io::stdout().lock();
-        serde_json::to_writer(&mut out, &value).context("serializing training report")?;
-        writeln!(out).context("writing training report")?;
+        // Through `crate::format`, whose writer escapes what a terminal
+        // would act on; a `note` on a model row is operator-authored text.
+        // `to_line`, not `to_document`: this flag has always emitted one line,
+        // and a consumer that reads a line at a time is a consumer this must
+        // not break. JSON is whitespace-insensitive, so the only thing the
+        // compact form costs is human indentation.
+        println!("{}", crate::format::to_line(&value)?);
         return Ok(());
     }
 
@@ -813,9 +838,7 @@ async fn train(socket: &Path, args: TrainArgs) -> Result<()> {
 ///
 /// Connection failure or a `ListRankerModels` RPC error.
 async fn models(socket: &Path, args: ModelsArgs) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = SearchServiceClient::new(channel);
 
     let response = client
@@ -824,7 +847,7 @@ async fn models(socket: &Path, args: ModelsArgs) -> Result<()> {
         .context("ListRankerModels RPC failed")?
         .into_inner();
 
-    if args.json {
+    if crate::format::wants_json(args.json) {
         let value = serde_json::json!({
             "active_model_id": response.active_model_id,
             "models": response
@@ -846,9 +869,13 @@ async fn models(socket: &Path, args: ModelsArgs) -> Result<()> {
                 }))
                 .collect::<Vec<_>>(),
         });
-        let mut out = std::io::stdout().lock();
-        serde_json::to_writer(&mut out, &value).context("serializing model history")?;
-        writeln!(out).context("writing model history")?;
+        // Through `crate::format`, whose writer escapes what a terminal
+        // would act on; a `note` on a model row is operator-authored text.
+        // `to_line`, not `to_document`: this flag has always emitted one line,
+        // and a consumer that reads a line at a time is a consumer this must
+        // not break. JSON is whitespace-insensitive, so the only thing the
+        // compact form costs is human indentation.
+        println!("{}", crate::format::to_line(&value)?);
         return Ok(());
     }
 
@@ -897,9 +924,7 @@ async fn models(socket: &Path, args: ModelsArgs) -> Result<()> {
 /// Connection failure or a `RollbackRanker` RPC error, including the
 /// `FAILED_PRECONDITION` returned for a model the guardrail refused.
 async fn rollback(socket: &Path, args: RollbackArgs) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = SearchServiceClient::new(channel);
 
     let response = client
@@ -963,9 +988,7 @@ fn truncate(text: &str, max: usize) -> String {
 /// neither a subject nor a body to build a query from, or a `Semantic`
 /// RPC/stream error.
 pub async fn similar(socket: &Path, args: SimilarArgs) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut mail_client = MailServiceClient::new(channel.clone());
     let mut search_client = SearchServiceClient::new(channel);
 
@@ -994,22 +1017,39 @@ pub async fn similar(socket: &Path, args: SimilarArgs) -> Result<()> {
         .into_inner();
 
     let styled = std::io::stdout().is_terminal();
+    // `--json` is the historical spelling of `--format ndjson` and still
+    // selects the same renderer; the global flag is the one documented now.
+    // An explicit `--format json` wins over the legacy flag: `--json` means
+    // ndjson only when nothing more specific was asked for, otherwise
+    // `--json --format json` would silently give the caller ndjson.
+    let mut seq = if args.json && !crate::format::current().is_structured() {
+        crate::format::JsonSeq::ndjson()
+    } else {
+        crate::format::JsonSeq::open()
+    };
+    // As in `search`: `finish` must run even on a stream error, or `--format
+    // json` leaves an unterminated array on stdout.
     let mut shown = 0u32;
-    while shown < args.limit {
-        let Some(item) = stream.next().await else {
-            break;
-        };
-        let hit = item.context("semantic stream item failed")?;
-        if hit.message.as_ref().is_some_and(|m| m.id == args.id) {
-            continue; // the source message is not a neighbor of itself.
+    let outcome = async {
+        while shown < args.limit {
+            let Some(item) = stream.next().await else {
+                break;
+            };
+            let hit = item.context("semantic stream item failed")?;
+            if hit.message.as_ref().is_some_and(|m| m.id == args.id) {
+                continue; // the source message is not a neighbor of itself.
+            }
+            print_hit(&hit, &mut seq, styled)?;
+            shown += 1;
         }
-        print_hit(&hit, args.json, styled)?;
-        shown += 1;
+        Ok::<(), anyhow::Error>(())
     }
-    if shown == 0 && !args.json {
+    .await;
+    if shown == 0 && !seq.is_structured() && outcome.is_ok() {
         println!("no similar messages found");
     }
-    Ok(())
+    seq.finish()?;
+    outcome
 }
 
 /// How much of a message's own subject+body seeds a `similar` query.
@@ -1064,16 +1104,17 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 /// Print one hit and flush immediately — see the module docs' "Streaming"
 /// section for why this cannot batch.
-fn print_hit(hit: &SearchHit, json: bool, styled: bool) -> Result<()> {
+fn print_hit(hit: &SearchHit, seq: &mut crate::format::JsonSeq, styled: bool) -> Result<()> {
+    if seq.is_structured() {
+        // The curated schema, unchanged: `--format json` wraps the same
+        // objects in an array and `--format ndjson` writes the same one-per-
+        // line stream `--json` always did. What a consumer parses out of each
+        // element is byte-for-byte what it was.
+        return seq.write(&JsonHit::from_wire(hit));
+    }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    if json {
-        let line = serde_json::to_string(&JsonHit::from_wire(hit))
-            .context("failed to serialize a search hit as JSON")?;
-        writeln!(out, "{line}").context("failed to write search output")?;
-    } else {
-        render_human(&mut out, hit, styled).context("failed to write search output")?;
-    }
+    render_human(&mut out, hit, styled).context("failed to write search output")?;
     out.flush().context("failed to flush stdout")?;
     Ok(())
 }

@@ -323,10 +323,8 @@ fn stop_reason_name(reason: i32) -> &'static str {
     }
 }
 
-async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
-    rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))
+async fn connect(socket: &Path) -> Result<crate::client::Client> {
+    crate::client::connect(socket).await
 }
 
 /// Strip control characters from text that came out of a message or a model.

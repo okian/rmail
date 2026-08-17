@@ -126,9 +126,7 @@ pub struct NewArgs {
 /// # Errors
 /// Whatever the RPC returns, plus a connection failure.
 pub async fn dispatch(socket: &Path, action: FolderAction) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = SavedSearchServiceClient::new(channel);
 
     match action {
@@ -215,7 +213,7 @@ pub async fn dispatch(socket: &Path, action: FolderAction) -> Result<()> {
 
 /// `mail folder new`, in whichever of its two forms was asked for.
 async fn new(
-    client: &mut SavedSearchServiceClient<tonic::transport::Channel>,
+    client: &mut SavedSearchServiceClient<crate::client::Client>,
     args: NewArgs,
 ) -> Result<()> {
     let name = match args.name {

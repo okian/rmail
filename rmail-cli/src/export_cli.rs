@@ -37,7 +37,25 @@ use tokio_stream::StreamExt;
 /// buffer an archive it has not written yet.
 const WRITE_QUEUE: usize = 4;
 
-/// `mail export <query> --format <fmt> -o <path>`.
+/// `mail export <query> --archive-format <fmt> -o <path>`.
+///
+/// # Why not `--format`
+///
+/// prd.md spells this `--format mbox`, and prd.md also gives `mail` a *global*
+/// `--format {table,json,ndjson}` (task 42). Those cannot both exist: `clap`
+/// resolves a global argument and a subcommand argument sharing an id by
+/// value-source precedence and then writes the winner back into the
+/// subcommand's matches — so `RMAIL_FORMAT=json mail export -o backup.mbox`
+/// silently wrote a JSON archive into a file named `.mbox`, with no
+/// diagnostic. It is not a conflict `clap` reports; it is a conflict that
+/// corrupts an archive.
+///
+/// The archive flag is the one that moved, because the global one is on ninety
+/// verbs and this one is on one. `-f` still works. Typing the old spelling now
+/// fails immediately and legibly — the global `--format` rejects `mbox` and
+/// lists its own three values — rather than quietly doing the wrong thing.
+/// `format::tests::no_subcommand_shadows_the_global_format_flag` keeps any
+/// future verb from re-introducing the collision.
 #[derive(Debug, clap::Args)]
 pub struct ExportArgs {
     /// The query to export (`from:alice has:attachment "office move"`).
@@ -50,10 +68,11 @@ pub struct ExportArgs {
     #[arg(long, conflicts_with = "query")]
     thread: Option<i64>,
 
-    /// Archive format.
-    #[arg(long, short = 'f', default_value = "mbox",
+    /// Archive format. (Named `--archive-format`, not `--format`; see this
+    /// module's docs.)
+    #[arg(long = "archive-format", short = 'f', default_value = "mbox",
           value_parser = ["mbox", "maildir", "eml", "json"])]
-    format: String,
+    archive_format: String,
 
     /// Where to write it: a file for `mbox`/`json`, a directory for
     /// `maildir`/`eml`. `-` writes a single-document format to stdout.
@@ -61,7 +80,7 @@ pub struct ExportArgs {
     out: PathBuf,
 
     /// Attach the AI summaries and tags already stored for each message.
-    /// Only meaningful with `--format json`; it never calls a model.
+    /// Only meaningful with `--archive-format json`; it never calls a model.
     #[arg(long)]
     with_ai: bool,
 
@@ -78,7 +97,7 @@ pub struct ExportArgs {
 /// Run the export.
 pub async fn export(socket: &Path, args: ExportArgs) -> Result<()> {
     let format: Format = args
-        .format
+        .archive_format
         .parse()
         .map_err(|e: rmail_core::Error| anyhow::anyhow!("{e}"))?;
 
@@ -93,7 +112,7 @@ pub async fn export(socket: &Path, args: ExportArgs) -> Result<()> {
 
     let to_stdout = args.out.as_os_str() == "-";
     if to_stdout && !format.is_single_stream() {
-        bail!("--format {format} writes one file per message; give a directory with -o, not `-`");
+        bail!("--archive-format {format} writes one file per message; give a directory with -o, not `-`");
     }
 
     // A single-document format truncates its destination. For a tool whose
@@ -109,9 +128,7 @@ pub async fn export(socket: &Path, args: ExportArgs) -> Result<()> {
         );
     }
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = ExportServiceClient::new(channel);
 
     let mut stream = client

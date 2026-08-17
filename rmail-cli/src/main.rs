@@ -2,11 +2,16 @@
 
 mod agent_cli;
 mod analytics_cli;
+mod api_call;
+mod api_cli;
+mod client;
+mod daemon_cli;
 mod digest_cli;
 mod export_cli;
 mod extract_cli;
 mod find_cli;
 mod folder_cli;
+mod format;
 mod hook_cli;
 mod index_cli;
 mod keymap;
@@ -59,12 +64,83 @@ use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::HealthCheckRequest;
 
 /// rmail command-line client.
+///
+/// # Global flags
+///
+/// The transport flags (`--socket`/`--addr`/`--token`/`--tls-*`/`--insecure`/
+/// `--deadline`) are consumed once, here, and handed to [`client`], which is
+/// the single connector every verb goes through — see that module for why
+/// they are not threaded through ninety signatures. `--format` is consumed the
+/// same way by [`format`].
+///
+/// `global = true` on each means `mail search --format json` and
+/// `mail --format json search` are the same command line.
+///
+/// A subcommand must never declare an argument with the same *id* as one of
+/// these. `clap` does not report that as a conflict — it merges the two by
+/// value-source precedence — so a collision is silent, and for `--format` it
+/// was silently destructive (see `export_cli`'s module docs).
+/// `format::tests::no_subcommand_shadows_the_global_format_flag` is the guard.
 #[derive(Debug, Parser)]
 #[command(name = "mail", version, about = "rmail command-line client")]
 struct Cli {
     /// Path to the rmaild gRPC Unix domain socket (defaults to $RMAIL_SOCKET).
     #[arg(long, global = true, env = rmail_core::SOCKET_ENV)]
     socket: Option<PathBuf>,
+
+    /// Reach rmaild over TCP at `host:port` instead of the Unix socket.
+    #[arg(long, global = true, value_name = "HOST:PORT")]
+    addr: Option<String>,
+
+    /// Bearer capability token presented on every request.
+    ///
+    /// Prefer $RMAIL_TOKEN: a secret on a command line is visible in `ps` and
+    /// in shell history.
+    #[arg(long, global = true, env = "RMAIL_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+
+    /// PEM root the server's certificate must chain to (with --addr).
+    #[arg(long, global = true, value_name = "PATH")]
+    tls_ca: Option<PathBuf>,
+
+    /// PEM client certificate, for mutual TLS (with --addr, needs --tls-key).
+    #[arg(long, global = true, value_name = "PATH")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key for --tls-cert.
+    #[arg(long, global = true, value_name = "PATH")]
+    tls_key: Option<PathBuf>,
+
+    /// Talk plaintext to --addr. Never do this off a trusted network.
+    #[arg(long, global = true)]
+    insecure: bool,
+
+    /// Deadline in seconds, applied to every request this invocation makes.
+    ///
+    /// Sent as the gRPC deadline, so the daemon stops working on a request
+    /// nobody is waiting for. It applies to streaming verbs too, which is what
+    /// a deadline means — `mail sync --watch --deadline 60` follows events for
+    /// a minute and stops.
+    #[arg(long, global = true, value_name = "SECS")]
+    deadline: Option<u64>,
+
+    /// Output shape: human columns, one JSON document, or one JSON object per
+    /// line.
+    ///
+    /// `json`/`ndjson` are a contract — see the `format` module. A verb with
+    /// no structured rendering refuses rather than printing a table.
+    ///
+    /// No subcommand may declare an argument with this id. `clap` does not
+    /// treat that as a conflict: it picks a winner by value-source precedence
+    /// and writes it into *both* sets of matches, so a subcommand's own
+    /// `--format` silently receives this value (which is how
+    /// `RMAIL_FORMAT=json mail export -o backup.mbox` used to write a JSON
+    /// archive). `format::tests::no_subcommand_shadows_the_global_format_flag`
+    /// is what keeps that from coming back; `mail export` spells its own flag
+    /// `--archive-format` because of it.
+    #[arg(long, global = true, value_enum,
+          default_value_t = format::OutputFormat::Table, env = "RMAIL_FORMAT")]
+    format: format::OutputFormat,
 
     #[command(subcommand)]
     command: Command,
@@ -74,6 +150,23 @@ struct Cli {
 enum Command {
     /// Round-trip a gRPC health check against rmaild.
     Ping,
+    /// Start, inspect or stop the background daemon (`daemon_cli`).
+    ///
+    /// The only verb that spawns a process. Everything else refuses with a
+    /// `FAILED_PRECONDITION` naming this one when rmaild is not running.
+    Daemon {
+        #[command(subcommand)]
+        action: daemon_cli::DaemonAction,
+    },
+    /// The generic gRPC client: health, reflection, and any RPC by name
+    /// (`api_cli`).
+    ///
+    /// `mail api call <Method> '<json>'` reaches every method the daemon
+    /// serves, through the same auth layer as every other verb.
+    Api {
+        #[command(subcommand)]
+        action: api_cli::ApiAction,
+    },
     /// Synchronize an account's mail.
     Sync {
         /// Account to sync.
@@ -698,13 +791,118 @@ enum TokenAction {
 /// Deadline for the health-check RPC so a wedged daemon cannot hang the CLI.
 const HEALTH_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The process entry point.
+///
+/// Returns [`std::process::ExitCode`] rather than `Result<()>` because the
+/// exit code is part of this binary's contract (see [`format::ExitCode`]) and
+/// `anyhow`'s `Termination` impl only knows the number 1. The error is printed
+/// here in the shape `anyhow` would have printed it — `Error: …` with the
+/// cause chain — so nothing about the human-facing output changes.
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn main() -> std::process::ExitCode {
+    // Parsed through `ArgMatches` rather than straight to the derived struct
+    // so the *invoked subcommand path* is available: `format` needs it to
+    // refuse `--format json` on a verb that has no structured rendering, and
+    // deriving it from the parsed enum would mean a second `match` over every
+    // variant that could only ever drift from `clap`'s tree.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let path = subcommand_path(&matches);
+    let cli = match <Cli as clap::FromArgMatches>::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(error) => {
+            // `clap`'s own rendering, and `clap`'s own exit code for it.
+            error.print().ok();
+            return format::ExitCode::Usage.into();
+        }
+    };
+
+    // Copied out before `run` consumes `cli`, so a failure *inside* `run` is
+    // still reported in the shape the caller asked for.
+    let format = cli.format;
+    match run(cli, &path).await {
+        Ok(()) => format::ExitCode::Success.into(),
+        Err(error) => {
+            let code = format::ExitCode::of(&error);
+            // On stderr in every format, so `--format json`'s stdout stays a
+            // single parseable document even when the command failed. In
+            // structured mode the failure is itself JSON, carrying the same
+            // classification the exit code does — a pipeline that captures
+            // stderr can branch on `.code` without matching English.
+            if format.is_structured() {
+                match format::to_line(&serde_json::json!({
+                    "error": format!("{error:#}"),
+                    "code": code.name(),
+                    "exit_code": code.code(),
+                })) {
+                    Ok(line) => eprintln!("{line}"),
+                    // The error being reported is the important one; a
+                    // serializer failure on top of it must not replace it.
+                    Err(_) => eprintln!("Error: {error:#}"),
+                }
+            } else {
+                eprintln!("Error: {error:#}");
+            }
+            code.into()
+        }
+    }
+}
+
+/// `["ai", "budget", "set"]` for `mail ai budget set` — the same spelling
+/// `rmail_core::parity` and [`format::UNSTRUCTURED`] use, joined by spaces.
+fn subcommand_path(matches: &clap::ArgMatches) -> String {
+    let mut parts = Vec::new();
+    let mut current = matches;
+    while let Some((name, sub)) = current.subcommand() {
+        parts.push(name.to_owned());
+        current = sub;
+    }
+    parts.join(" ")
+}
+
+async fn run(cli: Cli, path: &str) -> Result<()> {
     let socket = cli.socket.unwrap_or_else(socket_path_from_env);
+    let format = cli.format;
+    format::init(format);
+    client::init(client::Transport::new(
+        cli.addr,
+        cli.token,
+        cli.deadline,
+        cli.tls_ca,
+        cli.tls_cert,
+        cli.tls_key,
+        cli.insecure,
+    )?);
+
+    // Before any work, and before any connection: a caller who asked for JSON
+    // must never be handed a table. See `format`'s module docs — an error is
+    // fixed in a minute, a script that silently parses columns is wrong for a
+    // year.
+    if format.is_structured() {
+        // Two refusals, because they mean different things to whoever reads
+        // them: a declared one is a decision ("this verb has nothing to
+        // serialize"), an undeclared one is unfinished work. Both are enforced
+        // here rather than only in `format`'s drift test, so the guarantee
+        // holds at runtime and not merely in CI.
+        let refusal = format::is_unstructured(path).or_else(|| {
+            (!format::STRUCTURED.contains(&path))
+                .then_some("no structured rendering has been written for it yet")
+        });
+        if let Some(why) = refusal {
+            return Err(format::Classified::new(
+                format::ExitCode::Unimplemented,
+                format!(
+                    "`mail {path}` cannot answer --format {}: {why}. `mail api call <Method> \
+                     '<json>'` prints any RPC's response as JSON.",
+                    format.as_str()
+                ),
+            ));
+        }
+    }
 
     match cli.command {
         Command::Ping => ping(&socket).await,
+        Command::Daemon { action } => daemon_cli::run(&socket, action).await,
+        Command::Api { action } => api_cli::run(&socket, action).await,
         Command::Sync {
             account,
             mailbox,
@@ -845,9 +1043,7 @@ async fn sync(
     full: bool,
     watch: bool,
 ) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = SyncServiceClient::new(channel);
 
     let response = client
@@ -900,7 +1096,7 @@ async fn sync(
 
 /// Follow the event stream until the daemon closes it or the user interrupts.
 async fn watch_events(
-    client: &mut SyncServiceClient<tonic::transport::Channel>,
+    client: &mut SyncServiceClient<crate::client::Client>,
     account_id: i64,
     since_seq: i64,
 ) -> Result<()> {
@@ -952,9 +1148,7 @@ async fn watch_events(
 }
 
 async fn ping(socket: &Path) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
 
     let mut client = HealthClient::new(channel);
     let response = tokio::time::timeout(
@@ -968,12 +1162,27 @@ async fn ping(socket: &Path) -> Result<()> {
     .context("health check RPC failed")?;
 
     let status = response.into_inner().status();
-    println!("rmaild health: {status:?}");
+    // Hand-built rather than through `format::emit_response`: `Health/Check`
+    // is `grpc.health.v1`, not `rmail.v1`, so it has no capability row to
+    // derive a message name from — the same reason `ping` is in
+    // `parity::LOCAL_CLI`.
+    let value = serde_json::json!({
+        "serving": status == ServingStatus::Serving,
+        "status": status.as_str_name(),
+    });
+    match format::current() {
+        format::OutputFormat::Table => println!("rmaild health: {status:?}"),
+        format::OutputFormat::Json => println!("{}", format::to_document(&value)?),
+        format::OutputFormat::Ndjson => println!("{}", format::to_line(&value)?),
+    }
 
     if status == ServingStatus::Serving {
         Ok(())
     } else {
-        bail!("rmaild is not serving (status: {status:?})");
+        Err(format::Classified::new(
+            format::ExitCode::FailedPrecondition,
+            format!("rmaild is not serving (status: {status:?})"),
+        ))
     }
 }
 
@@ -997,9 +1206,7 @@ async fn account_login(
     scopes: Vec<String>,
     no_browser: bool,
 ) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = AccountServiceClient::new(channel);
 
     let begun = client
@@ -1052,9 +1259,7 @@ async fn list(socket: &Path, args: ListArgs) -> Result<()> {
     use rmail_proto::v1::mail_service_client::MailServiceClient;
     use rmail_proto::v1::{ListMessagesRequest, ListUnifiedRequest};
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = MailServiceClient::new(channel);
     let page_token = args.page_token.unwrap_or_default();
 
@@ -1136,9 +1341,7 @@ async fn account_add(
             source: Some(source),
         });
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let response = AccountServiceClient::new(channel)
         .autoconfigure(AutoconfigureRequest {
             email,
@@ -1236,9 +1439,7 @@ fn sanitized(value: &str) -> String {
 }
 
 async fn account_refresh(socket: &Path, id: i64, force: bool) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let response = AccountServiceClient::new(channel)
         .refresh_token(RefreshTokenRequest {
             account_id: id,
@@ -1306,9 +1507,7 @@ async fn token_create(
         .transpose()
         .map_err(|e| anyhow::anyhow!("invalid --ttl: {e}"))?;
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = AdminServiceClient::new(channel);
     let response = client
         .mint_token(MintTokenRequest {
@@ -1340,15 +1539,17 @@ async fn token_create(
 
 /// List tokens (metadata only).
 async fn token_list(socket: &Path) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = AdminServiceClient::new(channel);
     let response = client
         .list_tokens(ListTokensRequest {})
         .await
         .context("ListTokens RPC failed")?
         .into_inner();
+
+    if format::emit_response(rmail_core::parity::Command::AdminListTokens, &response)? {
+        return Ok(());
+    }
 
     if response.tokens.is_empty() {
         println!("no tokens");
@@ -1359,9 +1560,12 @@ async fn token_list(socket: &Path) -> Result<()> {
         println!(
             "{:<6} {:<20} {:<8} {}",
             token.id,
-            token.name,
+            // Operator-chosen, but chosen once and read many times, and a
+            // label is exactly where an escape sequence would be planted to
+            // repaint a listing.
+            sanitized(&token.name),
             status,
-            token.scopes.join(",")
+            sanitized(&token.scopes.join(","))
         );
     }
     Ok(())
@@ -1369,9 +1573,7 @@ async fn token_list(socket: &Path) -> Result<()> {
 
 /// Revoke a token by id.
 async fn token_revoke(socket: &Path, id: i64) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = AdminServiceClient::new(channel);
     client
         .revoke_token(RevokeTokenRequest { id })
@@ -1385,10 +1587,8 @@ async fn token_revoke(socket: &Path, id: i64) -> Result<()> {
 // `mail ai ...`
 // ---------------------------------------------------------------------------
 
-async fn ai_client(socket: &Path) -> Result<AiServiceClient<tonic::transport::Channel>> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+async fn ai_client(socket: &Path) -> Result<AiServiceClient<crate::client::Client>> {
+    let channel = crate::client::connect(socket).await?;
     Ok(AiServiceClient::new(channel))
 }
 
@@ -1400,6 +1600,10 @@ async fn ai_status(socket: &Path) -> Result<()> {
         .await
         .context("GetUsage RPC failed")?
         .into_inner();
+
+    if format::emit_response(rmail_core::parity::Command::AiGetUsage, &usage)? {
+        return Ok(());
+    }
 
     println!("enabled: {}", usage.enabled);
     println!("paused:  {}", usage.paused);
@@ -1623,11 +1827,12 @@ async fn ai_summary(socket: &Path, message_id: i64, json: bool) -> Result<()> {
         .context("GetSummary RPC failed")?
         .into_inner();
 
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&summary_to_json(&summary))?
-        );
+    // `wants_json`, not `json`: `--json` is the legacy spelling of
+    // `--format json` and a caller who used the global flag must not get the
+    // table. Written through `format` so the model-authored `tl_dr` cannot
+    // carry an escape sequence into a terminal.
+    if format::wants_json(json) {
+        println!("{}", format::to_document(&summary_to_json(&summary))?);
     } else {
         print_summary(&summary);
     }
@@ -1701,21 +1906,13 @@ async fn ai_cost(socket: &Path, month: bool) -> Result<()> {
     Ok(())
 }
 
-async fn ai_policy_client(
-    socket: &Path,
-) -> Result<AiPolicyServiceClient<tonic::transport::Channel>> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+async fn ai_policy_client(socket: &Path) -> Result<AiPolicyServiceClient<crate::client::Client>> {
+    let channel = crate::client::connect(socket).await?;
     Ok(AiPolicyServiceClient::new(channel))
 }
 
-async fn ai_safety_client(
-    socket: &Path,
-) -> Result<AiSafetyServiceClient<tonic::transport::Channel>> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+async fn ai_safety_client(socket: &Path) -> Result<AiSafetyServiceClient<crate::client::Client>> {
+    let channel = crate::client::connect(socket).await?;
     Ok(AiSafetyServiceClient::new(channel))
 }
 

@@ -166,10 +166,8 @@ async fn rm(socket: &Path, note_id: i64) -> Result<()> {
     Ok(())
 }
 
-async fn client(socket: &Path) -> Result<NoteServiceClient<tonic::transport::Channel>> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+async fn client(socket: &Path) -> Result<NoteServiceClient<crate::client::Client>> {
+    let channel = crate::client::connect(socket).await?;
     Ok(NoteServiceClient::new(channel))
 }
 

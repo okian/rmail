@@ -107,9 +107,7 @@ pub async fn run(socket: &Path, args: DigestArgs) -> Result<()> {
     // the time it was rendered.
     let since_abs = since.map_or(0, |seconds| now().saturating_sub(seconds));
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = AnalyticsServiceClient::new(channel);
 
     let digest = client

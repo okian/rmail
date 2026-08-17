@@ -105,10 +105,8 @@ pub enum DraftAction {
     },
 }
 
-async fn client(socket: &Path) -> Result<ComposeServiceClient<tonic::transport::Channel>> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+async fn client(socket: &Path) -> Result<ComposeServiceClient<crate::client::Client>> {
+    let channel = crate::client::connect(socket).await?;
     Ok(ComposeServiceClient::new(channel))
 }
 

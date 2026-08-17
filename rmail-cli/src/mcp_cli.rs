@@ -30,10 +30,12 @@
 //! all* (see `rmaild::auth`'s "Two principals"). So on the socket this command
 //! connects to:
 //!
-//! - `--token` is **not consulted**. Minting a `mail.read` token and passing
-//!   it here does not narrow anything server-side: the daemon still sees the
-//!   socket's owner and still grants admin. The token matters on the TCP
-//!   listener, where there is no peer uid to trust.
+//! - `--token` (the *global* flag since task 42 — this verb no longer declares
+//!   one of its own, because two arguments with one id are merged by `clap`
+//!   rather than reported) is **not consulted**. Minting a `mail.read` token
+//!   and passing it here does not narrow anything server-side: the daemon
+//!   still sees the socket's owner and still grants admin. The token matters
+//!   on the TCP listener, where there is no peer uid to trust.
 //! - `--scope` therefore constrains this process and nothing else. An agent
 //!   driving this server cannot call what is not listed and not authorized
 //!   here; anything else with access to the socket is unaffected.
@@ -80,24 +82,22 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with = "sse")]
     stdio: bool,
 
-    /// Speak MCP over HTTP+SSE on `--addr` instead of stdio.
+    /// Speak MCP over HTTP+SSE on `--sse-addr` instead of stdio.
     #[arg(long)]
     sse: bool,
 
-    /// Address for `--sse`. Loopback only: the endpoint is unauthenticated
-    /// and hands every caller the scopes this server was started with.
-    #[arg(long, default_value = "127.0.0.1:8909")]
-    addr: SocketAddr,
-
-    /// Bearer token presented to the daemon on every call. Without one the
-    /// daemon's Unix-peer path applies, which grants the owning user admin.
+    /// Listen address for `--sse`. Loopback only: the endpoint is
+    /// unauthenticated and hands every caller the scopes this server was
+    /// started with.
     ///
-    /// Prefer the RMAIL_TOKEN environment variable: a secret passed on the
-    /// command line is visible in `ps` for the life of the process and lands
-    /// in shell history. Note also that over the local Unix socket the daemon
-    /// never reads this — see this command's own docs.
-    #[arg(long, env = "RMAIL_TOKEN", hide_env_values = true)]
-    token: Option<String>,
+    /// Named `--sse-addr`, not `--addr`: the global `--addr` says where the
+    /// *daemon* is, and two arguments with the same id are merged by `clap`
+    /// rather than reported as a conflict (see `format`'s
+    /// `no_subcommand_shadows_the_global_format_flag`) — so `mail --addr
+    /// host:port mcp serve --sse` would have silently made this server bind
+    /// the daemon's address.
+    #[arg(long = "sse-addr", id = "sse_addr", default_value = "127.0.0.1:8909")]
+    sse_addr: SocketAddr,
 
     /// The scopes this connection claims, for filtering the tool list:
     /// `mail.read`, `mail.write`, `mail.send`, `ai.invoke`, `automation`,
@@ -170,21 +170,25 @@ async fn serve(socket: &Path, args: ServeArgs) -> Result<()> {
             "choose a transport: --stdio (for an MCP client that launches this process) or --sse"
         );
     }
-    let scopes = resolve_scopes(&args)?;
+    let bearer = crate::client::bearer();
+    let scopes = resolve_scopes(&args, bearer.as_deref())?;
     let timeout = rmail_core::config::parse_human_duration(&args.timeout)
         .map_err(|e| anyhow::anyhow!("invalid --timeout: {e}"))?;
     if args.max_frames == 0 {
         bail!("--max-frames must be at least 1; a call that drains no frames returns nothing");
     }
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    // The bare channel, not the intercepted one: this verb hands the
+    // connection to `McpServer`, which attaches the principal's own bearer to
+    // every projected call (see `principal` below). Layering the global
+    // `--token` interceptor underneath as well would put two `authorization`
+    // headers on each request.
+    let channel = crate::client::connect_parts(socket).await?.channel;
 
     let cancel = CancellationToken::new();
     let server = McpServer::new(
         channel,
-        principal(&args, scopes),
+        principal(&args, scopes, bearer),
         CallLimits {
             max_frames: args.max_frames,
             timeout,
@@ -209,7 +213,7 @@ async fn serve(socket: &Path, args: ServeArgs) -> Result<()> {
     });
 
     let result = if args.sse {
-        mcp::serve_sse(server, args.addr, cancel.clone()).await
+        mcp::serve_sse(server, args.sse_addr, cancel.clone()).await
     } else {
         mcp::serve_stdio(server, cancel.clone()).await
     };
@@ -224,10 +228,15 @@ async fn serve(socket: &Path, args: ServeArgs) -> Result<()> {
 /// policy is reachable from a test: it is the whole user-facing surface of
 /// "a read-only token's tool list contains only read tools", and inverting it
 /// would otherwise be invisible to every test in `rmaild::mcp`.
-fn principal(args: &ServeArgs, scopes: Vec<Scope>) -> Principal {
+/// `bearer` is the global `--token`/`$RMAIL_TOKEN`, passed in rather than
+/// read here: this verb used to declare a second `--token` of its own, which
+/// `clap` merged with the global one by value-source precedence rather than
+/// reporting as a conflict. One declaration, one reader, and a parameter the
+/// tests can set.
+fn principal(args: &ServeArgs, scopes: Vec<Scope>, bearer: Option<String>) -> Principal {
     Principal {
         scopes,
-        bearer: args.token.clone(),
+        bearer,
         mutations: if args.read_only {
             Mutations::Withheld
         } else {
@@ -238,9 +247,9 @@ fn principal(args: &ServeArgs, scopes: Vec<Scope>) -> Principal {
 
 /// The scopes this connection claims — see this module's docs on why the
 /// two cases differ.
-fn resolve_scopes(args: &ServeArgs) -> Result<Vec<Scope>> {
+fn resolve_scopes(args: &ServeArgs, bearer: Option<&str>) -> Result<Vec<Scope>> {
     if args.scopes.is_empty() {
-        if args.token.is_some() {
+        if bearer.is_some() {
             bail!(
                 "--token was given but --scope was not. A bearer secret is opaque, so this \
                  process cannot tell what the token grants and would either advertise tools the \
@@ -328,13 +337,13 @@ mod tests {
     fn read_only_is_what_withholds_the_mutating_tools() {
         let with = parse(&["--stdio", "--read-only"]);
         assert_eq!(
-            principal(&with, vec![Scope::MailRead]).mutations,
+            principal(&with, vec![Scope::MailRead], None).mutations,
             Mutations::Withheld
         );
 
         let without = parse(&["--stdio"]);
         assert_eq!(
-            principal(&without, vec![Scope::MailRead]).mutations,
+            principal(&without, vec![Scope::MailRead], None).mutations,
             Mutations::AsScoped,
             "the default must stay the surface the daemon actually accepts"
         );
@@ -345,7 +354,11 @@ mod tests {
     #[test]
     fn read_only_changes_nothing_but_the_effect_policy() {
         let args = parse(&["--stdio", "--read-only", "--scope", "mail.read,ai.invoke"]);
-        let principal = principal(&args, resolve_scopes(&args).expect("scopes parse"));
+        let principal = principal(
+            &args,
+            resolve_scopes(&args, None).expect("scopes parse"),
+            None,
+        );
         assert_eq!(principal.scopes, vec![Scope::MailRead, Scope::AiInvoke]);
         assert!(principal.bearer.is_none());
     }
@@ -355,23 +368,23 @@ mod tests {
     #[test]
     fn read_only_does_not_excuse_an_explicit_scope() {
         assert!(
-            resolve_scopes(&parse(&["--sse", "--read-only"])).is_err(),
+            resolve_scopes(&parse(&["--sse", "--read-only"]), None).is_err(),
             "--sse must still demand an explicit --scope"
         );
         assert!(
-            resolve_scopes(&parse(&[
-                "--stdio",
-                "--read-only",
-                "--token",
-                "rmail_tok_x"
-            ]))
+            resolve_scopes(
+                &parse(&["--stdio", "--read-only"]),
+                // The global `--token`, now passed in rather than declared
+                // here — see `principal`.
+                Some("rmail_tok_x"),
+            )
             .is_err(),
-            "--token must still demand an explicit --scope"
+            "a bearer token must still demand an explicit --scope"
         );
         // ...and `--stdio` alone still claims admin, rather than --read-only
         // being mistaken for a scope.
         assert_eq!(
-            resolve_scopes(&parse(&["--stdio", "--read-only"])).expect("scopes"),
+            resolve_scopes(&parse(&["--stdio", "--read-only"]), None).expect("scopes"),
             vec![Scope::Admin]
         );
     }

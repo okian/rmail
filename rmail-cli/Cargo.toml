@@ -40,6 +40,21 @@ rmail-proto.workspace = true
 # names no RPC — see `mcp_cli`'s own module docs.
 rmaild.workspace = true
 tonic-health.workspace = true
+# `mail api reflect`/`mail api call` (task 42) discover what the daemon serves
+# by asking its reflection service, rather than trusting the descriptor set
+# this binary happens to have been compiled with. Only the generated *client*
+# stubs are used here; they are not behind the crate's `server` feature, which
+# `rmaild` (a dependency of this crate) turns on regardless.
+tonic-reflection.workspace = true
+# `format::response_json` re-encodes a generated response message so the
+# descriptor-driven codec can render it as proto JSON; `api_call` decodes the
+# `FileDescriptorProto`s reflection returns.
+prost.workspace = true
+prost-types.workspace = true
+# `daemon_cli::stop` sends SIGTERM to the pid `mail daemon start` recorded —
+# the signal `rmaild::shutdown_signal` waits for. Already resolved
+# transitively; this only promotes it to a direct dependency.
+libc.workspace = true
 # `note_cli`'s `$EDITOR` flow launches the user's editor as a child process.
 tokio = { workspace = true, features = ["process"] }
 # `tui::grpc` cancels its in-flight background RPC tasks (and the long-lived

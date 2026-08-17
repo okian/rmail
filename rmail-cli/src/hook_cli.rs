@@ -295,10 +295,8 @@ fn toml_string(value: &str) -> String {
 // list / test: real RPCs against the running daemon
 // ---------------------------------------------------------------------------
 
-async fn hook_client(socket: &Path) -> Result<HookServiceClient<tonic::transport::Channel>> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+async fn hook_client(socket: &Path) -> Result<HookServiceClient<crate::client::Client>> {
+    let channel = crate::client::connect(socket).await?;
     Ok(HookServiceClient::new(channel))
 }
 

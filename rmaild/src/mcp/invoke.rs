@@ -43,7 +43,7 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 
-use super::descriptor::catalog;
+use super::descriptor::{catalog, Catalog};
 use super::projection::Tool;
 use super::{codec, McpError};
 
@@ -92,6 +92,28 @@ pub struct CallLimits {
     pub timeout: Duration,
 }
 
+/// Everything one dynamically dispatched RPC needs that a [`Tool`] would
+/// otherwise carry.
+///
+/// Split out from `Tool` so the same dispatch serves a caller that has no
+/// projection at all: `mail api call` (task 42) resolves a method against a
+/// [`Catalog`] built from the daemon's reflection response, which yields
+/// exactly these five facts and nothing about MCP tool names or scopes.
+#[derive(Debug, Clone, Copy)]
+pub struct RawCall<'a> {
+    /// What to call this method in an error message — the MCP tool name, or
+    /// the method spelling the operator typed.
+    pub label: &'a str,
+    /// The gRPC path, `/rmail.v1.MailService/Get`.
+    pub path: &'a str,
+    /// Fully-qualified request message name.
+    pub input_type: &'a str,
+    /// Fully-qualified response message name.
+    pub output_type: &'a str,
+    /// Whether the server may send more than one response message.
+    pub server_streaming: bool,
+}
+
 /// Run `tool` with `arguments`, over `channel`.
 ///
 /// # Errors
@@ -110,11 +132,50 @@ pub async fn call(
     bearer: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<CallOutcome, McpError> {
-    let catalog = catalog()?;
-    let body = codec::encode(catalog, tool.input_type(), arguments)?;
+    call_dynamic(
+        channel,
+        catalog()?,
+        &RawCall {
+            label: tool.name(),
+            path: tool.rpc(),
+            input_type: tool.input_type(),
+            output_type: tool.output_type(),
+            server_streaming: tool.is_streaming(),
+        },
+        arguments,
+        limits,
+        bearer,
+        cancel,
+    )
+    .await
+}
 
-    let path = http::uri::PathAndQuery::try_from(tool.rpc()).map_err(|e| {
-        McpError::Descriptor(format!("{} is not a valid gRPC path: {e}", tool.rpc()))
+/// [`call`] against an explicit descriptor set, for a caller with no
+/// projection.
+///
+/// `catalog` is a parameter rather than [`catalog()`] because the two callers
+/// disagree about which descriptor set is authoritative, on purpose: the MCP
+/// projection is a surface *this process* serves, so the compiled-in set is
+/// the right one; `mail api call` is a separate process talking to whatever
+/// `rmaild` is on the far end of the socket, so the set that server's
+/// reflection service reports is the right one.
+///
+/// # Errors
+///
+/// As [`call`].
+pub async fn call_dynamic(
+    channel: &Channel,
+    catalog: &Catalog,
+    call: &RawCall<'_>,
+    arguments: &Value,
+    limits: CallLimits,
+    bearer: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<CallOutcome, McpError> {
+    let body = codec::encode(catalog, call.input_type, arguments)?;
+
+    let path = http::uri::PathAndQuery::try_from(call.path).map_err(|e| {
+        McpError::Descriptor(format!("{} is not a valid gRPC path: {e}", call.path))
     })?;
 
     let mut grpc = tonic::client::Grpc::new(channel.clone());
@@ -138,7 +199,7 @@ pub async fn call(
     // share a budget rather than each getting a fresh `limits.timeout`.
     let deadline = tokio::time::Instant::now() + limits.timeout;
     let timed_out = || McpError::Timeout {
-        tool: tool.name().to_owned(),
+        tool: call.label.to_owned(),
         after: limits.timeout,
     };
 
@@ -151,13 +212,22 @@ pub async fn call(
             .map_err(|_| timed_out())?
             .map_err(|e| McpError::Unavailable(format!("{e}")))?;
 
-        if tool.is_streaming() {
-            drain(&mut grpc, request, path, tool, limits.max_frames, deadline).await
+        if call.server_streaming {
+            drain(
+                &mut grpc,
+                catalog,
+                request,
+                path,
+                call,
+                limits.max_frames,
+                deadline,
+            )
+            .await
         } else {
             let response = tokio::time::timeout_at(deadline, grpc.unary(request, path, RawCodec))
                 .await
                 .map_err(|_| timed_out())??;
-            let value = codec::decode(catalog, tool.output_type(), response.get_ref())?;
+            let value = codec::decode(catalog, call.output_type, response.get_ref())?;
             Ok(CallOutcome {
                 value,
                 truncation: Truncation::Complete,
@@ -184,18 +254,18 @@ pub async fn call(
 /// what the tool description promises the model.
 async fn drain(
     grpc: &mut tonic::client::Grpc<Channel>,
+    catalog: &Catalog,
     request: Request<Vec<u8>>,
     path: http::uri::PathAndQuery,
-    tool: &Tool,
+    call: &RawCall<'_>,
     max_frames: usize,
     deadline: tokio::time::Instant,
 ) -> Result<CallOutcome, McpError> {
-    let catalog = catalog()?;
     let mut stream =
         tokio::time::timeout_at(deadline, grpc.server_streaming(request, path, RawCodec))
             .await
             .map_err(|_| McpError::Timeout {
-                tool: tool.name().to_owned(),
+                tool: call.label.to_owned(),
                 after: deadline.elapsed(),
             })??
             .into_inner();
@@ -214,7 +284,7 @@ async fn drain(
         match next {
             None => break,
             Some(Ok(bytes)) => {
-                frames.push(codec::decode(catalog, tool.output_type(), &bytes)?);
+                frames.push(codec::decode(catalog, call.output_type, &bytes)?);
                 if frames.len() >= max_frames {
                     truncation = Truncation::FrameLimit;
                     break;

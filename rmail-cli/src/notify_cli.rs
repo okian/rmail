@@ -27,6 +27,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use rmail_core::parity::Command;
 use rmail_proto::v1::notification_service_client::NotificationServiceClient;
 use rmail_proto::v1::{
     NotificationState, NotificationTier, ScoreMessageRequest, StreamAlertsRequest,
@@ -68,10 +69,8 @@ pub async fn run(socket: &Path, action: NotifyAction) -> Result<()> {
     }
 }
 
-async fn client(socket: &Path) -> Result<NotificationServiceClient<tonic::transport::Channel>> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+async fn client(socket: &Path) -> Result<NotificationServiceClient<crate::client::Client>> {
+    let channel = crate::client::connect(socket).await?;
     Ok(NotificationServiceClient::new(channel))
 }
 
@@ -86,29 +85,47 @@ async fn watch(socket: &Path, since: Option<i64>, limit: Option<u64>) -> Result<
         .context("StreamAlerts RPC failed")?
         .into_inner();
 
-    let mut seen = 0u64;
-    while let Some(alert) = stream
-        .message()
-        .await
-        .context("the alert stream ended with an error")?
-    {
-        println!(
-            "{:>6}  {:<8} {:<16} {}",
-            alert.id,
-            tier_name(alert.tier),
-            alert.account,
-            summary_line(
-                alert.subject.as_deref(),
-                alert.from.as_deref(),
-                &alert.reason
-            )
-        );
-        seen += 1;
-        if limit.is_some_and(|limit| seen >= limit) {
-            break;
+    // One sink for all three formats: in `table` mode `emit` answers `false`
+    // and the row below is printed as it always was, so the loop body does not
+    // fork three ways.
+    let mut frames = crate::format::Frames::open(Command::NotificationStreamAlerts);
+    // Held rather than propagated so `finish` runs even when the stream fails:
+    // `--format json` writes its opening `[` with the first alert, and an
+    // early return would leave an unterminated array on stdout.
+    let outcome = async {
+        let mut seen = 0u64;
+        while let Some(alert) = stream
+            .message()
+            .await
+            .context("the alert stream ended with an error")?
+        {
+            if !frames.emit(&alert)? {
+                println!(
+                    "{:>6}  {:<8} {:<16} {}",
+                    alert.id,
+                    tier_name(alert.tier),
+                    // Attacker-controlled: an account label, a subject and a
+                    // sender are all somebody else's text on their way to a
+                    // terminal. The JSON path escapes them itself (see
+                    // `crate::format`); this is the table path's half.
+                    crate::terminal_safe(&alert.account),
+                    crate::terminal_safe(&summary_line(
+                        alert.subject.as_deref(),
+                        alert.from.as_deref(),
+                        &alert.reason
+                    ))
+                );
+            }
+            seen += 1;
+            if limit.is_some_and(|limit| seen >= limit) {
+                break;
+            }
         }
+        Ok::<(), anyhow::Error>(())
     }
-    Ok(())
+    .await;
+    frames.finish()?;
+    outcome
 }
 
 async fn score(socket: &Path, message_id: i64) -> Result<()> {
@@ -118,6 +135,10 @@ async fn score(socket: &Path, message_id: i64) -> Result<()> {
         .await
         .context("ScoreMessage RPC failed")?
         .into_inner();
+
+    if crate::format::emit_response(Command::NotificationScoreMessage, &response)? {
+        return Ok(());
+    }
 
     println!("state:      {}", state_name(response.state));
     match response.tier {

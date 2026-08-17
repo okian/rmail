@@ -160,9 +160,7 @@ struct JsonItem {
 /// Anything that stops the command completing: no daemon, a failed RPC, an
 /// unwritable stdout.
 pub async fn find(socket: &Path, args: FindArgs) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = FinderServiceClient::new(channel);
 
     if args.status {
@@ -206,10 +204,13 @@ pub async fn find(socket: &Path, args: FindArgs) -> Result<()> {
         account_id: args.account.unwrap_or(0),
         mailbox_id: args.in_folder.unwrap_or(0),
         limit: args.limit,
-        // Highlights are only rendered by `--json` (the table has nowhere to
-        // put them, and `search_cli`'s ANSI-safety argument applies here
+        // Highlights are only rendered by the JSON path (the table has nowhere
+        // to put them, and `search_cli`'s ANSI-safety argument applies here
         // too), so nothing else pays for the extra traceback per row.
-        with_positions: args.json,
+        // `wants_json`, not `args.json`: a `--format json` caller must get the
+        // same `positions` a `--json` one does, or the two spellings of the
+        // same flag would produce different objects.
+        with_positions: crate::format::wants_json(args.json),
     };
 
     let mut stream = client
@@ -248,13 +249,27 @@ pub async fn find(socket: &Path, args: FindArgs) -> Result<()> {
         return apply(&mut client, action, &latest).await;
     }
 
-    let mut out = std::io::stdout().lock();
-    if args.json {
+    // `wants_json`, not `args.json`: a `--format json` caller must not be
+    // handed the table. The sequence is written through `crate::format` so
+    // `--format json` gets one array and `--json`/`--format ndjson` get the
+    // line-per-item stream this flag has always emitted — and so every string
+    // goes through the escaper rather than raw `serde_json`.
+    if crate::format::wants_json(args.json) {
+        // An explicit `--format json` wins over the legacy flag; see
+        // `search_cli` for the same rule.
+        let mut seq = if args.json && !crate::format::current().is_structured() {
+            crate::format::JsonSeq::ndjson()
+        } else {
+            crate::format::JsonSeq::open()
+        };
         for item in &latest {
-            let line = serde_json::to_string(&to_json(item))?;
-            writeln!(out, "{line}")?;
+            seq.write(&to_json(item))?;
         }
-    } else {
+        return seq.finish();
+    }
+
+    let mut out = std::io::stdout().lock();
+    {
         for item in &latest {
             writeln!(
                 out,
@@ -279,7 +294,7 @@ pub async fn find(socket: &Path, args: FindArgs) -> Result<()> {
 
 /// Apply `--action` to every message the query matched.
 async fn apply(
-    client: &mut FinderServiceClient<tonic::transport::Channel>,
+    client: &mut FinderServiceClient<crate::client::Client>,
     action: &str,
     results: &[FindResult],
 ) -> Result<()> {

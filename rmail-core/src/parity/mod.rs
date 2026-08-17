@@ -1853,6 +1853,36 @@ pub const LOCAL_CLI: &[(&str, &str)] = &[
         "appends a [[hooks.hooks]] block to the operator's own config file; there is no \
          CreateHook RPC by design",
     ),
+    (
+        "daemon start",
+        "spawns the rmaild process; a capability row would have to name an RPC served by the \
+         daemon that is not running yet",
+    ),
+    (
+        "daemon status",
+        "the grpc.health.v1.Health/Check probe again, plus whether anything is listening at all \
+         — neither is a rmail.v1 method",
+    ),
+    (
+        "daemon stop",
+        "signals the process this machine's `mail daemon start` recorded; there is deliberately \
+         no Shutdown RPC, since a capability to stop the daemon would be reachable by MCP",
+    ),
+    (
+        "api ping",
+        "grpc.health.v1.Health/Check with a latency number, the same argument as `ping`",
+    ),
+    (
+        "api reflect",
+        "grpc.reflection.v1.ServerReflection, which is served by tonic-reflection rather than \
+         declared in proto/rmail/v1",
+    ),
+    (
+        "api call",
+        "the generic client itself — it reaches *every* row in this table by name, so a row of \
+         its own would be a capability that claims all the others (the same argument as \
+         `mcp serve`)",
+    ),
 ];
 
 /// TUI actions that are not capabilities, and why.

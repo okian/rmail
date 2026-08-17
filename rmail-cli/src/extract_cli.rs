@@ -1062,8 +1062,6 @@ fn invoice_json(extracted: &ExtractedInvoice) -> serde_json::Value {
     })
 }
 
-async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
-    rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))
+async fn connect(socket: &Path) -> Result<crate::client::Client> {
+    crate::client::connect(socket).await
 }

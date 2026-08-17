@@ -445,13 +445,35 @@ tests live; it is the filter (or `--test`) that does the selecting.
 - **verify:** `cargo nextest run -p rmail-core parity::` · `cargo nextest run -p rmaild auth::methods::` (every command → RPC; missing mapping fails; effect/scope agree)
 
 ## 42. CLI as gRPC client: structured output & generic call
-- [ ] status
+- [x] status
 - **depends-on:** 38, 40
 - **parallel-safe:** no
 - **acceptance:**
   - Global `--format {table,json,ndjson}` on every command with stable serde schemas and stable exit codes; streaming commands emit ndjson mirroring gRPC frames.
   - `rmail daemon start|status|stop`, `rmail api ping|reflect|call <Method> <json>`, and global flags (`--socket`,`--addr`,`--token`,`--tls-*`,`--insecure`,`--deadline`); daemon auto-start or `FAILED_PRECONDITION`.
 - **verify:** `cargo nextest run -p rmail-cli format:: api_call::` (format stability, generic call via reflection, exit codes)
+- **notes:** `--format` is accepted on every verb and never falls through to a
+  table: a verb with no structured rendering *refuses* with exit 12 and names
+  `mail api call <Method> '<json>'`, which prints any RPC's response as proto
+  JSON today. 16 verbs render structured output directly (`format::STRUCTURED`);
+  the remaining ~88 are declared in `format::NO_CURATED_SCHEMA` with the reason,
+  and `format::tests::every_cli_verb_declares_how_it_answers_format_json` fails
+  by name for any verb in neither list — so the gap is enforced and visible,
+  not silent. **Follow-up:** curate a per-verb schema for those 88 (one
+  `format::emit_response(Command::X, &response)?` per call site) and move each
+  path from `NO_CURATED_SCHEMA` to `STRUCTURED`.
+  `--tls-*` is implemented (tonic's `tls-webpki-roots`) but cannot be exercised
+  end to end: `rmaild` serves no TCP listener yet, so the integration test
+  reaches TCP over `--insecure`. Daemon lifecycle uses explicit start
+  (`FAILED_PRECONDITION` elsewhere), never auto-start.
+  **Flag rename:** `mail export`'s archive format is now `--archive-format`
+  (`-f` unchanged). It cannot share the id `format` with the global flag —
+  `clap` merges a global and a subcommand argument of the same id by
+  value-source precedence and writes the winner into both, so
+  `RMAIL_FORMAT=json mail export -o backup.mbox` wrote a JSON archive into a
+  `.mbox` file with no diagnostic. prd.md item 63's `--format mbox` spelling is
+  superseded by task 42's global flag (prd.md item 37); see `export_cli`'s
+  module docs.
 
 ## 43. Anthropic provider & Provider trait
 - [x] status

@@ -98,7 +98,16 @@ impl Catalog {
     /// `FileDescriptorSet`. For the compiled-in set this cannot happen at
     /// runtime — it would be a build failure — but the projection has no
     /// business panicking over it either way.
-    pub(super) fn build(bytes: &[u8]) -> Result<Self, McpError> {
+    ///
+    /// `pub` rather than `pub(super)` because `mail api call` builds one of
+    /// these from bytes the *daemon's reflection service* just handed it, not
+    /// from `rmail_proto::FILE_DESCRIPTOR_SET`. That is the whole point of
+    /// reaching an RPC through reflection: the shape used to encode the
+    /// request is the shape the process on the other end of the socket says
+    /// it serves, so a `mail` built against a different revision of the protos
+    /// than the `rmaild` it is talking to fails on the method it cannot find
+    /// rather than silently encoding a field number that has moved.
+    pub fn build(bytes: &[u8]) -> Result<Self, McpError> {
         let set = FileDescriptorSet::decode(bytes)
             .map_err(|e| McpError::Descriptor(format!("the compiled descriptor set: {e}")))?;
 

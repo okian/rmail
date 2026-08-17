@@ -133,9 +133,7 @@ pub async fn contact(socket: &Path, args: ContactArgs) -> Result<()> {
         .context("--since")?;
     let since_abs = since.map_or(0, |seconds| now().saturating_sub(seconds));
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = AnalyticsServiceClient::new(channel);
     let insight = client
         .get_contact_insight(GetContactInsightRequest {
@@ -177,9 +175,7 @@ pub async fn subs(socket: &Path, args: SubsArgs) -> Result<()> {
         .context("--since")?;
     let since_abs = since.map_or(0, |seconds| now().saturating_sub(seconds));
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = AnalyticsServiceClient::new(channel);
     let report = client
         .list_subscriptions(ListSubscriptionsRequest {
@@ -209,9 +205,7 @@ pub async fn subs(socket: &Path, args: SubsArgs) -> Result<()> {
 ///
 /// As [`contact`].
 pub async fn ask(socket: &Path, args: AskArgs) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = AnalyticsServiceClient::new(channel);
     let answer = client
         .ask_analytics(AskAnalyticsRequest {

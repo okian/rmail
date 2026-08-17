@@ -181,10 +181,8 @@ fn kinds(values: &[KindArg]) -> Vec<i32> {
     values.iter().map(|k| k.to_proto() as i32).collect()
 }
 
-async fn client(socket: &Path) -> Result<IndexServiceClient<tonic::transport::Channel>> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+async fn client(socket: &Path) -> Result<IndexServiceClient<crate::client::Client>> {
+    let channel = crate::client::connect(socket).await?;
     Ok(IndexServiceClient::new(channel))
 }
 
@@ -594,9 +592,7 @@ pub async fn entities(socket: &Path, args: EntitiesArgs) -> Result<()> {
 
 /// The `--search` half of `mail entities`.
 async fn search_entities(socket: &Path, query: &str, args: &EntitiesArgs) -> Result<()> {
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let response = SearchServiceClient::new(channel)
         .search_entities(SearchEntitiesRequest {
             query: query.to_owned(),

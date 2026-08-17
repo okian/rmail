@@ -173,9 +173,7 @@ async fn response_time(socket: &Path, args: ResponseTimeArgs) -> Result<()> {
 
     let (since_abs, until) = resolve_window(since, args.until, now());
 
-    let channel = rmail_core::connect_uds(socket)
-        .await
-        .with_context(|| format!("connecting to rmaild at {}", socket.display()))?;
+    let channel = crate::client::connect(socket).await?;
     let mut client = AnalyticsServiceClient::new(channel);
 
     let report = client

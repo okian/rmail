@@ -209,7 +209,7 @@ async fn export_writes_an_mbox_file_containing_the_stored_bytes() {
         .ok(&[
             "export",
             "",
-            "--format",
+            "--archive-format",
             "mbox",
             "-o",
             out.to_str().unwrap(),
@@ -244,7 +244,7 @@ async fn export_writes_a_real_maildir_tree() {
         .ok(&[
             "export",
             "",
-            "--format",
+            "--archive-format",
             "maildir",
             "-o",
             out.to_str().unwrap(),
@@ -272,7 +272,14 @@ async fn export_writes_one_eml_per_message() {
     let out = server.out("eml");
 
     server
-        .ok(&["export", "", "--format", "eml", "-o", out.to_str().unwrap()])
+        .ok(&[
+            "export",
+            "",
+            "--archive-format",
+            "eml",
+            "-o",
+            out.to_str().unwrap(),
+        ])
         .await;
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&out)
@@ -293,7 +300,7 @@ async fn export_json_to_stdout_is_a_single_valid_document() {
     server.seed(2).await;
 
     let output = server
-        .ok(&["export", "", "--format", "json", "-o", "-"])
+        .ok(&["export", "", "--archive-format", "json", "-o", "-"])
         .await;
     let document: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout is one JSON document");
@@ -321,7 +328,7 @@ async fn a_query_narrows_the_archive() {
         .ok(&[
             "export",
             "from:nobody@example.com",
-            "--format",
+            "--archive-format",
             "mbox",
             "-o",
             out.to_str().unwrap(),
@@ -343,7 +350,7 @@ async fn a_refused_export_leaves_no_file_behind() {
             "export",
             "--thread",
             "4242",
-            "--format",
+            "--archive-format",
             "mbox",
             "-o",
             out.to_str().unwrap(),
@@ -368,7 +375,7 @@ async fn with_ai_on_a_byte_format_is_refused_and_writes_nothing() {
         .fails(&[
             "export",
             "",
-            "--format",
+            "--archive-format",
             "mbox",
             "--with-ai",
             "-o",
@@ -384,7 +391,7 @@ async fn with_ai_on_a_byte_format_is_refused_and_writes_nothing() {
 async fn a_directory_format_cannot_be_streamed_to_stdout() {
     let server = TestServer::start().await;
     let stderr = server
-        .fails(&["export", "", "--format", "maildir", "-o", "-"])
+        .fails(&["export", "", "--archive-format", "maildir", "-o", "-"])
         .await;
     assert!(stderr.contains("directory"), "stderr: {stderr}");
     server.stop().await;
@@ -451,7 +458,13 @@ async fn naming_neither_a_query_nor_a_thread_is_refused() {
     let server = TestServer::start().await;
     let out = server.out("nothing.mbox");
     let stderr = server
-        .fails(&["export", "--format", "mbox", "-o", out.to_str().unwrap()])
+        .fails(&[
+            "export",
+            "--archive-format",
+            "mbox",
+            "-o",
+            out.to_str().unwrap(),
+        ])
         .await;
     assert!(stderr.contains("--thread"), "stderr: {stderr}");
     server.stop().await;

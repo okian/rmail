@@ -61,7 +61,14 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tonic::transport::Channel;
+/// The connection every client in this module is built on.
+///
+/// `crate::client::Client` rather than a bare `tonic` `Channel` so the TUI
+/// honours the same global transport flags every other verb does — `--addr`,
+/// `--token` and `--deadline` are attached by the interceptor that type
+/// carries, and a TUI that quietly ignored them would be the one surface where
+/// `--token` did nothing.
+type Conn = crate::client::Client;
 
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
@@ -106,14 +113,14 @@ const TICK: Duration = Duration::from_secs(1);
 
 /// Runs the TUI's commands against a live `rmaild`.
 pub struct GrpcExec {
-    mail: MailServiceClient<Channel>,
-    sync: SyncServiceClient<Channel>,
-    accounts: AccountServiceClient<Channel>,
-    compose: ComposeServiceClient<Channel>,
-    search: SearchServiceClient<Channel>,
-    finder: FinderServiceClient<Channel>,
-    ai: AiServiceClient<Channel>,
-    scheduler: SendSchedulerServiceClient<Channel>,
+    mail: MailServiceClient<Conn>,
+    sync: SyncServiceClient<Conn>,
+    accounts: AccountServiceClient<Conn>,
+    compose: ComposeServiceClient<Conn>,
+    search: SearchServiceClient<Conn>,
+    finder: FinderServiceClient<Conn>,
+    ai: AiServiceClient<Conn>,
+    scheduler: SendSchedulerServiceClient<Conn>,
     /// The task feeding the search overlay, so the next keystroke can abort
     /// it. One slot per stream kind: a search and a find can be outstanding
     /// at once (they are different overlays), but two searches cannot.
@@ -154,13 +161,13 @@ impl GrpcExec {
     /// reporting before the TUI takes the terminal over, since a TUI that
     /// cannot reach the daemon has nothing to draw.
     pub async fn connect(socket: &Path) -> anyhow::Result<Self> {
-        let channel = rmail_core::connect_uds(socket).await?;
+        let channel = crate::client::connect(socket).await?;
         Ok(Self::with_channel(channel))
     }
 
     /// Build every client over an already-established channel.
     #[must_use]
-    pub fn with_channel(channel: Channel) -> Self {
+    pub fn with_channel(channel: Conn) -> Self {
         let cancel = CancellationToken::new();
         Self {
             mail: MailServiceClient::new(channel.clone()),
@@ -572,7 +579,7 @@ fn now_unix() -> i64 {
 /// computed, and collecting into a `Vec` would throw away exactly the latency
 /// it exists to deliver.
 async fn stream_search(
-    client: &mut SearchServiceClient<Channel>,
+    client: &mut SearchServiceClient<Conn>,
     query: String,
     generation: u64,
     account_id: i64,
@@ -620,7 +627,7 @@ async fn stream_search(
 /// `CANCELLED` status, which is why nothing here treats the end of a stream
 /// as an error.
 async fn stream_find(
-    client: &mut FinderServiceClient<Channel>,
+    client: &mut FinderServiceClient<Conn>,
     query: String,
     generation: u64,
     account_id: i64,
@@ -672,7 +679,7 @@ async fn stream_find(
 /// whole one — so this reports that rather than letting the pane sit on
 /// "streaming" forever.
 async fn stream_ask(
-    client: &mut AiServiceClient<Channel>,
+    client: &mut AiServiceClient<Conn>,
     question: String,
     generation: u64,
     account_id: i64,
@@ -748,7 +755,7 @@ async fn stream_ask(
 }
 
 async fn list_outbox(
-    client: &mut SendSchedulerServiceClient<Channel>,
+    client: &mut SendSchedulerServiceClient<Conn>,
     account_id: i64,
 ) -> Result<Vec<super::overlays::OutboxRow>, String> {
     let response = call(client.list_outbox(ListOutboxRequest {
@@ -850,7 +857,7 @@ async fn call<T>(
 }
 
 async fn load_messages(
-    client: &mut MailServiceClient<Channel>,
+    client: &mut MailServiceClient<Conn>,
     mailbox_id: i64,
 ) -> Result<Vec<super::model::MessageRow>, String> {
     let response = call(client.list(ListMessagesRequest {
@@ -871,7 +878,7 @@ async fn load_messages(
 }
 
 async fn open_html(
-    client: &mut MailServiceClient<Channel>,
+    client: &mut MailServiceClient<Conn>,
     message_id: i64,
     opener: CommandOpener,
 ) -> Result<Effect, String> {

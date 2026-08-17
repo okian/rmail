@@ -24,6 +24,16 @@
 //! | [`server`] | MCP/JSON-RPC semantics: `initialize`, `tools/list`, `tools/call` |
 //! | [`transport`] | stdio and SSE, both feeding [`server::McpServer`] |
 //!
+//! [`codec`], [`descriptor`] and [`invoke`] are `pub` rather than
+//! `pub(crate)` because they are not only MCP's: `mail api call` (task 42) is
+//! the same translation — a method name and a JSON object in, a gRPC request
+//! out, JSON back — reached from a shell instead of from an agent. It calls
+//! [`invoke::call_dynamic`] against a [`descriptor::Catalog`] built from what
+//! the daemon's *reflection* service reports, so the one hard-won JSON <->
+//! protobuf bridge in this workspace has one implementation and one set of
+//! edge cases (64-bit fields as strings, unknown keys refused rather than
+//! dropped, enums by name, `null` meaning absence) rather than two.
+//!
 //! # Where enforcement lives
 //!
 //! The surface a caller sees is filtered by its granted scopes, and a call it
@@ -41,16 +51,16 @@
 //! therefore returns a bounded *prefix* and says so — see [`invoke`] for the
 //! two bounds and why both are needed.
 
-mod codec;
-mod descriptor;
-mod invoke;
+pub mod codec;
+pub mod descriptor;
+pub mod invoke;
 pub mod projection;
 mod schema;
 mod server;
 pub mod tools;
 mod transport;
 
-pub use invoke::{CallLimits, CallOutcome, Truncation};
+pub use invoke::{CallLimits, CallOutcome, RawCall, Truncation};
 pub use projection::{Tool, ToolSurface};
 pub use server::{McpServer, Principal};
 pub use tools::{Mutations, Visibility};
