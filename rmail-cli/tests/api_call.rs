@@ -409,7 +409,9 @@ async fn tcp_server(
             // `admin_uid` is irrelevant over TCP — there is no Unix peer to
             // compare it against — so the layer falls through to the bearer
             // token, which is exactly the principal this test needs.
-            .layer(rmaild::AuthLayer::new(db.clone(), 0))
+            // `require_login_for_peer: false` is likewise moot here (there is
+            // no peer trust to disable) but matches the daemon's default.
+            .layer(rmaild::AuthLayer::new(db.clone(), 0, false))
             .add_service(reflection)
             .add_service(AdminServiceServer::new(rmaild::AdminApi::new(db)))
             .serve_with_incoming_shutdown(

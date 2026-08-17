@@ -89,6 +89,18 @@ tracing.workspace = true
 # under `--stdio` and must carry nothing else. No other verb installs one.
 tracing-subscriber.workspace = true
 thiserror.workspace = true
+# `auth_cli`'s masked prompt for `mail auth setup`/`mail auth login`.
+rpassword.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `session`'s cached client-auth token store — the macOS Keychain, reached
+# through the same `security-framework` generic-password API
+# `rmail_core::oauth::store` already uses for OAuth refresh tokens. A second,
+# CLI-only dependency on it (rather than exposing this through `rmail-core`)
+# because caching *this* crate's own session token is transport/client
+# plumbing specific to `mail`/the TUI, not daemon-side domain logic the way
+# OAuth grant custody is.
+security-framework.workspace = true
 
 [dev-dependencies]
 rmaild.workspace = true

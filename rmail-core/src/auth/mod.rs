@@ -16,6 +16,7 @@
 //! rather than argon2-hashing the presented secret against every stored
 //! token — the id is not secret, only the 32 random bytes after it are.
 
+pub mod password;
 mod repo;
 pub mod scope;
 
@@ -294,6 +295,13 @@ fn generate_secret() -> String {
 /// Synchronous and CPU-bound by design (argon2's whole point is to cost real
 /// time and memory) — callers on the async path must run this via
 /// [`hash_secret_blocking`], never inline in an `async fn`.
+///
+/// Private, not `pub(super)`: [`password`] is a *descendant* module of
+/// `auth` (`auth::password`), and Rust's default visibility already reaches
+/// every descendant of the defining module, not just the module itself —
+/// `password` calls this via `super::hash_secret` with no modifier needed.
+/// `pub(super)` here would mean visible to `auth`'s *parent*, the crate
+/// root — every module in `rmail-core`, not the one that actually uses it.
 fn hash_secret(secret: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
@@ -356,6 +364,14 @@ async fn verify_secret_blocking(secret: String, phc: String) -> bool {
 /// `"rmail-dummy-verification-secret-never-stored"`; it protects nothing and
 /// never needs to change — its only job is to burn the same CPU a real
 /// verification would.
+///
+/// Private, not `pub(super)`: [`password::verify_password`] burns the same
+/// cost against this same constant on its own "nothing to compare against"
+/// paths (no password configured, or a caller checking while locked out) —
+/// one dummy hash for the crate, not one per module that happens to need the
+/// trick — and reaches it via plain `super::DUMMY_HASH`, since `password` is
+/// a descendant of `auth` and already sees everything private to it (see
+/// [`hash_secret`]'s own docs on this visibility rule).
 const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$DFaru382lYMgIot9qGJ15w$\
      fXiUth5w7z7RpssPoc+oUhJYNp86JW57d+iQJpB20hc";
 

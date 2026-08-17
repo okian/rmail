@@ -532,6 +532,12 @@ pub(crate) const UNSTRUCTURED: &[(&str, &str)] = &[
          global JSON would have nothing to mean (and, spelled `--format`, used to overwrite the \
          archive format — see `export_cli`'s own docs)",
     ),
+    (
+        "auth logout",
+        "composes a server call (AdminService.RevokeToken, best-effort) with forgetting the \
+         locally cached session, which is not a gRPC response at all — there is no single \
+         message a curated schema, or `mail api call`, could ever point at",
+    ),
 ];
 
 /// `mail` verbs that render `--format json` and `--format ndjson`.
@@ -556,6 +562,7 @@ pub(crate) const STRUCTURED: &[&str] = &[
     "notify score",
     "notify watch",
     "token list",
+    "auth status",
     "ai status",
     "api ping",
     "api reflect",
@@ -599,6 +606,9 @@ pub(crate) const NO_CURATED_SCHEMA: &[&str] = &[
     "account refresh",
     "token create",
     "token revoke",
+    "auth setup",
+    "auth clear",
+    "auth login",
     "search rollback",
     "folder new",
     "folder list",

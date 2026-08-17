@@ -27,8 +27,13 @@
 //!
 //! `rmaild`'s auth layer grants `admin` to a Unix-socket peer whose uid
 //! matches the daemon's *before it looks at the `authorization` header at
-//! all* (see `rmaild::auth`'s "Two principals"). So on the socket this command
-//! connects to:
+//! all* (see `rmaild::auth`'s "Two principals") — **unless**
+//! `client_auth.require_for_local` is set, in which case that shortcut is off
+//! for every caller, this one included, and `resolve_principal` falls back to
+//! whatever `mail auth login` cached instead (or refuses to start the server
+//! at all, loudly, if nothing is cached — see that function's own docs).
+//! Assume the shortcut applies for the rest of this section; it is the
+//! default. So on the socket this command connects to:
 //!
 //! - `--token` (the *global* flag since task 42 — this verb no longer declares
 //!   one of its own, because two arguments with one id are merged by `clap`
@@ -64,6 +69,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use rmail_core::auth::Scope;
+use rmail_proto::v1::client_auth_service_client::ClientAuthServiceClient;
+use rmail_proto::v1::AuthStatusRequest;
 use rmaild::mcp::{self, CallLimits, McpServer, Mutations, Principal};
 use tokio_util::sync::CancellationToken;
 
@@ -170,8 +177,6 @@ async fn serve(socket: &Path, args: ServeArgs) -> Result<()> {
             "choose a transport: --stdio (for an MCP client that launches this process) or --sse"
         );
     }
-    let bearer = crate::client::bearer();
-    let scopes = resolve_scopes(&args, bearer.as_deref())?;
     let timeout = rmail_core::config::parse_human_duration(&args.timeout)
         .map_err(|e| anyhow::anyhow!("invalid --timeout: {e}"))?;
     if args.max_frames == 0 {
@@ -184,6 +189,8 @@ async fn serve(socket: &Path, args: ServeArgs) -> Result<()> {
     // `--token` interceptor underneath as well would put two `authorization`
     // headers on each request.
     let channel = crate::client::connect_parts(socket).await?.channel;
+    let (bearer, scopes) =
+        resolve_principal(socket, &args, channel.clone(), crate::client::bearer()).await?;
 
     let cancel = CancellationToken::new();
     let server = McpServer::new(
@@ -245,42 +252,122 @@ fn principal(args: &ServeArgs, scopes: Vec<Scope>, bearer: Option<String>) -> Pr
     }
 }
 
-/// The scopes this connection claims — see this module's docs on why the
-/// two cases differ.
-fn resolve_scopes(args: &ServeArgs, bearer: Option<&str>) -> Result<Vec<Scope>> {
-    if args.scopes.is_empty() {
-        if bearer.is_some() {
-            bail!(
-                "--token was given but --scope was not. A bearer secret is opaque, so this \
-                 process cannot tell what the token grants and would either advertise tools the \
-                 daemon will refuse or hide tools it would allow. Pass the scopes the token was \
-                 minted with, e.g. --scope mail.read,ai.invoke."
-            );
-        }
-        if args.sse {
-            // Defaulting `--sse` to admin would put the whole surface behind a
-            // TCP port with no authentication, reachable by anything running
-            // as any user on this host. `--stdio` has a parent process that
-            // chose to launch it; a port does not, so it must be asked.
-            bail!(
-                "--sse needs an explicit --scope. Unlike --stdio, the SSE endpoint has no \
-                 parent process that chose to start it: it is a TCP port anything on this host \
-                 can connect to, so it must not silently inherit the admin the daemon grants \
-                 this socket's owner. State what the agent may do, e.g. --scope mail.read."
-            );
-        }
-        // `--stdio` with no token: the daemon's Unix-peer path decides, and
-        // for the socket's owner that is `admin`. Claiming anything narrower
-        // here would hide tools the daemon would in fact run.
-        return Ok(vec![Scope::Admin]);
+/// The bearer this connection presents, and the scopes it claims — the pure
+/// decision, given whatever [`resolve_principal`] already learned about the
+/// environment. Split out so the usage-error messages (the part worth
+/// pinning in a test) need no running daemon to exercise, even though the
+/// full resolution now sometimes does.
+///
+/// `local_login_required`/`cached_bearer` only matter for the `--stdio`,
+/// no-`--token`, no-`--scope` case; every other branch ignores them, which is
+/// exactly why [`resolve_principal`] skips the `AuthStatus` round trip and
+/// the Keychain read for every branch but that one.
+fn decide_principal(
+    args: &ServeArgs,
+    explicit_bearer: Option<&str>,
+    local_login_required: bool,
+    cached_bearer: Option<&str>,
+) -> Result<(Option<String>, Vec<Scope>)> {
+    if !args.scopes.is_empty() {
+        let scopes = args
+            .scopes
+            .iter()
+            .map(|raw| {
+                raw.parse::<Scope>()
+                    .map_err(|e| anyhow::anyhow!("invalid --scope {raw:?}: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok((explicit_bearer.map(str::to_owned), scopes));
     }
-    args.scopes
-        .iter()
-        .map(|raw| {
-            raw.parse::<Scope>()
-                .map_err(|e| anyhow::anyhow!("invalid --scope {raw:?}: {e}"))
-        })
-        .collect()
+    if explicit_bearer.is_some() {
+        bail!(
+            "--token was given but --scope was not. A bearer secret is opaque, so this process \
+             cannot tell what the token grants and would either advertise tools the daemon will \
+             refuse or hide tools it would allow. Pass the scopes the token was minted with, \
+             e.g. --scope mail.read,ai.invoke."
+        );
+    }
+    if args.sse {
+        // Defaulting `--sse` to admin would put the whole surface behind a
+        // TCP port with no authentication, reachable by anything running as
+        // any user on this host. `--stdio` has a parent process that chose to
+        // launch it; a port does not, so it must be asked.
+        bail!(
+            "--sse needs an explicit --scope. Unlike --stdio, the SSE endpoint has no parent \
+             process that chose to start it: it is a TCP port anything on this host can connect \
+             to, so it must not silently inherit the admin the daemon grants this socket's \
+             owner. State what the agent may do, e.g. --scope mail.read."
+        );
+    }
+    if !local_login_required {
+        // Unchanged from before `client_auth` existed: the daemon's
+        // Unix-peer path decides, and for the socket's owner that is
+        // `admin`. Claiming anything narrower here would hide tools the
+        // daemon would in fact run.
+        return Ok((None, vec![Scope::Admin]));
+    }
+
+    // Peer trust alone is not enough here. A session `mail auth login`
+    // cached is known, by construction, to carry exactly `Scope::Admin` —
+    // `rmaild::client_auth_service::login_password` always mints that one
+    // scope — so, unlike an operator-supplied `--token` of unknown
+    // provenance, it can stand in for the assumption above without an
+    // explicit `--scope`.
+    match cached_bearer {
+        Some(token) => Ok((Some(token.to_owned()), vec![Scope::Admin])),
+        None => bail!(
+            "this daemon requires client_auth login even for local callers \
+             (client_auth.require_for_local = true), and no session is cached for this socket. \
+             Run `mail auth login` first, or pass --token/--scope explicitly."
+        ),
+    }
+}
+
+/// [`decide_principal`], filling in `local_login_required`/`cached_bearer`
+/// with a real `AuthStatus` RPC and the local session cache — but only when
+/// the decision actually depends on them (an explicit `--scope`, an explicit
+/// `--token`, or `--sse` are all decidable with no daemon call at all; see
+/// `decide_principal`'s own early returns).
+///
+/// # Errors
+///
+/// Everything [`decide_principal`] can return, plus a mapped `AuthStatus`
+/// RPC failure.
+async fn resolve_principal(
+    socket: &Path,
+    args: &ServeArgs,
+    channel: tonic::transport::Channel,
+    explicit_bearer: Option<String>,
+) -> Result<(Option<String>, Vec<Scope>)> {
+    if !args.scopes.is_empty() || explicit_bearer.is_some() || args.sse {
+        return decide_principal(args, explicit_bearer.as_deref(), false, None);
+    }
+
+    // `--addr` has no Unix-peer trust to ask about at all: an explicit
+    // `--token` is the only way to reach a remote daemon here, and that path
+    // already returned above.
+    let local_login_required = if crate::client::remote_addr().is_some() {
+        false
+    } else {
+        let mut auth = ClientAuthServiceClient::new(channel);
+        auth.auth_status(AuthStatusRequest {})
+            .await
+            .context("AuthStatus RPC failed")?
+            .into_inner()
+            .local_login_required
+    };
+    // Off the runtime — see `client::connect_parts`'s identical guard on the
+    // same blocking Keychain call for why.
+    let socket_owned = socket.to_path_buf();
+    let cached = tokio::task::spawn_blocking(move || crate::session::load(&socket_owned))
+        .await
+        .unwrap_or_default();
+    decide_principal(
+        args,
+        None,
+        local_login_required,
+        cached.as_ref().map(|session| session.token.as_str()),
+    )
 }
 
 /// `--list`: the tool surface exactly as this connection would advertise it.
@@ -354,11 +441,8 @@ mod tests {
     #[test]
     fn read_only_changes_nothing_but_the_effect_policy() {
         let args = parse(&["--stdio", "--read-only", "--scope", "mail.read,ai.invoke"]);
-        let principal = principal(
-            &args,
-            resolve_scopes(&args, None).expect("scopes parse"),
-            None,
-        );
+        let (bearer, scopes) = decide_principal(&args, None, false, None).expect("scopes parse");
+        let principal = principal(&args, scopes, bearer);
         assert_eq!(principal.scopes, vec![Scope::MailRead, Scope::AiInvoke]);
         assert!(principal.bearer.is_none());
     }
@@ -368,24 +452,57 @@ mod tests {
     #[test]
     fn read_only_does_not_excuse_an_explicit_scope() {
         assert!(
-            resolve_scopes(&parse(&["--sse", "--read-only"]), None).is_err(),
+            decide_principal(&parse(&["--sse", "--read-only"]), None, false, None).is_err(),
             "--sse must still demand an explicit --scope"
         );
         assert!(
-            resolve_scopes(
+            decide_principal(
                 &parse(&["--stdio", "--read-only"]),
                 // The global `--token`, now passed in rather than declared
                 // here — see `principal`.
                 Some("rmail_tok_x"),
+                false,
+                None,
             )
             .is_err(),
             "a bearer token must still demand an explicit --scope"
         );
         // ...and `--stdio` alone still claims admin, rather than --read-only
-        // being mistaken for a scope.
+        // being mistaken for a scope — when the daemon does not require login
+        // even for local peers (the default; `client_auth.require_for_local`
+        // is the case the next two tests cover).
         assert_eq!(
-            resolve_scopes(&parse(&["--stdio", "--read-only"]), None).expect("scopes"),
-            vec![Scope::Admin]
+            decide_principal(&parse(&["--stdio", "--read-only"]), None, false, None)
+                .expect("scopes"),
+            (None, vec![Scope::Admin])
+        );
+    }
+
+    /// `client_auth.require_for_local`, the case peer trust alone cannot
+    /// answer: a cached session stands in for it, silently, because a
+    /// `LoginPassword`-minted session is known to carry exactly
+    /// `Scope::Admin` — see `decide_principal`'s own docs.
+    #[test]
+    fn require_for_local_uses_the_cached_session_as_admin() {
+        let args = parse(&["--stdio"]);
+        assert_eq!(
+            decide_principal(&args, None, true, Some("rmail_tok_cached")).expect("scopes"),
+            (Some("rmail_tok_cached".to_owned()), vec![Scope::Admin])
+        );
+    }
+
+    /// The same case with nothing cached: this must refuse loudly at
+    /// startup, not claim `admin` on the strength of a peer-uid check the
+    /// daemon has said it will not honour, and leave every tool call to fail
+    /// with `UNAUTHENTICATED` one at a time instead.
+    #[test]
+    fn require_for_local_with_no_cached_session_refuses() {
+        let args = parse(&["--stdio"]);
+        let err = decide_principal(&args, None, true, None)
+            .expect_err("no credential should back an admin claim");
+        assert!(
+            err.to_string().contains("mail auth login"),
+            "the refusal should say how to fix it: {err}"
         );
     }
 }

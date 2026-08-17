@@ -23,6 +23,7 @@ mod analytics_service;
 mod attachment_service;
 mod audit_service;
 mod auth;
+mod client_auth_service;
 mod compose_service;
 mod config_service;
 mod export_service;
@@ -59,6 +60,7 @@ pub use auth::AuthLayer;
 /// tool needs to be told which scope to mint, and re-deriving that from a
 /// second table is the drift `rmail_core::parity` exists to prevent.
 pub use auth::Requirement;
+pub use client_auth_service::ClientAuthApi;
 pub use compose_service::ComposeApi;
 pub use config_service::ConfigApi;
 pub use export_service::ExportApi;
@@ -139,6 +141,7 @@ use rmail_proto::v1::ai_service_server::AiServiceServer;
 use rmail_proto::v1::analytics_service_server::AnalyticsServiceServer;
 use rmail_proto::v1::attachment_service_server::AttachmentServiceServer;
 use rmail_proto::v1::audit_service_server::AuditServiceServer;
+use rmail_proto::v1::client_auth_service_server::ClientAuthServiceServer;
 use rmail_proto::v1::compose_service_server::ComposeServiceServer;
 use rmail_proto::v1::config_service_server::ConfigServiceServer;
 use rmail_proto::v1::export_service_server::ExportServiceServer;
@@ -240,6 +243,29 @@ pub enum ServeError {
     /// re-label every future `?` on that type in this function.
     #[error("invalid search.training: {0}")]
     InvalidTraining(String),
+
+    /// A `[client_auth]` value parses fine but does not mean what whoever
+    /// wrote it probably intended — see `ClientAuthConfig::validate`.
+    #[error("invalid client_auth config: {0}")]
+    InvalidClientAuth(String),
+
+    /// `client_auth.require_for_local = true` with no password (or passkey)
+    /// configured — checked before the socket is bound, for the same reason
+    /// as `InvalidRankWeights`/`InvalidTraining`: the alternative is a
+    /// daemon that starts, then locks its own operator out of the Unix
+    /// socket the moment they try to use it, with no local way back in short
+    /// of editing the database by hand.
+    #[error(
+        "client_auth.require_for_local is true, but no password is configured — this would lock \
+         out every local client including yourself. Run `mail auth setup` first (with \
+         require_for_local left at its default, false), then enable it."
+    )]
+    LocalLoginRequiredWithNoCredential,
+
+    /// Checking whether a `client_password` row exists (for the validation
+    /// above) failed at the storage layer.
+    #[error("could not check whether a client-auth password is configured: {0}")]
+    ClientAuthCheck(#[source] rmail_core::Error),
 
     /// The learned ranker model named by `ranker_model.active` could not be
     /// read from the database at startup.
@@ -671,6 +697,25 @@ where
     // job at 3 a.m.
     let training_params = TrainingParams::from_config(&config.search.training)
         .map_err(|error| ServeError::InvalidTraining(error.to_string()))?;
+    // Same reasoning again: a `client_auth.max_attempts = 0` or a zero
+    // `session_ttl` should fail here, not the first time someone tries to
+    // log in.
+    config
+        .client_auth
+        .validate()
+        .map_err(ServeError::InvalidClientAuth)?;
+    // Same eager-validation reasoning as the two checks above, but this one
+    // needs the database (a password is a row, not a config value), so it
+    // runs here rather than being expressible as a pure `from_config`. Only
+    // a password exists to check today; extend this once passkeys do.
+    if config.client_auth.require_for_local {
+        let password_configured = rmail_core::auth::password::is_configured(&db)
+            .await
+            .map_err(ServeError::ClientAuthCheck)?;
+        if !password_configured {
+            return Err(ServeError::LocalLoginRequiredWithNoCredential);
+        }
+    }
     let path = socket_path.as_ref().to_path_buf();
 
     if let Some(parent) = path.parent() {
@@ -798,6 +843,8 @@ where
         config.grpc.idempotency.in_flight.into(),
     );
     let admin_service = AdminServiceServer::new(AdminApi::new(db.clone()));
+    let client_auth_service =
+        ClientAuthServiceServer::new(ClientAuthApi::new(db.clone(), config.client_auth.clone()));
     // Registered further down, once the AI provider and policy engine exist:
     // `Autoconfigure`'s model fallback needs both, and `AccountApi` is built
     // here because everything else on that service needs neither.
@@ -2096,10 +2143,15 @@ where
         // inside it (so a denied request is still traced) and outside every
         // service (so no service can be added later without it).
         .layer(RequestTraceLayer::new())
-        .layer(AuthLayer::new(db, admin_uid))
+        .layer(AuthLayer::new(
+            db,
+            admin_uid,
+            config.client_auth.require_for_local,
+        ))
         .add_service(health_service)
         .add_service(reflection)
         .add_service(admin_service)
+        .add_service(client_auth_service)
         .add_service(audit_service)
         .add_service(analytics_service)
         .add_service(account_service)

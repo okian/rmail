@@ -33,6 +33,18 @@
 //! see `rmaild::auth`'s "Two principals"). Nothing in this module can widen
 //! what a principal may do; it can only carry the credential.
 //!
+//! # The client_auth session cache is a fallback, not a third flag
+//!
+//! When neither `--token` nor `$RMAIL_TOKEN` is given (and `--addr` is not
+//! in play — see [`connect_parts`]), the token comes from whatever `mail
+//! auth login` cached for this exact socket path ([`crate::session`]). This
+//! exists so `client_auth.require_for_local` is actually usable day to day:
+//! without it, a daemon with that flag on would need `--token` typed by hand
+//! on every single command forever, which is a strong incentive to just turn
+//! the flag back off. The cache carries no more authority than an explicit
+//! `--token` would — it is still just a bearer secret `rmaild`'s `AuthLayer`
+//! verifies the same way.
+//!
 //! # Nothing hangs
 //!
 //! `rmail_core::CONNECT_TIMEOUT` bounds connection establishment, and a socket
@@ -240,9 +252,35 @@ pub(crate) async fn connect_parts(socket: &Path) -> Result<Parts> {
         Some(addr) => connect_tcp(&transport, addr).await?,
         None => connect_socket(&transport, socket).await?,
     };
+    // `--token`/`$RMAIL_TOKEN` win outright; otherwise fall back to whatever
+    // `mail auth login` cached for *this* socket — only for the Unix-socket
+    // path, since the cache is keyed by socket path (see
+    // `session::account_for`) and a `--addr` target has no such path to key
+    // on. A `client_auth.require_for_local`-gated daemon depends on exactly
+    // this: without it, every command after `mail auth login` would need
+    // `--token` typed by hand, defeating the point of caching anything.
+    let token = match &transport.token {
+        Some(token) => Some(token.clone()),
+        None if transport.addr.is_none() => {
+            // `session::load` is a blocking Keychain call (the macOS
+            // Keychain API is synchronous FFI, and on an unsigned or
+            // rebuilt binary it can raise an OS access prompt) — run off
+            // the async runtime like any other blocking I/O, so it cannot
+            // stall this task's executor thread while a human is looking at
+            // a dialog. Every command pays this, including ones talking to
+            // a daemon with no password configured at all, which is exactly
+            // why it must never block inline.
+            let socket = socket.to_path_buf();
+            tokio::task::spawn_blocking(move || crate::session::load(&socket))
+                .await
+                .unwrap_or_default()
+                .map(|cached| cached.token)
+        }
+        None => None,
+    };
     Ok(Parts {
         channel,
-        token: transport.token,
+        token,
         deadline: transport.deadline,
     })
 }

@@ -48,6 +48,19 @@
 //!   what a TCP connection would present once task 38's config-only TCP
 //!   listener is actually stood up): verified via [`rmail_core::auth::verify`].
 //!
+//! # A third, opt-in gate: `require_login_for_peer`
+//!
+//! The Unix-peer-uid grant above answers "is this the same OS user as the
+//! daemon", which is not the same question as "did a human prove they are
+//! the rmail owner" — any process running as that user (a compromised app, a
+//! stray script, another person's session on a shared account) gets implicit
+//! [`Scope::Admin`] for free today. `client_auth.require_for_local`
+//! (surfaced here as [`AuthLayer::new`]'s `require_login_for_peer`) lets an
+//! operator close that gap: when `true`, `peer_admin` is no longer
+//! sufficient by itself, and even a local caller must present a bearer token
+//! — minted directly, or obtained via `ClientAuthService.LoginPassword`. The
+//! default (`false`) is the behavior described above, unchanged.
+//!
 //! [`admin_uid`]: AuthLayer::new
 
 /// Crate-visible so `crate::mcp::projection` can join the same table this
@@ -78,14 +91,23 @@ pub struct AuthLayer {
     /// the daemon's own effective uid, read from the socket file it just
     /// created (see `rmaild::serve_uds_with_engine`).
     admin_uid: u32,
+    /// `client_auth.require_for_local` — see the module docs' "A third,
+    /// opt-in gate" section.
+    require_login_for_peer: bool,
 }
 
 impl AuthLayer {
     /// Create a new layer. `admin_uid` is the uid a connecting Unix-socket
-    /// peer must present to be trusted as admin.
+    /// peer must present to be trusted as admin; `require_login_for_peer`
+    /// disables that trust (a peer must present a bearer token like any
+    /// other caller) when `true`.
     #[must_use]
-    pub fn new(db: Database, admin_uid: u32) -> Self {
-        Self { db, admin_uid }
+    pub fn new(db: Database, admin_uid: u32, require_login_for_peer: bool) -> Self {
+        Self {
+            db,
+            admin_uid,
+            require_login_for_peer,
+        }
     }
 }
 
@@ -97,6 +119,7 @@ impl<S> Layer<S> for AuthLayer {
             inner,
             db: self.db.clone(),
             admin_uid: self.admin_uid,
+            require_login_for_peer: self.require_login_for_peer,
         }
     }
 }
@@ -107,6 +130,7 @@ pub struct AuthService<S> {
     inner: S,
     db: Database,
     admin_uid: u32,
+    require_login_for_peer: bool,
 }
 
 impl<S> Service<http::Request<BoxBody>> for AuthService<S>
@@ -131,6 +155,7 @@ where
         let mut inner = self.inner.clone();
         let db = self.db.clone();
         let admin_uid = self.admin_uid;
+        let require_login_for_peer = self.require_login_for_peer;
 
         // Pulled out *synchronously*, before the async block: see the module
         // docs' "Extracting before awaiting" section for why a borrow of
@@ -140,7 +165,15 @@ where
         let bearer = bearer_token(&req).map(str::to_owned);
 
         Box::pin(async move {
-            match authorize(&db, &method, peer_admin, bearer.as_deref()).await {
+            match authorize(
+                &db,
+                &method,
+                peer_admin,
+                require_login_for_peer,
+                bearer.as_deref(),
+            )
+            .await
+            {
                 Ok(()) => inner.call(req).await,
                 Err(status) => Ok(status.into_http()),
             }
@@ -149,11 +182,13 @@ where
 }
 
 /// Decide whether a call to `method` may proceed, given the caller's
-/// principal: implicit admin (`peer_admin`) or a `bearer` token.
+/// principal: implicit admin (`peer_admin`, unless `require_login_for_peer`
+/// disables that shortcut) or a `bearer` token.
 async fn authorize(
     db: &Database,
     method: &str,
     peer_admin: bool,
+    require_login_for_peer: bool,
     bearer: Option<&str>,
 ) -> Result<(), Status> {
     let Some(requirement) = methods::lookup(method) else {
@@ -169,11 +204,18 @@ async fn authorize(
     // Short-circuited *before* resolving a principal: a public method (health,
     // reflection) must answer a caller that presents nothing at all, and
     // `principal_scopes` would reject one with `UNAUTHENTICATED`.
-    if matches!(requirement, Requirement::Public) {
+    // `SelfAuthenticated` (e.g. `ClientAuthService/LoginPassword`) takes the
+    // same path for the same reason — a caller with no bearer token must
+    // reach the handler, which is where its *own* credential (a password) is
+    // actually checked; see `Requirement::SelfAuthenticated`'s own docs.
+    if matches!(
+        requirement,
+        Requirement::Public | Requirement::SelfAuthenticated
+    ) {
         return Ok(());
     }
 
-    let granted = principal_scopes(db, peer_admin, bearer).await?;
+    let granted = principal_scopes(db, peer_admin, require_login_for_peer, bearer).await?;
     // The quantifier over the scope set (any/all) lives on `Requirement`
     // itself, so that `crate::mcp`'s tool gating and this layer's enforcement
     // are the same predicate rather than two implementations of it — see
@@ -188,26 +230,36 @@ async fn authorize(
     }
 }
 
-/// The scopes granted to the caller: implicit admin when `peer_admin`,
-/// otherwise whatever `bearer` (if present and valid) carries.
+/// The scopes granted to the caller: implicit admin when `peer_admin` (and
+/// `require_login_for_peer` has not disabled that shortcut), otherwise
+/// whatever `bearer` (if present and valid) carries.
 ///
 /// # Errors
 ///
 /// [`Status`] (mapped from [`rmail_core::Error::Unauthenticated`]) if there is
-/// neither Unix-peer trust nor a valid bearer token.
+/// neither an applicable Unix-peer trust nor a valid bearer token.
 async fn principal_scopes(
     db: &Database,
     peer_admin: bool,
+    require_login_for_peer: bool,
     bearer: Option<&str>,
 ) -> Result<Vec<Scope>, Status> {
-    if peer_admin {
+    if peer_admin && !require_login_for_peer {
         return Ok(vec![Scope::Admin]);
     }
 
     let token = bearer.ok_or_else(|| {
-        Status::from(RmailError::unauthenticated(
-            "no Unix-peer trust and no bearer token presented",
-        ))
+        let reason = if peer_admin {
+            // Kernel-level peer trust was there, but `require_login_for_peer`
+            // means it does not count for this method — a different failure
+            // than "nothing was presented at all", worth telling apart in the
+            // message an operator reads.
+            "this daemon requires client_auth login even for local callers \
+             (client_auth.require_for_local = true); run `mail auth login`"
+        } else {
+            "no Unix-peer trust and no bearer token presented"
+        };
+        Status::from(RmailError::unauthenticated(reason))
     })?;
     let api_token = rmail_core::auth::verify(db, token)
         .await

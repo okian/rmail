@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package rmail.v1;
+
+// ClientAuthService gates access to rmail's own API -- CLI, TUI, `mail api
+// call`, an MCP agent -- as opposed to AccountService (IMAP/SMTP
+// credentials) or the `crypto` package (mail encryption). Those are two
+// different kinds of secret; this is a third.
+//
+// SetupPassword/ClearPassword require the caller already be trusted (a local
+// Unix-socket peer, or an existing `admin`-scoped token) -- the same
+// `admin` requirement as AdminService.MintToken, and for the same reason:
+// changing what LoginPassword accepts is itself an admin action.
+//
+// LoginPassword and AuthStatus are reachable with *no* prior credential --
+// that is the entire point of a login endpoint, so the `auth` interceptor
+// treats them as public (AuthStatus) or self-authenticating (LoginPassword)
+// and everything they protect is enforced inside the handler instead:
+// Argon2id plus the lockout in `client_password` (V56). LoginPassword is
+// deliberately excluded from MCP projection -- see
+// `Requirement::SelfAuthenticated` and `Tool::granted_by` in
+// `rmaild::mcp::projection` -- because unlike every other RPC this codebase
+// projects, calling it mints Scope::Admin regardless of the caller's own
+// scope; "if gRPC can do it, Claude can do it" does not extend to a tool
+// whose entire job is to hand out more authority than the connection
+// calling it holds. `mail auth login` types the password through a masked
+// terminal prompt that never reaches a model -- that is the only door.
+service ClientAuthService {
+  // Set (or replace) the password. Clears any lockout the previous password
+  // had accumulated -- see `rmail_core::auth::password::set_password`.
+  rpc SetupPassword(SetupPasswordRequest) returns (SetupPasswordResponse);
+  // Remove the password gate entirely. Idempotent: clearing an already-absent
+  // password is not an error.
+  rpc ClearPassword(ClearPasswordRequest) returns (ClearPasswordResponse);
+  // Prove the password and receive a session bearer token -- the same kind
+  // AdminService.MintToken issues, presented the same way afterward
+  // (`authorization: Bearer <token>`). Verification is Argon2id in constant
+  // time; repeated failures lock the gate out for `client_auth.lockout`
+  // (RESOURCE_EXHAUSTED). A wrong password, or none configured at all, is
+  // UNAUTHENTICATED.
+  rpc LoginPassword(LoginPasswordRequest) returns (LoginPasswordResponse);
+  // Whether a password is configured, and whether a local (Unix-socket)
+  // caller must log in too -- what a client needs to know before deciding
+  // whether to prompt for anything. Reveals no secret.
+  rpc AuthStatus(AuthStatusRequest) returns (AuthStatusResponse);
+}
+
+message SetupPasswordRequest {
+  // The new password. Must be non-empty; rmail imposes no strength policy
+  // beyond that -- `mail auth setup` is what asks the operator to confirm it
+  // by re-typing.
+  string password = 1;
+  // Required, and must match, when a password is already configured --
+  // checked in constant time (Argon2id; see
+  // rmail_core::auth::password::verify_current), with no lockout of its own,
+  // before the replacement is written. Without this, a session token minted
+  // by one LoginPassword call -- meant to be a temporary, revocable
+  // credential -- could replace the password outright and turn itself into a
+  // permanent one. Ignored (and may be left empty) on first-time setup, when
+  // there is nothing yet to confirm.
+  string current_password = 2;
+}
+
+message SetupPasswordResponse {
+  int64 updated_at = 1;
+}
+
+message ClearPasswordRequest {}
+
+message ClearPasswordResponse {
+  // Always true on success (idempotent re-clear does not error).
+  bool cleared = 1;
+}
+
+message LoginPasswordRequest {
+  string password = 1;
+}
+
+message LoginPasswordResponse {
+  // The bearer secret. Shown here and only here -- store it now. Same
+  // promise MintTokenResponse.token makes, for the same reason: only the
+  // Argon2id hash is persisted, so this is the one moment it is readable.
+  string token = 1;
+  int64 expires_at = 2;
+  // The minted token's id -- the same value AdminService.MintTokenResponse.id
+  // carries, and revocable the same way (AdminService.RevokeToken). Without
+  // this, `mail auth logout` could only forget the token locally, not end the
+  // session at the daemon.
+  int64 id = 3;
+}
+
+message AuthStatusRequest {}
+
+message AuthStatusResponse {
+  // Whether SetupPassword has ever been called and not since cleared.
+  bool password_configured = 1;
+  // client_auth.require_for_local, reflected back: whether a Unix-socket
+  // peer is trusted implicitly (false, today's default) or must also
+  // present a token from LoginPassword (true).
+  bool local_login_required = 2;
+}
