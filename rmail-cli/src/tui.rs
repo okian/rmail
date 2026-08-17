@@ -67,6 +67,7 @@ pub mod html;
 pub mod model;
 pub mod overlays;
 pub mod term;
+pub mod theme;
 pub mod view;
 
 use std::io;
@@ -105,6 +106,14 @@ pub struct TuiArgs {
     /// Account to open. Defaults to the first one `mail accounts` lists.
     #[arg(long)]
     account: Option<i64>,
+    /// Color theme: `dark` (default), `light`, `mono`, or `high-contrast`.
+    ///
+    /// A full settings surface for this is task 89's `:set theme`; until
+    /// then this is the only way to reach the three built-ins besides
+    /// `dark`, the same way `$RMAIL_FORMAT` is the CLI's config path before
+    /// anything richer exists.
+    #[arg(long, env = "RMAIL_THEME")]
+    theme: Option<String>,
 }
 
 /// Run the TUI against the daemon at `socket`.
@@ -142,16 +151,13 @@ pub async fn run(socket: &Path, args: TuiArgs) -> Result<()> {
     // same path a key press would — nothing special-cased at startup.
     let _ = tx.send(Msg::Boot);
 
-    let result = drive::run_loop(
-        Model::for_account(args.account),
-        &mut rx,
-        &tx,
-        &exec,
-        |model| {
-            terminal.draw(|frame| view::render(model, frame))?;
-            Ok(())
-        },
-    )
+    let mut model = Model::for_account(args.account);
+    apply_theme_arg(&mut model, args.theme.as_deref());
+
+    let result = drive::run_loop(model, &mut rx, &tx, &exec, |model| {
+        terminal.draw(|frame| view::render(model, frame))?;
+        Ok(())
+    })
     .await;
 
     // Tear down in the reverse order of setup, and unconditionally: `result`
@@ -176,6 +182,26 @@ pub async fn run(socket: &Path, args: TuiArgs) -> Result<()> {
     drop(terminal);
 
     result.map(|_| ())
+}
+
+/// Apply `--theme`/`$RMAIL_THEME` to a freshly-constructed model.
+///
+/// A no-op for `None` (the flag was not given). An unrecognized name is a
+/// status line, never a startup failure — the same call this module's docs
+/// make about a malformed `keys.toml`: a config typo should not be the
+/// difference between reading mail and not. `Msg::Boot`'s handler
+/// (`model::dispatch`) is what keeps this notice from being overwritten a
+/// moment later by "loading accounts…" — it skips that write when the
+/// model is already showing an error.
+fn apply_theme_arg(model: &mut Model, name: Option<&str>) {
+    let Some(name) = name else { return };
+    match theme::ThemeName::from_id(name) {
+        Some(named) => model.theme = named.resolve(),
+        None => {
+            model.status = format!("unknown theme {name:?} — using dark");
+            model.level = model::Level::Error;
+        }
+    }
 }
 
 /// Poll `keys.toml` on its own thread, delivering every load — the first one
@@ -280,4 +306,41 @@ fn to_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         KeyCode::Down => Key::Down,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_recognized_theme_name_is_applied() {
+        let mut model = Model::new();
+        apply_theme_arg(&mut model, Some("mono"));
+        assert_eq!(model.theme, theme::Theme::mono());
+        assert_eq!(model.level, model::Level::Info, "not treated as an error");
+    }
+
+    #[test]
+    fn an_unrecognized_theme_name_falls_back_to_dark_and_says_so() {
+        let mut model = Model::new();
+        apply_theme_arg(&mut model, Some("solarized"));
+        assert_eq!(model.theme, theme::Theme::dark());
+        assert_eq!(model.level, model::Level::Error);
+        assert!(model.status.contains("solarized"), "{}", model.status);
+
+        // The notice this test just set must survive the boot sequence —
+        // `Msg::Boot`'s "loading accounts…" would otherwise overwrite it
+        // within the first frame, making it unobservable in practice.
+        model::update(&mut model, Msg::Boot);
+        assert_eq!(model.level, model::Level::Error);
+        assert!(model.status.contains("solarized"), "{}", model.status);
+    }
+
+    #[test]
+    fn no_theme_flag_leaves_the_default_untouched() {
+        let mut model = Model::new();
+        apply_theme_arg(&mut model, None);
+        assert_eq!(model.theme, theme::Theme::default());
+        assert_eq!(model.level, model::Level::Info);
+    }
 }
