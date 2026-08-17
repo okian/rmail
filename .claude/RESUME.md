@@ -6,19 +6,20 @@ orchestration rules that were learned the hard way.
 
 ## Merged and checked off
 
-**81 of 86 done, 5 remaining.** `tasks.md` is authoritative — count with
+**83 of 86 done, 3 remaining.** `tasks.md` is authoritative — count with
 `grep -c '^- \[ \]' tasks.md`. Every task is verified on the *combined* tree
-after merge, never on the agent's own report: currently **4117/4117** on the full
+after merge, never on the agent's own report: currently **4190/4190** on the full
 workspace suite, with clippy, gitleaks and typos clean.
 
-Remaining: 42, 65, 69. In flight: **36** (caching/incrementality) and **78**
-(local-only model path). **42 is the only `parallel-safe: no` task** — run it
-alone, last. **69 (autonomous inbox agent)** is the one that acts on the
-mailbox without a human in the loop; brief it hardest.
+Remaining: **42, 65, 69** — and **both 42 and 65 are `parallel-safe: no`**,
+so from here the tasks run one at a time. (An earlier revision of this file
+said only 42 was; that was wrong — check the flag in `tasks.md`, do not
+assume.) In flight: **69** (autonomous inbox agent), briefed hardest because
+it is the only feature that acts on a mailbox with no human in the loop.
 
-Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75, 58, 68, 73, 72. Every one verified on the
+Merged so far: 74, 71, 82, 79, 81, 70, 63, 57, 80, 62, 75, 58, 68, 73, 72, 36, 78. Every one verified on the
 *combined* tree, never on the agent's own count — the reports quoted a dozen
-different bases; the truth after merging all of them is 4117.
+different bases; the truth after merging all of them is 4190.
 
 **Three of the last five needed real work at merge, not just a cherry-pick:**
 
@@ -99,7 +100,8 @@ The rule now is: whatever number a branch used, rename it at merge to
 reference a migration version from Rust.
 
 Merged: V1–V14, V16, V18–V28, V32–V39. V15 and V17 are permanently unused, which
-costs nothing. **Next free: V51.** V47 -> 58, V48 -> 68, V49 -> 73, V50 -> 72.
+costs nothing. **Next free: V53.** V47 -> 58, V48 -> 68, V49 -> 73, V50 -> 72,
+V51 -> 36, V52 -> 78.
 
 Previous: V43 went to 57, V44 to 80, V45 to 62,
 V46 to 75 (renumbered from its own V45 — the second collision, again from two
@@ -462,3 +464,32 @@ AI subsystem" but only omits a provider gets one anyway, and its model-backed
 RPCs decline with `UNAUTHENTICATED` (key resolution failed) rather than
 `FAILED_PRECONDITION` (no subsystem). Tasks 80, 72 and one earlier suite all
 shipped that. A harness that wants no AI must say `config.ai.enabled = false`.
+
+## The `gitStatus` in a subagent's prompt can be badly stale
+
+Task 36's agent was handed a `gitStatus` naming HEAD as `a39243a` — the tip
+from the *start* of this session, 55 commits behind the worktree it was
+actually given. Its first squash trusted that and swallowed 55 other agents'
+commits into one; it caught the mistake from the diffstat and redid it
+against the true base, and nothing was lost.
+
+Tell agents not to trust that snapshot for anything destructive, and verify
+before merging a branch that claims a rebase or squash:
+
+    git -C <worktree> merge-base --is-ancestor <our HEAD> HEAD   # history intact?
+    git -C <worktree> diff --stat docs/tasks-breakdown..HEAD     # only its own files?
+
+## What the reviewers keep finding
+
+Across every task this session the highest-severity finding was the same
+shape: **the code did not do what its own documentation claimed.** Task 58's
+docs said a CTE shadowing a view fails at prepare (it did not — remote OOM).
+Task 63's said only deterministic checks can block a send (a model finding
+could). Task 78's surface reported that nothing could dial out while
+`BatchCoordinator` held its own HTTP client. Task 72's doc described a safe
+authorizer rule and the code implemented a weaker one.
+
+So the productive review question on this codebase is not "is this correct"
+but **"does the doc-comment claim something stronger than the code
+enforces"** — and the fix is usually to make the code match the doc, because
+the doc is describing the guarantee someone will rely on.
