@@ -731,11 +731,13 @@ fn spells_like_its_capability(verb: &Verb) -> bool {
 /// `parity::Command::cli()` does, or declares why not via
 /// [`Verb::cli_alias`].
 ///
-/// Currently vacuous over the real registry (`explicit` returns nothing —
-/// task 88's own scope), which is why the three tests above prove the check
-/// itself against constructed fixtures rather than trusting today's empty
-/// registry to exercise it. It stops being vacuous the moment a later task
-/// populates `explicit`.
+/// Still vacuous over the real registry, but no longer for the original
+/// reason: `explicit` is populated now (task 103's two `helpgrep` spellings),
+/// and both entries take the `verb.action.is_some()` exemption above. It stops
+/// being vacuous the first time a task declares a verb that reaches a
+/// capability *without* an action behind it — which is what tasks 94 onward
+/// are, and why the three tests above prove the check itself against
+/// constructed fixtures rather than trusting the registry to exercise it.
 #[test]
 fn every_declared_verb_spells_its_capability_like_the_cli() {
     for verb in registry() {
@@ -818,13 +820,14 @@ fn no_two_real_verbs_share_the_same_path() {
 /// positionals of its own can never receive, as one of them, whatever word
 /// would also continue a longer sibling verb's path — `search explain`
 /// can never mean "search for the word explain" while `search.explain`
-/// exists, no matter how `search` is parsed. Harmless today because no
-/// auto-derived verb declares any positionals at all (`explicit`'s docs),
-/// so this is vacuous over the real registry now — proven against a
+/// exists, no matter how `search` is parsed. The registry does now hold
+/// positional-taking verbs — task 103's `manual grep <pattern>` and
+/// `helpgrep <pattern>` — and they are legal precisely because neither has a
+/// longer sibling, which is what `no_real_verb_that_takes_positionals_is_shadowed_by_a_longer_one`
+/// checks over the real registry. This test proves the *rule* against a
 /// constructed pair instead, the same reason the CLI-spelling drift check
-/// proves itself against fixtures. It stops being vacuous, and starts
-/// actually protecting something, the moment `search` (or any verb sharing
-/// a prefix with another) gains a `<query>` positional.
+/// proves itself against fixtures: no real verb violates it, so nothing real
+/// would exercise the failing branch.
 #[test]
 fn a_positional_taking_verb_shadowed_by_a_longer_one_is_caught() {
     let short = Verb {

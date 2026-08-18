@@ -545,12 +545,27 @@ fn an_overlay_mode_does_not_inherit_the_list_bindings() {
     // structure, not an early return somebody has to remember to write.
     let keymap = Keymap::defaults();
     assert_eq!(
-        once(&keymap, Mode::Help, Key::Char('j')),
+        once(&keymap, Mode::Confirm, Key::Char('j')),
         Resolution::Unbound(Key::Char('j'))
     );
     assert_eq!(
         once(&keymap, Mode::Confirm, Key::Char('a')),
         Resolution::Unbound(Key::Char('a'))
+    );
+    // `Mode::Help` used to be the example above. It now binds `j` in its
+    // *own* layer — task 103's manual reuses this layer and is a document
+    // that scrolls — so the property has to be stated the way it was always
+    // meant: nothing arrives here *from* `Mode::Normal`. `a` is Normal's
+    // archive key, and reaching it through a modal is the bug.
+    assert_eq!(
+        once(&keymap, Mode::Help, Key::Char('j')),
+        run(Action::CursorDown),
+        "the help layer binds its own `j`"
+    );
+    assert_eq!(
+        once(&keymap, Mode::Help, Key::Char('a')),
+        Resolution::Unbound(Key::Char('a')),
+        "but Normal's archive key does not fall through to it"
     );
     // The picker is a list of its own, so it binds its own movement.
     assert_eq!(

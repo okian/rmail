@@ -168,13 +168,25 @@ fn split_path(text: &str) -> Vec<&str> {
 
 /// Verbs declared beyond what [`Action::ALL`] gives for free.
 ///
-/// Empty today. Task 88's own job is the parser and the auto-derivation —
-/// domains get their real verbs (`:tag`, `:rule`, `:ai budget`, …) from the
-/// tasks that actually build what those verbs would call (94 onward), the
-/// same way [`crate::keymap::Action`] grew one variant at a time rather
-/// than every future task's binding being declared up front. A declaration
-/// here with no task behind it yet would be exactly the half-finished state
-/// this project's non-negotiables refuse.
+/// Task 88's own job was the parser and the auto-derivation — domains get
+/// their real verbs (`:tag`, `:rule`, `:ai budget`, …) from the tasks that
+/// actually build what those verbs would call (94 onward), the same way
+/// [`crate::keymap::Action`] grew one variant at a time rather than every
+/// future task's binding being declared up front. A declaration here with
+/// no task behind it yet would be exactly the half-finished state this
+/// project's non-negotiables refuse.
+///
+/// The two entries are task 103's, and they are the same action twice.
+/// [`Action::ManualGrep`] needs a *declared* positional (`:helpgrep
+/// invoice`), which an auto-derived verb has none of — the spelling
+/// difference between a grammar that can describe itself and one that
+/// quietly accepts an argument it never mentions. And it needs two paths:
+/// `manual grep` because that is what its id spells, so `keys.toml` reads
+/// `g/ = "manual.grep"` next to `<c-o> = "manual.back"` rather than one odd
+/// sibling; and `helpgrep`, because that is what vim calls it and what task
+/// 103's acceptance names. Declaring either suppresses the auto-derivation
+/// (see [`registry`]), so both have to be written here or `manual grep`
+/// would stop resolving.
 ///
 /// A function, not a `const` slice: [`Verb::path`] is a `Vec`, which cannot
 /// appear in a `const` initializer at all (`Vec::new` allocates), so a
@@ -182,7 +194,34 @@ fn split_path(text: &str) -> Vec<&str> {
 /// matter what a later task writes here — it would need this type changed
 /// out from under it first. A plain function has no such ceiling.
 fn explicit() -> Vec<Verb> {
-    vec![]
+    /// Optional, not required. A bare `:helpgrep` opens the same prompt the
+    /// `g/` binding does, which is more useful than
+    /// [`CommandError::MissingPositional`] — and, before task 89 puts a
+    /// command line on screen, it is the only way the verb is reachable at
+    /// all. `rmail_cli::tui::model::open_manual_grep_for` is what consumes
+    /// the argument when there is one.
+    const PATTERN: &[Positional] = &[Positional {
+        name: "pattern",
+        required: false,
+    }];
+    vec![
+        Verb {
+            path: vec!["manual", "grep"],
+            capability: None,
+            action: Some(Action::ManualGrep),
+            positionals: PATTERN,
+            flags: &[],
+            cli_alias: None,
+        },
+        Verb {
+            path: vec!["helpgrep"],
+            capability: None,
+            action: Some(Action::ManualGrep),
+            positionals: PATTERN,
+            flags: &[],
+            cli_alias: None,
+        },
+    ]
 }
 
 /// Every verb: [`explicit`] plus one auto-derived from each [`Action`] that

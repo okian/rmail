@@ -1141,7 +1141,7 @@ fn the_intended_flag_set_is_order_independent_and_deduplicated() {
 // the keymap engine, as the model sees it (task 84)
 // ---------------------------------------------------------------------------
 
-use crate::keymap::{Keymap, Mode, MAX_COUNT};
+use crate::keymap::{Chord, Keymap, Mode, MAX_COUNT};
 
 /// A model in each mode the TUI can be in, with the keys that got it there.
 /// Table-driven so a mode added later cannot quietly skip the escape checks.
@@ -1162,6 +1162,11 @@ fn in_every_mode() -> Vec<(Mode, Model)> {
         (Mode::Pick, 'c'),
         (Mode::Confirm, 'd'),
         (Mode::Help, '?'),
+        // The manual reuses `Mode::Help` rather than adding a mode, so it
+        // appears twice here — deliberately: it is a *screen* rather than an
+        // overlay, and the Ctrl-C/Esc checks below have to cover both ways
+        // into that layer.
+        (Mode::Help, 'K'),
     ] {
         let mut model = loaded();
         press(&mut model, Key::Char(key));
@@ -1714,4 +1719,851 @@ fn an_overlays_own_action_bound_elsewhere_does_not_close_the_wrong_overlay() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// the manual (task 103)
+// ---------------------------------------------------------------------------
+
+/// A model on the manual's front page, reached the way a user reaches it.
+fn manual_open() -> Model {
+    let mut model = loaded();
+    press(&mut model, Key::Char('K'));
+    assert_eq!(model.screen, Screen::Manual);
+    model
+}
+
+fn manual(model: &Model) -> &ManualState {
+    model
+        .manual
+        .as_ref()
+        .unwrap_or_else(|| panic!("the manual is not open"))
+}
+
+/// Move the cursor down with `j` until it is on a row carrying a link, and
+/// return that row's target.
+///
+/// Driven with real keys rather than by assigning `cursor`, so the row cursor
+/// itself (`Cursor::Manual`) is under test too.
+fn walk_to_a_link(model: &mut Model) -> &'static str {
+    let lines = manual_doc(model).expect("a rendered page").lines.len();
+    for _ in 0..lines {
+        let target = manual_doc(model)
+            .and_then(|doc| doc.lines.get(manual(model).cursor).and_then(|l| l.link()));
+        if let Some(target) = target {
+            return target;
+        }
+        press(model, Key::Char('j'));
+    }
+    panic!("no row on this page carries a link");
+}
+
+#[test]
+fn k_opens_the_manual_and_q_puts_the_list_back() {
+    let mut model = manual_open();
+    assert_eq!(model.mode(), Mode::Help, "it reuses the help layer");
+    assert_eq!(manual(&model).at, manual::Location::start());
+
+    press(&mut model, Key::Char('q'));
+    assert_eq!(model.screen, Screen::List);
+    assert!(model.manual.is_none());
+}
+
+#[test]
+fn the_manual_returns_to_the_viewer_when_that_is_where_it_was_opened_from() {
+    let mut model = loaded();
+    press(&mut model, Key::Enter);
+    update(
+        &mut model,
+        Msg::Opened {
+            message_id: 10,
+            result: Ok(OpenMessage {
+                id: 10,
+                ..OpenMessage::default()
+            }),
+        },
+    );
+    assert_eq!(model.screen, Screen::Viewer);
+
+    press(&mut model, Key::Char('K'));
+    assert_eq!(model.screen, Screen::Manual);
+    press(&mut model, Key::Esc);
+    assert_eq!(
+        model.screen,
+        Screen::Viewer,
+        "reading the manual mid-message puts you back on the message"
+    );
+    assert!(model.open.is_some());
+}
+
+#[test]
+fn the_manual_falls_back_to_the_list_when_the_message_it_covered_is_gone() {
+    let mut model = loaded();
+    press(&mut model, Key::Enter);
+    update(
+        &mut model,
+        Msg::Opened {
+            message_id: 10,
+            result: Ok(OpenMessage {
+                id: 10,
+                ..OpenMessage::default()
+            }),
+        },
+    );
+    press(&mut model, Key::Char('K'));
+    // Archived from another client while the manual was up.
+    update(
+        &mut model,
+        Msg::Done {
+            label: "archived".to_owned(),
+            result: Ok(Effect::Removed(10)),
+        },
+    );
+    assert_eq!(
+        model.screen,
+        Screen::Manual,
+        "a message vanishing elsewhere does not close the page being read"
+    );
+    press(&mut model, Key::Esc);
+    assert_eq!(model.screen, Screen::List);
+}
+
+#[test]
+fn the_manual_state_and_the_screen_never_disagree() {
+    // The two are one piece of state in two fields (`set_screen`'s own docs),
+    // so this drives everything that changes a screen and asserts the pairing
+    // after each one rather than trusting the call sites.
+    let mut model = manual_open();
+    let steps: Vec<Msg> = vec![
+        Msg::Key(Key::Char('j')),
+        Msg::Changed,
+        Msg::Keymap {
+            result: Ok(Keymap::defaults()),
+            announce: true,
+        },
+        Msg::Opened {
+            message_id: 10,
+            result: Ok(OpenMessage {
+                id: 10,
+                ..OpenMessage::default()
+            }),
+        },
+        Msg::Key(Key::Char('K')),
+        Msg::Done {
+            label: "archived".to_owned(),
+            result: Ok(Effect::Removed(10)),
+        },
+        Msg::Key(Key::Esc),
+        Msg::Folders(Ok(folders())),
+        Msg::Key(Key::Char('K')),
+        Msg::Key(Key::Char('q')),
+        Msg::Boot,
+    ];
+    for step in steps {
+        let label = format!("{step:?}");
+        update(&mut model, step);
+        assert_eq!(
+            model.screen == Screen::Manual,
+            model.manual.is_some(),
+            "after {label}: screen={:?} manual={:?}",
+            model.screen,
+            model.manual.is_some()
+        );
+    }
+}
+
+#[test]
+fn a_slow_message_open_does_not_replace_the_manual() {
+    let mut model = loaded();
+    press(&mut model, Key::Enter); // asks for message 10
+    press(&mut model, Key::Char('K')); // changed their mind
+    let cmds = update(
+        &mut model,
+        Msg::Opened {
+            message_id: 10,
+            result: Ok(OpenMessage {
+                id: 10,
+                ..OpenMessage::default()
+            }),
+        },
+    );
+    assert!(cmds.is_empty());
+    assert_eq!(
+        model.screen,
+        Screen::Manual,
+        "the abandoned Get must not yank a viewer open over the manual"
+    );
+    assert!(model.open.is_none());
+}
+
+#[test]
+fn nothing_the_manual_does_needs_the_daemon() {
+    // The manual has to work when the daemon will not start, so no action on
+    // it may return a `Cmd` at all — that is the property, not an
+    // implementation detail.
+    let mut model = manual_open();
+    let mut cmds = Vec::new();
+    for key in [
+        Key::Char('j'),
+        Key::Char('k'),
+        Key::Char('G'),
+        Key::Char('g'),
+        Key::Char('g'),
+        Key::ctrl('o'),
+        Key::ctrl('i'),
+        Key::Char('n'),
+        Key::Char('N'),
+        Key::Char('/'),
+        Key::Esc,
+        Key::Char('g'),
+        Key::Char('/'),
+        Key::Esc,
+        Key::Enter,
+    ] {
+        cmds.extend(press(&mut model, key));
+    }
+    assert!(cmds.is_empty(), "the manual issued work: {cmds:?}");
+}
+
+#[test]
+fn enter_follows_the_link_under_the_cursor_and_ctrl_o_comes_back() {
+    let mut model = manual_open();
+    let target = walk_to_a_link(&mut model);
+    let cursor_before = manual(&model).cursor;
+
+    press(&mut model, Key::Enter);
+    assert_eq!(manual(&model).at, manual::Location::Page(target.to_owned()));
+    assert_eq!(manual(&model).cursor, 0, "a new page starts at the top");
+    assert!(manual(&model).can_jump_back());
+
+    press(&mut model, Key::ctrl('o'));
+    assert_eq!(manual(&model).at, manual::Location::start());
+    assert_eq!(
+        manual(&model).cursor,
+        cursor_before,
+        "the jump list remembers where you were on each page, not just which \
+         page it was"
+    );
+    assert!(manual(&model).can_jump_forward());
+
+    press(&mut model, Key::ctrl('i'));
+    assert_eq!(manual(&model).at, manual::Location::Page(target.to_owned()));
+}
+
+#[test]
+fn tab_goes_forward_too_because_most_terminals_cannot_send_ctrl_i() {
+    let mut model = manual_open();
+    walk_to_a_link(&mut model);
+    press(&mut model, Key::Enter);
+    press(&mut model, Key::ctrl('o'));
+    press(&mut model, Key::Tab);
+    assert_ne!(
+        manual(&model).at,
+        manual::Location::start(),
+        "Tab is the same byte as Ctrl-I on a terminal without the kitty \
+         keyboard protocol, so it has to mean the same thing"
+    );
+}
+
+#[test]
+fn there_is_nothing_to_go_back_to_from_the_first_page_and_it_says_so() {
+    let mut model = manual_open();
+    let cmds = press(&mut model, Key::ctrl('o'));
+    assert!(cmds.is_empty());
+    assert_eq!(model.level, Level::Error);
+    assert!(model.status.contains("back"), "{}", model.status);
+    assert_eq!(manual(&model).at, manual::Location::start());
+}
+
+#[test]
+fn following_a_link_forgets_what_was_ahead() {
+    let mut model = manual_open();
+    walk_to_a_link(&mut model);
+    press(&mut model, Key::Enter);
+    press(&mut model, Key::ctrl('o'));
+    assert!(manual(&model).can_jump_forward());
+
+    // A new branch: what was ahead is no longer reachable from here, exactly
+    // as in a browser.
+    let elsewhere = manual::PAGES
+        .iter()
+        .map(|page| page.anchor)
+        .find(|anchor| *anchor != manual::START)
+        .expect("another page");
+    enter_manual(&mut model, manual::Location::Page(elsewhere.to_owned()));
+    assert!(!manual(&model).can_jump_forward());
+}
+
+#[test]
+fn the_jump_list_is_bounded() {
+    let mut model = manual_open();
+    // Alternate between two pages so every step is a real move.
+    for step in 0..MAX_JUMPS * 2 {
+        let anchor = if step % 2 == 0 { "keys" } else { "modes" };
+        enter_manual(&mut model, manual::Location::Page(anchor.to_owned()));
+    }
+    assert_eq!(
+        manual(&model).back.len(),
+        MAX_JUMPS,
+        "following links for an hour must not grow a Vec for as long as it \
+         lasts"
+    );
+}
+
+#[test]
+fn navigating_to_the_page_already_showing_is_not_a_jump() {
+    let mut model = manual_open();
+    enter_manual(&mut model, manual::Location::start());
+    assert!(
+        !manual(&model).can_jump_back(),
+        "otherwise pressing K on the front page would fill the jump list with \
+         copies of it"
+    );
+}
+
+#[test]
+fn slash_searches_the_page_rather_than_the_mailbox() {
+    let mut model = manual_open();
+    press(&mut model, Key::Char('/'));
+    assert!(
+        model.overlay.is_none(),
+        "the mailbox search overlay would cover the text it was opened to \
+         search"
+    );
+    assert_eq!(model.mode(), Mode::Prompt, "the manual's own search line");
+    keys(&mut model, "modes");
+    assert_eq!(
+        manual(&model).prompt.as_ref().map(|p| p.pattern.as_str()),
+        Some("modes")
+    );
+    assert_eq!(
+        manual(&model).prompt.as_ref().map(|p| p.scope),
+        Some(Scope::Page)
+    );
+    // It previews as it is typed, before Enter.
+    assert_eq!(manual(&model).pattern(), Some("modes"));
+}
+
+#[test]
+fn an_in_page_search_lands_on_the_first_match_and_n_steps_through_the_rest() {
+    let mut model = manual_open();
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "manual");
+    press(&mut model, Key::Enter);
+
+    let hits = manual_matches(&model, "manual");
+    assert!(hits.len() > 1, "the front page mentions it more than once");
+    assert_eq!(manual(&model).cursor, hits[0]);
+    assert_eq!(manual(&model).highlight.as_deref(), Some("manual"));
+    assert!(!manual(&model).typing(), "the prompt closed on Enter");
+
+    press(&mut model, Key::Char('n'));
+    assert_eq!(manual(&model).cursor, hits[1]);
+    press(&mut model, Key::Char('N'));
+    assert_eq!(manual(&model).cursor, hits[0]);
+    // And it wraps rather than stopping dead.
+    press(&mut model, Key::Char('N'));
+    assert_eq!(manual(&model).cursor, hits[hits.len() - 1]);
+}
+
+#[test]
+fn searching_for_something_not_on_the_page_says_so_and_points_at_helpgrep() {
+    let mut model = manual_open();
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "zzzznope");
+    press(&mut model, Key::Enter);
+    assert_eq!(model.level, Level::Error);
+    assert!(model.status.contains("g/"), "{}", model.status);
+}
+
+#[test]
+fn n_before_anything_has_been_searched_for_says_so_rather_than_moving() {
+    let mut model = manual_open();
+    press(&mut model, Key::Char('n'));
+    assert_eq!(manual(&model).cursor, 0);
+    assert_eq!(model.level, Level::Error);
+}
+
+#[test]
+fn an_empty_search_clears_rather_than_matching_everything() {
+    let mut model = manual_open();
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "manual");
+    press(&mut model, Key::Enter);
+    assert!(manual(&model).highlight.is_some());
+
+    press(&mut model, Key::Char('/'));
+    press(&mut model, Key::Enter);
+    assert_eq!(manual(&model).highlight, None);
+}
+
+#[test]
+fn esc_leaves_the_prompt_then_the_highlight_then_the_manual() {
+    let mut model = manual_open();
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "manual");
+    press(&mut model, Key::Enter);
+    press(&mut model, Key::Char('/'));
+    assert!(manual(&model).typing());
+
+    press(&mut model, Key::Esc);
+    assert!(!manual(&model).typing(), "the prompt went first");
+    assert!(
+        manual(&model).highlight.is_some(),
+        "and left the highlight alone"
+    );
+
+    press(&mut model, Key::Esc);
+    assert_eq!(manual(&model).highlight, None, "then the highlight");
+    assert_eq!(model.screen, Screen::Manual);
+
+    press(&mut model, Key::Esc);
+    assert_eq!(model.screen, Screen::List, "then the manual itself");
+}
+
+#[test]
+fn g_slash_greps_every_page_and_a_hit_opens_it_with_the_pattern_still_showing() {
+    let mut model = manual_open();
+    keys(&mut model, "g/");
+    assert_eq!(model.mode(), Mode::Prompt);
+    assert_eq!(
+        manual(&model).prompt.as_ref().map(|p| p.scope),
+        Some(Scope::Manual)
+    );
+    keys(&mut model, "Command index");
+    press(&mut model, Key::Enter);
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Grep("Command index".to_owned())
+    );
+
+    let target = walk_to_a_link(&mut model);
+    press(&mut model, Key::Enter);
+    assert_eq!(manual(&model).at, manual::Location::Page(target.to_owned()));
+    assert_eq!(
+        manual(&model).highlight.as_deref(),
+        Some("Command index"),
+        "arriving with nothing highlighted would lose the one thing that made \
+         the row a hit"
+    );
+    assert!(
+        manual_matches(&model, "Command index").contains(&manual(&model).cursor),
+        "and it lands on a matching line rather than the top of the page"
+    );
+
+    press(&mut model, Key::ctrl('o'));
+    assert!(
+        matches!(manual(&model).at, manual::Location::Grep(_)),
+        "back goes to the hit list, which is what a jump list is for"
+    );
+}
+
+#[test]
+fn g_slash_from_the_message_list_is_the_mailbox_search_not_helpgrep() {
+    // `g/` is bound in the help layer only, and the engine drops a dead
+    // prefix one key at a time — so from the list `g` goes nowhere and the
+    // `/` that follows reaches the mailbox search box. Pinned because the
+    // alternative (a `g/` in `Mode::Normal`) would be a silent change to what
+    // `/` does there.
+    let mut model = loaded();
+    keys(&mut model, "g/");
+    assert_eq!(model.screen, Screen::List);
+    assert!(
+        matches!(model.overlay, Some(Overlay::Search(_))),
+        "{:?}",
+        model.overlay
+    );
+}
+
+#[test]
+fn helpgrep_reached_from_outside_the_manual_opens_the_manual_first() {
+    // Reachable today through the palette, and from task 89's command line
+    // once it exists: a grep prompt with nowhere to show its answer is not a
+    // prompt worth raising.
+    let mut model = loaded();
+    press(&mut model, Key::ctrl('k'));
+    // The palette resolves against action *ids*, and this one is
+    // `manual.grep` — `helpgrep` is the verb spelling, which is task 89's
+    // command line rather than this surface.
+    keys(&mut model, "grep");
+    press(&mut model, Key::Enter);
+    assert_eq!(
+        model.screen,
+        Screen::Manual,
+        "somebody who ran it still meant to search the manual"
+    );
+    assert!(model.overlay.is_none(), "the palette closed behind it");
+    assert!(manual(&model).typing());
+    assert_eq!(
+        manual(&model).prompt.as_ref().map(|prompt| prompt.scope),
+        Some(Scope::Manual)
+    );
+}
+
+#[test]
+fn enter_on_a_row_with_no_link_says_so_rather_than_doing_nothing() {
+    let mut model = manual_open();
+    // The front page's first line is its title, which is not a link.
+    assert!(manual_doc(&model)
+        .and_then(|doc| doc.lines.first().and_then(|line| line.link()))
+        .is_none());
+    let cmds = press(&mut model, Key::Enter);
+    assert!(cmds.is_empty());
+    assert_eq!(model.level, Level::Error);
+    assert_eq!(manual(&model).at, manual::Location::start());
+}
+
+#[test]
+fn enter_still_closes_the_key_reference_overlay() {
+    // `<enter>` in `Mode::Help` moved from `Action::Cancel` to
+    // `Action::MenuAccept` so that the manual could use it to follow a link.
+    // The `?` overlay has no row cursor, so the behaviour there must not have
+    // changed — task 102 is what replaces it with something richer.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    assert_eq!(model.overlay, Some(Overlay::Help));
+    press(&mut model, Key::Enter);
+    assert_eq!(model.overlay, None);
+    assert!(!model.quit);
+}
+
+#[test]
+fn the_manual_opens_over_a_visual_selection_and_gives_it_back() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    press(&mut model, Key::Char('j'));
+    assert_eq!(model.selection(), Some((0, 1)));
+
+    press(&mut model, Key::Char('K'));
+    assert_eq!(
+        model.mode(),
+        Mode::Help,
+        "the keyboard belongs to the page being read, not to the selection \
+         behind it"
+    );
+    press(&mut model, Key::Char('q'));
+    assert_eq!(model.mode(), Mode::Visual);
+    assert_eq!(model.selection(), Some((0, 1)), "the selection survived");
+}
+
+#[test]
+fn the_manual_offers_no_message_to_act_on() {
+    // Bound in `Mode::Normal`, so only reachable here through a rebind — the
+    // natural one for somebody who wants `a`/`d` to work everywhere. Reaching
+    // mail from behind a page of prose is exactly what must not happen, and
+    // the *selection* case is the one that did: `targets` consults the
+    // selection before it consults the screen, so `bulk_targets` resolved to
+    // the rows underneath and archived them.
+    for selection in [false, true] {
+        let mut model = loaded();
+        if selection {
+            press(&mut model, Key::Char('v'));
+            press(&mut model, Key::Char('j'));
+            assert_eq!(model.selection(), Some((0, 1)));
+        }
+        press(&mut model, Key::Char('K'));
+        model.keymap = keymap_from("[help]\nz = \"message.archive\"\n");
+
+        let cmds = press(&mut model, Key::Char('z'));
+        assert!(
+            cmds.is_empty(),
+            "archived mail from the manual (selection: {selection}): {cmds:?}"
+        );
+        assert_eq!(model.level, Level::Error);
+        assert_eq!(model.screen, Screen::Manual);
+        assert_eq!(
+            model.visual.is_some(),
+            selection,
+            "and the selection is neither used nor thrown away"
+        );
+    }
+}
+
+#[test]
+fn a_selection_made_on_the_list_does_not_act_from_the_viewer_either() {
+    // The same root cause, on the screen it predates the manual on: a hit
+    // opened from a search made mid-selection leaves the anchor set, and `a`
+    // there used to archive the *list rows* rather than the message on screen.
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    press(&mut model, Key::Char('j'));
+    let cmds = open_message_by_id(&mut model, 12);
+    assert_eq!(cmds, vec![Cmd::Open { message_id: 12 }]);
+    update(
+        &mut model,
+        Msg::Opened {
+            message_id: 12,
+            result: Ok(OpenMessage {
+                id: 12,
+                ..OpenMessage::default()
+            }),
+        },
+    );
+    assert_eq!(model.screen, Screen::Viewer);
+    assert_eq!(
+        model.mode(),
+        Mode::Viewer,
+        "and the mode follows the screen rather than the stale anchor"
+    );
+    assert_eq!(model.selection(), None, "the range is not on screen");
+
+    let cmds = press(&mut model, Key::Char('a'));
+    assert_eq!(
+        cmds,
+        vec![Cmd::Move {
+            message_id: 12,
+            dest_mailbox_id: 2,
+            label: "archived".to_owned(),
+        }],
+        "it archives what the viewer is showing, not the rows behind it"
+    );
+}
+
+#[test]
+fn opening_a_folder_from_the_manual_leaves_it() {
+    // `open_folder_by_id` is the finder's jump target; it sets the screen, and
+    // a screen set behind the manual would be a manual nobody could see with
+    // its state still allocated.
+    let mut model = manual_open();
+    let cmds = open_folder_by_id(&mut model, 2);
+    assert_eq!(model.screen, Screen::List);
+    assert!(model.manual.is_none());
+    assert_eq!(cmds, vec![Cmd::LoadMessages { mailbox_id: 2 }]);
+}
+
+#[test]
+fn a_page_shrinking_under_the_cursor_leaves_the_cursor_usable() {
+    // Nothing re-clamps `ManualState::cursor` when the page it is on gets
+    // *shorter* without a key being pressed, and the generated key reference
+    // does exactly that on a `keys.toml` reload. Unclamped, `k` needed one
+    // press per row of the difference before the highlighted row moved, and
+    // `<enter>` reported "no link on this line" about a row that had one.
+    let mut model = manual_open();
+    open_manual_at(&mut model, "keys");
+    press(&mut model, Key::Char('G'));
+    let full = manual_doc(&model).expect("the keys page").lines.len();
+    assert_eq!(manual(&model).cursor, full - 1);
+
+    // A keymap the page renders *shorter*. `keys.toml` is additive today
+    // (`keymap::file::parse` starts from the defaults), so this is built with
+    // `Keymap::unbind` — the model must not assume the map it is handed is a
+    // superset of the one it had, and `Msg::Keymap` replaces it wholesale.
+    // Both layers keep their `<enter>`, so no section disappears.
+    let mut smaller = Keymap::defaults();
+    for mode in [Mode::Menu, Mode::Pick] {
+        let chords: Vec<Chord> = smaller
+            .layer(mode)
+            .filter(|(_, action)| !matches!(action, Action::MenuAccept | Action::PickAccept))
+            .map(|(chord, _)| chord.clone())
+            .collect();
+        for chord in chords {
+            smaller.unbind(mode, &chord);
+        }
+    }
+    update(
+        &mut model,
+        Msg::Keymap {
+            result: Ok(smaller),
+            announce: false,
+        },
+    );
+    let shrunk = manual_doc(&model).expect("the keys page").lines.len();
+    assert!(shrunk < full, "the page did shrink: {shrunk} vs {full}");
+    assert_eq!(
+        manual(&model).cursor_in(shrunk),
+        shrunk - 1,
+        "the cursor reads as the last row of the page it is actually on"
+    );
+
+    // And one `k` moves it, rather than being swallowed by the difference.
+    press(&mut model, Key::Char('k'));
+    let after = manual_doc(&model).expect("the keys page").lines.len();
+    assert_eq!(manual(&model).cursor_in(after), after - 2);
+}
+
+#[test]
+fn a_keymap_reload_changes_what_the_manual_says_about_keys() {
+    // The whole reason the rendered page is not cached: a stored document is
+    // one that keeps claiming the old binding.
+    let mut model = manual_open();
+    enter_manual(&mut model, manual::Location::Page("keys".to_owned()));
+    let before = manual_doc(&model).expect("the keys page");
+
+    update(
+        &mut model,
+        Msg::Keymap {
+            result: Ok(keymap_from("[normal]\nZ = \"message.archive\"\n")),
+            announce: true,
+        },
+    );
+    let after = manual_doc(&model).expect("the keys page");
+    assert_ne!(before, after, "the page did not follow the reload");
+    let text: String = after
+        .lines
+        .iter()
+        .map(manual::DocLine::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains('Z'), "{text}");
+}
+
+#[test]
+fn opening_the_manual_at_a_named_page_goes_straight_there() {
+    // The seam tasks 89 and 102 use: `:manual <page>` and `K` on a key
+    // reference row both need "open it *there*", which an action's own
+    // signature cannot carry.
+    let mut model = loaded();
+    let cmds = open_manual_at(&mut model, "commands");
+    assert!(cmds.is_empty());
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Page("commands".to_owned())
+    );
+}
+
+#[test]
+fn opening_the_manual_at_a_page_that_does_not_exist_is_refused_by_name() {
+    let mut model = loaded();
+    let cmds = open_manual_at(&mut model, "nowhere");
+    assert!(cmds.is_empty());
+    assert_eq!(model.screen, Screen::List, "and nothing was opened");
+    assert!(model.manual.is_none());
+    assert_eq!(model.level, Level::Error);
+    assert!(model.status.contains("nowhere"), "{}", model.status);
+}
+
+#[test]
+fn opening_the_manual_over_a_streaming_overlay_stops_the_stream() {
+    // The manual is a screen; an overlay left up would cover it, and an
+    // abandoned `AskMailbox` left running would be billed for an answer
+    // nobody will read — `leave`'s rule, applied on this path too.
+    let mut model = loaded();
+    press(&mut model, Key::Char('A'));
+    keys(&mut model, "what happened");
+    press(&mut model, Key::Enter);
+    assert_eq!(model.mode(), Mode::Menu, "the answer is streaming");
+
+    // `manual` is not bound in the menu layer — the ask pane's own keys are —
+    // so this is the rebind case, which is also the shape task 89's `:manual`
+    // will take: an action reaching this path from a mode that has an overlay
+    // up.
+    model.keymap = keymap_from("[menu]\nK = \"manual\"\n");
+    let cmds = press(&mut model, Key::Char('K'));
+    assert_eq!(model.screen, Screen::Manual);
+    assert!(model.overlay.is_none());
+    assert!(
+        cmds.contains(&Cmd::CancelStream { which: Stream::Ask }),
+        "{cmds:?}"
+    );
+}
+
+#[test]
+fn a_jump_restores_what_was_highlighted_on_the_page_it_returns_to() {
+    // Not just the cursor: grep a phrase, open a hit, follow a link out of it
+    // and come back, and the hit you came for has to still be lit up.
+    let mut model = manual_open();
+    keys(&mut model, "g/");
+    keys(&mut model, "Modes and layers");
+    press(&mut model, Key::Enter);
+    walk_to_a_link(&mut model);
+    press(&mut model, Key::Enter);
+    assert_eq!(
+        manual(&model).highlight.as_deref(),
+        Some("Modes and layers")
+    );
+
+    // Out to another page, which clears it, then back.
+    enter_manual(
+        &mut model,
+        manual::Location::Page("capabilities".to_owned()),
+    );
+    assert_eq!(manual(&model).highlight, None);
+    press(&mut model, Key::ctrl('o'));
+    assert_eq!(
+        manual(&model).highlight.as_deref(),
+        Some("Modes and layers"),
+        "the jump list restores the page's state, not only its cursor"
+    );
+    press(&mut model, Key::ctrl('i'));
+    assert_eq!(manual(&model).highlight, None, "and forward again");
+}
+
+#[test]
+fn n_and_the_jump_keys_are_silent_when_the_manual_is_not_open() {
+    // `Mode::Help` is the `?` overlay's layer as well as the manual's, so
+    // every binding added for the manual has to be inert there. `n` was not:
+    // it painted a red "nothing searched for yet — / searches this page" over
+    // the status line, about a page the reader is not on.
+    for key in [
+        Key::Char('n'),
+        Key::Char('N'),
+        Key::ctrl('o'),
+        Key::ctrl('i'),
+        Key::Tab,
+        Key::Char('j'),
+        Key::Char('k'),
+        Key::Char('/'),
+    ] {
+        let mut model = loaded();
+        press(&mut model, Key::Char('?'));
+        model.info("2 message(s)");
+
+        let cmds = press(&mut model, key);
+        assert!(cmds.is_empty(), "{key:?} issued work: {cmds:?}");
+        assert_eq!(model.overlay, Some(Overlay::Help), "{key:?} closed it");
+        assert_eq!(
+            (model.level, model.status.as_str()),
+            (Level::Info, "2 message(s)"),
+            "{key:?} wrote to the status line"
+        );
+        assert_eq!(model.message_idx, 0, "{key:?} moved the list behind it");
+    }
+}
+
+#[test]
+fn helpgrep_with_its_pattern_supplied_goes_straight_to_the_hits() {
+    // The consumer of the `pattern` positional the verb declares — an action
+    // cannot carry a string, so this is the seam task 89 dispatches through.
+    let mut model = loaded();
+    let cmds = open_manual_grep_for(&mut model, "  Command index  ");
+    assert!(cmds.is_empty());
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Grep("Command index".to_owned()),
+        "the pattern is trimmed and used, not dropped"
+    );
+    // And `<c-o>` still has somewhere to go, so the hit list is not a dead end.
+    assert!(manual(&model).can_jump_back());
+}
+
+#[test]
+fn a_bare_helpgrep_raises_the_prompt_rather_than_listing_nothing() {
+    for pattern in ["", "   "] {
+        let mut model = loaded();
+        open_manual_grep_for(&mut model, pattern);
+        assert_eq!(model.screen, Screen::Manual);
+        assert!(manual(&model).typing(), "{pattern:?}");
+        assert_eq!(
+            manual(&model).prompt.as_ref().map(|prompt| prompt.scope),
+            Some(Scope::Manual)
+        );
+    }
+}
+
+#[test]
+fn helpgrep_with_a_pattern_closes_an_overlay_it_was_dispatched_from() {
+    // Task 89's command line is an overlay, and it will be up when it
+    // dispatches. A hit list drawn behind it would be a hit list nobody sees.
+    let mut model = loaded();
+    press(&mut model, Key::Char('A'));
+    keys(&mut model, "what happened");
+    press(&mut model, Key::Enter);
+
+    let cmds = open_manual_grep_for(&mut model, "Key reference");
+    assert!(model.overlay.is_none());
+    assert!(cmds.contains(&Cmd::CancelStream { which: Stream::Ask }));
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Grep("Key reference".to_owned())
+    );
 }

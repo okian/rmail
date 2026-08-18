@@ -336,6 +336,12 @@ actions! {
     Cancel        => "cancel",              "close the overlay, selection or viewer";
     Quit          => "quit",                "quit from anywhere";
     Help          => "help",                "this help";
+    ManualOpen    => "manual",              "the manual: guides, concepts and the generated reference";
+    ManualBack    => "manual.back",         "back to the manual page you came from";
+    ManualForward => "manual.forward",      "forward again, after going back";
+    ManualNext    => "manual.next-match",   "next match on this manual page";
+    ManualPrev    => "manual.prev-match",   "previous match on this manual page";
+    ManualGrep    => "manual.grep",         "search every manual page";
     VisualToggle  => "visual.toggle",       "start or leave a visual selection";
     VisualSwapEnds => "visual.swap-ends",   "jump to the other end of the selection";
     Archive       => "message.archive",     "archive";
@@ -603,6 +609,9 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Normal, "<enter>", Action::Open),
     (Mode::Normal, "q", Action::Back),
     (Mode::Normal, "?", Action::Help),
+    // vim's `K` — "look this up" — for the manual (task 103). `?` stays the
+    // key reference; `K` is the prose behind it.
+    (Mode::Normal, "K", Action::ManualOpen),
     (Mode::Normal, "v", Action::VisualToggle),
     (Mode::Normal, "a", Action::Archive),
     (Mode::Normal, "d", Action::Delete),
@@ -673,7 +682,54 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Confirm, "q", Action::Cancel),
     (Mode::Help, "q", Action::Cancel),
     (Mode::Help, "?", Action::Cancel),
-    (Mode::Help, "<enter>", Action::Cancel),
+    // `Mode::Help` is also `Screen::Manual`'s layer (task 103), so `<enter>`
+    // has to mean "use the row under the cursor" rather than "close" — on the
+    // manual that row is a `[[link]]`. It was `Action::Cancel` here through
+    // tasks 83–102 and the *behaviour* is unchanged: the `?` overlay has no
+    // row cursor, so `menu.accept` there still falls through to closing it
+    // (`menu_accept`'s `Overlay::Help` arm, pinned by
+    // `enter_still_closes_the_help_overlay`). Task 102 makes that arm run the
+    // highlighted binding instead, which is the same key meaning the same
+    // thing about a richer overlay.
+    (Mode::Help, "<enter>", Action::MenuAccept),
+    // The manual is a document: it scrolls, it is searched, and it has a jump
+    // list. None of these were bound in this layer before, so none of them
+    // takes anything away — and the `?` overlay, which has no cursor of its
+    // own until task 102 gives it one, is unaffected by all of them.
+    (Mode::Help, "j", Action::CursorDown),
+    (Mode::Help, "<down>", Action::CursorDown),
+    (Mode::Help, "k", Action::CursorUp),
+    (Mode::Help, "<up>", Action::CursorUp),
+    (Mode::Help, "gg", Action::CursorTop),
+    (Mode::Help, "G", Action::CursorBottom),
+    // `K` in this layer *is* a change: it used to be unbound in the `?`
+    // overlay and now closes it and opens the manual. Deliberate — the two are
+    // halves of the same thing, the reference and the prose behind it — and
+    // task 102 refines it to land on the page documenting the highlighted row
+    // rather than the front page.
+    (Mode::Help, "K", Action::ManualOpen),
+    // `/` is "search what is in front of me" in every mode that binds it; on
+    // the manual that is this page rather than the mailbox (`open_search`
+    // dispatches on the screen, the same way `cursor.down` dispatches on
+    // which list is up). `g/` widens it to every page.
+    //
+    // Task 102 wants `/` for filtering the `?` overlay's rows, which is the
+    // same collision `<tab>` has below and takes the same answer: one action,
+    // dispatched on which of the two surfaces sharing this layer is up.
+    (Mode::Help, "/", Action::SearchOpen),
+    (Mode::Help, "g/", Action::ManualGrep),
+    (Mode::Help, "n", Action::ManualNext),
+    (Mode::Help, "N", Action::ManualPrev),
+    // vim's jump list. `<tab>` is bound alongside `<c-i>` because the two are
+    // the same byte (0x09) on a terminal without the kitty keyboard protocol:
+    // crossterm reports `KeyCode::Tab` for Ctrl-I, so `<c-i>` alone would be
+    // a binding most terminals can never deliver. Task 102 wants `<tab>` for
+    // cycling the `?` overlay's mode — that is a different surface under the
+    // same layer, so make `manual.forward` context-sensitive there rather
+    // than taking this binding away.
+    (Mode::Help, "<c-o>", Action::ManualBack),
+    (Mode::Help, "<c-i>", Action::ManualForward),
+    (Mode::Help, "<tab>", Action::ManualForward),
 ];
 
 impl Default for Keymap {

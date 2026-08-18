@@ -1148,10 +1148,199 @@ fn no_color_literal_escapes_the_theme_module() {
     for (path, source) in [
         ("view.rs", include_str!("../view.rs")),
         ("overlays.rs", include_str!("../overlays.rs")),
+        // `manual.rs` is the same shape as `overlays.rs`: it holds what a run
+        // *means* (`manual::Ink`) and never what it looks like, so the mapping
+        // to a token stays in one place — `view::ink_style`.
+        ("manual.rs", include_str!("../manual.rs")),
     ] {
         assert!(
             !source.contains("Color::"),
             "{path} names `Color::` directly — route it through `Theme` instead"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the manual (task 103)
+// ---------------------------------------------------------------------------
+
+/// A model showing the manual, reached with the key that opens it.
+fn manual_model() -> Model {
+    let mut model = loaded();
+    press(&mut model, Key::Char('K'));
+    model
+}
+
+/// The manual is longer than a terminal, and every assertion below is about
+/// something further down the page than a 30-row frame reaches. Tall enough
+/// for the whole front page, so nothing here depends on where the viewport
+/// happens to have scrolled to.
+const TALL: u16 = 120;
+
+fn tall(model: &Model) -> String {
+    draw(model, 120, TALL).join("\n")
+}
+
+#[test]
+fn the_manual_takes_the_whole_screen_and_names_the_page_it_is_on() {
+    let mut model = manual_model();
+    model.ai_panel = true; // the panel is about a message; the manual is not
+    let rendered = tall(&model);
+    assert!(rendered.contains("manual · Start here"), "{rendered}");
+    assert!(
+        !rendered.contains("\\ hides"),
+        "the AI panel's own chrome is absent — it is about a message, and the \
+         manual is not: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Quarterly invoice"),
+        "and the message list is not behind it: {rendered}"
+    );
+}
+
+#[test]
+fn the_manual_renders_the_chords_that_are_actually_bound() {
+    // The same property the `?` overlay has, reached through a different path:
+    // the page says `{{keys:message.archive}}` and the renderer resolves it
+    // against the keymap in force.
+    let mut model = manual_model();
+    assert!(
+        !tall(&model).contains("Z / a"),
+        "not yet — nothing is bound to Z"
+    );
+
+    model.keymap =
+        crate::keymap::file::parse("[normal]\nZ = \"message.archive\"\n", "keys.toml").unwrap();
+    let rebound = tall(&model);
+    assert!(
+        rebound.contains("Z / a"),
+        "a rebind reaches the manual with no page edited:\n{rebound}"
+    );
+}
+
+/// Move the row cursor down until it is on a followable row.
+fn walk_to_a_link(model: &mut Model) {
+    for _ in 0..400 {
+        let state = model.manual.as_ref().expect("the manual is open");
+        if manual::doc(&state.at, &model.keymap)
+            .lines
+            .get(state.cursor)
+            .and_then(manual::DocLine::link)
+            .is_some()
+        {
+            return;
+        }
+        press(model, Key::Char('j'));
+    }
+    panic!("no row on this page carries a link");
+}
+
+#[test]
+fn a_generated_reference_page_renders_its_table() {
+    let mut model = manual_model();
+    crate::tui::model::open_manual_at(&mut model, "modes");
+    let rendered = screen(&model);
+    assert!(rendered.contains("normal"), "{rendered}");
+    assert!(
+        rendered.contains("→"),
+        "the layer chain is drawn: {rendered}"
+    );
+}
+
+#[test]
+fn the_manual_search_line_shows_what_is_being_typed_and_which_scope() {
+    let mut model = manual_model();
+    press(&mut model, Key::Char('/'));
+    for c in "invoice".chars() {
+        press(&mut model, Key::Char(c));
+    }
+    let rendered = screen(&model);
+    assert!(rendered.contains("/invoice"), "{rendered}");
+
+    let mut model = manual_model();
+    press(&mut model, Key::Char('g'));
+    press(&mut model, Key::Char('/'));
+    for c in "invoice".chars() {
+        press(&mut model, Key::Char(c));
+    }
+    assert!(screen(&model).contains("g/invoice"));
+}
+
+#[test]
+fn a_matched_word_in_the_manual_is_styled_and_nothing_is_spliced_into_the_text() {
+    let mut model = manual_model();
+    press(&mut model, Key::Char('/'));
+    for c in "archive".chars() {
+        press(&mut model, Key::Char(c));
+    }
+    press(&mut model, Key::Enter);
+
+    // Read off a row the cursor is *not* on. `List::highlight_style` patches
+    // `sel_focus` — which sets an explicit `fg` — over every span of the
+    // selected row, so on that one row a `Chord`, a link, a `Match` and a
+    // `Broken` marker all render identically. Submitting a search lands the
+    // cursor on the first match, so that match is precisely the one whose own
+    // ink is overridden; asserting without moving off it would prove nothing
+    // about the styling. (`chars_matching`'s own docs make the same point for
+    // the message list's unread rows.)
+    press(&mut model, Key::Char('G'));
+    let matched = chars_matching(&model, 120, TALL, model.theme.match_hl);
+    assert!(
+        matched.to_lowercase().contains("archive"),
+        "the match is the styled run, got {matched:?}"
+    );
+    // The highlight is *style*, never markup spliced into the text — splicing
+    // is what re-introduces the escaping bugs offsets exist to avoid — and it
+    // splits runs rather than lines, so not one character moves. Compared
+    // against the same frame with the highlight dropped rather than against
+    // `before`: submitting a search also *moves the cursor to the match*,
+    // which is a change to the frame that has nothing to do with styling.
+    let highlighted = tall(&model);
+    model.manual.as_mut().expect("the manual is open").highlight = None;
+    assert_eq!(
+        highlighted,
+        tall(&model),
+        "highlighting changed what the page says, not just how it looks"
+    );
+    assert!(
+        !highlighted.contains('*') && !highlighted.contains("[["),
+        "no markup was spliced in: {highlighted}"
+    );
+}
+
+#[test]
+fn the_pane_title_says_when_there_is_somewhere_to_go_back_to() {
+    let mut model = manual_model();
+    // Row 0 is the pane's top border, which carries the title. Asserted on
+    // that row alone rather than on the whole frame: the status line names
+    // `<c-o>` too, and a whole-frame match would pass without the title
+    // saying anything.
+    assert!(!draw(&model, 120, TALL)[0].contains("<c-o> back"));
+    walk_to_a_link(&mut model);
+    press(&mut model, Key::Enter);
+    let title = draw(&model, 120, TALL)[0].clone();
+    assert!(
+        title.contains("<c-o> back"),
+        "following a link says so in the title: {title:?}"
+    );
+}
+
+#[test]
+fn every_built_in_theme_draws_the_manual() {
+    for name in ThemeName::ALL {
+        let mut model = manual_model();
+        model.theme = name.resolve();
+        press(&mut model, Key::Char('/'));
+        for c in "the".chars() {
+            press(&mut model, Key::Char(c));
+        }
+        press(&mut model, Key::Enter);
+        // Panic-freedom across every page, prompt state and theme; the
+        // per-theme values are `theme::tests`' job.
+        for anchor in manual::PAGES.iter().map(|page| page.anchor) {
+            crate::tui::model::open_manual_at(&mut model, anchor);
+            draw(&model, 120, 44);
+            draw(&model, 40, 10);
+        }
     }
 }

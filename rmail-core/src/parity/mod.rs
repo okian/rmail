@@ -1990,6 +1990,17 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     Action::Cancel,
     Action::Quit,
     Action::Help,
+    // Task 103's manual. Local for the reason `help` is, only more so: every
+    // page is `include_str!`-compiled and every generated section is read out
+    // of `Keymap`/`command::registry`/[`Command::ALL`] in this process, so the
+    // manual has no RPC to declare and works with the daemon stopped —
+    // which is most of the point of a manual.
+    Action::ManualOpen,
+    Action::ManualBack,
+    Action::ManualForward,
+    Action::ManualNext,
+    Action::ManualPrev,
+    Action::ManualGrep,
     Action::VisualToggle,
     Action::VisualSwapEnds,
     Action::OpenHtml,

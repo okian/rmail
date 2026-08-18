@@ -107,3 +107,14 @@ nam = "nam"
 # wrong hash, and the symptom would be every WKD lookup silently 404ing with
 # encryption quietly never engaging.
 iy = "iy"
+
+# Deliberate typos, and the point of the tests that hold them: task 88's
+# `closest` suggests the nearest real verb for a mistyped `:` line, and each
+# of these is a specific shape it has to get right. `cancl` is `cancel` with
+# its last letter dropped (a subsequence match, which a transposition is not);
+# `message archiv` and `mesage archive` are the regression pair that caught
+# `closest` briefly suggesting the unrelated `search` for a garbled
+# `message archive`. Correcting any of them would delete the case.
+cancl = "cancl"
+archiv = "archiv"
+mesage = "mesage"

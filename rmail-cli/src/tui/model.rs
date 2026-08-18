@@ -54,6 +54,7 @@ pub mod wire;
 #[cfg(test)]
 mod tests;
 
+use super::manual;
 use super::overlays;
 use super::overlays::{
     complete_operator, palette_matches, AiSummary, AskPane, AskPhase, Citation, Explanation,
@@ -212,6 +213,219 @@ pub enum Screen {
     List,
     /// One message, full width, scrollable.
     Viewer,
+    /// The built-in manual ([`manual`]). Its state is [`Model::manual`]; see
+    /// [`set_screen`] on why that is a second field rather than a payload
+    /// here.
+    Manual,
+}
+
+/// The screen the manual was opened from, so leaving it goes back there.
+///
+/// A closed set of two rather than a `Screen`, because a `Screen::Manual`
+/// stored here would be a state that has to be prevented — [`enter_manual`]
+/// navigates within an open manual instead of re-entering it, so the case
+/// cannot arise, and a type that cannot express it needs no invariant to say
+/// so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The folder/message list.
+    List,
+    /// The message viewer.
+    Viewer,
+}
+
+impl Origin {
+    /// Which origin `screen` is. Total: [`Screen::Manual`] maps to
+    /// [`Origin::List`], which is where a manual opened from the manual would
+    /// have to return to anyway.
+    const fn of(screen: Screen) -> Self {
+        match screen {
+            Screen::Viewer => Self::Viewer,
+            Screen::List | Screen::Manual => Self::List,
+        }
+    }
+}
+
+/// Where the manual's search line is aimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// `/` — this page.
+    Page,
+    /// `g/` (and `:helpgrep`) — every page.
+    Manual,
+}
+
+/// The manual's search line, while it is being typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualPrompt {
+    /// What has been typed so far.
+    pub pattern: String,
+    /// What it will search.
+    pub scope: Scope,
+}
+
+/// Somewhere the manual has been, for the jump list.
+///
+/// Carries the highlight as well as the cursor: a jump restores the state of
+/// that page, and "which line I was on but not what was lit up on it" is a
+/// half-restore that shows through immediately — grep a phrase, open a hit,
+/// follow a link out of it, `<c-o>` back, and the hit you came for would be
+/// unmarked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Waypoint {
+    at: manual::Location,
+    cursor: usize,
+    highlight: Option<String>,
+}
+
+/// The most pages the jump list remembers in each direction.
+///
+/// Bounded for the reason every buffer in this crate is: following links for
+/// an hour is ordinary use, and it must not grow a `Vec` for as long as it
+/// lasts. Sixty-four is far past any reader's memory of where they have been.
+pub const MAX_JUMPS: usize = 64;
+
+/// The manual, as the model holds it: where it is, where the cursor is, what
+/// is being searched, and how to get back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualState {
+    /// The page (or hit list) on screen.
+    pub at: manual::Location,
+    /// Cursor within the rendered lines. The rendered document is *not* kept
+    /// here — [`manual::doc`] is a pure function of the location and the
+    /// keymap, cheap enough to call per frame, and a stored copy is a copy
+    /// that goes stale the moment `keys.toml` is saved.
+    pub cursor: usize,
+    /// The search line, while one is up.
+    pub prompt: Option<ManualPrompt>,
+    /// The submitted in-page pattern still being highlighted.
+    pub highlight: Option<String>,
+    /// Where leaving the manual returns to.
+    from: Origin,
+    /// Pages left behind by following a link. `<c-o>` pops.
+    back: Vec<Waypoint>,
+    /// Pages left behind by `<c-o>`. `<c-i>` pops.
+    forward: Vec<Waypoint>,
+}
+
+impl ManualState {
+    fn new(at: manual::Location, from: Origin) -> Self {
+        Self {
+            at,
+            cursor: 0,
+            prompt: None,
+            highlight: None,
+            from,
+            back: Vec::new(),
+            forward: Vec::new(),
+        }
+    }
+
+    /// Whether the search line is up — what makes the manual's mode
+    /// [`Mode::Prompt`] rather than [`Mode::Help`].
+    #[must_use]
+    pub fn typing(&self) -> bool {
+        self.prompt.is_some()
+    }
+
+    /// The pattern the page is highlighted for: whatever is being typed into
+    /// an in-page search (so it previews as it is typed), otherwise the last
+    /// one submitted.
+    #[must_use]
+    pub fn pattern(&self) -> Option<&str> {
+        match self.prompt.as_ref() {
+            Some(prompt) if prompt.scope == Scope::Page => Some(prompt.pattern.as_str()),
+            _ => self.highlight.as_deref(),
+        }
+    }
+
+    /// The cursor, clamped to a page of `lines` rows.
+    ///
+    /// The stored cursor can legitimately point past the end: nothing
+    /// re-clamps it when the page it is on gets *shorter* underneath it, and
+    /// two things do that without a key being pressed — a `keys.toml` reload
+    /// shrinking the generated key reference, and `<c-i>`/`<c-o>` restoring a
+    /// waypoint's cursor onto a page that has since changed length. Clamping
+    /// on read rather than trying to find every writer is what keeps `k` from
+    /// needing twenty presses to move a highlighted row, and `<enter>` from
+    /// reporting "no link on this line" about a row that visibly has one.
+    #[must_use]
+    pub fn cursor_in(&self, lines: usize) -> usize {
+        self.cursor.min(lines.saturating_sub(1))
+    }
+
+    /// Whether `<c-o>` has anywhere to go — what the pane title's marker says.
+    #[must_use]
+    pub fn can_jump_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    /// Whether `<c-i>` has anywhere to go.
+    #[must_use]
+    pub fn can_jump_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
+    fn here(&self) -> Waypoint {
+        Waypoint {
+            at: self.at.clone(),
+            cursor: self.cursor,
+            highlight: self.highlight.clone(),
+        }
+    }
+
+    /// Go to `to`, remembering where we were.
+    fn go(&mut self, to: manual::Location) {
+        if to == self.at {
+            return;
+        }
+        let here = self.here();
+        push_bounded(&mut self.back, here);
+        // Following a link is a new branch: what was ahead is no longer
+        // reachable from here, exactly as in a browser or vim's jump list.
+        self.forward.clear();
+        self.at = to;
+        self.cursor = 0;
+        self.prompt = None;
+        self.highlight = None;
+    }
+
+    fn jump(&mut self, jump: Jump) -> bool {
+        let (from, to) = match jump {
+            Jump::Back => (&mut self.back, &mut self.forward),
+            Jump::Forward => (&mut self.forward, &mut self.back),
+        };
+        let Some(waypoint) = from.pop() else {
+            return false;
+        };
+        let here = Waypoint {
+            at: std::mem::replace(&mut self.at, waypoint.at),
+            cursor: self.cursor,
+            highlight: self.highlight.take(),
+        };
+        push_bounded(to, here);
+        self.cursor = waypoint.cursor;
+        self.highlight = waypoint.highlight;
+        self.prompt = None;
+        true
+    }
+}
+
+/// Push onto a jump stack, dropping the oldest entry at [`MAX_JUMPS`].
+fn push_bounded(stack: &mut Vec<Waypoint>, waypoint: Waypoint) {
+    if stack.len() >= MAX_JUMPS {
+        stack.remove(0);
+    }
+    stack.push(waypoint);
+}
+
+/// Which way through the jump list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Jump {
+    /// `<c-o>`.
+    Back,
+    /// `<c-i>`.
+    Forward,
 }
 
 /// What a folder-picker overlay is picking a destination for.
@@ -711,6 +925,11 @@ pub struct Model {
     pub focus: Focus,
     /// Which screen is showing.
     pub screen: Screen,
+    /// The manual's state, when it is the screen. `Some` exactly when
+    /// [`Model::screen`] is [`Screen::Manual`]; [`set_screen`] is the only
+    /// place either is assigned, and `the_manual_state_and_the_screen_agree`
+    /// is what holds them to it.
+    pub manual: Option<ManualState>,
     /// The modal layer, if any.
     pub overlay: Option<Overlay>,
     /// Whether the collapsible AI panel is showing.
@@ -795,6 +1014,7 @@ impl Model {
             scroll: 0,
             focus: Focus::Messages,
             screen: Screen::List,
+            manual: None,
             overlay: None,
             ai_panel: false,
             summary: None,
@@ -855,8 +1075,24 @@ impl Model {
             Some(Overlay::Search(_) | Overlay::Ask(_) | Overlay::Outbox(_) | Overlay::Quick(_)) => {
                 Mode::Menu
             }
-            None if self.visual.is_some() => Mode::Visual,
             None => match self.screen {
+                // Checked before the visual selection, not after: the manual
+                // can be opened mid-selection and read, and while it is on
+                // screen the keyboard belongs to it. The selection is still
+                // there when it closes.
+                Screen::Manual => match self.manual.as_ref() {
+                    Some(manual) if manual.typing() => Mode::Prompt,
+                    _ => Mode::Help,
+                },
+                // Gated on the list rather than checked before the screen.
+                // `Model::visual` deliberately *outlives* leaving the list —
+                // opening a search hit found mid-selection puts the viewer up
+                // with the anchor still set — and the mode has to follow what
+                // is on screen, so `-- VISUAL --` over a full-width message
+                // (and `o` meaning swap-ends there rather than open-html) is
+                // wrong. [`Model::selection`] draws the same line for the same
+                // reason.
+                Screen::List if self.is_selecting() => Mode::Visual,
                 Screen::List => Mode::Normal,
                 Screen::Viewer => Mode::Viewer,
             },
@@ -865,8 +1101,23 @@ impl Model {
 
     /// The rows a visual selection covers, low index first, or `None` when
     /// there is no selection.
+    ///
+    /// `None` on any screen but the list, whatever [`Model::visual`] holds. A
+    /// selection is a range of *these rows*, and the rows are only on screen
+    /// on the list — but the anchor legitimately outlives leaving it (open a
+    /// hit from a search made mid-selection, or read the manual and come
+    /// back), so the anchor is kept and the *range* is what stops existing.
+    ///
+    /// This is what keeps a bulk action from mutating mail behind a screen
+    /// that is not the list at all: with the manual open over a selection and
+    /// `message.archive` rebound into the `help` layer, `targets` would
+    /// otherwise resolve to the rows underneath and archive them — from a page
+    /// of prose, with the list not even drawn.
     #[must_use]
     pub fn selection(&self) -> Option<(usize, usize)> {
+        if self.screen != Screen::List {
+            return None;
+        }
         let anchor = self.visual?;
         if self.messages.is_empty() {
             return None;
@@ -878,6 +1129,19 @@ impl Model {
             (self.message_idx, anchor)
         };
         Some((from.min(last), to.min(last)))
+    }
+
+    /// Whether a selection is on screen at all.
+    ///
+    /// The question every caller that reads [`Model::visual`] is actually
+    /// asking, spelled once. Reading the field raw is not the same question —
+    /// the anchor deliberately outlives leaving the list — and having some
+    /// callers ask one and some the other is how `a` came to archive the
+    /// viewer's message while `r` refused, in the same state, citing a
+    /// selection that was not drawn anywhere.
+    #[must_use]
+    pub fn is_selecting(&self) -> bool {
+        self.selection().is_some()
     }
 
     /// Whether row `idx` is inside the visual selection.
@@ -910,6 +1174,23 @@ impl Model {
             (Some(anchor), len) => Some(anchor.min(len - 1)),
             (None, _) => None,
         };
+    }
+}
+
+/// Change screens, keeping [`Model::screen`] and [`Model::manual`] in step.
+///
+/// The two are one piece of state spread over two fields, and this is the only
+/// place either is assigned (besides [`enter_manual`], which sets both at
+/// once). Putting [`ManualState`] *inside* the [`Screen::Manual`] variant
+/// would make the invariant structural and was the first design — but
+/// [`Screen`] is `Copy` and compared with `==` throughout this module and
+/// `view`, and a boxed payload costs that at every one of those sites for a
+/// pairing two functions can hold on their own. `Model::open`/[`Screen::Viewer`]
+/// already relate the same way.
+fn set_screen(model: &mut Model, screen: Screen) {
+    model.screen = screen;
+    if screen != Screen::Manual {
+        model.manual = None;
     }
 }
 
@@ -1072,8 +1353,8 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 Ok(open) => {
                     model.open = Some(open);
                     model.scroll = 0;
-                    model.screen = Screen::Viewer;
-                    model.info("q back · o open HTML · r reply · ? help");
+                    set_screen(model, Screen::Viewer);
+                    model.info("q back · o open HTML · r reply · ? help · K manual");
                     Vec::new()
                 }
                 Err(error) => {
@@ -1458,7 +1739,14 @@ fn apply_effect(model: &mut Model, effect: &Effect) {
             model.messages.retain(|m| m.id != *id);
             if model.open.as_ref().is_some_and(|o| o.id == *id) {
                 model.open = None;
-                model.screen = Screen::List;
+                // Only when the viewer is actually what is on screen. The
+                // manual may have been opened over it, and a message being
+                // archived elsewhere is not a reason to close the page
+                // somebody is reading; `leave_manual` notices the viewer is
+                // empty and returns to the list instead.
+                if model.screen == Screen::Viewer {
+                    set_screen(model, Screen::List);
+                }
             }
             if model.opening == Some(*id) {
                 model.opening = None;
@@ -1546,6 +1834,19 @@ enum Typed {
 /// Apply `edit` to whichever text field is up, and issue whatever the change
 /// implies.
 fn edit_prompt(model: &mut Model, edit: TextEdit) -> Vec<Cmd> {
+    // The manual's search line is not an overlay — the manual is a screen —
+    // so it is checked first rather than added to the match below. Nothing
+    // follows an edit to it: an in-page pattern previews from
+    // `ManualState::pattern` as it is typed, which is a render-time read of
+    // state that is already here, not work to issue.
+    if let Some(prompt) = model
+        .manual
+        .as_mut()
+        .and_then(|manual| manual.prompt.as_mut())
+    {
+        apply_edit(&mut prompt.pattern, edit);
+        return Vec::new();
+    }
     let typed = match model.overlay.as_mut() {
         Some(Overlay::Input { buffer, .. }) => {
             apply_edit(buffer, edit);
@@ -1631,6 +1932,12 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
             model.overlay = Some(Overlay::Help);
             Vec::new()
         }
+        Action::ManualOpen => open_manual(model),
+        Action::ManualBack => manual_jump(model, Jump::Back),
+        Action::ManualForward => manual_jump(model, Jump::Forward),
+        Action::ManualNext => step_manual_match(model, Direction::Down),
+        Action::ManualPrev => step_manual_match(model, Direction::Up),
+        Action::ManualGrep => open_manual_grep(model),
         Action::VisualToggle => toggle_visual(model),
         Action::VisualSwapEnds => swap_ends(model),
         Action::Archive => archive(model),
@@ -1704,6 +2011,10 @@ enum Cursor {
     Folders,
     /// The message list.
     Messages,
+    /// The manual's selected line. A row cursor rather than a scroll offset
+    /// (which is what the viewer has) because a manual row is followable:
+    /// `<enter>` takes the link on it.
+    Manual,
 }
 
 fn active_cursor(model: &Model) -> Option<Cursor> {
@@ -1715,6 +2026,7 @@ fn active_cursor(model: &Model) -> Option<Cursor> {
         Some(_) => None,
         None => match model.screen {
             Screen::Viewer => Some(Cursor::Scroll),
+            Screen::Manual => Some(Cursor::Manual),
             Screen::List => Some(match model.focus {
                 Focus::Folders => Cursor::Folders,
                 Focus::Messages => Cursor::Messages,
@@ -1738,8 +2050,25 @@ fn cursor_span(model: &Model, cursor: Cursor) -> Option<(usize, usize)> {
         ),
         Cursor::Folders => (model.folder_idx, model.folders.len()),
         Cursor::Messages => (model.message_idx, model.messages.len()),
+        Cursor::Manual => {
+            let manual = model.manual.as_ref()?;
+            let lines = manual_doc(model)?.lines.len();
+            (manual.cursor_in(lines), lines)
+        }
     };
     (len > 0).then(|| (idx, len - 1))
+}
+
+/// The manual page as it stands, or `None` when the manual is not up.
+///
+/// Rendered on demand rather than cached: it is a pure function of the
+/// location and the bindings in force, so a cache would be a copy that lies
+/// about the keymap the moment `keys.toml` is saved — and the whole document
+/// is a few kilobytes of `&'static str` plus a `Vec` walk, which is cheaper
+/// than the invalidation would be.
+fn manual_doc(model: &Model) -> Option<manual::Doc> {
+    let manual = model.manual.as_ref()?;
+    Some(manual::doc(&manual.at, &model.keymap))
 }
 
 fn set_cursor(model: &mut Model, cursor: Cursor, at: usize) {
@@ -1757,6 +2086,11 @@ fn set_cursor(model: &mut Model, cursor: Cursor, at: usize) {
         Cursor::Scroll => model.scroll = at,
         Cursor::Folders => model.folder_idx = at,
         Cursor::Messages => model.message_idx = at,
+        Cursor::Manual => {
+            if let Some(manual) = model.manual.as_mut() {
+                manual.cursor = at;
+            }
+        }
     }
 }
 
@@ -1851,17 +2185,37 @@ fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
         if !matches!(overlay, Overlay::Help) {
             model.info("cancelled");
         }
-        return streams_of(&overlay)
-            .iter()
-            .map(|which| Cmd::CancelStream { which: *which })
-            .collect();
+        return cancels(&overlay);
     }
-    if model.visual.take().is_some() {
+    // The manual's own layers, innermost first: the search line, then the
+    // highlight it left behind, then the manual itself. Ahead of the visual
+    // selection rather than after it, because the manual can be opened
+    // mid-selection — and backing out of the page somebody is reading by
+    // silently discarding their selection instead would be the opposite of
+    // "leave the innermost thing".
+    if let Some(manual) = model.manual.as_mut() {
+        if manual.prompt.take().is_some() {
+            model.info("cancelled");
+            return Vec::new();
+        }
+        if manual.highlight.take().is_some() {
+            model.info("search cleared");
+            return Vec::new();
+        }
+        leave_manual(model);
+        return Vec::new();
+    }
+    // `is_selecting` rather than the raw anchor: in the viewer the anchor is
+    // still set but nothing is drawn selected, and "selection cleared" about
+    // an invisible range reads as a keypress that did nothing. Leaving the
+    // viewer with the anchor intact puts the selection back where it was made.
+    if model.is_selecting() {
+        model.visual = None;
         model.info("selection cleared");
         return Vec::new();
     }
     if model.screen == Screen::Viewer {
-        model.screen = Screen::List;
+        set_screen(model, Screen::List);
         model.open = None;
         model.opening = None;
         return Vec::new();
@@ -1870,6 +2224,14 @@ fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
         model.quit = true;
     }
     Vec::new()
+}
+
+/// The [`Cmd::CancelStream`]s that closing `overlay` implies.
+fn cancels(overlay: &Overlay) -> Vec<Cmd> {
+    streams_of(overlay)
+        .iter()
+        .map(|which| Cmd::CancelStream { which: *which })
+        .collect()
 }
 
 /// The streams an overlay was feeding on, which closing it should stop.
@@ -1895,7 +2257,8 @@ fn streams_of(overlay: &Overlay) -> &'static [Stream] {
 // ---------------------------------------------------------------------------
 
 fn toggle_visual(model: &mut Model) -> Vec<Cmd> {
-    if model.visual.take().is_some() {
+    if model.is_selecting() {
+        model.visual = None;
         model.info("selection cleared");
         return Vec::new();
     }
@@ -1964,7 +2327,7 @@ fn bulk_targets(model: &mut Model, what: &str) -> Option<Vec<i64>> {
 
 /// The single message an action that has no bulk form applies to.
 fn single_target(model: &mut Model) -> Option<i64> {
-    if model.visual.is_some() {
+    if model.is_selecting() {
         model.fail("that acts on one message — Esc ends the selection");
         return None;
     }
@@ -1982,10 +2345,14 @@ fn single_target(model: &mut Model) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 fn open(model: &mut Model) -> Vec<Cmd> {
-    if model.screen == Screen::Viewer {
+    // Only the list has something to open. The viewer already holds the
+    // message; the manual's own `<enter>` is `menu.accept` (follow a link),
+    // and this action reaching it through a rebind must not load mail behind
+    // the page being read.
+    if model.screen != Screen::List {
         return Vec::new();
     }
-    if model.visual.is_some() {
+    if model.is_selecting() {
         model.fail("that acts on one message — Esc ends the selection");
         return Vec::new();
     }
@@ -2302,6 +2669,318 @@ fn open_html(model: &mut Model) -> Vec<Cmd> {
 }
 
 // ---------------------------------------------------------------------------
+// the manual (task 103)
+// ---------------------------------------------------------------------------
+
+/// `K` — the manual, at its front page.
+fn open_manual(model: &mut Model) -> Vec<Cmd> {
+    open_manual_at(model, manual::START)
+}
+
+/// Put the manual on screen at the page `anchor` names.
+///
+/// The seam the rest of the TUI reaches the manual through, and the one an
+/// [`Action`] cannot express on its own — [`run_action`] takes a count, not a
+/// string. Task 89's `:` dispatch needs it to carry a page argument, and task
+/// 102's `K`-on-a-key-reference-row needs it to land on the page documenting
+/// that action.
+///
+/// # Errors, of a sort
+///
+/// An anchor the registry does not have is refused on the status line rather
+/// than opened: [`manual::doc`] is total and would render a "no such page"
+/// page, which is the right answer for a link inside the manual and the wrong
+/// one for a caller that got a name wrong.
+pub fn open_manual_at(model: &mut Model, anchor: &str) -> Vec<Cmd> {
+    if manual::page(anchor).is_none() {
+        model.fail(format!("this build has no manual page called {anchor:?}"));
+        return Vec::new();
+    }
+    // The manual is a *screen*, so an overlay left up would cover the thing
+    // the caller just asked to show. Taking it also stops whatever it was
+    // streaming, which is `leave`'s rule for closing one.
+    let stop = model.overlay.take().map(|overlay| cancels(&overlay));
+    let mut cmds = enter_manual(model, manual::Location::Page(anchor.to_owned()));
+    cmds.extend(stop.unwrap_or_default());
+    cmds
+}
+
+/// Put the manual on screen at `at`, or navigate an already-open one.
+///
+/// Navigating rather than re-entering is what keeps [`Origin`] honest: the
+/// screen the manual returns to is the one it was *first* opened from, not
+/// whichever page happened to be showing when a link was followed.
+fn enter_manual(model: &mut Model, at: manual::Location) -> Vec<Cmd> {
+    match model.manual.as_mut() {
+        Some(manual) => manual.go(at),
+        None => {
+            model.manual = Some(ManualState::new(at, Origin::of(model.screen)));
+            model.screen = Screen::Manual;
+            // A `MailService.Get` still in flight would otherwise land later
+            // and replace the manual with a viewer nobody asked for — the
+            // same reason leaving the viewer clears it.
+            model.opening = None;
+        }
+    }
+    announce_manual(model);
+    Vec::new()
+}
+
+/// Take the manual off screen, back where it came from.
+fn leave_manual(model: &mut Model) {
+    let from = model
+        .manual
+        .as_ref()
+        .map_or(Origin::List, |manual| manual.from);
+    // Back to the viewer only if it still holds something: the message can
+    // have been archived, or the folder reloaded, while a page was being read.
+    let screen = match from {
+        Origin::Viewer if model.open.is_some() => Screen::Viewer,
+        Origin::Viewer | Origin::List => Screen::List,
+    };
+    set_screen(model, screen);
+    model.info("closed the manual");
+}
+
+fn announce_manual(model: &mut Model) {
+    let Some(manual) = model.manual.as_ref() else {
+        return;
+    };
+    let label = manual.at.label();
+    model.info(format!(
+        "{label} — Enter follows a link · <c-o> back · / searches · g/ searches every page · q leaves"
+    ));
+}
+
+/// `<c-o>` / `<c-i>`.
+fn manual_jump(model: &mut Model, jump: Jump) -> Vec<Cmd> {
+    let Some(manual) = model.manual.as_mut() else {
+        return Vec::new();
+    };
+    if manual.jump(jump) {
+        announce_manual(model);
+    } else {
+        model.fail(match jump {
+            Jump::Back => "no page to go back to",
+            Jump::Forward => "no page to go forward to — <c-o> goes back",
+        });
+    }
+    Vec::new()
+}
+
+/// `g/` — the cross-page search prompt, opening the manual first when it is
+/// not already up.
+fn open_manual_grep(model: &mut Model) -> Vec<Cmd> {
+    // A prompt raised behind a modal is a prompt nobody can see themselves
+    // typing into, so the *key* path refuses rather than opening one: whatever
+    // that modal is, it is what the keyboard belongs to. The argument-carrying
+    // path takes the modal down first instead — it was dispatched *by* one
+    // (the palette today, task 89's command line next), which is a modal
+    // asking to be replaced rather than one being talked over.
+    if model.overlay.is_some() {
+        return Vec::new();
+    }
+    open_manual_grep_for(model, "")
+}
+
+/// Show the cross-page hits for `pattern` — `:helpgrep <pattern>` with its
+/// argument supplied.
+///
+/// The consumer of the `pattern` positional `command::explicit` declares, and
+/// the counterpart of [`open_manual_at`]: [`run_action`] takes a count, not a
+/// string, so an argument-carrying verb cannot reach this through the ordinary
+/// action path and task 89 calls it directly. A blank pattern raises the
+/// prompt rather than listing nothing, which is what a bare `:helpgrep` means.
+pub fn open_manual_grep_for(model: &mut Model, pattern: &str) -> Vec<Cmd> {
+    let stop = model.overlay.take().map(|overlay| cancels(&overlay));
+    // The front page first, so `<c-o>` from the hit list has somewhere to go
+    // rather than the list being a dead end.
+    if model.screen != Screen::Manual {
+        enter_manual(model, manual::Location::start());
+    }
+    let pattern = pattern.trim();
+    let mut cmds = if pattern.is_empty() {
+        prompt_manual(model, Scope::Manual)
+    } else {
+        enter_manual(model, manual::Location::Grep(pattern.to_owned()))
+    };
+    cmds.extend(stop.unwrap_or_default());
+    cmds
+}
+
+/// Raise the manual's search line.
+fn prompt_manual(model: &mut Model, scope: Scope) -> Vec<Cmd> {
+    let Some(manual) = model.manual.as_mut() else {
+        return Vec::new();
+    };
+    manual.prompt = Some(ManualPrompt {
+        pattern: String::new(),
+        scope,
+    });
+    model.info(match scope {
+        Scope::Page => "search this page — Enter jumps to the first match, then n and N step",
+        Scope::Manual => "search every page — Enter lists what mentions it",
+    });
+    Vec::new()
+}
+
+/// `Enter` on the manual's search line.
+fn submit_manual_search(model: &mut Model) -> Vec<Cmd> {
+    let Some(prompt) = model
+        .manual
+        .as_mut()
+        .and_then(|manual| manual.prompt.take())
+    else {
+        return Vec::new();
+    };
+    let pattern = prompt.pattern.trim().to_owned();
+    if pattern.is_empty() {
+        // Nothing typed means nothing searched for, not everything matched —
+        // the rule `search_now` follows for the mailbox box, for the same
+        // reason.
+        if let Some(manual) = model.manual.as_mut() {
+            manual.highlight = None;
+        }
+        model.info("cancelled");
+        return Vec::new();
+    }
+    match prompt.scope {
+        Scope::Manual => enter_manual(model, manual::Location::Grep(pattern)),
+        Scope::Page => search_manual_page(model, pattern),
+    }
+}
+
+fn search_manual_page(model: &mut Model, pattern: String) -> Vec<Cmd> {
+    let hits = manual_matches(model, &pattern);
+    let from = model
+        .manual
+        .as_ref()
+        .map_or(0, |manual| manual.cursor_in(hits_of(model)));
+    // vim's `/`: forward from where the cursor already is, wrapping to the
+    // top rather than reporting nothing when every hit is above it.
+    let landing = hits
+        .iter()
+        .copied()
+        .find(|line| *line >= from)
+        .or_else(|| hits.first().copied());
+    if let Some(manual) = model.manual.as_mut() {
+        manual.highlight = Some(pattern.clone());
+        if let Some(landing) = landing {
+            manual.cursor = landing;
+        }
+    }
+    if hits.is_empty() {
+        model.fail(format!(
+            "{pattern:?} is not on this page — g/ searches all of them"
+        ));
+    } else {
+        model.info(format!(
+            "{} line(s) match — n and N step through them",
+            hits.len()
+        ));
+    }
+    Vec::new()
+}
+
+/// `n` / `N`.
+fn step_manual_match(model: &mut Model, direction: Direction) -> Vec<Cmd> {
+    // Silent when the manual is not up at all. These are bound in the `help`
+    // layer, which the `?` overlay shares — pressing `n` there would otherwise
+    // paint a red "nothing searched for yet — / searches this page" over the
+    // status line, about a page the reader is not on. `manual_jump` is silent
+    // in the same situation for the same reason.
+    if model.manual.is_none() {
+        return Vec::new();
+    }
+    let Some(pattern) = model
+        .manual
+        .as_ref()
+        .and_then(|manual| manual.highlight.clone())
+    else {
+        model.fail("nothing searched for yet — / searches this page");
+        return Vec::new();
+    };
+    let hits = manual_matches(model, &pattern);
+    if hits.is_empty() {
+        model.fail(format!("{pattern:?} is no longer on this page"));
+        return Vec::new();
+    }
+    let at = model
+        .manual
+        .as_ref()
+        .map_or(0, |manual| manual.cursor_in(hits_of(model)));
+    // Wrapping both ways: a step that stopped dead at the last hit would
+    // leave the reader guessing whether there were more above it.
+    let next = match direction {
+        Direction::Down => hits
+            .iter()
+            .copied()
+            .find(|line| *line > at)
+            .or_else(|| hits.first().copied()),
+        Direction::Up => hits
+            .iter()
+            .copied()
+            .rev()
+            .find(|line| *line < at)
+            .or_else(|| hits.last().copied()),
+    };
+    let Some(next) = next else {
+        return Vec::new();
+    };
+    if let Some(manual) = model.manual.as_mut() {
+        manual.cursor = next;
+    }
+    let which = hits.iter().position(|line| *line == next).unwrap_or(0) + 1;
+    model.info(format!("match {which} of {}", hits.len()));
+    Vec::new()
+}
+
+/// How many rendered lines the open page has, for clamping a cursor against.
+fn hits_of(model: &Model) -> usize {
+    manual_doc(model).map_or(0, |doc| doc.lines.len())
+}
+
+/// Which rendered lines of the open page contain `pattern`.
+fn manual_matches(model: &Model, pattern: &str) -> Vec<usize> {
+    manual_doc(model)
+        .map(|doc| manual::matching_lines(&doc, pattern))
+        .unwrap_or_default()
+}
+
+/// `Enter` on a manual row: follow the link on it.
+fn follow_manual_link(model: &mut Model) -> Vec<Cmd> {
+    let (target, carry) = {
+        let Some(manual) = model.manual.as_ref() else {
+            return Vec::new();
+        };
+        let Some(doc) = manual_doc(model) else {
+            return Vec::new();
+        };
+        let target = doc
+            .lines
+            .get(manual.cursor_in(doc.lines.len()))
+            .and_then(manual::DocLine::link);
+        // A hit list's rows carry their pattern with them: arriving on the
+        // page with nothing highlighted would lose the one thing that made
+        // the row a hit.
+        let carry = match &manual.at {
+            manual::Location::Grep(pattern) => Some(pattern.clone()),
+            manual::Location::Page(_) => None,
+        };
+        (target, carry)
+    };
+    let Some(anchor) = target else {
+        model.fail("no link on this line — j and k move, Enter follows one");
+        return Vec::new();
+    };
+    let cmds = enter_manual(model, manual::Location::Page(anchor.to_owned()));
+    if let Some(pattern) = carry {
+        return [cmds, search_manual_page(model, pattern)].concat();
+    }
+    cmds
+}
+
+// ---------------------------------------------------------------------------
 // task 85's overlays
 // ---------------------------------------------------------------------------
 
@@ -2317,6 +2996,12 @@ fn screen_is_clear(model: &Model) -> bool {
 
 /// `/` — open the search overlay, or take an open one back to its query line.
 fn open_search(model: &mut Model) -> Vec<Cmd> {
+    // `/` means "search what is in front of me" in every layer that binds it.
+    // On the manual that is this page: opening the mailbox search overlay
+    // there would cover the text it was pressed to search.
+    if model.screen == Screen::Manual && model.overlay.is_none() {
+        return prompt_manual(model, Scope::Page);
+    }
     if let Some(Overlay::Search(pane)) = model.overlay.as_mut() {
         pane.focus = SearchFocus::Query;
         return Vec::new();
@@ -2720,6 +3405,12 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Message(i64),
         Outbox,
         Quick(QuickAction),
+        /// The row under the cursor is a manual link.
+        ManualLink,
+        /// There is no row cursor here, so "use the highlighted row" is
+        /// "close this" — which is what `<enter>` has meant on the `?`
+        /// overlay since task 83.
+        Close,
         Nothing,
     }
     let chosen = match model.overlay.as_ref() {
@@ -2731,12 +3422,19 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         }),
         Some(Overlay::Outbox(_)) => Chosen::Outbox,
         Some(Overlay::Quick(pane)) => pane.action().map_or(Chosen::Nothing, Chosen::Quick),
+        // Task 102 gives the key reference a row cursor of its own; until it
+        // does, `<enter>` there closes it, exactly as before this action was
+        // bound to that key.
+        Some(Overlay::Help) => Chosen::Close,
+        None if model.screen == Screen::Manual => Chosen::ManualLink,
         _ => Chosen::Nothing,
     };
     match chosen {
         Chosen::Message(message_id) => open_message_by_id(model, message_id),
         Chosen::Outbox => describe_outbox_row(model),
         Chosen::Quick(action) => run_quick(model, action),
+        Chosen::ManualLink => follow_manual_link(model),
+        Chosen::Close => leave(model, Leave::ThenNothing),
         Chosen::Nothing => Vec::new(),
     }
 }
@@ -2772,7 +3470,7 @@ fn open_folder_by_id(model: &mut Model, mailbox_id: i64) -> Vec<Cmd> {
         return Vec::new();
     };
     model.folder_idx = idx;
-    model.screen = Screen::List;
+    set_screen(model, Screen::List);
     open_folder(model)
 }
 
@@ -2785,6 +3483,16 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         AskQuestion,
         Nothing,
     }
+    // The manual's search line first, and unconditionally: it is the only
+    // typing surface that is a screen rather than an overlay, so an overlay
+    // cannot be up at the same time as it.
+    if model
+        .manual
+        .as_ref()
+        .is_some_and(|manual| manual.typing() && model.overlay.is_none())
+    {
+        return submit_manual_search(model);
+    }
     let which = match model.overlay.as_ref() {
         Some(Overlay::Search(pane)) if pane.typing() => Which::SearchQuery,
         Some(Overlay::Finder(_)) => Which::Finder,
@@ -2793,11 +3501,11 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         _ => Which::Nothing,
     };
     match which {
+        Which::Nothing => Vec::new(),
         Which::SearchQuery => focus_results(model),
         Which::Finder => activate_finder(model),
         Which::Palette => run_palette(model),
         Which::AskQuestion => ask_now(model),
-        Which::Nothing => Vec::new(),
     }
 }
 
@@ -2835,6 +3543,9 @@ fn target_subject(model: &Model) -> Option<(i64, String)> {
         Screen::List => model
             .current_message()
             .map(|row| (row.id, row.subject.clone())),
+        // The manual is not about a message, and an action that needs one
+        // must say "no message selected" rather than reach behind the page.
+        Screen::Manual => None,
     }
 }
 
@@ -2844,5 +3555,6 @@ fn target_message(model: &Model) -> Option<i64> {
     match model.screen {
         Screen::Viewer => model.open.as_ref().map(|o| o.id),
         Screen::List => model.current_message().map(|m| m.id),
+        Screen::Manual => None,
     }
 }

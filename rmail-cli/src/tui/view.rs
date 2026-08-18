@@ -26,7 +26,8 @@ use ratatui::Frame;
 
 use crate::keymap::{Action, Mode};
 
-use super::model::{Focus, Level, Model, Overlay, Screen, FLAGGED, SEEN};
+use super::manual;
+use super::model::{Focus, Level, Model, Overlay, Scope, Screen, FLAGGED, SEEN};
 use super::overlays::{
     self, AskPane, AskPhase, FinderPane, OutboxPane, PalettePane, QuickAction, QuickPane,
     SearchFocus, SearchPane, UndoToast,
@@ -52,6 +53,10 @@ pub fn render(model: &Model, frame: &mut Frame) {
     match model.screen {
         Screen::List => render_panes(model, frame, rows[0]),
         Screen::Viewer => render_main_with_panel(model, frame, rows[0], render_viewer),
+        // Full width, and deliberately without the AI panel: the manual is
+        // not about a message, so there is nothing for that column to be
+        // about either.
+        Screen::Manual => render_manual(model, frame, rows[0]),
     }
     if let Some(toast) = model.toast.as_ref() {
         render_toast(&model.theme, toast, frame, rows[1]);
@@ -278,6 +283,117 @@ fn render_viewer(model: &Model, frame: &mut Frame, area: Rect) {
         .block(pane_block(theme, "message", true))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+// ---------------------------------------------------------------------------
+// the manual (task 103)
+// ---------------------------------------------------------------------------
+
+/// The manual: one already-wrapped line per row, with a row cursor.
+///
+/// A `List` rather than a `Paragraph`, and for the opposite reason to
+/// [`render_viewer`]'s slicing: the manual's cursor selects a *row*, because a
+/// row is what `<enter>` follows a link from. `ListState` keeps that row on
+/// screen as it moves without the model needing to know the pane's height,
+/// and because [`manual`] has already wrapped every line at [`manual::WRAP`]
+/// there is no `Wrap` here to make the widget's line count disagree with the
+/// model's.
+fn render_manual(model: &Model, frame: &mut Frame, area: Rect) {
+    let theme = &model.theme;
+    let Some(state) = model.manual.as_ref() else {
+        // Unreachable: `Screen::Manual` and `Model::manual` are set together
+        // (`model::set_screen`). Drawn rather than skipped so that a future
+        // edit which broke that pairing shows up as something visible instead
+        // of an empty frame.
+        frame.render_widget(
+            Paragraph::new("the manual is not open").block(pane_block(theme, "manual", true)),
+            area,
+        );
+        return;
+    };
+
+    let mut doc = manual::doc(&state.at, &model.keymap);
+    if let Some(pattern) = state.pattern() {
+        manual::highlight(&mut doc, pattern);
+    }
+
+    // The search line gets a row of its own, below the page, for the reason
+    // the undo toast gets one: a prompt drawn over the text it is searching
+    // hides the answer.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(u16::from(state.typing())),
+        ])
+        .split(area);
+
+    let items: Vec<ListItem> = doc
+        .lines
+        .iter()
+        .map(|line| ListItem::new(doc_line(theme, line)))
+        .collect();
+    let mut list_state = ListState::default();
+    list_state.select(if doc.lines.is_empty() {
+        None
+    } else {
+        Some(state.cursor_in(doc.lines.len()))
+    });
+
+    let mut title = format!("manual · {}", doc.title);
+    if state.can_jump_back() {
+        title.push_str(" · <c-o> back");
+    }
+    if state.can_jump_forward() {
+        title.push_str(" · <c-i> forward");
+    }
+    let list = List::new(items)
+        .block(pane_block(theme, &title, true))
+        .highlight_style(selected_style(theme, true));
+    frame.render_stateful_widget(list, rows[0], &mut list_state);
+
+    if let Some(prompt) = state.prompt.as_ref() {
+        let sigil = match prompt.scope {
+            Scope::Page => "/",
+            Scope::Manual => "g/",
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(sigil.to_owned(), theme.accent),
+                Span::raw(overlays::safe_line(&prompt.pattern)),
+                Span::styled("▏", theme.accent),
+            ])),
+            rows[1],
+        );
+    }
+}
+
+/// One rendered manual line, with each run's [`manual::Ink`] resolved to a
+/// theme token. This is the only place the manual's styling is decided, which
+/// is what keeps `manual.rs` free of `ratatui` entirely.
+fn doc_line<'a>(theme: &Theme, line: &manual::DocLine) -> Line<'a> {
+    Line::from(
+        line.runs
+            .iter()
+            .map(|run| Span::styled(overlays::safe_line(&run.text), ink_style(theme, run.ink)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn ink_style(theme: &Theme, ink: manual::Ink) -> Style {
+    match ink {
+        // Prose and code both take the terminal's own foreground. Code is
+        // told apart by its `│` gutter rather than by colour, which is the
+        // rule `theme::Theme::mono` exists to keep every surface honest
+        // about — and a code block dimmed or tinted would be the *command
+        // you are meant to type* rendered as an aside.
+        manual::Ink::Body | manual::Ink::Code => Style::default(),
+        manual::Ink::Heading | manual::Ink::Chord => theme.emphasis,
+        manual::Ink::Muted => theme.muted,
+        manual::Ink::Accent => theme.accent,
+        manual::Ink::Match => theme.match_hl,
+        manual::Ink::Broken => theme.err,
+    }
 }
 
 fn render_status(model: &Model, frame: &mut Frame, area: Rect) {
