@@ -1078,7 +1078,7 @@ Known backend gaps this phase deliberately does **not** paper over (Settings sho
 - **verify:** `cargo nextest run -p rmail-cli tui::settings` (every field's keypress produces the expected Invocation with no daemon connection, config-file-only fields render their block, Keys section bypasses gRPC)
 
 ## 102. Help overlay redesign
-- [ ] status
+- [x] status
 - **depends-on:** 91
 - **parallel-safe:** yes
 - **acceptance:**
