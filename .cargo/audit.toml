@@ -14,6 +14,16 @@ ignore = [
     "RUSTSEC-2025-0134", # rustls-pemfile, unmaintained via tonic 0.12 — see deny.toml
     "RUSTSEC-2026-0253", # lru 0.12 unsound via ratatui 0.29 — see deny.toml
     "RUSTSEC-2026-0002", # lru 0.12 unsound via ratatui 0.29 — see deny.toml
+    # The one entry here that is an actual *vulnerability* rather than an
+    # unmaintained/unsound finding, and the only one whose rationale is
+    # load-bearing rather than "nothing to bump to": it holds solely because
+    # this workspace performs no RSA *private-key* operation, so there is no
+    # decryption oracle to time. Read the full note in deny.toml before
+    # inheriting this — it stops being true the moment decryption of incoming
+    # mail lands. It was present in deny.toml and missing here, which is the
+    # exact drift the header warns about: `cargo deny` passed it while
+    # `cargo audit` failed on it.
+    "RUSTSEC-2023-0071", # rsa 0.9 Marvin attack via pgp — see deny.toml
 ]
 
 [output]
