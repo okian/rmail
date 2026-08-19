@@ -21,6 +21,16 @@ use crate::tui::model::{
 // fixtures
 // ---------------------------------------------------------------------------
 
+/// The queued undo toast, if [`Model::shown_toast`] is showing one — these
+/// tests only ever arm at most one, so unwrapping past a non-`Undo` variant
+/// would itself be the failure worth seeing.
+fn undo_toast(model: &Model) -> Option<&UndoToast> {
+    match model.shown_toast() {
+        Some(Toast::Undo(toast)) => Some(toast),
+        _ => None,
+    }
+}
+
 fn account() -> Account {
     Account {
         id: 7,
@@ -846,7 +856,7 @@ fn the_outbox_lists_and_raises_a_toast_for_a_send_still_inside_its_window() {
             ]),
         },
     );
-    let toast = model.toast.as_ref().unwrap_or_else(|| panic!("no toast"));
+    let toast = undo_toast(&model).unwrap_or_else(|| panic!("no toast"));
     assert_eq!(
         toast.outbox_id, 2,
         "the window about to close is the one a countdown is for"
@@ -868,7 +878,7 @@ fn a_sent_or_cancelled_entry_never_raises_a_toast() {
                 result: Ok(vec![outbox_row(1, state, Some(1_010))]),
             },
         );
-        assert!(model.toast.is_none(), "{state} must not be undoable");
+        assert!(model.toasts.is_empty(), "{state} must not be undoable");
     }
 }
 
@@ -883,11 +893,11 @@ fn the_toast_counts_down_and_retires_when_the_window_closes() {
         },
     );
     update(&mut model, Msg::Tick(1_001));
-    assert_eq!(model.toast.as_ref().map(|toast| toast.remaining), Some(2));
+    assert_eq!(undo_toast(&model).map(|toast| toast.remaining), Some(2));
 
     update(&mut model, Msg::Tick(1_003));
     assert!(
-        model.toast.is_none(),
+        model.toasts.is_empty(),
         "an undo offer that no longer works is worse than none"
     );
 }
@@ -905,7 +915,7 @@ fn u_cancels_the_send_the_toast_names_from_the_message_list() {
     let cmds = press(&mut model, Key::Char('u'));
     assert_eq!(cmds, vec![Cmd::CancelSend { outbox_id: 9 }]);
     assert!(
-        model.toast.is_none(),
+        model.toasts.is_empty(),
         "the offer is taken, so it stops being offered"
     );
 }
@@ -1600,7 +1610,7 @@ fn a_window_too_long_to_be_an_undo_gets_no_toast() {
             )]),
         },
     );
-    assert!(model.toast.is_none());
+    assert!(model.toasts.is_empty());
     assert!(cmds.is_empty(), "and no ticker is started: {cmds:?}");
 }
 

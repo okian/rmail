@@ -976,13 +976,14 @@ Known backend gaps this phase deliberately does **not** paper over (Settings sho
 - **verify:** `cargo nextest run -p rmail-cli tui::status` (all ten mode labels render, heartbeat never touches `inflight`, indicator glyph/color pairs for each daemon state, push events preempt polling)
 
 ## 93. Responsive layout and toast queue
-- [ ] status
+- [x] status
 - **depends-on:** 87
 - **parallel-safe:** yes
 - **acceptance:**
   - `render_panes` drops the preview column below ~100 terminal columns and the folder column below ~60 (2-pane, then 1-pane; `<tab>`/`h` still switch focus); pane widths and the AI-panel width become `:set` options; `Model::summary_pinned`'s pin state becomes visible in the AI panel header.
   - The single toast row becomes a capped queue (1 visible + `+N` badge) carrying undo countdowns (existing), completion notices, and priority alerts, without growing past its existing one-line reflow.
 - **verify:** `cargo nextest run -p rmail-cli tui::view` (breakpoint transitions at ~100/~60 columns, toast queue caps at 1+N, pin indicator visible)
+- **as built:** `:set <option> <value>` is a new explicit registry `Verb` (both positionals `required: false` — a `required: true` pair fails `every_real_verb_is_reachable_by_typing_its_own_path`, which admits no exceptions, so "both are mandatory" is `set_option`'s job, not the grammar's); it gained `Verb.description` since it's the first verb with neither an action nor a capability for `describe()` to borrow a sentence from. `Model.toast: Option<UndoToast>` became `Model.toasts: VecDeque<Toast>` (cap 5); `Toast::Undo` is the only variant with a real producer today. `Toast::Completion`/`Toast::Priority` exist (`#[allow(dead_code)]`, exercised only by tests) as the queue's declared shape for what tasks 94/98 will push — not wired to a real source, and deliberately not given a self-expiry: `Msg::Tick` is driven solely by `Cmd::Countdown` from an armed undo window (`arm_toast`/`grpc.rs`'s countdown timer), not a free-running heartbeat, so a tick-based TTL for these would only fire while an unrelated undo toast happened to also be live. Until 94/98 thread a real clock or event to a push call site, this queue's lifecycle is "shown until evicted by the cap" — `shown_toast()` ranks Undo > newest Priority > newest overall, and `push_toast` evicts the oldest *non*-Undo entry so a flood of other toasts can never silently swallow a live undo offer. `render_panes` measures the area *after* the AI panel's own split (`render_main_with_panel` takes its share first), so the two breakpoints are against the panes' own width, not the raw terminal — `panes_width()` re-derives that same number for `render_status`, which now shows `focus: folders (<tab>)` in a reserved column (not appended after the unbounded `model.status`, which would truncate it off narrow terminals) whenever `Focus::Folders` is off-screen — `update` has no `Msg::Resize`/terminal width, so this makes the state legible rather than preventing it.
 
 ## 94. Daemon-observability commands
 - [ ] status

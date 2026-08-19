@@ -59,6 +59,15 @@ follow it:
   {{cmd:message delete}}! expunges without asking. It never changes what a
   command does.
 
+One verb worth knowing early: {{cmd:set}} folder-width 25 (or
+preview-width, or ai-panel-width) resizes a pane for this session only —
+never a round trip to the daemon, and reset to the defaults the next time
+the TUI starts. An out-of-range percentage or a name that does not exist
+says so on the command line rather than doing nothing. The folder and
+preview columns narrow on their own as the terminal does — under about 100
+columns the preview goes, under about 60 the folders go too — so
+{{cmd:set}} is for taste, not for making a narrow terminal fit.
+
 The three other doors out of the message list are [[search-vs-finder]] for
 finding mail, [[bulk]] for acting on more than one message, and this manual —
 {{keys:manual}} from anywhere, described in [[manual]].

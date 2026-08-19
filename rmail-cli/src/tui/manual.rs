@@ -207,6 +207,7 @@ pub const PAGES: &[Page] = &[
             "cancel",
             "quit",
             "palette",
+            "set",
         ],
     },
     Page {

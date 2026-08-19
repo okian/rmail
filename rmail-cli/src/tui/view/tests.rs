@@ -7,6 +7,8 @@
 //! `tui::model::tests` and `tui::overlays::tests` take.
 #![allow(clippy::panic)]
 
+use std::collections::VecDeque;
+
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 use ratatui::Terminal;
@@ -16,6 +18,7 @@ use crate::keymap::Key;
 use crate::tui::model::{
     update, Account, Confirmed, Folder, InputFor, MessageRow, Msg, OpenMessage, PickFor,
 };
+use crate::tui::overlays::UndoToast;
 use crate::tui::theme::ThemeName;
 
 /// Render `model` and flatten the buffer into one string per row.
@@ -1107,12 +1110,12 @@ fn dark_theme_outbox_state_colors_match_the_historical_colors() {
 fn dark_theme_undo_toast_matches_the_historical_colors() {
     let dark = Theme::dark();
     let mut model = loaded();
-    model.toast = Some(UndoToast {
+    model.toasts = VecDeque::from([Toast::Undo(UndoToast {
         outbox_id: 1,
         to: "bob@example.com".to_owned(),
         deadline: 1_030,
         remaining: 30,
-    });
+    })]);
     let band = chars_matching(&model, 120, 30, dark.toast);
     assert!(band.contains("bob@example.com"), "{}", screen(&model));
     let hint = chars_matching(&model, 120, 30, dark.warn);
@@ -1380,4 +1383,332 @@ fn every_built_in_theme_draws_the_manual() {
             draw(&model, 40, 10);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// responsive layout and the toast queue (task 93)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn three_panes_render_at_and_above_the_preview_breakpoint() {
+    let model = loaded();
+    for width in [100, 120] {
+        let rendered = draw(&model, width, 30).join("\n");
+        assert!(rendered.contains("folders"), "width {width}: {rendered}");
+        assert!(rendered.contains("preview"), "width {width}: {rendered}");
+    }
+}
+
+#[test]
+fn the_preview_column_drops_just_below_its_own_breakpoint() {
+    let model = loaded();
+    for width in [99, 60] {
+        let rendered = draw(&model, width, 30).join("\n");
+        assert!(rendered.contains("folders"), "width {width}: {rendered}");
+        assert!(!rendered.contains("preview"), "width {width}: {rendered}");
+    }
+}
+
+#[test]
+fn the_folder_column_drops_below_its_own_breakpoint_leaving_messages_alone() {
+    let model = loaded();
+    let rendered = draw(&model, 59, 30).join("\n");
+    assert!(!rendered.contains("folders"), "{rendered}");
+    assert!(!rendered.contains("preview"), "{rendered}");
+    assert!(
+        rendered.contains("Quarterly invoice"),
+        "the message list is still there: {rendered}"
+    );
+}
+
+#[test]
+fn tab_and_h_still_move_focus_with_the_folder_column_off_screen() {
+    // `render` never special-cases a narrow terminal for focus — it is the
+    // same `Focus::Folders`/`Focus::Messages` toggle either way. Proof it
+    // does not panic or wedge with the column not on screen at all.
+    let mut model = loaded();
+    press(&mut model, Key::Char('h'));
+    assert_eq!(model.focus, Focus::Folders);
+    draw(&model, 50, 30);
+    press(&mut model, Key::Tab);
+    assert_eq!(
+        model.focus,
+        Focus::Messages,
+        "<tab> toggles too, not just l"
+    );
+    draw(&model, 50, 30);
+    press(&mut model, Key::Tab);
+    assert_eq!(model.focus, Focus::Folders);
+    press(&mut model, Key::Char('l'));
+    assert_eq!(model.focus, Focus::Messages);
+    draw(&model, 50, 30);
+}
+
+#[test]
+fn the_status_line_names_focus_only_when_folders_are_off_screen_and_focused() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('h'));
+    assert_eq!(model.focus, Focus::Folders);
+
+    // Wide enough that folders are drawn: the border highlight already says
+    // where focus is, so the status line stays quiet.
+    assert!(
+        !draw(&model, 120, 30).join("\n").contains("focus: folders"),
+        "the folder pane is on screen and shows its own focus"
+    );
+    // Narrow enough to drop the column: nothing on screen shows focus
+    // without this.
+    let narrow = draw(&model, 50, 30).join("\n");
+    assert!(
+        narrow.contains("focus: folders"),
+        "the only pane drawn is unfocused and says nothing about why: {narrow}"
+    );
+
+    // Focus on messages needs no hint at any width — the one pane drawn is
+    // exactly the one with the cursor.
+    press(&mut model, Key::Char('l'));
+    assert!(!draw(&model, 50, 30).join("\n").contains("focus: folders"));
+}
+
+#[test]
+fn the_focus_hint_survives_a_long_status_line() {
+    // `\` both opens the AI panel and installs a 63-column status
+    // ("AI panel — cached analysis only; `.` offers the calls that cost").
+    // At 59 columns that status alone overruns the row; the hint must still
+    // reach the screen rather than being truncated off the right edge of an
+    // unbounded, unwrapped status span.
+    let mut model = loaded();
+    press(&mut model, Key::Char('\\'));
+    press(&mut model, Key::Char('h'));
+    assert_eq!(model.focus, Focus::Folders);
+    assert!(model.ai_panel);
+    assert!(
+        model.status.len() > 59,
+        "the repro needs a status that alone overruns the row: {:?}",
+        model.status
+    );
+    let rendered = draw(&model, 59, 30).join("\n");
+    assert!(
+        rendered.contains("focus: folders"),
+        "the hint has its own reserved column, not whatever status leaves over: {rendered}"
+    );
+}
+
+#[test]
+fn the_focus_hint_accounts_for_the_open_ai_panel_when_measuring_width() {
+    // `panes_width` must subtract the AI panel's share before comparing
+    // against `FOLDER_BREAKPOINT` — a terminal wide enough on its own, but
+    // not once the open panel's column is taken out, is exactly the case
+    // `render_panes` collapses to 1-pane and this hint exists for.
+    let mut model = loaded();
+    model.ai_panel = true;
+    model.ai_panel_width_pct = 30;
+    press(&mut model, Key::Char('h'));
+    assert_eq!(model.focus, Focus::Folders);
+
+    // 100 columns: 70% for the panes (70) is still >= FOLDER_BREAKPOINT
+    // (60), so folders are drawn and the hint stays quiet.
+    assert!(
+        !draw(&model, 100, 30).join("\n").contains("focus: folders"),
+        "70 columns for the panes still fits the folder column"
+    );
+    // 80 columns: 70% (56) is now under FOLDER_BREAKPOINT even though 80 on
+    // its own is not. Proves the panel's share was actually subtracted.
+    let narrowed_by_panel = draw(&model, 80, 30).join("\n");
+    assert!(
+        narrowed_by_panel.contains("focus: folders"),
+        "56 columns for the panes should read as narrow, even though the \
+         terminal itself is 80: {narrowed_by_panel}"
+    );
+}
+
+#[test]
+fn the_toast_row_shows_one_entry_and_a_badge_for_the_rest() {
+    let mut model = loaded();
+    model.toasts = VecDeque::from([
+        Toast::Priority {
+            text: "3 messages need a reply".to_owned(),
+        },
+        Toast::Completion {
+            text: "reindex complete".to_owned(),
+        },
+    ]);
+    let rendered = screen(&model);
+    assert!(
+        rendered.contains("3 messages need a reply"),
+        "the ranked-highest toast is shown: {rendered}"
+    );
+    assert!(
+        !rendered.contains("reindex complete"),
+        "only the shown toast draws: {rendered}"
+    );
+    assert!(rendered.contains("+1"), "the rest are a badge: {rendered}");
+}
+
+#[test]
+fn a_priority_toast_is_shown_over_a_completion_regardless_of_push_order() {
+    // The mirror of the test above: `Completion` pushed *after* `Priority`
+    // this time, so a selection that just picked the front of the queue
+    // would show the wrong one here even though it happened to pass above.
+    let mut model = loaded();
+    model.toasts = VecDeque::from([
+        Toast::Completion {
+            text: "reindex complete".to_owned(),
+        },
+        Toast::Priority {
+            text: "3 messages need a reply".to_owned(),
+        },
+    ]);
+    let rendered = screen(&model);
+    assert!(
+        rendered.contains("3 messages need a reply"),
+        "priority is ranked to interrupt, regardless of arrival order: {rendered}"
+    );
+    assert!(!rendered.contains("reindex complete"), "{rendered}");
+}
+
+#[test]
+fn the_newest_completion_is_shown_not_the_oldest() {
+    let mut model = loaded();
+    model.toasts = VecDeque::from([
+        Toast::Completion {
+            text: "export finished".to_owned(),
+        },
+        Toast::Completion {
+            text: "reindex complete".to_owned(),
+        },
+    ]);
+    let rendered = screen(&model);
+    assert!(
+        rendered.contains("reindex complete"),
+        "the most recent notice is the useful one to show: {rendered}"
+    );
+    assert!(!rendered.contains("export finished"), "{rendered}");
+}
+
+#[test]
+fn an_undo_toast_is_always_shown_first_even_queued_behind_others() {
+    let mut model = loaded();
+    model.toasts = VecDeque::from([
+        Toast::Completion {
+            text: "reindex complete".to_owned(),
+        },
+        Toast::Undo(UndoToast {
+            outbox_id: 1,
+            to: "bob@example.com".to_owned(),
+            deadline: 1_030,
+            remaining: 30,
+        }),
+    ]);
+    let rendered = screen(&model);
+    assert!(
+        rendered.contains("bob@example.com"),
+        "the undo offer is what a person needs to see: {rendered}"
+    );
+    assert!(rendered.contains("+1"), "{rendered}");
+}
+
+#[test]
+fn the_ai_panel_header_shows_when_the_summary_is_pinned() {
+    let mut model = loaded();
+    assert!(!screen(&model).contains("AI ·"), "not open yet");
+
+    // Opened by \, following the cursor: not pinned, and the header must
+    // not claim otherwise.
+    press(&mut model, Key::Char('\\'));
+    let unpinned = screen(&model);
+    assert!(unpinned.contains("AI ·"), "the panel is open: {unpinned}");
+    assert!(
+        !unpinned.contains("pinned"),
+        "following the cursor is not pinned: {unpinned}"
+    );
+
+    // Opened by the . menu, on a specific message: pinned.
+    press(&mut model, Key::Char('.'));
+    press(&mut model, Key::Enter);
+    let pinned = screen(&model);
+    assert!(
+        pinned.contains("pinned"),
+        "the panel header names the pin: {pinned}"
+    );
+}
+
+#[test]
+fn set_folder_width_actually_moves_the_message_columns_left_edge() {
+    // Row 0 specifically, not the whole screen: the folders *list* can
+    // itself contain "INBOX" as a row's text once the cursor scrolls, which
+    // would make a whole-screen search ambiguous about which column it
+    // found. Row 0 is border/title only, and the message pane's title is
+    // the open folder's name (see `render_messages`), so this is
+    // unambiguously that pane's left edge.
+    let narrow = {
+        let mut model = loaded();
+        model.folder_width_pct = 10;
+        model
+    };
+    let wide = {
+        let mut model = loaded();
+        model.folder_width_pct = 50;
+        model
+    };
+    let narrow_x = draw(&narrow, 120, 30)[0]
+        .find("INBOX")
+        .unwrap_or_else(|| panic!("no INBOX title: {:?}", draw(&narrow, 120, 30)));
+    let wide_x = draw(&wide, 120, 30)[0]
+        .find("INBOX")
+        .unwrap_or_else(|| panic!("no INBOX title: {:?}", draw(&wide, 120, 30)));
+    assert!(
+        wide_x > narrow_x,
+        "a wider folder column should push the message list right: {narrow_x} vs {wide_x}"
+    );
+}
+
+#[test]
+fn set_preview_width_actually_moves_the_preview_columns_left_edge() {
+    let narrow = {
+        let mut model = loaded();
+        model.preview_width_pct = 15;
+        model
+    };
+    let wide = {
+        let mut model = loaded();
+        model.preview_width_pct = 55;
+        model
+    };
+    let narrow_x = draw(&narrow, 120, 30)[0]
+        .find("preview")
+        .unwrap_or_else(|| panic!("no preview title: {:?}", draw(&narrow, 120, 30)));
+    let wide_x = draw(&wide, 120, 30)[0]
+        .find("preview")
+        .unwrap_or_else(|| panic!("no preview title: {:?}", draw(&wide, 120, 30)));
+    assert!(
+        wide_x < narrow_x,
+        "a wider preview column should push its own left edge left: {narrow_x} vs {wide_x}"
+    );
+}
+
+#[test]
+fn set_ai_panel_width_actually_moves_the_panels_left_edge() {
+    let narrow = {
+        let mut model = loaded();
+        model.ai_panel = true;
+        model.ai_panel_width_pct = 15;
+        model
+    };
+    let wide = {
+        let mut model = loaded();
+        model.ai_panel = true;
+        model.ai_panel_width_pct = 60;
+        model
+    };
+    let narrow_x = draw(&narrow, 120, 30)[0]
+        .find("AI ·")
+        .unwrap_or_else(|| panic!("no AI panel title: {:?}", draw(&narrow, 120, 30)));
+    let wide_x = draw(&wide, 120, 30)[0]
+        .find("AI ·")
+        .unwrap_or_else(|| panic!("no AI panel title: {:?}", draw(&wide, 120, 30)));
+    assert!(
+        wide_x < narrow_x,
+        "a wider AI panel should push its own left edge left: {narrow_x} vs {wide_x}"
+    );
 }
