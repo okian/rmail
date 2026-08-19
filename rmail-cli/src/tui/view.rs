@@ -30,7 +30,7 @@ use super::manual;
 use super::model::{Focus, Level, Model, Overlay, Scope, Screen, FLAGGED, SEEN};
 use super::overlays::{
     self, AskPane, AskPhase, CommandPane, FinderPane, OutboxPane, QuickAction, QuickPane,
-    SearchFocus, SearchPane, UndoToast,
+    SearchFocus, SearchPane, Toast,
 };
 use super::theme::Theme;
 
@@ -39,8 +39,9 @@ pub fn render(model: &Model, frame: &mut Frame) {
     let area = frame.area();
     // The toast gets a row of its own rather than sharing the status line: it
     // is a countdown with an offer attached, and an offer that scrolls away
-    // behind the next "3 messages" is not an offer.
-    let toast_height = u16::from(model.toast.is_some());
+    // behind the next "3 messages" is not an offer. The row's height never
+    // grows past one even when several are queued — see `render_toast`.
+    let toast_height = u16::from(model.shown_toast().is_some());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -58,8 +59,8 @@ pub fn render(model: &Model, frame: &mut Frame) {
         // about either.
         Screen::Manual => render_manual(model, frame, rows[0]),
     }
-    if let Some(toast) = model.toast.as_ref() {
-        render_toast(&model.theme, toast, frame, rows[1]);
+    if model.shown_toast().is_some() {
+        render_toast(model, frame, rows[1]);
     }
     render_status(model, frame, rows[2]);
 
@@ -82,14 +83,65 @@ pub fn render(model: &Model, frame: &mut Frame) {
     }
 }
 
+/// Below this width the preview column is dropped: folders + messages,
+/// 2-pane.
+const PREVIEW_BREAKPOINT: u16 = 100;
+/// Below this width the folder column is dropped too: messages alone,
+/// 1-pane.
+const FOLDER_BREAKPOINT: u16 = 60;
+
+/// The list screen's three panes, collapsing as `area` narrows.
+///
+/// `area` is what is left *after* [`render_main_with_panel`] has already
+/// taken the AI panel's share out, when it is open — so the breakpoints
+/// below fire against the space the panes actually have, not the raw
+/// terminal width. A 120-column terminal with the panel open at its default
+/// 30% gives this closure 84 columns, already under [`PREVIEW_BREAKPOINT`].
+/// [`panes_width`] duplicates this same split for [`render_status`], which
+/// needs the answer from outside the panel's own column.
+///
+/// `Model::focus` still toggles between [`Focus::Folders`] and
+/// [`Focus::Messages`] exactly as it does at full width — `update` has no
+/// terminal size to special-case a narrow one with (this module's own docs:
+/// render "cannot decide anything the model has not already decided"), and
+/// it does not need one. Focusing folders while they are off-screen paints
+/// nothing differently until the terminal widens again; [`render_status`]
+/// is what tells a person that rather than leaving them to wonder why `j`
+/// stopped moving the message cursor.
 fn render_panes(model: &Model, frame: &mut Frame, area: Rect) {
     render_main_with_panel(model, frame, area, |model, frame, area| {
+        if area.width < FOLDER_BREAKPOINT {
+            render_messages(model, frame, area);
+            return;
+        }
+        if area.width < PREVIEW_BREAKPOINT {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(model.folder_width_pct),
+                    Constraint::Percentage(100 - model.folder_width_pct),
+                ])
+                .split(area);
+            render_folders(model, frame, columns[0]);
+            render_messages(model, frame, columns[1]);
+            return;
+        }
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(20),
-                Constraint::Percentage(40),
-                Constraint::Percentage(40),
+                Constraint::Percentage(model.folder_width_pct),
+                // `set_option` enforces folder_width_pct + preview_width_pct
+                // <= MAX_PANES_PCT (<= 90) as the only writer of either
+                // field, so this cannot underflow — `saturating_sub` all the
+                // same, because a `Rect` computed from a bad percentage
+                // split must never be the thing that turns a stale or
+                // hand-built `Model` into a panic.
+                Constraint::Percentage(
+                    100u16
+                        .saturating_sub(model.folder_width_pct)
+                        .saturating_sub(model.preview_width_pct),
+                ),
+                Constraint::Percentage(model.preview_width_pct),
             ])
             .split(area);
 
@@ -116,10 +168,34 @@ where
     }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([
+            Constraint::Percentage(100u16.saturating_sub(model.ai_panel_width_pct)),
+            Constraint::Percentage(model.ai_panel_width_pct),
+        ])
         .split(area);
     main(model, frame, columns[0]);
     render_ai_panel(model, frame, columns[1]);
+}
+
+/// The width [`render_panes`] actually lays its columns out in: `terminal_width`
+/// minus the AI panel's share when it is open, zero otherwise. [`render_status`]
+/// needs this — not the raw terminal width — to say whether [`Focus::Folders`]
+/// has anywhere on screen to point at. Re-running [`render_main_with_panel`]'s
+/// own split against a throwaway one-row `Rect` (rather than approximating the
+/// percentage arithmetic by hand) is what keeps the two answers in agreement by
+/// construction instead of by two copies of the same formula staying in sync.
+fn panes_width(model: &Model, terminal_width: u16) -> u16 {
+    if !model.ai_panel {
+        return terminal_width;
+    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(100u16.saturating_sub(model.ai_panel_width_pct)),
+            Constraint::Percentage(model.ai_panel_width_pct),
+        ])
+        .split(Rect::new(0, 0, terminal_width, 1));
+    columns[0].width
 }
 
 fn render_folders(model: &Model, frame: &mut Frame, area: Rect) {
@@ -425,6 +501,39 @@ fn render_status(model: &Model, frame: &mut Frame, area: Rect) {
     } else {
         format!(" {}", model.pending.label())
     };
+    // `render_panes` drops the folder column below `FOLDER_BREAKPOINT` (see
+    // its own doc comment) without touching `Model::focus` — the model has
+    // no terminal size to react to, by this module's own rule. Left alone,
+    // a `Focus::Folders` state at that width points at a pane nothing draws:
+    // `j`/`k` would move the folder cursor and `<enter>` would open a
+    // folder, with no pane on screen showing focus at all to explain either.
+    // This is the other half of that trade — not preventing the state, only
+    // making it legible.
+    //
+    // Reserved as its own right-hand column rather than appended to `line`:
+    // `model.status` is unbounded (task 85 — an SMTP server's verbatim
+    // rejection, a recipient address) and this `Paragraph` does not wrap, so
+    // a hint appended after it would be exactly what a long status pushes
+    // off the edge of the row it exists to explain. Splitting `area` first
+    // gives the hint a width nothing else can encroach on.
+    let focus_hint = if model.screen == Screen::List
+        && model.focus == Focus::Folders
+        && panes_width(model, area.width) < FOLDER_BREAKPOINT
+    {
+        "focus: folders (<tab>)"
+    } else {
+        ""
+    };
+    let hint_width = focus_hint.len() as u16;
+    let (status_area, hint_area) = if hint_width == 0 || hint_width >= area.width {
+        (area, None)
+    } else {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(hint_width)])
+            .split(area);
+        (columns[0], Some(columns[1]))
+    };
     let line = Line::from(vec![
         // Sanitized here rather than at each call site: the status line is
         // the one surface every part of the TUI writes to, and task 85 is
@@ -436,7 +545,13 @@ fn render_status(model: &Model, frame: &mut Frame, area: Rect) {
         Span::styled(mode, theme.mode_indicator),
         Span::styled(pending, theme.warn),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(line), status_area);
+    if let Some(hint_area) = hint_area {
+        frame.render_widget(
+            Paragraph::new(Span::styled(focus_hint, theme.warn)),
+            hint_area,
+        );
+    }
 }
 
 /// The key reference, read out of the keymap rather than written alongside it.
@@ -1031,6 +1146,11 @@ fn render_quick(theme: &Theme, pane: &QuickPane, frame: &mut Frame, area: Rect) 
 /// The collapsible AI panel.
 fn render_ai_panel(model: &Model, frame: &mut Frame, area: Rect) {
     let theme = &model.theme;
+    let title = if model.is_summary_pinned() {
+        "AI · pinned · \\ hides · . acts"
+    } else {
+        "AI · \\ hides · . acts"
+    };
     let mut lines: Vec<Line> = Vec::new();
     match model.summary.as_ref() {
         None => lines.push(Line::styled("reading…", theme.muted)),
@@ -1063,7 +1183,7 @@ fn render_ai_panel(model: &Model, frame: &mut Frame, area: Rect) {
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(pane_block(theme, "AI · \\ hides · . acts", false))
+            .block(pane_block(theme, title, false))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1081,10 +1201,17 @@ fn push_bullets(theme: &Theme, lines: &mut Vec<Line<'_>>, label: &str, values: &
     );
 }
 
-/// The undo-send countdown.
-fn render_toast(theme: &Theme, toast: &UndoToast, frame: &mut Frame, area: Rect) {
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
+/// The bottom-row notification: whichever toast [`Model::shown_toast`] picks,
+/// plus a `+N` badge when the queue is carrying more than that one. The
+/// badge is what keeps this a one-line reflow no matter how many are
+/// queued — nothing here ever draws a second row.
+fn render_toast(model: &Model, frame: &mut Frame, area: Rect) {
+    let theme = &model.theme;
+    let Some(shown) = model.shown_toast() else {
+        return;
+    };
+    let mut spans = match shown {
+        Toast::Undo(toast) => vec![
             Span::styled(
                 format!(
                     " sending to {} in {}s ",
@@ -1094,9 +1221,25 @@ fn render_toast(theme: &Theme, toast: &UndoToast, frame: &mut Frame, area: Rect)
                 theme.toast,
             ),
             Span::styled("  u undoes", theme.warn),
-        ])),
-        area,
-    );
+        ],
+        Toast::Completion { text } => {
+            vec![Span::styled(
+                format!(" {} ", overlays::safe_line(text)),
+                theme.toast,
+            )]
+        }
+        Toast::Priority { text } => {
+            vec![Span::styled(
+                format!(" {} ", overlays::safe_line(text)),
+                theme.warn,
+            )]
+        }
+    };
+    let queued = model.toasts.len() - 1;
+    if queued > 0 {
+        spans.push(Span::styled(format!("  +{queued}"), theme.muted));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Draw `title`'s border around `area` and return what is left inside it.

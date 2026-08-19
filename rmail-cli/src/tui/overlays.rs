@@ -863,6 +863,43 @@ pub struct UndoToast {
     pub remaining: i64,
 }
 
+/// One line at the bottom of the message list: an undo countdown, a
+/// finished background job, or a priority alert.
+///
+/// [`super::model::Model::toasts`] is a queue rather than a single slot
+/// because more than one can be true at once — a reindex can finish while a
+/// send is still undoable — but the row itself does not grow: `view::render`
+/// draws one [`super::model::Model::shown_toast`] plus a `+N` badge for
+/// whatever else is queued, which is what keeps this a one-line reflow no
+/// matter how many are waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Toast {
+    /// A scheduled send still inside its undo window.
+    Undo(UndoToast),
+    /// A background job finished — a reindex, an export, a rebuild.
+    ///
+    /// `#[allow(dead_code)]`: no task wires a real completion event into the
+    /// TUI yet (that needs `WatchEvents`, task 94's job) — this variant and
+    /// [`Toast::Priority`] are exercised by `tui::model::tests` and
+    /// `tui::view::tests` today, and by task 94's own production code once
+    /// it lands. Declaring the shape now, against the queue and the render
+    /// side both built in task 93, is what lets 94 add one line rather than
+    /// a second toast type.
+    #[allow(dead_code)]
+    Completion {
+        /// What to show on the row.
+        text: String,
+    },
+    /// `NotificationService::StreamAlerts` surfaced something ranked to
+    /// interrupt. Same `#[allow(dead_code)]` reasoning as
+    /// [`Toast::Completion`]; task 98's `:notify` is the real source.
+    #[allow(dead_code)]
+    Priority {
+        /// What to show on the row.
+        text: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // AI panel and quick actions
 // ---------------------------------------------------------------------------

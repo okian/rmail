@@ -117,6 +117,13 @@ pub struct Verb {
     /// `None` for every verb that just spells things the way its
     /// capability already does.
     pub cli_alias: Option<&'static str>,
+    /// A description for a verb reaching neither an action nor a capability
+    /// — `describe`'s last resort before falling back to the bare path.
+    /// `None` for every verb an action or a capability already describes;
+    /// `Some` only exists so a verb like `:set`, local to the grammar with
+    /// nothing behind it to borrow a sentence from, does not read as its own
+    /// path twice in the generated command index.
+    pub description: Option<&'static str>,
 }
 
 impl Verb {
@@ -129,15 +136,17 @@ impl Verb {
     }
 
     /// One line describing this verb — the action's own description if it
-    /// has one, the capability's summary otherwise, and a bare statement of
-    /// the path if it reaches neither (an interior node has no [`Verb`] at
-    /// all, so every real [`Verb`] reaches at least one). Action first, the
-    /// same precedence `tests`' `spells_like_its_capability` gives path
-    /// spelling: for an auto-derived verb the action *is* the specific
-    /// thing (`message.reply` and `message.forward` share one capability
-    /// summary — "create a draft, optionally pre-filled..." — but each has
-    /// its own action description), and a capability-only verb has no
-    /// action to prefer over it anyway.
+    /// has one, the capability's summary otherwise, this verb's own
+    /// [`Verb::description`] if it was given one, and a bare statement of
+    /// the path only if none of those apply (an interior node has no
+    /// [`Verb`] at all, so every real [`Verb`] reaches at least one of the
+    /// first three). Action first, the same precedence `tests`'
+    /// `spells_like_its_capability` gives path spelling: for an auto-derived
+    /// verb the action *is* the specific thing (`message.reply` and
+    /// `message.forward` share one capability summary — "create a draft,
+    /// optionally pre-filled..." — but each has its own action
+    /// description), and a capability-only verb has no action to prefer
+    /// over it anyway.
     #[must_use]
     pub fn describe(&self) -> String {
         if let Some(action) = self.action {
@@ -145,6 +154,9 @@ impl Verb {
         }
         if let Some(capability) = self.capability {
             return capability.summary().to_owned();
+        }
+        if let Some(description) = self.description {
+            return description.to_owned();
         }
         self.canonical()
     }
@@ -176,8 +188,8 @@ fn split_path(text: &str) -> Vec<&str> {
 /// no task behind it yet would be exactly the half-finished state this
 /// project's non-negotiables refuse.
 ///
-/// The two entries are task 103's, and they are the same action twice.
-/// [`Action::ManualGrep`] needs a *declared* positional (`:helpgrep
+/// The first two entries are task 103's, and they are the same action
+/// twice. [`Action::ManualGrep`] needs a *declared* positional (`:helpgrep
 /// invoice`), which an auto-derived verb has none of — the spelling
 /// difference between a grammar that can describe itself and one that
 /// quietly accepts an argument it never mentions. And it needs two paths:
@@ -197,6 +209,10 @@ fn split_path(text: &str) -> Vec<&str> {
 /// convenience would have made the guard advisory. The page-name seam is
 /// therefore still `rmail_cli::tui::model::open_manual_at`, called directly,
 /// which is what task 102's `K`-on-a-key-reference-row does.
+///
+/// The third entry is task 93's `:set` — no action, no capability, and so
+/// the first real verb to need [`Verb::description`]: neither of the other
+/// two sources `Verb::describe` prefers has anything to say about it.
 ///
 /// A function, not a `const` slice: [`Verb::path`] is a `Vec`, which cannot
 /// appear in a `const` initializer at all (`Vec::new` allocates), so a
@@ -222,6 +238,7 @@ fn explicit() -> Vec<Verb> {
             positionals: PATTERN,
             flags: &[],
             cli_alias: None,
+            description: None,
         },
         Verb {
             path: vec!["helpgrep"],
@@ -230,6 +247,41 @@ fn explicit() -> Vec<Verb> {
             positionals: PATTERN,
             flags: &[],
             cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["set"],
+            capability: None,
+            // No delegate: nothing binds `set` to a chord, and the two
+            // positionals below (an option name and its value) are not
+            // something an `Action` can carry, the same reason `manual grep`
+            // has none either. Task 93's only tunables are the pane widths
+            // and the AI panel width; task 101's `Screen::Settings` is the
+            // fuller surface, not a second grammar for the same option
+            // names.
+            action: None,
+            // Both optional, like `manual grep`'s `PATTERN` — required: true
+            // would make bare `set` fail to parse at all, which
+            // `every_real_verb_is_reachable_by_typing_its_own_path` refuses
+            // for *every* real verb, no exceptions. `rmail_cli`'s
+            // `set_option` is where "an option and a value are both
+            // mandatory to do anything" is actually enforced — a semantic
+            // question the grammar has no business answering.
+            positionals: &[
+                Positional {
+                    name: "option",
+                    required: false,
+                },
+                Positional {
+                    name: "value",
+                    required: false,
+                },
+            ],
+            flags: &[],
+            cli_alias: None,
+            description: Some(
+                "resize a pane or the AI panel — both an option and a value are required",
+            ),
         },
     ]
 }
@@ -258,6 +310,7 @@ fn registry() -> &'static [Verb] {
                 positionals: &[],
                 flags: &[],
                 cli_alias: None,
+                description: None,
             });
         }
         verbs

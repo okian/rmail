@@ -244,6 +244,7 @@ fn folder_verb() -> Verb {
             },
         ],
         cli_alias: None,
+        description: None,
     }
 }
 
@@ -642,6 +643,7 @@ fn a_capability_only_verb_whose_path_does_not_match_cli_is_a_real_mismatch() {
         positionals: &[],
         flags: &[],
         cli_alias: None,
+        description: None,
     };
     assert!(!spells_like_its_capability(&verb));
 }
@@ -659,6 +661,7 @@ fn a_capability_only_verb_matching_one_of_several_cli_entries_is_not_a_mismatch(
         positionals: &[],
         flags: &[],
         cli_alias: None,
+        description: None,
     };
     assert!(spells_like_its_capability(&verb));
 }
@@ -673,6 +676,7 @@ fn a_declared_cli_alias_excuses_a_real_spelling_difference() {
         positionals: &[],
         flags: &[],
         cli_alias: Some("tag-rules set"),
+        description: None,
     };
     assert!(spells_like_its_capability(&verb));
 }
@@ -732,12 +736,14 @@ fn spells_like_its_capability(verb: &Verb) -> bool {
 /// [`Verb::cli_alias`].
 ///
 /// Still vacuous over the real registry, but no longer for the original
-/// reason: `explicit` is populated now (task 103's two `helpgrep` spellings),
-/// and both entries take the `verb.action.is_some()` exemption above. It stops
-/// being vacuous the first time a task declares a verb that reaches a
-/// capability *without* an action behind it — which is what tasks 94 onward
-/// are, and why the three tests above prove the check itself against
-/// constructed fixtures rather than trusting the registry to exercise it.
+/// reason: `explicit` is populated now — task 103's two `helpgrep` spellings
+/// take the `verb.action.is_some()` exemption above, and task 93's `:set`
+/// takes the `verb.capability.is_none()` one right after it, having neither
+/// an action nor a capability to spell. It stops being vacuous the first
+/// time a task declares a verb that reaches a capability *without* an
+/// action behind it — which is what tasks 94 onward are, and why the three
+/// tests above prove the check itself against constructed fixtures rather
+/// than trusting the registry to exercise it.
 #[test]
 fn every_declared_verb_spells_its_capability_like_the_cli() {
     for verb in registry() {
@@ -840,6 +846,7 @@ fn a_positional_taking_verb_shadowed_by_a_longer_one_is_caught() {
         }],
         flags: &[],
         cli_alias: None,
+        description: None,
     };
     let long = Verb {
         path: vec!["fixture", "shadow", "deeper"],
@@ -848,6 +855,7 @@ fn a_positional_taking_verb_shadowed_by_a_longer_one_is_caught() {
         positionals: &[],
         flags: &[],
         cli_alias: None,
+        description: None,
     };
     let shadowed = !short.positionals.is_empty()
         && short.path.len() < long.path.len()

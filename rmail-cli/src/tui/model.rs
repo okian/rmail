@@ -46,7 +46,7 @@
 //! scroll depending on what is on screen, and none of those distinctions
 //! belong in a key table.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 pub mod drive;
 pub mod wire;
@@ -63,7 +63,7 @@ use super::overlays;
 use super::overlays::{
     command_matches, complete_operator, AiSummary, AskPane, AskPhase, Browse, Citation,
     CommandPane, Explanation, FinderItem, FinderKind, FinderPane, Hit, OutboxPane, OutboxRow,
-    QuickAction, QuickPane, SearchFocus, SearchPane, UndoToast,
+    QuickAction, QuickPane, SearchFocus, SearchPane, Toast, UndoToast,
 };
 use super::theme::Theme;
 pub use crate::keymap::Key;
@@ -99,6 +99,34 @@ pub const MAX_BULK: usize = 100;
 /// force a repaint every second until it expired. The outbox pane (`O`) shows
 /// those, with no countdown.
 pub const MAX_UNDO_TOAST: i64 = 120;
+
+/// How many toasts [`Model::toasts`] holds before the oldest is dropped to
+/// make room. Only the front one is ever drawn — the rest are a `+N` badge —
+/// so this bounds memory and the badge count, not the screen: past five
+/// unread notices the exact number stops mattering next to the fact that
+/// there are several.
+const MAX_TOASTS: usize = 5;
+
+/// `:set folder-width`/`:set preview-width`'s allowed range, each. Below 10
+/// a column cannot hold a folder name or a subject line; above 60 the pane
+/// declaring it stops being one of several and starts being the screen.
+const MIN_PANE_PCT: u16 = 10;
+const MAX_PANE_PCT: u16 = 60;
+/// The most [`Model::folder_width_pct`] and [`Model::preview_width_pct`] may
+/// sum to, leaving the message list at least this much: `100 -
+/// MAX_PANES_PCT`. [`render_panes`] trusts this invariant rather than
+/// re-clamping every frame — [`set_option`] is the only place either field
+/// is written, and it is where the check belongs once, not on every draw.
+const MAX_PANES_PCT: u16 = 90;
+/// `:set ai-panel-width`'s allowed range. Below 15 the panel cannot hold a
+/// `tl;dr` line; above 60 the message list underneath stops being usable
+/// while the panel is open.
+const MIN_AI_PANEL_PCT: u16 = 15;
+const MAX_AI_PANEL_PCT: u16 = 60;
+
+const DEFAULT_FOLDER_WIDTH_PCT: u16 = 20;
+const DEFAULT_PREVIEW_WIDTH_PCT: u16 = 40;
+const DEFAULT_AI_PANEL_WIDTH_PCT: u16 = 30;
 
 /// The most characters a text prompt accepts.
 ///
@@ -980,9 +1008,11 @@ pub struct Model {
     /// the write is a [`Cmd`], issued by whichever call next has a `Vec<Cmd>`
     /// to put it in, so the model never touches a filesystem.
     pub pending_history: bool,
-    /// The undo-send countdown, when a scheduled send is still inside its
-    /// window.
-    pub toast: Option<UndoToast>,
+    /// The bottom-row notification queue: at most [`MAX_TOASTS`], oldest
+    /// dropped first. [`Model::shown_toast`] is what a render reads; this
+    /// field is public because `view` also needs the raw count for the `+N`
+    /// badge, and a second accessor for that alone would be pure ceremony.
+    pub toasts: VecDeque<Toast>,
     /// Stamped onto every streaming command so a frame from a superseded
     /// query can be told from a frame of the current one. Monotonic for the
     /// life of the session.
@@ -1011,6 +1041,18 @@ pub struct Model {
     /// and so a future `:set theme <name>` command is an ordinary state
     /// mutation, not a second channel into the renderer.
     pub theme: Theme,
+    /// The folder column's share of the 3-pane (and 2-pane) layout, as a
+    /// percentage. `:set folder-width` tunes it; [`set_option`] is the only
+    /// writer and enforces the bound `render_panes` relies on without
+    /// re-checking: `folder_width_pct + preview_width_pct <= MAX_PANES_PCT`.
+    pub folder_width_pct: u16,
+    /// The preview column's share of the 3-pane layout, as a percentage.
+    /// `:set preview-width` tunes it; see [`Model::folder_width_pct`] for the
+    /// invariant the two are held to together.
+    pub preview_width_pct: u16,
+    /// The collapsible AI panel's share of the width it is given, as a
+    /// percentage. `:set ai-panel-width` tunes it.
+    pub ai_panel_width_pct: u16,
 }
 
 impl Default for Model {
@@ -1057,7 +1099,7 @@ impl Model {
             summary_pinned: None,
             history: History::default(),
             pending_history: false,
-            toast: None,
+            toasts: VecDeque::new(),
             generation: 0,
             visual: None,
             keymap: Keymap::defaults(),
@@ -1067,7 +1109,43 @@ impl Model {
             level: Level::Info,
             quit: false,
             theme: Theme::default(),
+            folder_width_pct: DEFAULT_FOLDER_WIDTH_PCT,
+            preview_width_pct: DEFAULT_PREVIEW_WIDTH_PCT,
+            ai_panel_width_pct: DEFAULT_AI_PANEL_WIDTH_PCT,
         }
+    }
+
+    /// The toast a render draws, ranked rather than positional: the undo
+    /// countdown first — it is the one with a clock on it, and `u` only
+    /// ever cancels whichever send that clock belongs to — then the newest
+    /// [`Toast::Priority`] (its own doc comment: "ranked to interrupt", so a
+    /// stale [`Toast::Completion`] must not sit in front of one), then
+    /// whatever is newest overall. Newest, not oldest: past
+    /// [`MAX_TOASTS`], [`push_toast`] evicts the oldest survivor, and a
+    /// front-first pick would then show the one entry a person has had the
+    /// longest chance to already read.
+    #[must_use]
+    pub fn shown_toast(&self) -> Option<&Toast> {
+        self.toasts
+            .iter()
+            .find(|toast| matches!(toast, Toast::Undo(_)))
+            .or_else(|| {
+                self.toasts
+                    .iter()
+                    .rev()
+                    .find(|toast| matches!(toast, Toast::Priority { .. }))
+            })
+            .or_else(|| self.toasts.back())
+    }
+
+    /// Whether the `.` menu is holding the AI panel on a message rather than
+    /// letting it follow the cursor. A method rather than a public field
+    /// (unlike [`Model::ai_panel`]) because [`Model::summary_pinned`] itself
+    /// stays private — nothing outside `update` needs the pinned message's
+    /// id, only whether one is pinned.
+    #[must_use]
+    pub fn is_summary_pinned(&self) -> bool {
+        self.summary_pinned.is_some()
     }
 
     /// The row under the message cursor.
@@ -1617,14 +1695,14 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             arm_toast(model, now, &rows)
         }
         Msg::Tick(now) => {
-            let Some(toast) = model.toast.as_mut() else {
+            let Some(toast) = undo_toast_mut(model) else {
                 return Vec::new();
             };
             toast.remaining = toast.deadline.saturating_sub(now).max(0);
             if toast.remaining == 0 {
                 // The window closed. The message is the scheduler's now, and
                 // an "undo" offer that no longer works is worse than none.
-                model.toast = None;
+                remove_undo_toast(model);
             }
             Vec::new()
         }
@@ -1679,16 +1757,74 @@ fn arm_toast(model: &mut Model, now: i64, rows: &[OutboxRow]) -> Vec<Cmd> {
         .filter(|(deadline, _)| *deadline > now && *deadline - now <= MAX_UNDO_TOAST)
         .min_by_key(|(deadline, _)| *deadline);
     let Some((deadline, row)) = soonest else {
-        model.toast = None;
+        remove_undo_toast(model);
         return Vec::new();
     };
-    model.toast = Some(UndoToast {
-        outbox_id: row.id,
-        to: row.to.clone(),
-        deadline,
-        remaining: deadline.saturating_sub(now).max(0),
-    });
+    set_undo_toast(
+        model,
+        UndoToast {
+            outbox_id: row.id,
+            to: row.to.clone(),
+            deadline,
+            remaining: deadline.saturating_sub(now).max(0),
+        },
+    );
     vec![Cmd::Countdown { until: deadline }]
+}
+
+/// The queued undo toast, if any. At most one exists at a time —
+/// [`set_undo_toast`] replaces rather than appends — so a linear find is
+/// always enough, over a queue capped at [`MAX_TOASTS`].
+fn undo_toast(model: &Model) -> Option<&UndoToast> {
+    model.toasts.iter().find_map(|toast| match toast {
+        Toast::Undo(toast) => Some(toast),
+        Toast::Completion { .. } | Toast::Priority { .. } => None,
+    })
+}
+
+fn undo_toast_mut(model: &mut Model) -> Option<&mut UndoToast> {
+    model.toasts.iter_mut().find_map(|toast| match toast {
+        Toast::Undo(toast) => Some(toast),
+        Toast::Completion { .. } | Toast::Priority { .. } => None,
+    })
+}
+
+/// Replace whatever undo toast is queued with `toast`. There is only ever
+/// one: [`arm_toast`] re-derives it from the outbox's own state on every
+/// listing rather than accumulating one per send.
+fn set_undo_toast(model: &mut Model, toast: UndoToast) {
+    remove_undo_toast(model);
+    push_toast(model, Toast::Undo(toast));
+}
+
+/// Drop the queued undo toast, if any. A no-op otherwise — callers do not
+/// need to check first.
+fn remove_undo_toast(model: &mut Model) {
+    model
+        .toasts
+        .retain(|toast| !matches!(toast, Toast::Undo(_)));
+}
+
+/// Append a toast to the queue, dropping the oldest *non-undo* entry first
+/// if that would exceed [`MAX_TOASTS`].
+///
+/// Not simply the oldest: an active undo countdown must survive a flood of
+/// other toasts, or `u` stops cancelling a send that is still inside its
+/// window while [`Cmd::Countdown`] keeps ticking against nothing. At most
+/// one [`Toast::Undo`] ever exists ([`set_undo_toast`] replaces rather than
+/// accumulates), so among [`MAX_TOASTS`] queued there is always a non-undo
+/// victim; `unwrap_or(0)` is a total fallback for that impossible case, not
+/// a claim it can happen.
+fn push_toast(model: &mut Model, toast: Toast) {
+    if model.toasts.len() >= MAX_TOASTS {
+        let victim = model
+            .toasts
+            .iter()
+            .position(|toast| !matches!(toast, Toast::Undo(_)))
+            .unwrap_or(0);
+        model.toasts.remove(victim);
+    }
+    model.toasts.push_back(toast);
 }
 
 /// Keep the two cursor-following panes pointed at what the cursor is on.
@@ -3462,6 +3598,19 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         close_command(model);
         return open_manual_grep_for(model, &pattern);
     }
+    if verb == "set" {
+        // Left open on a bad option/value (`complain` writes into the
+        // command pane's own error line) and only closed once `set_option`
+        // has actually applied something — the same rule the generic path
+        // below follows for a bad flag or a missing action.
+        let [option, value] = invocation.positionals.as_slice() else {
+            return complain(
+                model,
+                "set needs two arguments: an option and a value".to_owned(),
+            );
+        };
+        return set_option(model, option, value);
+    }
     if !invocation.positionals.is_empty() {
         return complain(
             model,
@@ -3492,6 +3641,84 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         cmds.extend(accept_confirm(model));
     }
     cmds
+}
+
+/// The tunables `:set` reaches.
+enum PaneOption {
+    Folder,
+    Preview,
+    AiPanel,
+}
+
+/// `:set <option> <value>` — the pane widths and the AI panel width are the
+/// only tunables this grammar reaches yet. A fuller settings surface is task
+/// 101's `Screen::Settings`; when it lands, this is where a new `Invocation`
+/// it wants to issue for one of its own fields should keep landing too,
+/// rather than a second `:set`-shaped path growing next to it.
+fn set_option(model: &mut Model, option: &str, value: &str) -> Vec<Cmd> {
+    // `option` is matched into `PaneOption` before `value` is parsed: `set
+    // bogus abc` should say `bogus` is not an option this build has, not
+    // that `abc` is not a number — the second reads as though `bogus` were
+    // real and only its value were wrong. Matching once into an enum, not
+    // twice against `&str`, is also what keeps the acting `match` below
+    // exhaustive with no wildcard arm — a fourth option added to this list
+    // and forgotten in the other would otherwise silently report "unknown
+    // option" for something real, or need a dead arm to stay total.
+    let kind = match option {
+        "folder-width" => PaneOption::Folder,
+        "preview-width" => PaneOption::Preview,
+        "ai-panel-width" => PaneOption::AiPanel,
+        _ => return complain(model, format!("unknown option: {option}")),
+    };
+    let Ok(pct) = value.parse::<u16>() else {
+        return complain(
+            model,
+            format!("{option}: \"{value}\" is not a whole number"),
+        );
+    };
+    match kind {
+        PaneOption::Folder => {
+            if let Err(why) = check_pane_pct(pct, model.preview_width_pct, "folder-width") {
+                return complain(model, why);
+            }
+            model.folder_width_pct = pct;
+        }
+        PaneOption::Preview => {
+            if let Err(why) = check_pane_pct(pct, model.folder_width_pct, "preview-width") {
+                return complain(model, why);
+            }
+            model.preview_width_pct = pct;
+        }
+        PaneOption::AiPanel => {
+            if !(MIN_AI_PANEL_PCT..=MAX_AI_PANEL_PCT).contains(&pct) {
+                return complain(
+                    model,
+                    format!("ai-panel-width must be {MIN_AI_PANEL_PCT}-{MAX_AI_PANEL_PCT}"),
+                );
+            }
+            model.ai_panel_width_pct = pct;
+        }
+    }
+    close_command(model);
+    model.info(format!("{option} set to {pct}"));
+    Vec::new()
+}
+
+/// `pct`, and its counterpart `other` (the other of `folder-width`/
+/// `preview-width`), against the bounds [`set_option`] enforces so
+/// `render_panes` never has to: `pct` alone in range, and the pair leaving
+/// the message list at least `100 - MAX_PANES_PCT` wide.
+fn check_pane_pct(pct: u16, other: u16, name: &str) -> Result<(), String> {
+    if !(MIN_PANE_PCT..=MAX_PANE_PCT).contains(&pct) {
+        return Err(format!("{name} must be {MIN_PANE_PCT}-{MAX_PANE_PCT}"));
+    }
+    if pct + other > MAX_PANES_PCT {
+        return Err(format!(
+            "folder-width + preview-width must not exceed {MAX_PANES_PCT} \
+             (the message list needs the rest)"
+        ));
+    }
+    Ok(())
 }
 
 /// Why this range cannot be honoured, or `None` when it can.
@@ -3770,9 +3997,7 @@ fn undo_send(model: &mut Model) -> Vec<Cmd> {
         Some(Overlay::Outbox(pane)) => pane
             .row()
             .map(|row| (row.id, row.to.clone(), row.state.clone())),
-        _ => model
-            .toast
-            .as_ref()
+        _ => undo_toast(model)
             .map(|toast| (toast.outbox_id, toast.to.clone(), "scheduled".to_owned())),
     };
     let Some((outbox_id, to, state)) = target else {
@@ -3786,12 +4011,8 @@ fn undo_send(model: &mut Model) -> Vec<Cmd> {
         model.fail(format!("that one is already {state}"));
         return Vec::new();
     }
-    if model
-        .toast
-        .as_ref()
-        .is_some_and(|toast| toast.outbox_id == outbox_id)
-    {
-        model.toast = None;
+    if undo_toast(model).is_some_and(|toast| toast.outbox_id == outbox_id) {
+        remove_undo_toast(model);
     }
     model.inflight += 1;
     model.info(format!("cancelling the send to {to}…"));

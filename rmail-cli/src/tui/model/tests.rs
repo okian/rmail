@@ -3332,3 +3332,209 @@ fn the_fallback_refuses_a_line_carrying_a_flag() {
         "and it was not recorded"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `:set` (task 93)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_updates_a_pane_width_and_closes_the_overlay() {
+    let mut model = loaded();
+    command(&mut model, "set folder-width 25");
+    press(&mut model, Key::Enter);
+    assert_eq!(model.folder_width_pct, 25);
+    assert!(model.overlay.is_none(), "a successful :set closes the line");
+    assert_eq!(model.status, "folder-width set to 25");
+}
+
+#[test]
+fn set_updates_the_preview_width_and_the_ai_panel_width_independently() {
+    let mut model = loaded();
+    command(&mut model, "set preview-width 35");
+    press(&mut model, Key::Enter);
+    command(&mut model, "set ai-panel-width 45");
+    press(&mut model, Key::Enter);
+    assert_eq!(model.preview_width_pct, 35);
+    assert_eq!(model.ai_panel_width_pct, 45);
+    // Untouched by either write.
+    assert_eq!(model.folder_width_pct, 20);
+}
+
+#[test]
+fn set_rejects_a_non_numeric_value_and_leaves_the_line_open() {
+    let mut model = loaded();
+    command(&mut model, "set folder-width abc");
+    press(&mut model, Key::Enter);
+    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("not a whole number"), "{why}");
+    assert_eq!(model.folder_width_pct, 20, "the bad value never lands");
+}
+
+#[test]
+fn set_rejects_a_pane_width_outside_its_range() {
+    let mut model = loaded();
+    command(&mut model, "set folder-width 5");
+    press(&mut model, Key::Enter);
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("folder-width must be"), "{why}");
+    assert_eq!(model.folder_width_pct, 20);
+}
+
+#[test]
+fn set_rejects_folder_and_preview_widths_that_would_crowd_out_the_message_list() {
+    // Defaults are 20/40; 55 + 40 = 95 leaves the message list 5% — below the
+    // 10% `render_panes` is entitled to assume.
+    let mut model = loaded();
+    command(&mut model, "set folder-width 55");
+    press(&mut model, Key::Enter);
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("message list needs the rest"), "{why}");
+    assert_eq!(model.folder_width_pct, 20, "rejected together, not clamped");
+}
+
+#[test]
+fn set_rejects_preview_and_folder_widths_that_would_crowd_out_the_message_list() {
+    // The other direction of the combined cap: preview-width is the one
+    // that trips it this time. No single preview-width is both in its own
+    // 10-60 range and, combined with the *default* 20 folder-width, over
+    // the 90 cap (20 + 60 = 80) — so folder-width is widened to 40 first,
+    // a valid `:set` in its own right, before 55 (also valid alone) pushes
+    // the combined total to 95.
+    let mut model = loaded();
+    command(&mut model, "set folder-width 40");
+    press(&mut model, Key::Enter);
+    assert_eq!(
+        model.folder_width_pct, 40,
+        "the setup step itself must land"
+    );
+    command(&mut model, "set preview-width 55");
+    press(&mut model, Key::Enter);
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("message list needs the rest"), "{why}");
+    assert_eq!(
+        model.preview_width_pct, 40,
+        "rejected together, not clamped"
+    );
+}
+
+#[test]
+fn set_rejects_an_ai_panel_width_outside_its_range() {
+    for value in ["5", "99"] {
+        let mut model = loaded();
+        command(&mut model, &format!("set ai-panel-width {value}"));
+        press(&mut model, Key::Enter);
+        let why = command_pane(&model).error.clone().unwrap_or_default();
+        assert!(why.contains("ai-panel-width must be"), "{value}: {why}");
+        assert_eq!(
+            model.ai_panel_width_pct, 30,
+            "{value}: rejected, not clamped"
+        );
+    }
+}
+
+#[test]
+fn set_rejects_an_unknown_option() {
+    let mut model = loaded();
+    command(&mut model, "set bogus 10");
+    press(&mut model, Key::Enter);
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("unknown option"), "{why}");
+}
+
+#[test]
+fn set_names_the_option_not_the_value_when_both_are_wrong() {
+    // The option is checked first: `bogus` is not a real option regardless
+    // of what its value looks like, so the error must say that rather than
+    // implying `bogus` were real and only "abc" were the problem.
+    let mut model = loaded();
+    command(&mut model, "set bogus abc");
+    press(&mut model, Key::Enter);
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("unknown option"), "{why}");
+    assert!(!why.contains("whole number"), "{why}");
+}
+
+#[test]
+fn set_with_a_missing_value_is_refused_cleanly_not_a_panic() {
+    // Both positionals parse as optional (bare `set` must still resolve to
+    // itself, like every other real verb), so "only one argument given" is
+    // `set_option`'s job to catch, not the parser's.
+    let mut model = loaded();
+    command(&mut model, "set folder-width");
+    press(&mut model, Key::Enter);
+    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    assert!(
+        command_pane(&model).error.is_some(),
+        "a half-given set must surface as an error, not silently no-op"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the toast queue's cap (task 93)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn push_toast_caps_the_queue_and_drops_the_oldest_first() {
+    let mut model = loaded();
+    for n in 0..MAX_TOASTS {
+        push_toast(
+            &mut model,
+            Toast::Completion {
+                text: format!("job {n}"),
+            },
+        );
+    }
+    assert_eq!(model.toasts.len(), MAX_TOASTS);
+    push_toast(
+        &mut model,
+        Toast::Completion {
+            text: "job overflow".to_owned(),
+        },
+    );
+    assert_eq!(model.toasts.len(), MAX_TOASTS, "capped, not grown");
+    assert!(
+        !model
+            .toasts
+            .iter()
+            .any(|toast| matches!(toast, Toast::Completion { text } if text == "job 0")),
+        "the oldest was dropped: {:?}",
+        model.toasts
+    );
+    assert!(
+        model
+            .toasts
+            .iter()
+            .any(|toast| matches!(toast, Toast::Completion { text } if text == "job overflow")),
+        "the new one landed"
+    );
+}
+
+#[test]
+fn push_toast_never_evicts_the_undo_toast() {
+    // An active undo countdown must survive a flood of other toasts, or `u`
+    // silently stops being able to cancel a send still inside its window.
+    let mut model = loaded();
+    set_undo_toast(
+        &mut model,
+        UndoToast {
+            outbox_id: 1,
+            to: "bob@example.com".to_owned(),
+            deadline: 1_030,
+            remaining: 30,
+        },
+    );
+    for n in 0..MAX_TOASTS {
+        push_toast(
+            &mut model,
+            Toast::Priority {
+                text: format!("alert {n}"),
+            },
+        );
+    }
+    assert_eq!(model.toasts.len(), MAX_TOASTS, "still capped");
+    assert!(
+        undo_toast(&model).is_some(),
+        "a flood of other toasts must not evict an active undo offer"
+    );
+}
