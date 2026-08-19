@@ -56,7 +56,13 @@ mail auth login      prove it, and cache a session for later commands
 mail auth status     whether one is set, and whether local callers need it
 ```
 
+From inside the client, {{cmd:auth status}} answers the same question without
+quitting, and adds the half the daemon cannot know: which credential this
+client is presenting. It draws that as a [[reports]] screen, and the row for a
+configured password offers {{cmd:auth clear}} on Enter.
+
 ## Where to read next
 
 - [[troubleshooting]] — the symptoms this page's answers usually arrive as.
 - [[offline]] — what still works with the network gone.
+- [[reports]] — the screen every row-shaped answer arrives on.

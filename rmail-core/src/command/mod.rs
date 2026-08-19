@@ -214,6 +214,18 @@ fn split_path(text: &str) -> Vec<&str> {
 /// the first real verb to need [`Verb::description`]: neither of the other
 /// two sources `Verb::describe` prefers has anything to say about it.
 ///
+/// The last two are task 90's, and they are the first verbs here that reach a
+/// [`Capability`] with **no** [`Action`] behind them — the shape
+/// `tests::every_declared_verb_spells_its_capability_like_the_cli` was written
+/// for and had until now no registry entry to check. `ClientAuthService` is
+/// the one capability family no later task in `tasks.md` claims, and a TUI
+/// that cannot answer "does this daemon want a password" has to be quit and
+/// re-entered through `mail auth status` to find out; both paths spell the
+/// verb exactly as `mail` does, so `spells_like_its_capability` holds with no
+/// [`Verb::cli_alias`]. They also make task 90's Report reachable by typing:
+/// `:auth status` renders one, and `auth clear` is the mutating row that
+/// report's confirmation gate is about.
+///
 /// A function, not a `const` slice: [`Verb::path`] is a `Vec`, which cannot
 /// appear in a `const` initializer at all (`Vec::new` allocates), so a
 /// `const EXPLICIT: &[Verb] = &[]` can never actually gain an entry no
@@ -282,6 +294,24 @@ fn explicit() -> Vec<Verb> {
             description: Some(
                 "resize a pane or the AI panel — both an option and a value are required",
             ),
+        },
+        Verb {
+            path: vec!["auth", "status"],
+            capability: Some(Capability::ClientAuthAuthStatus),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["auth", "clear"],
+            capability: Some(Capability::ClientAuthClearPassword),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
         },
     ]
 }

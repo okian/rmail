@@ -31,14 +31,18 @@
 mod tests;
 
 use rmail_proto::v1::{
-    Account as ProtoAccount, Attachment, Citation as ProtoCitation, CreateDraftRequest,
-    DraftAddress, FindResult, FolderStatus, FullMessage, ItemKind, Message as ProtoMessage,
-    OutboxEntry, OutboxState, RankExplanation, RetrievalTrace, SearchHit, Summary,
+    Account as ProtoAccount, Attachment, AuthStatusResponse, Citation as ProtoCitation,
+    CreateDraftRequest, DraftAddress, FindResult, FolderStatus, FullMessage, ItemKind,
+    Message as ProtoMessage, OutboxEntry, OutboxState, RankExplanation, RetrievalTrace, SearchHit,
+    Summary,
 };
+
+use rmail_core::command;
 
 use crate::tui::overlays::{
     valid_byte_ranges, AiSummary, Citation, Explanation, FinderItem, FinderKind, Hit, OutboxRow,
 };
+use crate::tui::report::{ReportRow, ReportTone};
 
 use super::{Account, DraftKind, Folder, MessageRow, OpenMessage};
 
@@ -485,5 +489,71 @@ pub fn summary(proto: Summary) -> AiSummary {
         priority: non_empty(proto.priority),
         needs_reply: proto.needs_reply,
         suggested_reply: non_empty(proto.suggested_reply),
+    }
+}
+
+/// The `:auth status` report's rows.
+///
+/// Two settings, each with the state it is in, and — when there is a password
+/// to remove — a row `<enter>` clears it from. The remedial action rides on the
+/// row rather than being a second verb the reader has to know: a status screen
+/// that reports a problem and cannot act on it sends them back to the shell.
+///
+/// The tone is the honest reading of each fact rather than "configured is
+/// good": a password gate is a choice, so *having* one is [`ReportTone::Ok`]
+/// and not having one is [`ReportTone::Muted`] — a default, not a fault.
+/// Requiring local callers to log in is the stricter setting, hence
+/// [`ReportTone::Warn`] when it is on: that is the state in which a client
+/// needs `mail auth login` before anything works, which is the one thing this
+/// report exists to be able to say.
+pub fn auth_status_rows(response: &AuthStatusResponse) -> Vec<ReportRow> {
+    let password = if response.password_configured {
+        let row =
+            ReportRow::new(["password", "configured — Enter removes it"]).toned(ReportTone::Ok);
+        match clear_password() {
+            Some(invocation) => row.running(invocation),
+            None => row,
+        }
+    } else {
+        ReportRow::new(["password", "not configured"]).toned(ReportTone::Muted)
+    };
+    // The one combination that is not a choice but a lock-out: local callers
+    // are told to log in and there is no password to log in *with*, so
+    // `LoginPassword` answers `UNAUTHENTICATED` to every caller and the only
+    // way back in is editing the config file. That is a fault, and the row
+    // says so rather than reporting the stricter half as merely strict.
+    let local = match (response.local_login_required, response.password_configured) {
+        (true, false) => ReportRow::new([
+            "local login",
+            "required, but no password is set — nothing can log in",
+        ])
+        .toned(ReportTone::Bad),
+        (true, true) => ReportRow::new([
+            "local login",
+            "required — a socket peer must log in as well",
+        ])
+        .toned(ReportTone::Warn),
+        (false, _) => ReportRow::new(["local login", "not required — a socket peer is trusted"])
+            .toned(ReportTone::Muted),
+    };
+    vec![password, local]
+}
+
+/// The `:auth clear` invocation an `:auth status` row runs.
+///
+/// Parsed rather than constructed field by field, so the row runs exactly what
+/// typing that line runs: the capability it carries — which the report's
+/// confirmation gate reads to decide whether to ask first — comes from the verb
+/// registry rather than from a literal here that could name the wrong one.
+///
+/// `None` cannot happen (`auth clear` is a declared verb, and
+/// `rmail_core::command::tests::every_real_verb_is_reachable_by_typing_its_own_path`
+/// is what keeps it reachable), and is still returned rather than unwrapped:
+/// a row that does nothing on Enter is a degraded report, and a panic is a
+/// terminal left in raw mode.
+fn clear_password() -> Option<command::Invocation> {
+    match command::parse("auth clear") {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
     }
 }

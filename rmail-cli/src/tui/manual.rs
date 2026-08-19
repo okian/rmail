@@ -293,6 +293,12 @@ pub const PAGES: &[Page] = &[
         documents: &["outbox", "outbox.cancel"],
     },
     Page {
+        anchor: "reports",
+        title: "Reports",
+        body: Body::Authored(include_str!("manual/pages/reports.md")),
+        documents: &["report.rerun", "auth status", "auth clear"],
+    },
+    Page {
         anchor: "grounded",
         title: "Grounded answers",
         body: Body::Authored(include_str!("manual/pages/grounded.md")),

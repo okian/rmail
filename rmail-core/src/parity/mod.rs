@@ -2018,4 +2018,9 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     Action::PromptAccept,
     Action::PromptComplete,
     Action::MenuAccept,
+    // Task 90's `r`. Local for the same reason `command` is: re-running a
+    // report reaches whatever that report's own verb reaches, and that verb's
+    // row is what declares it. One action claiming every reportable capability
+    // would make this table say nothing about any of them.
+    Action::ReportRerun,
 ];

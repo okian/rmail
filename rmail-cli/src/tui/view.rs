@@ -32,6 +32,7 @@ use super::overlays::{
     self, AskPane, AskPhase, CommandPane, FinderPane, OutboxPane, QuickAction, QuickPane,
     SearchFocus, SearchPane, Toast,
 };
+use super::report::{ReportColumn, ReportPane, ReportTone};
 use super::theme::Theme;
 
 /// Draw one frame.
@@ -79,6 +80,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
         Some(Overlay::Ask(pane)) => render_ask(&model.theme, pane, frame, area),
         Some(Overlay::Outbox(pane)) => render_outbox(&model.theme, pane, frame, area),
         Some(Overlay::Quick(pane)) => render_quick(&model.theme, pane, frame, area),
+        Some(Overlay::Report(pane)) => render_report(&model.theme, pane, frame, area),
         None => {}
     }
 }
@@ -1113,6 +1115,153 @@ fn render_outbox(theme: &Theme, pane: &OutboxPane, frame: &mut Frame, area: Rect
         inner_area,
         &mut state,
     );
+}
+
+/// Task 90's Report: a fixed-width grid with a header row.
+///
+/// The columns are padded to the widths the report declared rather than to
+/// what the rows happen to contain, so a streamed table does not shift
+/// sideways as frames arrive — see `report`'s module docs on why that is the
+/// interesting property of a report and not of a list.
+fn render_report(theme: &Theme, pane: &ReportPane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 84, 72);
+    frame.render_widget(Clear, area);
+    let title = report_title(pane);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner(theme, frame, area, &title));
+
+    // The header is indented by one cell — the column a row's tone glyph
+    // occupies — so the headings sit above the cells they name rather than one
+    // place to the left of them.
+    let headers: Vec<String> = pane
+        .columns
+        .iter()
+        .map(|column| column.header.clone())
+        .collect();
+    let mut header = vec![Span::styled(" ", theme.muted)];
+    header.extend(report_cells(&headers, &pane.columns, theme.muted));
+    frame.render_widget(Paragraph::new(Line::from(header)), rows[0]);
+
+    // Only when there is nothing else to show, the same rule the outbox
+    // follows: a report that streamed forty rows and then failed has told the
+    // reader something true about those forty, and blanking them to show the
+    // error would throw it away. The status line already carries why.
+    if let Some(error) = pane.error.as_ref().filter(|_| pane.rows.is_empty()) {
+        frame.render_widget(
+            Paragraph::new(Line::styled(overlays::safe_line(error), theme.err)),
+            rows[1],
+        );
+        return;
+    }
+    if pane.rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if pane.complete {
+                "nothing to report"
+            } else {
+                "asking…"
+            }),
+            rows[1],
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = pane
+        .rows
+        .iter()
+        .map(|row| {
+            let style = tone_style(theme, row.tone);
+            let mut spans = vec![Span::styled(row.tone.glyph().to_owned(), style)];
+            spans.extend(report_cells(&row.cells, &pane.columns, style));
+            // A marker rather than a colour, for the same reason a tone
+            // carries a glyph: "this row does something" has to survive a
+            // monochrome terminal, and it is what tells a reader that Enter
+            // here is not a no-op before they press it.
+            if row.on_enter.is_some() {
+                spans.push(Span::styled(" ⏎", theme.accent));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(pane.cursor.min(pane.rows.len().saturating_sub(1))));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selected_style(theme, true)),
+        rows[1],
+        &mut state,
+    );
+}
+
+/// One row's cells, each padded or truncated to its column's declared width.
+///
+/// A row with fewer cells than there are columns draws blanks for the rest; a
+/// row with more has the extras dropped, because a cell with no column has no
+/// width to be drawn at and appending it would shear the grid it is part of.
+fn report_cells(cells: &[String], columns: &[ReportColumn], style: Style) -> Vec<Span<'static>> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            let text = fitted(cells.get(idx).map_or("", String::as_str), column.width);
+            Span::styled(format!(" {text}"), style)
+        })
+        .collect()
+}
+
+/// `text` at exactly `width` characters: padded when it is short, elided when
+/// it is long.
+///
+/// Characters throughout, never bytes — `format!("{:<width$}")` pads on bytes,
+/// so one non-ASCII cell would shift every column after it, and a byte
+/// truncation of "café" can land inside the `é`.
+///
+/// The ellipsis is *inside* the width rather than added to it, which is the
+/// difference between a grid and a nearly-a-grid:
+/// [`overlays::truncate_chars`] answers `max + 1` characters when it cuts, so
+/// using it directly here would push every column after an elided cell one
+/// place right — on that row only.
+fn fitted(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let safe = overlays::safe_line(text);
+    let count = safe.chars().count();
+    if count <= width {
+        return format!("{safe}{}", " ".repeat(width - count));
+    }
+    let kept: String = safe.chars().take(width - 1).collect();
+    format!("{kept}…")
+}
+
+/// What a report's border says: the verb, and how far along it is.
+fn report_title(pane: &ReportPane) -> String {
+    let verb = pane.invocation.verb.join(" ");
+    let state = if pane.stale {
+        "stale since a row ran · r re-reads"
+    } else if pane.error.is_some() {
+        "failed"
+    } else if pane.complete {
+        "r re-runs · Esc closes"
+    } else {
+        "asking…"
+    };
+    format!(
+        "{} — {} row(s) · {state}",
+        overlays::safe_line(&verb),
+        pane.rows.len()
+    )
+}
+
+/// The style a row's tone draws in.
+fn tone_style(theme: &Theme, tone: ReportTone) -> Style {
+    match tone {
+        ReportTone::Plain => Style::default(),
+        ReportTone::Muted => theme.muted,
+        ReportTone::Ok => theme.ok,
+        ReportTone::Warn => theme.warn,
+        ReportTone::Bad => theme.err,
+    }
 }
 
 fn render_quick(theme: &Theme, pane: &QuickPane, frame: &mut Frame, area: Rect) {

@@ -15,7 +15,9 @@ use ratatui::Terminal;
 
 use super::*;
 use crate::keymap::Key;
-use crate::tui::model::{update, Account, Folder, InputFor, MessageRow, Msg, OpenMessage, PickFor};
+use crate::tui::model::{
+    update, Account, Confirmed, Folder, InputFor, MessageRow, Msg, OpenMessage, PickFor,
+};
 use crate::tui::overlays::UndoToast;
 use crate::tui::theme::ThemeName;
 
@@ -309,7 +311,7 @@ fn the_confirm_and_input_overlays_show_their_prompts() {
     let mut model = loaded();
     model.overlay = Some(Overlay::Confirm {
         prompt: "delete permanently (expunges on the server)? [y/N]".to_owned(),
-        message_ids: vec![10],
+        then: Confirmed::Delete(vec![10]),
     });
     assert!(screen(&model).contains("expunges on the server"));
 
@@ -923,7 +925,7 @@ fn dark_theme_pick_confirm_and_input_overlays_border_matches_the_historical_colo
         (
             Overlay::Confirm {
                 prompt: "delete? [y/N]".to_owned(),
-                message_ids: vec![10],
+                then: Confirmed::Delete(vec![10]),
             },
             "confirm",
         ),
@@ -1153,7 +1155,7 @@ fn mono_theme_still_renders_without_panicking_for_every_overlay() {
         },
         Overlay::Confirm {
             prompt: "y/N".to_owned(),
-            message_ids: vec![10],
+            then: Confirmed::Delete(vec![10]),
         },
     ] {
         model.overlay = Some(overlay);

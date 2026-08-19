@@ -363,6 +363,7 @@ actions! {
     AiQuick       => "ai.quick",            "AI actions for this message";
     OutboxOpen    => "outbox",              "the outbox: scheduled, failed and undoable sends";
     OutboxCancel  => "outbox.cancel",       "cancel the highlighted send (undo)";
+    ReportRerun   => "report.rerun",        "run this report's own : line again";
     PromptAccept  => "prompt.accept",       "accept what has been typed";
     PromptComplete => "prompt.complete",    "complete the operator being typed";
     MenuAccept    => "menu.accept",         "use the highlighted row";
@@ -671,6 +672,10 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Menu, "<enter>", Action::MenuAccept),
     (Mode::Menu, "x", Action::SearchExplain),
     (Mode::Menu, "u", Action::OutboxCancel),
+    // `r` re-runs a report's own `:` line (task 90). Bound in `Menu` only —
+    // `Normal`'s `r` is `message.reply`, and a report is the one thing in this
+    // layer that has a line to run again.
+    (Mode::Menu, "r", Action::ReportRerun),
     // Back to the query line of whichever overlay is up.
     (Mode::Menu, ":", Action::CommandOpen),
     (Mode::Menu, "/", Action::SearchOpen),

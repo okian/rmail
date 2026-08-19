@@ -252,37 +252,85 @@ pub(crate) async fn connect_parts(socket: &Path) -> Result<Parts> {
         Some(addr) => connect_tcp(&transport, addr).await?,
         None => connect_socket(&transport, socket).await?,
     };
-    // `--token`/`$RMAIL_TOKEN` win outright; otherwise fall back to whatever
-    // `mail auth login` cached for *this* socket — only for the Unix-socket
-    // path, since the cache is keyed by socket path (see
-    // `session::account_for`) and a `--addr` target has no such path to key
-    // on. A `client_auth.require_for_local`-gated daemon depends on exactly
-    // this: without it, every command after `mail auth login` would need
-    // `--token` typed by hand, defeating the point of caching anything.
-    let token = match &transport.token {
-        Some(token) => Some(token.clone()),
+    Ok(Parts {
+        channel,
+        token: credential(&transport, socket).await.secret(),
+        deadline: transport.deadline,
+    })
+}
+
+/// Which credential a call over `socket` would present.
+///
+/// Named rather than reduced straight to an `Option<String>` because two
+/// surfaces need the *kind* without the secret: [`connect_parts`], which only
+/// wants the bytes, and the TUI's `:auth status` report, which says which
+/// credential is in play so "the daemon refused me" is diagnosable without
+/// quitting the TUI. One function answers both, so the report cannot claim a
+/// precedence the connector does not follow.
+#[derive(Debug)]
+pub(crate) enum Credential {
+    /// `--token`, or `$RMAIL_TOKEN`.
+    Flag(String),
+    /// What `mail auth login` cached for this socket.
+    Cached(String),
+    /// Nothing — over the Unix socket, the daemon's peer-uid check is what
+    /// decides (see this module's docs).
+    None,
+}
+
+impl Credential {
+    /// The bearer secret, if there is one.
+    fn secret(self) -> Option<String> {
+        match self {
+            Self::Flag(secret) | Self::Cached(secret) => Some(secret),
+            Self::None => None,
+        }
+    }
+
+    /// What this credential is, without revealing it — for a screen that
+    /// reports which one is in play.
+    pub(crate) const fn describe(&self) -> &'static str {
+        match self {
+            Self::Flag(_) => "--token/$RMAIL_TOKEN",
+            Self::Cached(_) => "the session `mail auth login` cached",
+            Self::None => "none",
+        }
+    }
+}
+
+/// `--token`/`$RMAIL_TOKEN` win outright; otherwise fall back to whatever
+/// `mail auth login` cached for *this* socket — only for the Unix-socket path,
+/// since the cache is keyed by socket path (see `session::account_for`) and a
+/// `--addr` target has no such path to key on. A
+/// `client_auth.require_for_local`-gated daemon depends on exactly this:
+/// without it, every command after `mail auth login` would need `--token`
+/// typed by hand, defeating the point of caching anything.
+pub(crate) async fn credential(transport: &Transport, socket: &Path) -> Credential {
+    match &transport.token {
+        Some(token) => Credential::Flag(token.clone()),
         None if transport.addr.is_none() => {
-            // `session::load` is a blocking Keychain call (the macOS
-            // Keychain API is synchronous FFI, and on an unsigned or
-            // rebuilt binary it can raise an OS access prompt) — run off
-            // the async runtime like any other blocking I/O, so it cannot
-            // stall this task's executor thread while a human is looking at
-            // a dialog. Every command pays this, including ones talking to
-            // a daemon with no password configured at all, which is exactly
-            // why it must never block inline.
+            // `session::load` is a blocking Keychain call (the macOS Keychain
+            // API is synchronous FFI, and on an unsigned or rebuilt binary it
+            // can raise an OS access prompt) — run off the async runtime like
+            // any other blocking I/O, so it cannot stall this task's executor
+            // thread while a human is looking at a dialog. Every command pays
+            // this, including ones talking to a daemon with no password
+            // configured at all, which is exactly why it must never block
+            // inline.
             let socket = socket.to_path_buf();
             tokio::task::spawn_blocking(move || crate::session::load(&socket))
                 .await
                 .unwrap_or_default()
-                .map(|cached| cached.token)
+                .map_or(Credential::None, |cached| Credential::Cached(cached.token))
         }
-        None => None,
-    };
-    Ok(Parts {
-        channel,
-        token,
-        deadline: transport.deadline,
-    })
+        None => Credential::None,
+    }
+}
+
+/// The transport flags this invocation was given — for a caller that needs to
+/// ask [`credential`] the same question [`connect_parts`] asks it.
+pub(crate) fn current_transport() -> Transport {
+    transport()
 }
 
 impl Parts {
