@@ -854,17 +854,23 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
 // complete
 // ---------------------------------------------------------------------------
 
-/// One completion candidate: what the WhichKey band (task 91) renders for
-/// the command line.
+/// One completion candidate: what the command line's WhichKey band (task 91)
+/// renders as a thing that could be typed next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     /// The text this candidate would insert.
     pub text: String,
     /// Whether choosing this candidate still leaves more to type (`true`
     /// for a verb-path segment with children of its own, `false` for a
-    /// leaf verb or a flag) — task 91's "leaves first, groups last"
-    /// ordering rule reads this the same way it reads task 91's own
-    /// `Continuation::Group` vs. `::Leaf` (not yet written).
+    /// leaf verb or a flag) — `command_band` reads this the same way
+    /// `rmail_core::keymap::Continuation::leads` distinguishes `Leads::Run`
+    /// from `Leads::Group` for a chord, so one `Kind` enum on the band side
+    /// drives both without either source needing to imitate the other's
+    /// shape. `complete`'s own alphabetical order is kept rather than
+    /// re-sorted leaves-first: unlike a chord prefix (usually one or two
+    /// live continuations), a verb-path segment can have a dozen-plus
+    /// children, and sorting every group behind every leaf buries exactly
+    /// the namespaces worth navigating toward.
     pub has_more: bool,
 }
 

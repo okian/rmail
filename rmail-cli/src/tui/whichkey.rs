@@ -140,8 +140,15 @@ fn chord_band(keymap: &Keymap, mode: Mode, pending: &[Key]) -> Band {
         }
     }
     let warning = (!dead.is_empty()).then(|| {
+        // Not "a nearer layer": `resolve` asks `lookup` for the exact chord
+        // built so far and fires whatever answers, so nearness between the
+        // two layers has nothing to do with *whether* this happens — only
+        // which of two bindings of the *same* length would win. The killer
+        // is routinely the farther layer (`[normal] "za"` buries a
+        // `[viewer] "zab"` added later, even though `Viewer` is nearer);
+        // see `keymap::continuations`' own module docs.
         format!(
-            "{} binding(s) here cannot be typed: a shorter chord in a nearer layer runs first",
+            "{} binding(s) here cannot be typed: a shorter chord elsewhere in this mode's chain runs first",
             dead.len()
         )
     });

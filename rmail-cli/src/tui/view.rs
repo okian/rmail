@@ -35,7 +35,7 @@ use super::overlays::{
 use super::report::{ReportColumn, ReportPane, ReportTone};
 use super::status;
 use super::theme::Theme;
-use super::whichkey::{self, Band, Kind};
+use super::whichkey::{self, Band, Entry, Kind};
 
 /// Draw one frame.
 pub fn render(model: &Model, frame: &mut Frame) {
@@ -1479,17 +1479,136 @@ fn inner(theme: &Theme, frame: &mut Frame, area: Rect, title: &str) -> Rect {
 /// Task 91's WhichKey band: what the next key can do.
 ///
 /// One row of `key label` pairs, plus the warning row when a binding under the
-/// pending prefix can never be typed. The pinned ways out sit at the end of the
-/// entry list rather than being placed at the right edge: a right-aligned strip
-/// would have to be measured against a row whose own width depends on how many
-/// entries fit, and an `<esc>` that jumps around as the list grows is harder to
-/// find than one that is simply always last.
+/// pending prefix can never be typed.
+///
+/// The pinned ways out get their own reserved column at the right edge rather
+/// than sitting at the end of the same unwrapped line as the other entries.
+/// They used to: it reads better when everything fits, but this `Paragraph`
+/// has no `.wrap()`, and the entry list is exactly the part with no fixed
+/// length — the command line alone can offer 26 top-level candidates, well
+/// past 120 columns, which pushed `<esc>`/`<c-c>` off the right edge of the
+/// very first `:` a person opens (measured, not hypothetical). A column
+/// sized to the pinned entries' *own* rendered width, not the entry list's,
+/// is what makes "the way out is there whatever else is" true regardless of
+/// how many other entries there are. On a terminal too narrow to hold both,
+/// the pinned column wins that argument outright — `Constraint::Min(0)` on
+/// the entry side gives up its space first, and that is the intended order:
+/// a vanished hint is a smaller loss than a vanished exit.
+///
+/// The entry list is measured the same way and capped to what is left, with
+/// its own `+N` when that cap — not [`Band::dropped`], which only counts
+/// what [`MAX_ENTRIES`] already dropped before this ever sees them — is what
+/// cuts something off. Two different reasons a `+N` can appear, so they are
+/// added together rather than either one silently standing in for both, and
+/// the room reserved for that suffix accounts for [`Band::dropped`] on its
+/// own: `dropped` is settled before a terminal width even exists, so a row
+/// wide enough for every live entry but not for the `+N` it already owes
+/// would otherwise draw all of them and then run the suffix straight off
+/// the edge of the column — the same disappearance this function exists to
+/// stop, just for a number instead of a key.
 fn render_band(theme: &Theme, band: &Band, frame: &mut Frame, area: Rect) {
-    let mut spans = vec![Span::styled(
+    let (pinned, live): (Vec<&Entry>, Vec<&Entry>) = band
+        .entries
+        .iter()
+        .partition(|entry| entry.kind == Kind::Pinned);
+
+    let mut pinned_spans = entry_spans(theme, pinned.iter().copied());
+    // The trailing " ·" separates one entry from the next; the last pinned
+    // entry has nothing after it, and flush against the column's own right
+    // edge it reads as a stray mark rather than a separator.
+    if pinned_spans
+        .last()
+        .is_some_and(|span| span.content.as_ref() == " ·")
+    {
+        pinned_spans.pop();
+    }
+    let pinned_width = spans_width(&pinned_spans);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(pinned_width)])
+        .split(rows[0]);
+
+    let title = Span::styled(
         format!("{} ", overlays::safe_line(&band.title)),
         theme.accent.add_modifier(Modifier::BOLD),
-    )];
-    for entry in &band.entries {
+    );
+    let title_width = u16::try_from(title.width()).unwrap_or(u16::MAX);
+    let mut spans = vec![title];
+
+    let live_spans: Vec<Vec<Span<'static>>> = live
+        .iter()
+        .map(|entry| entry_spans(theme, std::iter::once(*entry)))
+        .collect();
+    let live_widths: Vec<u16> = live_spans.iter().map(|s| spans_width(s)).collect();
+    let total_live_width: u16 = live_widths.iter().fold(0, |acc, w| acc.saturating_add(*w));
+    let available = columns[0].width.saturating_sub(title_width);
+
+    // Two passes, not one budget guessed up front: whether a "+N" suffix
+    // needs room depends on whether anything is actually going to be cut,
+    // which is not known until every entry's width has been added up —
+    // reserving unconditionally would cut the last entry off a row that was
+    // always going to fit, over a suffix that was never going to be drawn.
+    // But `band.dropped` alone can already force that suffix to appear
+    // before a single live entry is measured, so the fast "nothing to
+    // reserve for" path only applies when there is nothing owed yet.
+    let cut_off = if band.dropped == 0 && total_live_width <= available {
+        for entry in live_spans {
+            spans.extend(entry);
+        }
+        0
+    } else {
+        // Reserved for the *worst* count this row could end up reporting —
+        // every live entry cut on top of whatever was already dropped —
+        // measured from the actual formatted string rather than a guessed
+        // width, so a triple-digit `+N` gets a triple-digit column instead
+        // of losing a digit to the same off-screen clipping this function
+        // exists to prevent. Reserving for a count larger than what
+        // actually gets cut only costs a sliver of otherwise-unused column;
+        // reserving for one that is too small costs a wrong number.
+        let worst_case = band.dropped.saturating_add(live.len());
+        let reserve = spans_width(&[Span::raw(format!(" +{worst_case}"))]);
+        let budget = available.saturating_sub(reserve);
+        let mut used = 0u16;
+        let mut taken = 0usize;
+        for (entry, &width) in live_spans.into_iter().zip(&live_widths) {
+            if used.saturating_add(width) > budget {
+                break;
+            }
+            used += width;
+            taken += 1;
+            spans.extend(entry);
+        }
+        live.len().saturating_sub(taken)
+    };
+    let total_dropped = band.dropped.saturating_add(cut_off);
+    if total_dropped > 0 {
+        spans.push(Span::styled(format!(" +{total_dropped}"), theme.muted));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), columns[0]);
+    frame.render_widget(Paragraph::new(Line::from(pinned_spans)), columns[1]);
+
+    if let Some(warning) = band.warning.as_ref() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(overlays::safe_line(warning), theme.warn)),
+            rows[1],
+        );
+    }
+}
+
+/// The `key label ·` spans for a run of entries — factored out so the pinned
+/// column and the ordinary entry list build identical-looking spans from the
+/// same two styling functions.
+fn entry_spans<'a>(
+    theme: &Theme,
+    entries: impl IntoIterator<Item = &'a Entry>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for entry in entries {
         spans.push(Span::styled(
             format!(" {}", overlays::safe_line(&entry.keys)),
             band_key_style(theme, entry.kind),
@@ -1502,20 +1621,27 @@ fn render_band(theme: &Theme, band: &Band, frame: &mut Frame, area: Rect) {
         }
         spans.push(Span::styled(" ·", theme.muted));
     }
-    if band.dropped > 0 {
-        spans.push(Span::styled(format!(" +{}", band.dropped), theme.muted));
-    }
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(area);
-    frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
-    if let Some(warning) = band.warning.as_ref() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(overlays::safe_line(warning), theme.warn)),
-            rows[1],
-        );
-    }
+    spans
+}
+
+/// A run of spans' combined display width.
+///
+/// `Span::width` is the same `unicode_width` measure ratatui's own text
+/// layout walks the string with (per-grapheme, so combining marks count as
+/// zero) to decide how many columns it consumes, so measuring the same way
+/// here is what makes this function's arithmetic agree with what actually
+/// lands on screen. A plain `chars().count()` looked equivalent for the
+/// chrome this module writes itself — a chord's vim notation, an action id,
+/// the `·` separator, all one column per `char` — but [`Band::title`] is not
+/// this module's own text: it is `pending`'s keys or the raw `:` line, and a
+/// bound key can be any `char` (a `keys.toml` binding to `Key::Char('日')` is
+/// legal) while the command line echoes whatever was typed, unicode-width-2
+/// glyphs included.
+fn spans_width(spans: &[Span<'_>]) -> u16 {
+    spans
+        .iter()
+        .map(|span| u16::try_from(span.width()).unwrap_or(u16::MAX))
+        .fold(0, u16::saturating_add)
 }
 
 /// How a band entry's key is drawn.

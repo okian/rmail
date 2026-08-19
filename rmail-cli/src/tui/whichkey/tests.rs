@@ -97,6 +97,13 @@ fn of_kind(band: &Band, kind: Kind) -> Vec<String> {
         .collect()
 }
 
+/// Parses the `N` out of a rendered row's `+N`, if the row has one.
+fn overflow_count(row: &str) -> Option<u32> {
+    let after = row.rsplit_once('+')?.1;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Render `model` and flatten the buffer into one string per row.
 fn draw(model: &Model, width: u16, height: u16) -> Vec<String> {
     let mut terminal = match Terminal::new(TestBackend::new(width, height)) {
@@ -625,4 +632,173 @@ fn the_band_survives_a_terminal_too_narrow_to_hold_it() {
     // No assertion beyond "this returns": every overlay here is expected to
     // clamp rather than to be handed a terminal that fits.
     assert_eq!(draw(&model, 10, 6).len(), 6);
+}
+
+#[test]
+fn a_binding_can_be_killed_by_a_farther_layer_too() {
+    // The mirror of `a_dead_entry_is_drawn_struck_through`: there, the
+    // shorter chord ("za") happens to be in the *nearer* layer (`Visual`)
+    // relative to the longer one ("zab", `Normal`) — which is also the
+    // arrangement that would make a wrong "a nearer layer runs first"
+    // warning read as correct. Reversed here (shorter in `Normal`, the
+    // farther layer; longer in `Visual`, the nearer one) to prove the
+    // warning names no particular layer, because `resolve` does not care
+    // which layer is nearer — only which chord is shorter.
+    let mut model = loaded();
+    bind(&mut model, Mode::Normal, "za", Action::AiQuick);
+    bind(&mut model, Mode::Visual, "zab", Action::AiPanel);
+    press(&mut model, Key::Char('v'));
+    keys(&mut model, "z");
+
+    let struck: String = styled_cells(&model, ratatui::style::Modifier::CROSSED_OUT)
+        .into_iter()
+        .collect();
+    assert!(struck.contains("zab"), "{struck:?}");
+
+    let rendered = draw(&model, 120, 24).join("\n");
+    assert!(
+        rendered.contains("cannot be typed"),
+        "the warning still has to say what happened, not just avoid saying \
+         the wrong thing: {rendered}"
+    );
+    assert!(
+        !rendered.contains("nearer"),
+        "the warning must not claim a specific layer's nearness: {rendered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the pinned ways out survive an overflowing band
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_pinned_ways_out_are_visible_when_the_command_band_overflows_the_terminal() {
+    // Regression: every top-level verb rendered on one unwrapped line ran to
+    // 244 columns on the real registry — `<esc>`/`<c-c>` landed roughly 96
+    // columns off the right edge of a 120-column terminal, the width every
+    // other test in this file already uses.
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    let band = shown(&model);
+    assert!(
+        band.entries.len() > 20,
+        "the repro needs the overflow to actually happen: {band:?}"
+    );
+
+    let rendered = draw(&model, 120, 24).join("\n");
+    assert!(rendered.contains("<esc>"), "{rendered}");
+    assert!(rendered.contains("<c-c>"), "{rendered}");
+}
+
+#[test]
+fn the_pinned_ways_out_survive_a_busy_chord_band_too() {
+    // Not exercised by the shipped keymap today — task 105's `<space>`
+    // leader, which depends on this task, is what will make a chord prefix
+    // with a dozen live continuations real. Simulated directly so the fix
+    // does not wait on that task to land before it is provable.
+    let mut model = loaded();
+    for (i, c) in ('a'..='l').enumerate() {
+        let action = if i % 2 == 0 {
+            Action::AiPanel
+        } else {
+            Action::AiQuick
+        };
+        bind(&mut model, Mode::Normal, &format!("z{c}"), action);
+    }
+    keys(&mut model, "z");
+    let band = shown(&model);
+    assert!(
+        band.entries.len() > 8,
+        "the setup needs enough entries to actually overflow: {band:?}"
+    );
+
+    let rendered = draw(&model, 120, 24).join("\n");
+    assert!(rendered.contains("<esc>"), "{rendered}");
+    assert!(rendered.contains("<c-c>"), "{rendered}");
+}
+
+#[test]
+fn a_band_that_fits_shows_no_overflow_indicator() {
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    keys(&mut model, "message a");
+    let band = shown(&model);
+    assert!(
+        band.entries.len() < 6,
+        "the setup needs a narrow enough match set: {band:?}"
+    );
+
+    let rendered = draw(&model, 120, 24);
+    let band_row = rendered
+        .get(rendered.len().saturating_sub(2))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        overflow_count(&band_row).is_none(),
+        "nothing was cut, so no +N belongs on the band's own row: {band_row:?}"
+    );
+}
+
+#[test]
+fn a_dropped_count_is_reported_at_every_width_not_just_narrow_ones() {
+    // `band.dropped` (from `finish`'s `MAX_ENTRIES` cap) is settled before a
+    // terminal width exists at all, so once it is nonzero a `+N` is owed at
+    // every width — including one comfortably wide enough that every live
+    // entry, taken alone, would have fit with room to spare. A reservation
+    // that only ever looks at the live entries' own total width can walk
+    // right past that: it would draw all of them thinking nothing needed
+    // cutting, then try to append a suffix nobody left room for.
+    let mut model = loaded();
+    for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP".chars() {
+        bind(&mut model, Mode::Normal, &format!("z{c}"), Action::Help);
+    }
+    keys(&mut model, "z");
+    let band = shown(&model);
+    assert!(
+        band.dropped > 0,
+        "the cap alone must already be biting: {band:?}"
+    );
+    let known_dropped = u32::try_from(band.dropped).unwrap_or(u32::MAX);
+
+    // The sweep starts well past the pinned column's own width (measured at
+    // 26 for the default `<esc>`/`<c-c>` labels), not at some narrow width:
+    // below that, `Constraint::Min(0)` on the entry+suffix side has already
+    // given up the whole row to `Constraint::Length` on the pinned side —
+    // deliberately, per `render_band`'s own doc comment — so there is no
+    // column left for a `+N` to appear in at all, regardless of what this
+    // function's arithmetic computes. That narrower regime is covered by
+    // `the_band_survives_a_terminal_too_narrow_to_hold_it` instead.
+    for width in (60..=400).step_by(2) {
+        let rendered = draw(&model, width, 24);
+        let band_row = rendered
+            .get(rendered.len().saturating_sub(2))
+            .cloned()
+            .unwrap_or_default();
+        match overflow_count(&band_row) {
+            Some(reported) => assert!(
+                reported >= known_dropped,
+                "width {width}: at least the {known_dropped} the cap already \
+                 dropped must be reported, not swallowed by a reservation \
+                 that only looked at the live entries: {band_row:?}"
+            ),
+            None => panic!(
+                "width {width}: the cap alone already owes a +N and none is \
+                 on screen: {band_row:?}"
+            ),
+        }
+    }
+
+    // Wide enough that the terminal itself cuts nothing: the count reported
+    // must be exactly what the cap dropped, no more.
+    let rendered = draw(&model, 600, 24);
+    let band_row = rendered
+        .get(rendered.len().saturating_sub(2))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        overflow_count(&band_row),
+        Some(known_dropped),
+        "at 600 columns only the cap should be reporting, not the terminal \
+         clip too: {band_row:?}"
+    );
 }
