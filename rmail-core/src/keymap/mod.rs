@@ -53,6 +53,7 @@
 //! *cursor arithmetic*, which is `O(1)` and clamped; it never multiplies
 //! commands (see `tui::model`'s `run_action`).
 
+pub mod continuations;
 pub mod file;
 
 #[cfg(test)]
@@ -61,6 +62,8 @@ mod tests;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound;
+
+pub use continuations::{Continuation, Leads};
 
 /// The largest count a user can type. Beyond this, further digits are
 /// absorbed rather than accumulated: a held-down `9` is a stuck key, not a

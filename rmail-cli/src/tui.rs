@@ -72,6 +72,7 @@ pub mod report;
 pub mod term;
 pub mod theme;
 pub mod view;
+pub mod whichkey;
 
 use std::io;
 use std::path::Path;

@@ -34,6 +34,7 @@ use super::overlays::{
 };
 use super::report::{ReportColumn, ReportPane, ReportTone};
 use super::theme::Theme;
+use super::whichkey::{self, Band, Kind};
 
 /// Draw one frame.
 pub fn render(model: &Model, frame: &mut Frame) {
@@ -42,11 +43,23 @@ pub fn render(model: &Model, frame: &mut Frame) {
     // is a countdown with an offer attached, and an offer that scrolls away
     // behind the next "3 messages" is not an offer.
     let toast_height = u16::from(model.toast.is_some());
+    // Task 91's band. Derived once and used twice — for the height and for the
+    // drawing — because `whichkey::band` walks the keymap's layers and doing
+    // that twice per frame to ask the same question is work for nothing.
+    let band = whichkey::band(model);
+    // Two rows when a binding is unreachable: the warning is a sentence, and
+    // reflowing it into the entry row would push the entries off the screen in
+    // exactly the state somebody needs to read them.
+    let band_height = match band.as_ref() {
+        None => 0,
+        Some(band) => 1 + u16::from(band.warning.is_some()),
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(toast_height),
+            Constraint::Length(band_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -62,7 +75,10 @@ pub fn render(model: &Model, frame: &mut Frame) {
     if let Some(toast) = model.toast.as_ref() {
         render_toast(&model.theme, toast, frame, rows[1]);
     }
-    render_status(model, frame, rows[2]);
+    if let Some(band) = band.as_ref() {
+        render_band(&model.theme, band, frame, rows[2]);
+    }
+    render_status(model, frame, rows[3]);
 
     match &model.overlay {
         Some(Overlay::Help) => render_help(model, frame, area),
@@ -1258,6 +1274,70 @@ fn inner(theme: &Theme, frame: &mut Frame, area: Rect, title: &str) -> Rect {
     let inside = block.inner(area);
     frame.render_widget(block, area);
     inside
+}
+
+/// Task 91's WhichKey band: what the next key can do.
+///
+/// One row of `key label` pairs, plus the warning row when a binding under the
+/// pending prefix can never be typed. The pinned ways out sit at the end of the
+/// entry list rather than being placed at the right edge: a right-aligned strip
+/// would have to be measured against a row whose own width depends on how many
+/// entries fit, and an `<esc>` that jumps around as the list grows is harder to
+/// find than one that is simply always last.
+fn render_band(theme: &Theme, band: &Band, frame: &mut Frame, area: Rect) {
+    let mut spans = vec![Span::styled(
+        format!("{} ", overlays::safe_line(&band.title)),
+        theme.accent.add_modifier(Modifier::BOLD),
+    )];
+    for entry in &band.entries {
+        spans.push(Span::styled(
+            format!(" {}", overlays::safe_line(&entry.keys)),
+            band_key_style(theme, entry.kind),
+        ));
+        if !entry.label.is_empty() {
+            spans.push(Span::styled(
+                format!(" {}", overlays::safe_line(&entry.label)),
+                band_label_style(theme, entry.kind),
+            ));
+        }
+        spans.push(Span::styled(" ·", theme.muted));
+    }
+    if band.dropped > 0 {
+        spans.push(Span::styled(format!(" +{}", band.dropped), theme.muted));
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+    if let Some(warning) = band.warning.as_ref() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(overlays::safe_line(warning), theme.warn)),
+            rows[1],
+        );
+    }
+}
+
+/// How a band entry's key is drawn.
+fn band_key_style(theme: &Theme, kind: Kind) -> Style {
+    match kind {
+        // Struck through, not merely dimmed: this binding exists and the
+        // keyboard cannot deliver it, which is a different thing from "not
+        // interesting" and has to look different.
+        Kind::Dead => theme.err.add_modifier(Modifier::CROSSED_OUT),
+        Kind::Pinned => theme.warn.add_modifier(Modifier::BOLD),
+        Kind::Group => theme.accent.add_modifier(Modifier::BOLD),
+        Kind::Run => theme.emphasis,
+    }
+}
+
+/// How a band entry's label is drawn.
+fn band_label_style(theme: &Theme, kind: Kind) -> Style {
+    match kind {
+        Kind::Dead => theme.err.add_modifier(Modifier::CROSSED_OUT),
+        Kind::Group => theme.accent,
+        Kind::Pinned | Kind::Run => theme.muted,
+    }
 }
 
 /// A percentage-sized rectangle in the middle of `area`.

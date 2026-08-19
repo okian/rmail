@@ -44,6 +44,34 @@ j        gg       G        ?
 
 Quote them in a shell: the angle brackets are redirections.
 
+## A chord fires as soon as it is complete
+
+There is no timeout anywhere in this. A chord that is complete runs at once,
+even when a longer binding starts with it — so binding `g` in a layer that
+already has `gg` does not make `g` wait to find out which you meant; it makes
+`gg` a binding the keyboard can never deliver.
+
+Within one layer that is refused outright: an edit that would make either of
+two bindings unreachable is rejected rather than written. Across layers it
+cannot be, because the edit is legal on its own terms — `g` in the viewer is a
+reasonable thing to want, and the fact that it kills the `gg` the viewer
+inherits from `normal` is a consequence of the chain rather than of that line.
+So it is reported instead: the band along the bottom of the screen draws such a
+binding struck through, with a note saying it cannot be typed.
+
+## The band along the bottom
+
+Press part of a chord and a strip appears immediately, listing what the next
+key can do: the keys that complete something, the ones that open more, and Esc
+and Ctrl-C, which are in every one of them. A count on its own does not raise
+it — `3` is a repeat waiting for a command, and every binding is still
+available, so a list of all of them would say nothing.
+
+Group names in that strip are derived from the ids of what is under them, never
+written down anywhere: two bindings under one key whose actions are `ai.panel`
+and `ai.quick` label their group `ai`. Rebind either and the label follows,
+because there is no second copy of it to go stale.
+
 ## Editing it from the command line
 
 ```

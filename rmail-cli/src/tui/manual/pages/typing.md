@@ -36,6 +36,17 @@ client that asked about everything would train you to answer yes without
 reading, which is the state in which a confirmation stops protecting
 anything.
 
+## A half-typed chord
+
+Press the first key of a chord and a strip appears along the bottom saying what
+the next key can do. It appears at once rather than after a pause: a chord that
+is complete has already run by then, so nothing half-typed is waiting to find
+out what you meant. [[keys-toml]] has the longer version, including what a
+struck-through entry in that strip means.
+
+The same strip serves {{keys:command}}: with a `:` line half-typed it lists the
+verbs that could come next instead of the keys.
+
 ## The way out is always the same
 
 Esc backs out of the innermost thing, in every one of these layers, and no
