@@ -515,6 +515,82 @@ async fn a_move_removes_the_row_and_the_listing_agrees() {
     daemon.stop().await;
 }
 
+/// Task 90's report, through the daemon rather than through the model.
+///
+/// The one thing a model test structurally cannot prove: that `Cmd::AuthStatus`
+/// names an RPC this daemon actually serves, and that both halves of the answer
+/// — the daemon's two settings and this client's own credential — arrive as
+/// frames the pane can apply. A mechanism whose rows only ever came from a test
+/// fixture would be the "shipped inert" failure this project keeps finding.
+#[tokio::test]
+async fn auth_status_reports_the_daemons_gate_and_this_clients_credential() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(Cmd::AuthStatus { generation: 3 }, tx.clone());
+
+    // The daemon's frame: a snapshot, so it replaces.
+    let settings = match next(&mut rx, "the auth settings").await {
+        Msg::Report {
+            generation: 3,
+            event:
+                ReportEvent::Frame {
+                    fill: ReportFill::Replace,
+                    rows,
+                    complete: false,
+                },
+        } => rows,
+        other => unreachable!("expected the settings frame, got {other:?}"),
+    };
+    let cells: Vec<String> = settings.iter().map(|row| row.cells.join(" ")).collect();
+    assert_eq!(cells.len(), 2, "{cells:?}");
+    assert!(
+        cells[0].starts_with("password not configured"),
+        "a fresh daemon has no password gate: {cells:?}"
+    );
+    assert!(
+        cells[1].starts_with("local login not required"),
+        "and does not require a socket peer to log in: {cells:?}"
+    );
+    assert_eq!(
+        settings[0].tone,
+        ReportTone::Muted,
+        "an absent gate is a default, not a fault"
+    );
+    assert!(
+        settings[0].on_enter.is_none(),
+        "there is nothing to clear, so the row offers nothing"
+    );
+
+    // This client's frame: a different source, so it appends — and it is the
+    // last, so it completes the report.
+    let mine = match next(&mut rx, "the credential row").await {
+        Msg::Report {
+            generation: 3,
+            event:
+                ReportEvent::Frame {
+                    fill: ReportFill::Append,
+                    rows,
+                    complete: true,
+                },
+        } => rows,
+        other => unreachable!("expected the credential frame, got {other:?}"),
+    };
+    assert_eq!(mine.len(), 1, "{mine:?}");
+    let row = mine
+        .first()
+        .map(|row| row.cells.join(" "))
+        .unwrap_or_default();
+    assert!(
+        row.starts_with("this client presents"),
+        "and it names the kind, never the secret: {row}"
+    );
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
 #[tokio::test]
 async fn shutdown_stops_the_event_stream_rather_than_leaving_it_running() {
     let daemon = Daemon::start().await;

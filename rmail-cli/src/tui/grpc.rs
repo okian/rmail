@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use rmail_proto::v1::account_service_client::AccountServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
+use rmail_proto::v1::client_auth_service_client::ClientAuthServiceClient;
 use rmail_proto::v1::compose_service_client::ComposeServiceClient;
 use rmail_proto::v1::finder_service_client::FinderServiceClient;
 use rmail_proto::v1::mail_service_client::MailServiceClient;
@@ -52,10 +53,10 @@ use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::send_scheduler_service_client::SendSchedulerServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
-    ask_chunk, AskRequest, CancelRequest, CopyRequest, DeleteRequest, EventKind, ExplainRequest,
-    FindRequest, GetMessageRequest, GetSummaryRequest, ListAccountsRequest, ListMessagesRequest,
-    ListOutboxRequest, MoveRequest, SearchRequest, SetFlagsRequest, SuggestReplyRequest,
-    SyncStatusRequest, WatchEventsRequest,
+    ask_chunk, AskRequest, AuthStatusRequest, CancelRequest, ClearPasswordRequest, CopyRequest,
+    DeleteRequest, EventKind, ExplainRequest, FindRequest, GetMessageRequest, GetSummaryRequest,
+    ListAccountsRequest, ListMessagesRequest, ListOutboxRequest, MoveRequest, SearchRequest,
+    SetFlagsRequest, SuggestReplyRequest, SyncStatusRequest, WatchEventsRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
@@ -73,7 +74,10 @@ type Conn = crate::client::Client;
 use super::history;
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
-use super::model::{wire, AskEvent, Cmd, Effect, FinderEvent, Msg, SearchEvent, Stream};
+use super::model::{
+    wire, AskEvent, Cmd, Effect, FinderEvent, Msg, ReportEvent, SearchEvent, Stream,
+};
+use super::report::{ReportFill, ReportRow, ReportTone};
 
 /// Deadline for a unary RPC. Generous: these are local reads over a Unix
 /// socket, and the ones that reach IMAP (move/copy/delete) are several
@@ -122,6 +126,7 @@ pub struct GrpcExec {
     finder: FinderServiceClient<Conn>,
     ai: AiServiceClient<Conn>,
     scheduler: SendSchedulerServiceClient<Conn>,
+    auth: ClientAuthServiceClient<Conn>,
     /// The task feeding the search overlay, so the next keystroke can abort
     /// it. One slot per stream kind: a search and a find can be outstanding
     /// at once (they are different overlays), but two searches cannot.
@@ -139,6 +144,12 @@ pub struct GrpcExec {
     /// whole retrieval pipeline server-side, and only the last one can ever
     /// be drawn.
     explaining: Mutex<Option<AbortHandle>>,
+    /// Whatever is feeding the Report overlay. A slot for the same reason
+    /// `explaining` is one even though today's only reporting verb is unary:
+    /// one report is on screen at a time, so a second request is always a
+    /// supersession of the first, and `Esc` needs exactly one thing to abort
+    /// whether the report was streaming or not.
+    reporting: Mutex<Option<AbortHandle>>,
     ticking: Mutex<Option<AbortHandle>>,
     /// The command-history write. Superseding, because `write_atomic`'s temp
     /// path is per-*process*: two commands in quick succession would
@@ -147,6 +158,15 @@ pub struct GrpcExec {
     /// always the complete answer and the older is never worth finishing.
     saving: Mutex<Option<AbortHandle>>,
     opener: CommandOpener,
+    /// The Unix socket this session connected over.
+    ///
+    /// Kept only for [`Cmd::AuthClear`], which — exactly as `mail auth clear`
+    /// does — also forgets the session cached for this socket, since a cleared
+    /// password makes it moot. `crate::session` is keyed by socket path, so
+    /// the path has to travel with the executor; the model must not hold it,
+    /// because `update` is pure and a path in it would invite a filesystem
+    /// call from a place that cannot make one.
+    socket: std::path::PathBuf,
     cancel: CancellationToken,
     /// Cancels `cancel` when this struct is dropped.
     ///
@@ -159,7 +179,7 @@ pub struct GrpcExec {
 }
 
 impl GrpcExec {
-    /// Connect to rmaild's Unix socket and build the four clients over one
+    /// Connect to rmaild's Unix socket and build every client over one
     /// channel.
     ///
     /// # Errors
@@ -169,12 +189,15 @@ impl GrpcExec {
     /// cannot reach the daemon has nothing to draw.
     pub async fn connect(socket: &Path) -> anyhow::Result<Self> {
         let channel = crate::client::connect(socket).await?;
-        Ok(Self::with_channel(channel))
+        Ok(Self::with_channel(channel, socket))
     }
 
     /// Build every client over an already-established channel.
+    ///
+    /// `socket` is the path the channel was opened over — see
+    /// [`GrpcExec::socket`] for the one command that needs it.
     #[must_use]
-    pub fn with_channel(channel: Conn) -> Self {
+    pub fn with_channel(channel: Conn, socket: &Path) -> Self {
         let cancel = CancellationToken::new();
         Self {
             mail: MailServiceClient::new(channel.clone()),
@@ -184,14 +207,17 @@ impl GrpcExec {
             search: SearchServiceClient::new(channel.clone()),
             finder: FinderServiceClient::new(channel.clone()),
             ai: AiServiceClient::new(channel.clone()),
-            scheduler: SendSchedulerServiceClient::new(channel),
+            scheduler: SendSchedulerServiceClient::new(channel.clone()),
+            auth: ClientAuthServiceClient::new(channel),
             searching: Mutex::new(None),
             finding: Mutex::new(None),
             asking: Mutex::new(None),
             explaining: Mutex::new(None),
+            reporting: Mutex::new(None),
             ticking: Mutex::new(None),
             saving: Mutex::new(None),
             opener: CommandOpener::platform(),
+            socket: socket.to_path_buf(),
             _guard: cancel.clone().drop_guard(),
             cancel,
         }
@@ -527,12 +553,35 @@ impl CmdExec for GrpcExec {
                     }
                 });
             }
+            Cmd::AuthStatus { generation } => {
+                let mut client = self.auth.clone();
+                let socket = self.socket.clone();
+                // Through the superseding slot even though the RPC is unary.
+                // Two reasons: `Esc` needs one thing to abort whichever kind of
+                // report is running, and `r` supersedes by *issuing* rather than
+                // by cancelling — which only works if the previous request is in
+                // a slot the new one replaces.
+                self.spawn_superseding(&self.reporting, async move {
+                    auth_status(&mut client, &socket, generation, &out).await;
+                });
+            }
+            Cmd::AuthClear => {
+                let mut client = self.auth.clone();
+                let socket = self.socket.clone();
+                self.spawn(out, async move {
+                    Msg::Done {
+                        label: "password cleared".to_owned(),
+                        result: clear_password(&mut client, &socket).await,
+                    }
+                });
+            }
             Cmd::CancelStream { which } => {
                 let slot = match which {
                     Stream::Search => &self.searching,
                     Stream::Find => &self.finding,
                     Stream::Ask => &self.asking,
                     Stream::Explain => &self.explaining,
+                    Stream::Report => &self.reporting,
                 };
                 abort(slot);
             }
@@ -784,6 +833,115 @@ async fn stream_ask(
         generation,
         event: AskEvent::Failed("the daemon ended the answer early".to_owned()),
     });
+}
+
+/// The `:auth status` report: the daemon's gate, then this client's own
+/// credential.
+///
+/// Two frames from two sources, which is what [`ReportFill`] is for. The
+/// daemon's two settings are the complete current state of the gate, so that
+/// frame *replaces*; the credential row comes from argv and the keychain and
+/// must not erase what the daemon said, so it *appends*. It is also sent when
+/// the RPC failed, because "the daemon did not answer and I am presenting
+/// nothing" is the most useful thing this screen can say — and it is sent
+/// before the failure frame, since [`ReportEvent::Failed`] ends the report.
+async fn auth_status(
+    client: &mut ClientAuthServiceClient<Conn>,
+    socket: &Path,
+    generation: u64,
+    out: &UnboundedSender<Msg>,
+) {
+    let answered = match call(client.auth_status(AuthStatusRequest {})).await {
+        Ok(response) => {
+            let _ = out.send(Msg::Report {
+                generation,
+                event: ReportEvent::Frame {
+                    fill: ReportFill::Replace,
+                    rows: wire::auth_status_rows(&response.into_inner()),
+                    complete: false,
+                },
+            });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    };
+    let credential = crate::client::credential(&crate::client::current_transport(), socket).await;
+    let _ = out.send(Msg::Report {
+        generation,
+        event: ReportEvent::Frame {
+            fill: ReportFill::Append,
+            rows: vec![credential_row(&credential)],
+            complete: answered.is_ok(),
+        },
+    });
+    if let Err(error) = answered {
+        let _ = out.send(Msg::Report {
+            generation,
+            event: ReportEvent::Failed(error),
+        });
+    }
+}
+
+/// The row naming which credential this client would present — the kind, never
+/// the secret.
+///
+/// Here rather than in `wire` because a credential is not a wire type: it comes
+/// from argv and the keychain, and `wire`'s job is proto to model. This is the
+/// module that has both halves of the `:auth status` answer.
+///
+/// A cached session or an explicit `--token` is the state everything works in,
+/// so both read [`ReportTone::Ok`]; presenting nothing is [`ReportTone::Muted`]
+/// rather than a warning, because over the Unix socket with `local login` off it
+/// is the normal, correct state — the daemon's own row above is where "and that
+/// is not enough here" is said.
+fn credential_row(credential: &crate::client::Credential) -> ReportRow {
+    let tone = match credential {
+        crate::client::Credential::Flag(_) | crate::client::Credential::Cached(_) => ReportTone::Ok,
+        crate::client::Credential::None => ReportTone::Muted,
+    };
+    ReportRow::new(["this client presents", credential.describe()]).toned(tone)
+}
+
+/// `ClientAuthService.ClearPassword`, plus the local session hygiene
+/// `mail auth clear` performs.
+///
+/// Refused under `--addr` for exactly the reason `auth_cli::run` refuses it:
+/// `crate::session` is keyed by the *local* socket path and has no `--addr`
+/// form, so clearing against a remote daemon would forget a session belonging
+/// to the local one. Two surfaces over one capability that disagreed about
+/// that would be the drift `rmail_core::parity` exists to prevent.
+///
+/// Forgetting the session is best effort: the password is already gone at the
+/// daemon, which is the part that matters, and a keychain that refuses to
+/// delete must not turn a completed operation into a reported failure.
+async fn clear_password(
+    client: &mut ClientAuthServiceClient<Conn>,
+    socket: &Path,
+) -> Result<Effect, String> {
+    if let Some(addr) = crate::client::remote_addr() {
+        return Err(format!(
+            "`:auth clear` manages the local session cache, which is keyed by socket path — it \
+             cannot be pointed at --addr {addr}"
+        ));
+    }
+    call(client.clear_password(ClearPasswordRequest {})).await?;
+    // `spawn_blocking` for the reason `client::credential` reads the same store
+    // that way: the Keychain API is synchronous FFI that can raise an OS access
+    // prompt, and waiting on a human inside an async task blocks the runtime
+    // thread the whole TUI is drawn from.
+    let path = socket.to_path_buf();
+    match tokio::task::spawn_blocking(move || crate::session::clear(&path)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            error = %error,
+            "the password was cleared, but the cached session could not be forgotten",
+        ),
+        Err(error) => tracing::warn!(
+            error = %error,
+            "the password was cleared, but the task forgetting the cached session did not finish",
+        ),
+    }
+    Ok(Effect::None)
 }
 
 async fn list_outbox(

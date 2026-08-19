@@ -65,6 +65,7 @@ use super::overlays::{
     CommandPane, Explanation, FinderItem, FinderKind, FinderPane, Hit, OutboxPane, OutboxRow,
     QuickAction, QuickPane, SearchFocus, SearchPane, UndoToast,
 };
+use super::report::{self, ReportColumn, ReportFill, ReportPane, ReportRow};
 use super::theme::Theme;
 pub use crate::keymap::Key;
 use crate::keymap::{Action, Keymap, Mode, Pending, Resolution};
@@ -474,9 +475,8 @@ pub enum Overlay {
     Confirm {
         /// What is being asked.
         prompt: String,
-        /// The messages the answer applies to, captured when the question was
-        /// asked for the same reason the picker captures its own.
-        message_ids: Vec<i64>,
+        /// What `y` does.
+        then: Confirmed,
     },
     /// Collect a line of text.
     Input {
@@ -503,6 +503,47 @@ pub enum Overlay {
     Outbox(Box<OutboxPane>),
     /// `.` — the AI quick-action menu.
     Quick(QuickPane),
+    /// The answer to a `:` verb that reports rows (task 90).
+    Report(Box<ReportPane>),
+}
+
+/// What answering `y` to an [`Overlay::Confirm`] does.
+///
+/// A closed vocabulary rather than a `Vec<Cmd>` captured when the question was
+/// asked: the commands a confirmation implies depend on the model *at the
+/// moment it is answered* (how many messages are selected, which folder is
+/// open), and a pre-built list would be a decision taken before the user had
+/// agreed to it. It is also what keeps `Overlay` comparable with `assert_eq!`,
+/// which most of this module's tests rely on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirmed {
+    /// Expunge these messages — the `d` key's question since task 83.
+    ///
+    /// The ids are captured when the question is asked, never re-derived when
+    /// it is answered: the message list is live (a `Msg::Changed` reload can
+    /// arrive and re-clamp the cursor while the question is up) and the
+    /// viewer's message is not the one under the list cursor at all.
+    Delete(Vec<i64>),
+    /// Run this `:` line — what a report row whose verb mutates asks about
+    /// first (task 90).
+    Invoke {
+        /// What to run. Always carries `bang: true`, so dispatching it does
+        /// not re-open a confirmation the user has just answered — the same
+        /// `!` the command line means by "skip the question", so there is one
+        /// implementation of skipping it rather than a second, report-only one.
+        invocation: Box<command::Invocation>,
+        /// The report the question was asked over, put back whichever way it
+        /// is answered.
+        ///
+        /// Carried rather than re-derived because this model has one overlay
+        /// and not a stack — task 89 recorded that absence deliberately — so a
+        /// question asked over a report either travels with it or loses it. A
+        /// row that acts on what the report is showing and takes the report
+        /// down with it is not a mechanism tasks 94 onward can use: a
+        /// suggestion list whose rows accept inline would close itself on the
+        /// first acceptance.
+        over: Box<ReportPane>,
+    },
 }
 
 impl Overlay {
@@ -518,6 +559,7 @@ impl Overlay {
             Self::Ask(pane) => (pane.cursor, pane.citations.len()),
             Self::Outbox(pane) => (pane.cursor, pane.rows.len()),
             Self::Quick(pane) => (pane.cursor, QuickAction::ALL.len()),
+            Self::Report(pane) => (pane.cursor, pane.rows.len()),
             // The command line is absent on purpose: its `<up>`/`<down>`
             // walk the history rather than a list, which is what `:` means
             // everywhere else it exists. Its ranked matches are a preview
@@ -539,6 +581,7 @@ impl Overlay {
             Self::Ask(pane) => pane.cursor = at,
             Self::Outbox(pane) => pane.cursor = at,
             Self::Quick(pane) => pane.cursor = at,
+            Self::Report(pane) => pane.cursor = at,
             Self::Help
             | Self::Pick { .. }
             | Self::Confirm { .. }
@@ -668,6 +711,14 @@ pub enum Msg {
     },
     /// A second passed while an undo countdown was running, unix seconds.
     Tick(i64),
+    /// One frame of a Report's answer (task 90).
+    Report {
+        /// Which request it belongs to. A frame from a superseded one is
+        /// dropped; see `tui::report`'s module docs.
+        generation: u64,
+        /// What arrived.
+        event: ReportEvent,
+    },
     /// `keys.toml` was read (see [`crate::keymap::file::Source`]).
     Keymap {
         /// The bindings to switch to, or why the file was refused — in which
@@ -707,6 +758,29 @@ pub enum FinderEvent {
         scanned: u64,
     },
     /// The stream failed.
+    Failed(String),
+}
+
+/// What a reporting verb delivered.
+///
+/// One frame type for the unary and the streaming case alike: `:auth status`
+/// sends a single [`ReportEvent::Frame`] with `complete: true`, and a streaming
+/// verb sends several with `complete: false` before its last. The pane cannot
+/// tell them apart, which is what makes "line, table and stream are the same
+/// thing here" true rather than aspirational.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportEvent {
+    /// Rows, and how they join the ones already shown.
+    Frame {
+        /// Extend or replace.
+        fill: ReportFill,
+        /// The rows themselves.
+        rows: Vec<ReportRow>,
+        /// Whether this is the last frame.
+        complete: bool,
+    },
+    /// The report failed. Rows already shown are kept — see
+    /// [`ReportPane::fail`].
     Failed(String),
 }
 
@@ -882,6 +956,14 @@ pub enum Cmd {
         /// Every recorded line, oldest first.
         entries: Vec<String>,
     },
+    /// `ClientAuthService.AuthStatus` — the `:auth status` report.
+    AuthStatus {
+        /// Which report this is, so a frame from a superseded run is
+        /// recognisable.
+        generation: u64,
+    },
+    /// `ClientAuthService.ClearPassword` — remove the password gate.
+    AuthClear,
     /// Stop a stream nobody is reading any more.
     ///
     /// Leaving an overlay is the one case the generation stamp does not
@@ -908,6 +990,14 @@ pub enum Stream {
     /// `SearchService.Explain` — superseded per cursor row, so it is a stream
     /// slot even though the RPC itself is unary.
     Explain,
+    /// Whatever is feeding the Report overlay (task 90).
+    ///
+    /// One slot for every reporting verb rather than one per verb: only one
+    /// report is on screen at a time, so a second one starting is always a
+    /// supersession of the first — and a unary report (`:auth status`) shares
+    /// the slot for the same reason `Explain` has one, so `Esc` has exactly one
+    /// thing to cancel whichever kind is running.
+    Report,
 }
 
 /// Which kind of draft `Cmd::Draft` creates.
@@ -1108,9 +1198,13 @@ impl Model {
             Some(Overlay::Search(pane)) if pane.typing() => Mode::Prompt,
             Some(Overlay::Ask(pane)) if pane.typing() => Mode::Prompt,
             Some(Overlay::Finder(_) | Overlay::Command(_)) => Mode::Prompt,
-            Some(Overlay::Search(_) | Overlay::Ask(_) | Overlay::Outbox(_) | Overlay::Quick(_)) => {
-                Mode::Menu
-            }
+            Some(
+                Overlay::Search(_)
+                | Overlay::Ask(_)
+                | Overlay::Outbox(_)
+                | Overlay::Quick(_)
+                | Overlay::Report(_),
+            ) => Mode::Menu,
             None => match self.screen {
                 // Checked before the visual selection, not after: the manual
                 // can be opened mid-selection and read, and while it is on
@@ -1534,6 +1628,31 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                             note = Some(Err(format!("ask: {error}")));
                         }
                     }
+                }
+            }
+            apply_note(model, note);
+            Vec::new()
+        }
+        Msg::Report { generation, event } => {
+            let mut note = None;
+            if let Some(Overlay::Report(pane)) = model.overlay.as_mut() {
+                match event {
+                    ReportEvent::Frame {
+                        fill,
+                        rows,
+                        complete,
+                    } => {
+                        let last = complete && generation == pane.generation;
+                        pane.apply(generation, fill, rows, complete);
+                        if last {
+                            note = Some(Ok(report_summary(pane)));
+                        }
+                    }
+                    ReportEvent::Failed(error) if generation == pane.generation => {
+                        pane.fail(generation, error.clone());
+                        note = Some(Err(format!("{}: {error}", pane.invocation.verb.join(" "))));
+                    }
+                    ReportEvent::Failed(_) => {}
                 }
             }
             apply_note(model, note);
@@ -2012,6 +2131,7 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
         Action::AiQuick => open_quick(model),
         Action::OutboxOpen => open_outbox(model),
         Action::OutboxCancel => undo_send(model),
+        Action::ReportRerun => rerun_report(model),
         Action::PromptAccept => prompt_accept(model),
         Action::PromptComplete => prompt_complete(model),
         Action::MenuAccept => menu_accept(model),
@@ -2247,7 +2367,19 @@ fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
         if !matches!(overlay, Overlay::Help) {
             model.info("cancelled");
         }
-        return cancels(&overlay);
+        let stop = cancels(&overlay);
+        // A question asked over a report puts the report back rather than
+        // dropping two layers for one `n`: declining the question is not
+        // asking to leave the screen it was asked on, and the report's own
+        // stream is still the one running.
+        if let Overlay::Confirm {
+            then: Confirmed::Invoke { over, .. },
+            ..
+        } = overlay
+        {
+            model.overlay = Some(Overlay::Report(over));
+        }
+        return stop;
     }
     // The manual's own layers, innermost first: the search line, then the
     // highlight it left behind, then the manual itself. Ahead of the visual
@@ -2304,6 +2436,7 @@ fn streams_of(overlay: &Overlay) -> &'static [Stream] {
         Overlay::Search(_) => &[Stream::Search, Stream::Explain],
         Overlay::Finder(_) => &[Stream::Find],
         Overlay::Ask(_) => &[Stream::Ask],
+        Overlay::Report(_) => &[Stream::Report],
         Overlay::Help
         | Overlay::Pick { .. }
         | Overlay::Confirm { .. }
@@ -2462,18 +2595,26 @@ fn accept_pick(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn accept_confirm(model: &mut Model) -> Vec<Cmd> {
-    let message_ids = match model.overlay.take() {
-        Some(Overlay::Confirm { message_ids, .. }) => message_ids,
+    let then = match model.overlay.take() {
+        Some(Overlay::Confirm { then, .. }) => then,
         other => {
             model.overlay = other;
             return Vec::new();
         }
     };
-    model.inflight += message_ids.len();
-    message_ids
-        .into_iter()
-        .map(|message_id| Cmd::Delete { message_id })
-        .collect()
+    match then {
+        Confirmed::Delete(message_ids) => {
+            model.inflight += message_ids.len();
+            message_ids
+                .into_iter()
+                .map(|message_id| Cmd::Delete { message_id })
+                .collect()
+        }
+        // Straight back through the one dispatcher, carrying the bang the gate
+        // stamped on it — so the answered question is not asked again, and a
+        // confirmed row does exactly what typing that line with a `!` does.
+        Confirmed::Invoke { invocation, over } => run_row(model, *invocation, over),
+    }
 }
 
 fn submit(model: &mut Model) -> Vec<Cmd> {
@@ -2602,7 +2743,7 @@ fn confirm_delete(model: &mut Model) -> Vec<Cmd> {
     model.visual = None;
     model.overlay = Some(Overlay::Confirm {
         prompt,
-        message_ids: ids,
+        then: Confirmed::Delete(ids),
     });
     Vec::new()
 }
@@ -3364,11 +3505,19 @@ fn carries_a_flag(line: &str) -> bool {
     line.split_whitespace().any(|word| word.starts_with('-'))
 }
 
-/// Show `why` inside the command line, leaving the overlay up.
+/// Show `why` inside the command line, leaving the overlay up — or on the
+/// status line when there is no command line to show it in.
+///
+/// The fallback is not decoration: a report row's command is dispatched with
+/// the report down and no command line ever opened (task 90's [`run_row`]), and
+/// a refusal written only into an overlay that is not there is a keystroke that
+/// silently did nothing.
 fn complain(model: &mut Model, why: String) -> Vec<Cmd> {
     if let Some(Overlay::Command(pane)) = model.overlay.as_mut() {
         pane.error = Some(why);
+        return Vec::new();
     }
+    model.fail(why);
     Vec::new()
 }
 
@@ -3478,6 +3627,18 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         // dispatch has not learned — rather than claiming the verb has no
         // such flag, which by then would be false.
         return complain(model, format!("{verb} --{}: not wired up yet", flag.name));
+    }
+    // Task 90's verbs, after the argument guards rather than before them: these
+    // reach a capability with no `Action` behind them, so there is nothing to
+    // delegate to and they are named here — and a flag neither of them declares
+    // has to be refused rather than silently dropped on the way past.
+    // `auth status` answers with rows and opens a report; `auth clear` answers
+    // with a fact and does not.
+    if verb == "auth clear" {
+        return run_auth_clear(model);
+    }
+    if invocation.action.is_none() && invocation.capability.is_some() {
+        return open_report(model, invocation);
     }
     let Some(action) = invocation.action else {
         return complain(model, format!("{verb} is not something this TUI runs"));
@@ -3603,6 +3764,165 @@ fn browse_history(model: &mut Model, direction: Direction) -> bool {
     pane.error = None;
     refresh_command(model);
     true
+}
+
+// ---------------------------------------------------------------------------
+// reports
+// ---------------------------------------------------------------------------
+
+/// The title, columns and request a reporting verb answers with, or `None`
+/// when this build has no report for it.
+///
+/// The seam tasks 94 onward extend. Keyed on the verb path rather than on the
+/// capability because the *presentation* is a client decision — how wide a
+/// column is, what the border says — and two verbs over one capability may
+/// well want different ones. One function rather than one per caller so
+/// opening a report and re-running it cannot disagree about either.
+fn report_spec(verb: &str, generation: u64) -> Option<(String, Vec<ReportColumn>, Cmd)> {
+    match verb {
+        "auth status" => Some((
+            "auth — access to rmail's own API".to_owned(),
+            vec![
+                ReportColumn::new("setting", 21),
+                ReportColumn::new("state", 48),
+            ],
+            Cmd::AuthStatus { generation },
+        )),
+        _ => None,
+    }
+}
+
+/// Open a report for `invocation`, or say why this build has none for it.
+fn open_report(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd> {
+    let verb = invocation.verb.join(" ");
+    let generation = model.generation + 1;
+    let Some((title, columns, cmd)) = report_spec(&verb, generation) else {
+        return complain(
+            model,
+            format!("{verb} reaches the daemon, but this build has no report for it"),
+        );
+    };
+    model.generation = generation;
+    close_command(model);
+    model.overlay = Some(Overlay::Report(Box::new(ReportPane::new(
+        invocation, title, columns, generation,
+    ))));
+    model.info(format!("{verb} — r re-runs · Esc closes"));
+    vec![cmd]
+}
+
+/// `r` — run this report's own `:` line again.
+///
+/// Restarted in place rather than rebuilt, so the pane keeps its title, its
+/// columns and — deliberately — its cursor (see [`ReportPane::restart`]): a
+/// re-run is the same report asked again, not a differently shaped one.
+///
+/// The new generation is what makes it immune to the previous run's tail: a
+/// frame still in flight is dropped by [`ReportPane::apply`] rather than mixed
+/// into the new answer. No [`Cmd::CancelStream`] is issued, for the reason
+/// `restart_search` spells out — the *superseding request* is what cancels the
+/// old stream (`tui::grpc`'s `reporting` slot aborts the task it replaces), and
+/// an explicit cancel is needed only where no new request follows.
+fn rerun_report(model: &mut Model) -> Vec<Cmd> {
+    let Some(Overlay::Report(pane)) = model.overlay.as_ref() else {
+        return Vec::new();
+    };
+    let verb = pane.invocation.verb.join(" ");
+    let generation = model.generation + 1;
+    let Some((_, _, cmd)) = report_spec(&verb, generation) else {
+        // Unreachable: the pane exists because `report_spec` answered for this
+        // verb when it opened, and the registry does not change at runtime. A
+        // status line saying so beats an `unwrap` nobody can check from here.
+        model.fail(format!("{verb} can no longer be re-run"));
+        return Vec::new();
+    };
+    model.generation = generation;
+    if let Some(Overlay::Report(pane)) = model.overlay.as_mut() {
+        pane.restart(generation);
+    }
+    model.info(format!("{verb} — re-running…"));
+    vec![cmd]
+}
+
+/// `<enter>` on a report row: run what the row carries, asking first when it
+/// mutates.
+///
+/// The gate reads [`Capability::effect`] through [`report::mutates`] rather
+/// than a list of dangerous verbs kept here — see that function's docs. A
+/// mutating row becomes an [`Overlay::Confirm`] carrying both the bang'd
+/// invocation and the report itself, so `y` runs it without asking twice and
+/// either answer leaves the reader on the screen they were reading.
+fn run_report_row(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd> {
+    let Some(Overlay::Report(over)) = model.overlay.take() else {
+        return Vec::new();
+    };
+    if !report::mutates(&invocation) || invocation.bang {
+        return run_row(model, invocation, over);
+    }
+    let prompt = format!(":{} — run it? [y/N]", invocation.verb.join(" "));
+    model.overlay = Some(Overlay::Confirm {
+        prompt,
+        then: Confirmed::Invoke {
+            invocation: Box::new(command::Invocation {
+                bang: true,
+                ..invocation
+            }),
+            over,
+        },
+    });
+    Vec::new()
+}
+
+/// Run a row's command with the report down, and put the report back unless
+/// the command put something else in its place.
+///
+/// Down first for the reason [`close_command`] takes the command line down:
+/// every action reads [`Model::mode`], and `cursor.down` dispatched with the
+/// report still up would move the *report's* cursor rather than doing whatever
+/// the row's verb is about.
+///
+/// Back afterwards, marked stale. Stale rather than re-read: the mutation is
+/// still in flight when this returns, so a re-run issued here would race it and
+/// could redraw the state from *before* the change — which is worse than saying
+/// plainly that the rows are from before it. `r` is what re-reads, and the
+/// title says so.
+fn run_row(
+    model: &mut Model,
+    invocation: command::Invocation,
+    mut over: Box<ReportPane>,
+) -> Vec<Cmd> {
+    let stale = report::mutates(&invocation);
+    let cmds = run_invocation(model, invocation);
+    if model.overlay.is_none() {
+        over.stale = over.stale || stale;
+        model.overlay = Some(Overlay::Report(over));
+    }
+    cmds
+}
+
+/// What the status line says once a report has finished arriving.
+fn report_summary(pane: &ReportPane) -> String {
+    let verb = pane.invocation.verb.join(" ");
+    match pane.rows.len() {
+        0 => format!("{verb} — nothing to report"),
+        1 => format!("{verb} — 1 row · r re-runs"),
+        n => format!("{verb} — {n} rows · r re-runs"),
+    }
+}
+
+/// `:auth clear` — remove the password gate.
+///
+/// Not a report: it answers with a fact, not with rows, and the status line is
+/// where a one-line answer belongs. It is here because it is the mutating row
+/// `:auth status`'s report offers, and the confirmation that row goes through
+/// is [`run_report_row`]'s — typed bare on the command line it is confirmed by
+/// nothing, exactly as `mail auth clear` is, because a line somebody typed in
+/// full is already the deliberate act a confirmation asks for.
+fn run_auth_clear(model: &mut Model) -> Vec<Cmd> {
+    close_command(model);
+    model.inflight += 1;
+    model.info("clearing the password…");
+    vec![Cmd::AuthClear]
 }
 
 /// Run `id` as a command, if this build has one by that name.
@@ -3804,6 +4124,8 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Message(i64),
         Outbox,
         Quick(QuickAction),
+        /// A report row carrying something to run.
+        Row(Box<command::Invocation>),
         /// The row under the cursor is a manual link.
         ManualLink,
         /// There is no row cursor here, so "use the highlighted row" is
@@ -3821,6 +4143,12 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         }),
         Some(Overlay::Outbox(_)) => Chosen::Outbox,
         Some(Overlay::Quick(pane)) => pane.action().map_or(Chosen::Nothing, Chosen::Quick),
+        Some(Overlay::Report(pane)) => pane
+            .row()
+            .and_then(|row| row.on_enter.clone())
+            .map_or(Chosen::Nothing, |invocation| {
+                Chosen::Row(Box::new(invocation))
+            }),
         // Task 102 gives the key reference a row cursor of its own; until it
         // does, `<enter>` there closes it, exactly as before this action was
         // bound to that key.
@@ -3832,6 +4160,7 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Chosen::Message(message_id) => open_message_by_id(model, message_id),
         Chosen::Outbox => describe_outbox_row(model),
         Chosen::Quick(action) => run_quick(model, action),
+        Chosen::Row(invocation) => run_report_row(model, *invocation),
         Chosen::ManualLink => follow_manual_link(model),
         Chosen::Close => leave(model, Leave::ThenNothing),
         Chosen::Nothing => Vec::new(),

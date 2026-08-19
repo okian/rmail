@@ -176,7 +176,7 @@ fn split_path(text: &str) -> Vec<&str> {
 /// no task behind it yet would be exactly the half-finished state this
 /// project's non-negotiables refuse.
 ///
-/// The two entries are task 103's, and they are the same action twice.
+/// The first two entries are task 103's, and they are the same action twice.
 /// [`Action::ManualGrep`] needs a *declared* positional (`:helpgrep
 /// invoice`), which an auto-derived verb has none of — the spelling
 /// difference between a grammar that can describe itself and one that
@@ -197,6 +197,18 @@ fn split_path(text: &str) -> Vec<&str> {
 /// convenience would have made the guard advisory. The page-name seam is
 /// therefore still `rmail_cli::tui::model::open_manual_at`, called directly,
 /// which is what task 102's `K`-on-a-key-reference-row does.
+///
+/// The last two are task 90's, and they are the first verbs here that reach a
+/// [`Capability`] with **no** [`Action`] behind them — the shape
+/// `tests::every_declared_verb_spells_its_capability_like_the_cli` was written
+/// for and had until now no registry entry to check. `ClientAuthService` is
+/// the one capability family no later task in `tasks.md` claims, and a TUI
+/// that cannot answer "does this daemon want a password" has to be quit and
+/// re-entered through `mail auth status` to find out; both paths spell the
+/// verb exactly as `mail` does, so `spells_like_its_capability` holds with no
+/// [`Verb::cli_alias`]. They also make task 90's Report reachable by typing:
+/// `:auth status` renders one, and `auth clear` is the mutating row that
+/// report's confirmation gate is about.
 ///
 /// A function, not a `const` slice: [`Verb::path`] is a `Vec`, which cannot
 /// appear in a `const` initializer at all (`Vec::new` allocates), so a
@@ -228,6 +240,22 @@ fn explicit() -> Vec<Verb> {
             capability: None,
             action: Some(Action::ManualGrep),
             positionals: PATTERN,
+            flags: &[],
+            cli_alias: None,
+        },
+        Verb {
+            path: vec!["auth", "status"],
+            capability: Some(Capability::ClientAuthAuthStatus),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+        },
+        Verb {
+            path: vec!["auth", "clear"],
+            capability: Some(Capability::ClientAuthClearPassword),
+            action: None,
+            positionals: &[],
             flags: &[],
             cli_alias: None,
         },
