@@ -486,7 +486,7 @@ pub const PAGES: &[Page] = &[
         anchor: "keys-toml",
         title: "keys.toml",
         body: Body::Authored(include_str!("manual/pages/keys-toml.md")),
-        documents: &[],
+        documents: &["help.rebind", "keys set"],
     },
     Page {
         anchor: "config-file",

@@ -217,7 +217,13 @@ impl Keymap {
 /// segment. Segments rather than characters, so `search` and `search.explain`
 /// answer `search` while `manual` and `menu.accept` answer nothing at all
 /// instead of the meaningless `m`.
-fn common_id_prefix(actions: impl Iterator<Item = Action>) -> String {
+///
+/// `pub`, not merely used inside [`Keymap::continuations`]: it takes any
+/// `impl Iterator<Item = Action>`, with no dependency on a chord or a
+/// pending prefix, so task 102's key reference reuses it unchanged to label
+/// groups over *every* action bound in a mode rather than one chord's
+/// continuations.
+pub fn common_id_prefix(actions: impl Iterator<Item = Action>) -> String {
     let mut common: Option<Vec<&str>> = None;
     for action in actions {
         let segments: Vec<&str> = action.id().split('.').collect();

@@ -82,7 +82,8 @@ use super::history;
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
 use super::model::{
-    wire, AskEvent, Cmd, Effect, FinderEvent, Msg, ReportEvent, SearchEvent, Stream,
+    wire, write_keybinding, AskEvent, Cmd, Effect, FinderEvent, Msg, ReportEvent, SearchEvent,
+    Stream,
 };
 use super::report::{ReportFill, ReportRow, ReportTone};
 use super::status::{Health, Subsystem};
@@ -910,6 +911,31 @@ impl CmdExec for GrpcExec {
                             "could not write the command history",
                         );
                     }
+                });
+            }
+            Cmd::WriteKeybinding {
+                path,
+                mode,
+                chord,
+                action,
+                label,
+            } => {
+                // Plain `spawn`, not `spawn_superseding`: two `:keys set`
+                // invocations are independent edits, not the same growing
+                // list `SaveHistory` re-sends whole — cancelling the first
+                // because a second one landed would strand its `inflight`
+                // increment with no `Msg::KeysWritten` ever arriving to
+                // release it.
+                self.spawn(out, async move {
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        write_keybinding(&path, mode, &chord, action)
+                    })
+                    .await;
+                    let result = match outcome {
+                        Ok(result) => result,
+                        Err(join_error) => Err(join_error.to_string()),
+                    };
+                    Msg::KeysWritten { label, result }
                 });
             }
             Cmd::Countdown { until } => {

@@ -535,7 +535,7 @@ fn q_backs_out_of_the_viewer_before_it_quits() {
 #[test]
 fn ctrl_c_quits_from_anywhere_including_a_modal() {
     let mut model = loaded();
-    model.overlay = Some(Overlay::Help);
+    press(&mut model, Key::Char('?'));
     press(&mut model, Key::CTRL_C);
     assert!(model.quit);
 }
@@ -549,12 +549,36 @@ fn question_mark_opens_help_and_it_closes_on_q_esc_or_another_question_mark() {
     for closer in [Key::Char('q'), Key::Esc, Key::Char('?')] {
         let mut model = loaded();
         press(&mut model, Key::Char('?'));
-        assert_eq!(model.overlay, Some(Overlay::Help));
+        assert!(matches!(model.overlay, Some(Overlay::Help(_))));
 
         press(&mut model, closer);
         assert_eq!(model.overlay, None, "{closer:?} closed the help");
         assert!(!model.quit, "{closer:?} must not also quit");
     }
+}
+
+#[test]
+fn esc_on_the_key_reference_is_silent_while_browsing_but_says_cancelled_while_filtering() {
+    // `leave()`'s two branches: browsing the key reference and backing out
+    // with Esc says nothing, matching every other cursor key on this
+    // overlay; Esc *while typing a filter* says "cancelled", the same as
+    // leaving any other prompt mid-edit.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    let status_before = model.status.clone();
+    press(&mut model, Key::Esc);
+    assert_eq!(model.overlay, None);
+    assert_eq!(
+        model.status, status_before,
+        "browsing and backing out must not touch the status line"
+    );
+
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    press(&mut model, Key::Char('/'));
+    press(&mut model, Key::Esc);
+    assert_eq!(model.overlay, None);
+    assert_eq!(model.status, "cancelled");
 }
 
 #[test]
@@ -1433,6 +1457,55 @@ fn a_reloaded_keymap_changes_what_a_key_does() {
 }
 
 #[test]
+fn a_keymap_reload_updates_the_open_key_references_rows_without_resetting_its_cursor() {
+    // Task 102's own regression: `HelpPane::rows` is cached (`help.rs`'s
+    // module docs explain why) and `Msg::Keymap` used to swap `model.keymap`
+    // without ever recomputing it, so a rebind made from a second terminal
+    // — or from this very overlay's own `c` row action — took effect in the
+    // keymap immediately but stayed invisible on screen until the overlay
+    // was closed and reopened.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    assert_eq!(help_pane_mode(&model), Mode::Normal);
+    press(&mut model, Key::Char('j'));
+    let cursor_before = help_pane_cursor(&model);
+    assert_eq!(cursor_before, 1, "moved off the top before the reload");
+
+    update(
+        &mut model,
+        Msg::Keymap {
+            result: Ok(keymap_from("[normal]\nz = \"cursor.down\"\n")),
+            announce: false,
+        },
+    );
+
+    assert_eq!(
+        help_pane_cursor(&model),
+        cursor_before,
+        "a background reload must not reset where the cursor was, unlike a \
+         mode switch or a filter edit"
+    );
+    match model.overlay.as_ref() {
+        Some(Overlay::Help(pane)) => {
+            let cursor_down = pane.rows.iter().find_map(|row| match row {
+                help::Row::Binding {
+                    action: Action::CursorDown,
+                    chords,
+                    ..
+                } => Some(chords.as_str()),
+                _ => None,
+            });
+            assert!(
+                cursor_down.unwrap_or_default().contains('z'),
+                "the reload must reach the cached rows, not just model.keymap: {:?}",
+                pane.rows
+            );
+        }
+        other => panic!("expected the key reference to still be open: {other:?}"),
+    }
+}
+
+#[test]
 fn a_silent_load_does_not_stamp_on_the_status_line() {
     let mut model = Model::new();
     update(&mut model, Msg::Boot);
@@ -2220,14 +2293,50 @@ fn enter_on_a_row_with_no_link_says_so_rather_than_doing_nothing() {
 }
 
 #[test]
-fn enter_still_closes_the_key_reference_overlay() {
+fn enter_on_the_key_reference_runs_the_highlighted_action() {
     // `<enter>` in `Mode::Help` moved from `Action::Cancel` to
-    // `Action::MenuAccept` so that the manual could use it to follow a link.
-    // The `?` overlay has no row cursor, so the behaviour there must not have
-    // changed — task 102 is what replaces it with something richer.
+    // `Action::MenuAccept` so that the manual could use it to follow a link;
+    // through task 102 the `?` overlay itself had no row cursor, so it fell
+    // through to closing. It has one now.
+    //
+    // `<c-o>` cycles backward through `Mode::CONFIGURABLE`, which wraps
+    // `Normal` (index 0) straight to `Help` (its last entry) in one press —
+    // landing on a mode where `c`/`help.rebind` is a row: unique enough
+    // (nothing else's id or description mentions "rebind") that filtering
+    // for it cannot leave more than the one match, and running it is
+    // independently verifiable — it replaces the overlay with a pre-filled
+    // command line — without this test depending on which action this
+    // build's defaults happen to sort first anywhere else.
     let mut model = loaded();
     press(&mut model, Key::Char('?'));
-    assert_eq!(model.overlay, Some(Overlay::Help));
+    press(&mut model, Key::ctrl('o'));
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "rebind");
+    press(&mut model, Key::Enter);
+    assert!(
+        matches!(model.overlay, Some(Overlay::Help(_))),
+        "typing and submitting a filter must not by itself close the overlay"
+    );
+
+    press(&mut model, Key::Enter);
+    match model.overlay.as_ref() {
+        Some(Overlay::Command(pane)) => {
+            assert_eq!(pane.input, "keys set c help.rebind --mode=help")
+        }
+        other => panic!("expected a pre-filled command line, got {other:?}"),
+    }
+}
+
+#[test]
+fn enter_on_an_empty_key_reference_filter_result_still_closes_it() {
+    // The fallback the old, cursorless `<enter>` always took — still correct
+    // now that "nothing is highlighted" is one case among several rather
+    // than the only one.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "no such binding exists anywhere in this build");
+    press(&mut model, Key::Enter);
     press(&mut model, Key::Enter);
     assert_eq!(model.overlay, None);
     assert!(!model.quit);
@@ -2538,34 +2647,162 @@ fn a_jump_restores_what_was_highlighted_on_the_page_it_returns_to() {
 }
 
 #[test]
-fn n_and_the_jump_keys_are_silent_when_the_manual_is_not_open() {
-    // `Mode::Help` is the `?` overlay's layer as well as the manual's, so
-    // every binding added for the manual has to be inert there. `n` was not:
-    // it painted a red "nothing searched for yet — / searches this page" over
+fn n_and_capital_n_are_silent_when_the_manual_is_not_open() {
+    // `Mode::Help` is the `?` overlay's layer as well as the manual's, so a
+    // binding added for the manual has to be inert there. `n` was not: it
+    // painted a red "nothing searched for yet — / searches this page" over
     // the status line, about a page the reader is not on.
-    for key in [
-        Key::Char('n'),
-        Key::Char('N'),
-        Key::ctrl('o'),
-        Key::ctrl('i'),
-        Key::Tab,
-        Key::Char('j'),
-        Key::Char('k'),
-        Key::Char('/'),
-    ] {
+    //
+    // This used to also cover `<c-o>`/`<c-i>`/`<tab>`/`j`/`k`/`/` — every
+    // other binding this layer shares with the manual — but task 102 gives
+    // every one of those a real effect on the `?` overlay itself (cycling
+    // its mode, moving its row cursor, starting its filter), so "silent" is
+    // no longer honestly what they are even where the specific fields this
+    // test happens to check still hold. They get their own tests below.
+    for key in [Key::Char('n'), Key::Char('N')] {
         let mut model = loaded();
         press(&mut model, Key::Char('?'));
         model.info("2 message(s)");
 
         let cmds = press(&mut model, key);
         assert!(cmds.is_empty(), "{key:?} issued work: {cmds:?}");
-        assert_eq!(model.overlay, Some(Overlay::Help), "{key:?} closed it");
+        assert!(
+            matches!(model.overlay, Some(Overlay::Help(_))),
+            "{key:?} closed it"
+        );
         assert_eq!(
             (model.level, model.status.as_str()),
             (Level::Info, "2 message(s)"),
             "{key:?} wrote to the status line"
         );
         assert_eq!(model.message_idx, 0, "{key:?} moved the list behind it");
+    }
+}
+
+fn help_pane_mode(model: &Model) -> Mode {
+    match model.overlay.as_ref() {
+        Some(Overlay::Help(pane)) => pane.mode,
+        other => panic!("expected the key reference to be open: {other:?}"),
+    }
+}
+
+fn help_pane_cursor(model: &Model) -> usize {
+    match model.overlay.as_ref() {
+        Some(Overlay::Help(pane)) => pane.cursor,
+        other => panic!("expected the key reference to be open: {other:?}"),
+    }
+}
+
+#[test]
+fn j_and_k_move_the_key_references_own_row_cursor() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    model.info("2 message(s)");
+    let before = help_pane_cursor(&model);
+
+    press(&mut model, Key::Char('j'));
+    assert_eq!(help_pane_cursor(&model), before + 1, "j moves it down");
+
+    press(&mut model, Key::Char('k'));
+    assert_eq!(help_pane_cursor(&model), before, "k undoes it");
+    assert_eq!(
+        model.status, "2 message(s)",
+        "moving the row cursor must not touch the status line behind it"
+    );
+}
+
+#[test]
+fn tab_and_ctrl_o_cycle_the_key_references_mode_both_ways() {
+    // `<c-o>` (back) from `Normal`, `Mode::CONFIGURABLE`'s first entry,
+    // wraps to `Help`, its last — proving the cycle actually wraps rather
+    // than merely clamping at an end. `<c-i>` is then checked as a second,
+    // independent forward step from `Normal` rather than assumed identical
+    // to `<tab>` just because both are bound to `Action::ManualForward`.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    model.info("2 message(s)");
+    assert_eq!(help_pane_mode(&model), Mode::Normal);
+
+    press(&mut model, Key::ctrl('o'));
+    assert_eq!(
+        help_pane_mode(&model),
+        Mode::Help,
+        "back from the first wraps to the last"
+    );
+
+    press(&mut model, Key::Tab);
+    assert_eq!(
+        help_pane_mode(&model),
+        Mode::Normal,
+        "forward from the last wraps to the first"
+    );
+
+    press(&mut model, Key::ctrl('i'));
+    assert_eq!(
+        help_pane_mode(&model),
+        Mode::Viewer,
+        "<c-i> steps forward too"
+    );
+    assert_eq!(
+        model.status, "2 message(s)",
+        "cycling the mode must not touch the status line behind it"
+    );
+}
+
+#[test]
+fn cycling_the_key_references_mode_resets_its_cursor_and_rows() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    press(&mut model, Key::Char('j'));
+    assert_eq!(help_pane_cursor(&model), 1, "moved before cycling");
+
+    press(&mut model, Key::ctrl('o'));
+    assert_eq!(
+        help_pane_cursor(&model),
+        0,
+        "a new mode's rows are a different list; the old numeric position \
+         is not a row in it worth staying on"
+    );
+}
+
+#[test]
+fn slash_starts_filtering_the_key_reference_instead_of_opening_a_second_overlay() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    model.info("2 message(s)");
+    press(&mut model, Key::Char('/'));
+    match model.overlay.as_ref() {
+        Some(Overlay::Help(pane)) => assert!(pane.editing, "/ should start editing the filter"),
+        other => panic!("/ must not open a second overlay: {other:?}"),
+    }
+    assert_eq!(
+        model.status, "2 message(s)",
+        "starting the filter must not touch the status line behind it"
+    );
+}
+
+#[test]
+fn typing_into_the_key_references_filter_narrows_its_rows_live() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    let before = match model.overlay.as_ref() {
+        Some(Overlay::Help(pane)) => pane.rows.len(),
+        other => panic!("expected the key reference to be open: {other:?}"),
+    };
+
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "rebind");
+    match model.overlay.as_ref() {
+        Some(Overlay::Help(pane)) => {
+            assert_eq!(pane.filter, "rebind");
+            assert!(
+                pane.rows.len() < before,
+                "a specific filter must narrow the rows, not just add a query \
+                 nobody reads: {before} before, {} after",
+                pane.rows.len()
+            );
+        }
+        other => panic!("expected the key reference to be open: {other:?}"),
     }
 }
 
@@ -2670,7 +2907,7 @@ fn a_verb_with_no_arguments_delegates_straight_to_run_action() {
     command(&mut by_line, "help");
     press(&mut by_line, Key::Enter);
 
-    assert!(matches!(by_key.overlay, Some(Overlay::Help)));
+    assert!(matches!(by_key.overlay, Some(Overlay::Help(_))));
     assert_eq!(by_line.overlay, by_key.overlay);
     assert_eq!(by_line.screen, by_key.screen);
 }
@@ -3473,6 +3710,404 @@ fn set_with_a_missing_value_is_refused_cleanly_not_a_panic() {
     assert!(
         command_pane(&model).error.is_some(),
         "a half-given set must surface as an error, not silently no-op"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `:keys set` (task 102)
+// ---------------------------------------------------------------------------
+
+fn chord(text: &str) -> Chord {
+    match Chord::parse(text) {
+        Ok(chord) => chord,
+        Err(error) => panic!("{text:?} should parse: {error}"),
+    }
+}
+
+/// A `keys.toml` in the OS temp directory, unique per test and removed on
+/// drop — the same reason `keys_cli::tests::TempKeys` exists: `$RMAIL_KEYS`
+/// is process-global, and `set_keybinding` takes a path directly rather than
+/// resolving it, so a real environment variable never needs setting here at
+/// all (`crate::keys_cli::tests`' own module docs record why that matters).
+struct TempKeys(std::path::PathBuf);
+
+impl TempKeys {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        Self(std::env::temp_dir().join(format!("rmail-tui-model-tests-{pid}-{n}.toml")))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn read(&self) -> String {
+        std::fs::read_to_string(&self.0).unwrap_or_default()
+    }
+}
+
+impl Drop for TempKeys {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn keys_set_writes_the_file_and_reports_success() {
+    let keys = TempKeys::new();
+    let mut model = loaded();
+    let cmds = set_keybinding(&mut model, keys.path(), "normal", "<c-d>", "cursor.down");
+    let Some(Cmd::WriteKeybinding {
+        path,
+        mode,
+        chord: bound_chord,
+        action,
+        label,
+    }) = cmds.into_iter().next()
+    else {
+        panic!("expected a WriteKeybinding command");
+    };
+    assert_eq!(path.as_path(), keys.path());
+    assert_eq!(
+        model.inflight, 1,
+        "dispatching the write must count as outstanding work, the same as \
+         any other RPC-backed verb"
+    );
+
+    // The blocking half runs off the executor in production; called
+    // directly here for the same reason `archive_moves_the_message_into_the_archive_folder`
+    // hand-builds `Msg::Done` rather than running a real RPC.
+    let result = write_keybinding(&path, mode, &bound_chord, action);
+    assert!(result.is_ok(), "{result:?}");
+    update(&mut model, Msg::KeysWritten { label, result });
+    assert_eq!(model.inflight, 0, "the completion must release it again");
+
+    assert!(keys.read().contains("cursor.down"), "{}", keys.read());
+    let written = match keys_file::parse(&keys.read(), "keys.toml") {
+        Ok(keymap) => keymap,
+        Err(error) => panic!("what write_keybinding wrote does not parse: {error}"),
+    };
+    assert_eq!(
+        written.lookup(Mode::Normal, &chord("<c-d>")),
+        Some(Action::CursorDown),
+        "what it wrote is what the TUI would load back"
+    );
+    assert!(
+        model.status.contains("<c-d>") && model.status.contains("cursor.down"),
+        "{}",
+        model.status
+    );
+}
+
+#[test]
+fn keys_set_writes_to_the_flagged_mode_not_normal() {
+    let keys = TempKeys::new();
+    let mut model = loaded();
+    let cmds = set_keybinding(&mut model, keys.path(), "viewer", "z", "cursor.down");
+    let Some(Cmd::WriteKeybinding {
+        path,
+        mode,
+        chord: bound_chord,
+        action,
+        label,
+    }) = cmds.into_iter().next()
+    else {
+        panic!("expected a WriteKeybinding command");
+    };
+    let result = write_keybinding(&path, mode, &bound_chord, action);
+    update(&mut model, Msg::KeysWritten { label, result });
+
+    let written = match keys_file::parse(&keys.read(), "keys.toml") {
+        Ok(keymap) => keymap,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(
+        written.lookup(Mode::Viewer, &chord("z")),
+        Some(Action::CursorDown)
+    );
+    assert_eq!(
+        written.lookup(Mode::Normal, &chord("z")),
+        None,
+        "must land only in the mode asked for"
+    );
+}
+
+#[test]
+fn keys_set_rejects_an_unknown_mode_and_writes_nothing() {
+    // `complain` writes into the command pane's own error line only while
+    // one is open — its fallback (`model.fail`, the status line) is what a
+    // caller with no overlay at all gets instead, which is not the shape
+    // `:keys set`'s real caller is ever in. Opening it first is what makes
+    // `command_pane` below the right place to have looked.
+    let keys = TempKeys::new();
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    set_keybinding(&mut model, keys.path(), "bogus", "z", "cursor.down");
+    assert!(command_pane(&model)
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("mode"));
+    assert!(
+        keys.read().is_empty(),
+        "a rejected mode must not touch the file"
+    );
+}
+
+#[test]
+fn keys_set_rejects_an_unparseable_chord() {
+    let keys = TempKeys::new();
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    set_keybinding(
+        &mut model,
+        keys.path(),
+        "normal",
+        "<not-a-key>",
+        "cursor.down",
+    );
+    assert!(command_pane(&model).error.is_some());
+    assert!(keys.read().is_empty());
+}
+
+#[test]
+fn keys_set_rejects_an_unknown_action() {
+    let keys = TempKeys::new();
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    set_keybinding(&mut model, keys.path(), "normal", "z", "no.such.action");
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("no.such.action"), "{why}");
+    assert!(keys.read().is_empty());
+}
+
+#[test]
+fn keys_set_refuses_a_reserved_chord() {
+    // `<esc>` is the way out from every mode there is (`Chord::is_reserved`)
+    // and stays that way regardless of what a config file asks for.
+    // `Chord::parse` alone cannot see this — it is a syntactically ordinary
+    // chord — so the refusal has to survive all the way through
+    // `write_keybinding`'s call into `keys_file::edit`, which is the one
+    // place `Keymap::bind`'s own reserved check actually runs.
+    let keys = TempKeys::new();
+    let mut model = loaded();
+    let cmds = set_keybinding(&mut model, keys.path(), "normal", "<esc>", "quit");
+    let Some(Cmd::WriteKeybinding {
+        path,
+        mode,
+        chord: bound_chord,
+        action,
+        label,
+    }) = cmds.into_iter().next()
+    else {
+        panic!(
+            "expected a WriteKeybinding command — reserved-ness is not caught by validation alone"
+        );
+    };
+    let result = write_keybinding(&path, mode, &bound_chord, action);
+    assert!(result.is_err(), "<esc> must stay unbindable");
+    update(&mut model, Msg::KeysWritten { label, result });
+    assert_eq!(model.level, Level::Error);
+    assert!(
+        keys.read().is_empty(),
+        "a refused edit must not touch the file"
+    );
+}
+
+#[test]
+fn keys_set_reports_an_already_broken_file_rather_than_half_fixing_it() {
+    // Validation alone cannot see this: the mode, chord and action are all
+    // well-formed, so `set_keybinding` dispatches `Cmd::WriteKeybinding`
+    // same as a healthy run would, and only `write_keybinding` — off in the
+    // blocking half — discovers the file itself will not parse. The failure
+    // therefore reaches the status line via `Msg::KeysWritten`, not the
+    // command pane's inline error: the pane already closed when the
+    // command was dispatched, the same as every other verb that reaches
+    // the daemon rather than failing synchronously.
+    let keys = TempKeys::new();
+    std::fs::write(keys.path(), "this is not [ valid toml")
+        .unwrap_or_else(|error| panic!("test setup: could not write the fixture file: {error}"));
+    let before = keys.read();
+
+    let mut model = loaded();
+    let cmds = set_keybinding(&mut model, keys.path(), "normal", "z", "cursor.down");
+    let Some(Cmd::WriteKeybinding {
+        path,
+        mode,
+        chord: bound_chord,
+        action,
+        label,
+    }) = cmds.into_iter().next()
+    else {
+        panic!("expected a WriteKeybinding command");
+    };
+    assert_eq!(model.inflight, 1);
+    let result = write_keybinding(&path, mode, &bound_chord, action);
+    assert!(
+        result.is_err(),
+        "an already-broken file must not parse as an edit target"
+    );
+    update(&mut model, Msg::KeysWritten { label, result });
+    assert_eq!(
+        model.inflight, 0,
+        "a failure must release the counter too, not just success"
+    );
+
+    assert_eq!(model.level, Level::Error);
+    assert_eq!(
+        keys.read(),
+        before,
+        "a file that already fails to parse must be left exactly as it was"
+    );
+}
+
+#[test]
+fn typing_keys_set_with_a_trailing_mode_flag_parses_and_dispatches() {
+    // Every other `:keys set` test drives `set_keybinding` directly, which
+    // proves nothing about the line as *typed* — specifically the trailing,
+    // equals-joined `--mode=` form `open_help_rebind` actually prefills.
+    // This one goes through the real `command::parse` and `run_invocation`.
+    // Never executed, so `keys_path_from_env`'s real, un-injected path
+    // costs nothing here.
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    keys(&mut model, "keys set <c-d> cursor.down --mode=viewer");
+    let cmds = press(&mut model, Key::Enter);
+    let Some(Cmd::WriteKeybinding {
+        mode,
+        chord: bound_chord,
+        action,
+        ..
+    }) = cmds.into_iter().next()
+    else {
+        panic!("expected the typed line to dispatch a WriteKeybinding command");
+    };
+    assert_eq!(mode, Mode::Viewer, "--mode reached set_keybinding");
+    assert_eq!(bound_chord, chord("<c-d>"));
+    assert_eq!(action, Action::CursorDown);
+}
+
+#[test]
+fn typing_keys_set_with_only_one_argument_is_refused_before_any_write() {
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    keys(&mut model, "keys set <c-d>");
+    let cmds = press(&mut model, Key::Enter);
+    // Not `cmds.is_empty()`: a parsed-but-refused line is still recorded to
+    // history (`a_line_refused_after_parsing_is_still_recorded`), which
+    // `update`'s own wrapper turns into a `Cmd::SaveHistory` regardless of
+    // what `run_invocation` decided. What must not be there is a write.
+    assert!(
+        !cmds
+            .iter()
+            .any(|cmd| matches!(cmd, Cmd::WriteKeybinding { .. })),
+        "a bad line must not dispatch a write: {cmds:?}"
+    );
+    assert!(command_pane(&model)
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("two arguments"));
+}
+
+#[test]
+fn c_on_a_key_reference_row_opens_the_same_prefilled_rebind_enter_does() {
+    // Two dispatch paths reach `Action::HelpRebind` — the direct `c`
+    // binding through `run_action`, and `<enter>` through `menu_accept`'s
+    // special case — and both have to produce the same line. Filesystem-free:
+    // this only checks what gets pre-filled, never submits it.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    press(&mut model, Key::ctrl('o'));
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "rebind");
+    press(&mut model, Key::Enter);
+
+    press(&mut model, Key::Char('c'));
+    match model.overlay.as_ref() {
+        Some(Overlay::Command(pane)) => {
+            assert_eq!(pane.input, "keys set c help.rebind --mode=help")
+        }
+        other => panic!("expected a pre-filled command line, got {other:?}"),
+    }
+}
+
+#[test]
+fn k_on_a_key_reference_row_navigates_to_that_actions_manual_page() {
+    // Task 102's third row action, alongside `<enter>` (runs it) and `c`
+    // (rebinds it): `K` opens the manual at the highlighted action's own
+    // home page — `open_manual` reading `help::selected` before falling
+    // back to `manual::START` — not the front page `K` opens everywhere
+    // else in this build.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "archive");
+    press(&mut model, Key::Enter);
+
+    press(&mut model, Key::Char('K'));
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Page("archive".to_owned()),
+        "K must land on the highlighted row's own page, not the front page"
+    );
+}
+
+#[test]
+fn rebind_targets_the_mode_that_actually_owns_the_binding_not_the_one_being_browsed() {
+    // `message.archive` is bound only in Normal (`a`); Viewer inherits it
+    // without restating it. Browsing the key reference from Viewer and
+    // rebinding it has to edit Normal's own layer — prefilling
+    // `--mode=viewer` would only add a Viewer-local shadow next to a
+    // binding still live everywhere Viewer's chain reaches, which is not
+    // what "rebind" means.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    press(&mut model, Key::Tab);
+    assert_eq!(help_pane_mode(&model), Mode::Viewer);
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "archive");
+    press(&mut model, Key::Enter);
+
+    press(&mut model, Key::Char('c'));
+    match model.overlay.as_ref() {
+        Some(Overlay::Command(pane)) => {
+            assert_eq!(pane.input, "keys set a message.archive")
+        }
+        other => panic!("expected a pre-filled command line, got {other:?}"),
+    }
+}
+
+#[test]
+fn rebind_refuses_an_action_whose_only_binding_is_global() {
+    // `quit`'s only chord, `<c-c>`, lives in `Mode::Global` — "the way out
+    // from every mode there is", deliberately not rebindable. Prefilling a
+    // command line here would either misname the mode (Global is not in
+    // `Mode::CONFIGURABLE`) or silently add a same-named shadow next to a
+    // binding still reachable everywhere; refusing outright is the honest
+    // answer.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    press(&mut model, Key::Char('/'));
+    keys(&mut model, "anywhere");
+    press(&mut model, Key::Enter);
+
+    press(&mut model, Key::Char('c'));
+    assert!(
+        matches!(model.overlay, Some(Overlay::Help(_))),
+        "a refused rebind must not open a command line to edit"
+    );
+    // Not just `Level::Error`: `open_help_rebind`'s other failure path
+    // (nothing highlighted) sets the same level, so that alone would still
+    // pass if the filter stopped matching `quit` and this test silently
+    // stopped testing what it claims to.
+    assert!(
+        model.status.contains("cannot be rebound"),
+        "{}",
+        model.status
     );
 }
 

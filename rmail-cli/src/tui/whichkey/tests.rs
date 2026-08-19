@@ -239,13 +239,18 @@ fn a_command_candidate_with_children_reads_as_a_group() {
     let mut model = loaded();
     press(&mut model, Key::Char(':'));
     let band = shown(&model);
-    // `message` has children (`message.archive`, …); `help` does not.
+    // `message` has children (`message.archive`, …); `quit` does not — and,
+    // unlike this test's original example, is a poor candidate for ever
+    // growing one. (`help` was that original example; task 102 gave it a
+    // child of its own — `help.rebind` — which correctly flips it to
+    // `Group` here too, the same way `search`/`search.explain` already
+    // coexist as a bare leaf with a dotted sibling.)
     assert!(
         of_kind(&band, Kind::Group).contains(&"message".to_owned()),
         "{band:?}"
     );
     assert!(
-        of_kind(&band, Kind::Run).contains(&"help".to_owned()),
+        of_kind(&band, Kind::Run).contains(&"quit".to_owned()),
         "{band:?}"
     );
 }

@@ -64,6 +64,7 @@
 
 pub mod commands;
 pub mod grpc;
+pub mod help;
 pub mod history;
 pub mod html;
 pub mod manual;

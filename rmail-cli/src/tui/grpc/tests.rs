@@ -901,3 +901,51 @@ async fn shutdown_stops_the_event_stream_rather_than_leaving_it_running() {
 
     daemon.stop().await;
 }
+
+#[tokio::test]
+async fn cmd_write_keybinding_runs_through_the_real_executor_and_reports_back() {
+    // `Cmd::WriteKeybinding` reaches no RPC at all — every `model::tests`
+    // covering it hand-calls `write_keybinding` and hand-builds
+    // `Msg::KeysWritten`, which proves the dispatch and the message
+    // handling but nothing about the thing task 102's P1 fix actually
+    // delivered: that the write really runs through `spawn_blocking` behind
+    // the real executor and a real `Msg` comes back on the channel, rather
+    // than a swapped label or a dropped result compiling clean and never
+    // being caught. The daemon this harness starts is unused by the
+    // command itself; it is the only way this file constructs a
+    // [`GrpcExec`] at all.
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    let path = std::env::temp_dir().join(format!(
+        "rmail-grpc-tests-write-keybinding-{}-{}.toml",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    exec.exec(
+        Cmd::WriteKeybinding {
+            path: path.clone(),
+            mode: rmail_core::keymap::Mode::Normal,
+            chord: rmail_core::keymap::Chord::parse("z").expect("z parses"),
+            action: rmail_core::keymap::Action::CursorDown,
+            label: "bound z to cursor.down in normal mode".to_owned(),
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "keys written").await {
+        Msg::KeysWritten { label, result } => {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(label.contains("cursor.down"), "{label}");
+        }
+        other => unreachable!("expected KeysWritten, got {other:?}"),
+    }
+
+    let written = std::fs::read_to_string(&path).expect("the write actually landed on disk");
+    assert!(written.contains("cursor.down"), "{written}");
+    let _ = std::fs::remove_file(&path);
+
+    daemon.stop().await;
+}

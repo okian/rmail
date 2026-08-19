@@ -214,6 +214,16 @@ fn split_path(text: &str) -> Vec<&str> {
 /// the first real verb to need [`Verb::description`]: neither of the other
 /// two sources `Verb::describe` prefers has anything to say about it.
 ///
+/// The fourth is task 102's `:keys set` — the command line's counterpart to
+/// `mail keys set`, reached from the key reference's `c` row action. Local to
+/// the grammar in the same way `:set` is (no action, no capability: it edits
+/// `keys.toml` directly, the same file `mail keys set` does), and the first
+/// verb here to actually declare a [`Flag`] — `--mode`, mirroring the CLI's
+/// own, defaulted to `normal` the same way when the row being rebound is one
+/// of Normal's own. [`check_flags`] already validates a flag against
+/// whatever a [`Verb`] declares; nothing else needed to grow for this to
+/// parse.
+///
 /// The last two are task 90's, and they are the first verbs here that reach a
 /// [`Capability`] with **no** [`Action`] behind them — the shape
 /// `tests::every_declared_verb_spells_its_capability_like_the_cli` was written
@@ -310,6 +320,35 @@ fn explicit() -> Vec<Verb> {
             description: Some(
                 "resize a pane or the AI panel — both an option and a value are required",
             ),
+        },
+        Verb {
+            path: vec!["keys", "set"],
+            capability: None,
+            // No delegate, for the same reason `set` has none: a chord and
+            // an action are not something an `Action` can carry. Both
+            // positionals optional for the same reachability rule `set`'s
+            // own comment gives — `rmail_cli`'s dispatch is where "a chord
+            // and an action are both mandatory" is actually enforced.
+            action: None,
+            positionals: &[
+                Positional {
+                    name: "chord",
+                    required: false,
+                },
+                Positional {
+                    name: "action",
+                    required: false,
+                },
+            ],
+            // The one flag any verb in this registry declares today — the
+            // mode to bind in, mirroring `mail keys set`'s own `--mode`,
+            // defaulted the same way (`normal`) when absent.
+            flags: &[Flag {
+                name: "mode",
+                takes_value: true,
+            }],
+            cli_alias: None,
+            description: Some("bind a chord to an action in keys.toml"),
         },
         Verb {
             path: vec!["auth", "status"],
@@ -729,8 +768,11 @@ pub enum CommandError {
         /// Every flag the verb does accept, `--`-prefixed.
         valid: Vec<String>,
     },
-    /// A value-taking flag with nothing after it.
-    #[error("--{flag} needs a value")]
+    /// A value-taking flag with nothing after it — including the common
+    /// mistake of typing `--flag value` (space-separated) rather than this
+    /// grammar's `--flag=value`, which `tokenize` reads as an empty `--flag`
+    /// followed by a stray positional word.
+    #[error("--{flag} needs a value (write it as --{flag}=value)")]
     MissingFlagValue {
         /// The flag's name.
         flag: String,

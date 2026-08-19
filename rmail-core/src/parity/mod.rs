@@ -1990,6 +1990,13 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     Action::Cancel,
     Action::Quit,
     Action::Help,
+    // Task 102's key reference. Local for the same reason `command` is:
+    // pressing it seeds the command line with `keys set <chord> <action>`
+    // and opens it for editing, but writes nothing itself. The write is
+    // `keys.toml` rewritten in place — the same local file edit as
+    // `LOCAL_CLI`'s "keys set" entry — reached only once Enter dispatches
+    // the prefilled line.
+    Action::HelpRebind,
     // Task 103's manual. Local for the reason `help` is, only more so: every
     // page is `include_str!`-compiled and every generated section is read out
     // of `Keymap`/`command::registry`/[`Command::ALL`] in this process, so the

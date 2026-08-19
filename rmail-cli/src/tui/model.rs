@@ -58,6 +58,7 @@ use rmail_core::command;
 use rmail_core::parity::Command as Capability;
 
 use super::commands::{self, Answer, Target};
+use super::help::{self, HelpPane};
 use super::history::History;
 use super::manual;
 use super::overlays;
@@ -69,8 +70,9 @@ use super::overlays::{
 use super::report::{self, ReportFill, ReportPane, ReportRow};
 use super::status::{Daemon, Health, Subsystem};
 use super::theme::Theme;
+use crate::keymap::file::{self as keys_file, keys_path_from_env};
 pub use crate::keymap::Key;
-use crate::keymap::{Action, Keymap, Mode, Pending, Resolution};
+use crate::keymap::{Action, Chord, Keymap, Mode, Pending, Resolution};
 
 /// The IMAP flag marking a message read.
 pub const SEEN: &str = "\\Seen";
@@ -484,8 +486,8 @@ pub enum InputFor {
 /// A modal layer drawn over the main screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
-    /// The `?` key binding reference.
-    Help,
+    /// The `?` key binding reference (task 102).
+    Help(Box<HelpPane>),
     /// Pick a destination folder.
     Pick {
         /// What the pick is for.
@@ -594,15 +596,17 @@ impl Overlay {
             Self::Outbox(pane) => (pane.cursor, pane.rows.len()),
             Self::Quick(pane) => (pane.cursor, QuickAction::ALL.len()),
             Self::Report(pane) => (pane.cursor, pane.rows.len()),
+            // Counts only `help::Row::Binding` entries — the group headers
+            // interspersed among them are not something a cursor can land
+            // on, so they must not be something its length counts either.
+            Self::Help(pane) => (pane.cursor, help::binding_count(pane)),
             // The command line is absent on purpose: its `<up>`/`<down>`
             // walk the history rather than a list, which is what `:` means
             // everywhere else it exists. Its ranked matches are a preview
             // with no cursor — `<tab>` is what puts one into the line.
-            Self::Help
-            | Self::Pick { .. }
-            | Self::Confirm { .. }
-            | Self::Input { .. }
-            | Self::Command(_) => return None,
+            Self::Pick { .. } | Self::Confirm { .. } | Self::Input { .. } | Self::Command(_) => {
+                return None
+            }
         })
     }
 
@@ -616,11 +620,8 @@ impl Overlay {
             Self::Outbox(pane) => pane.cursor = at,
             Self::Quick(pane) => pane.cursor = at,
             Self::Report(pane) => pane.cursor = at,
-            Self::Help
-            | Self::Pick { .. }
-            | Self::Confirm { .. }
-            | Self::Input { .. }
-            | Self::Command(_) => {}
+            Self::Help(pane) => pane.cursor = at,
+            Self::Pick { .. } | Self::Confirm { .. } | Self::Input { .. } | Self::Command(_) => {}
         }
     }
 }
@@ -685,6 +686,19 @@ pub enum Msg {
         label: String,
         /// What it did, or why it failed.
         result: Result<Effect, String>,
+    },
+    /// [`Cmd::WriteKeybinding`] finished.
+    ///
+    /// Not a [`Msg::Done`]: that variant's [`Effect`] is a mail-side change
+    /// the model applies to its own rows, and a keybinding write is
+    /// neither — `model.keymap` is never touched here. A running `mail tui`
+    /// picks the edit up within a second through the same file-watch reload
+    /// path a `mail keys set` run from a second terminal already relies on.
+    KeysWritten {
+        /// What to say on success.
+        label: String,
+        /// The write's outcome.
+        result: Result<(), String>,
     },
     /// The daemon's event log reported a change to the open folder. Carries
     /// no payload beyond "something changed" on purpose: the model re-reads
@@ -1001,6 +1015,36 @@ pub enum Cmd {
     SaveHistory {
         /// Every recorded line, oldest first.
         entries: Vec<String>,
+    },
+    /// Write one binding into `keys.toml` — `:keys set`'s (task 102)
+    /// blocking half.
+    ///
+    /// A [`Cmd`] rather than a write inside [`update`] for the reason
+    /// [`Cmd::SaveHistory`] is: `update` is pure, synchronous and clockless,
+    /// and `crate::keymap::file::write_atomic`'s `fsync` is none of those
+    /// things. Unlike history, a failed write here has to reach the person
+    /// who asked for it — there is no "the next line corrects it" — so this
+    /// one reports back through [`Msg::KeysWritten`] rather than only
+    /// logging.
+    ///
+    /// Not superseding (unlike most streamed work here): two of these in
+    /// flight at once run two independent read-edit-write cycles with no
+    /// lock between them, so the second's read can land before the first's
+    /// `rename`. `mail keys set` already carries the same exposure between
+    /// two terminals; this does not add to it, only widens who can trigger
+    /// it from inside one.
+    WriteKeybinding {
+        /// `keys.toml`'s path (env-overridable; see `keys_path_from_env`).
+        path: std::path::PathBuf,
+        /// Which mode's layer to bind in.
+        mode: Mode,
+        /// The chord to bind.
+        chord: Chord,
+        /// What it should run.
+        action: Action,
+        /// What to say on success; formatted before the write so a failure
+        /// can still explain what was attempted.
+        label: String,
     },
     /// Start the daemon heartbeat (task 92): poll `SyncService.Status`,
     /// `IndexService.Status`, `AiService.GetUsage` and
@@ -1394,17 +1438,19 @@ impl Model {
     #[must_use]
     pub fn mode(&self) -> Mode {
         match &self.overlay {
-            Some(Overlay::Help) => Mode::Help,
             Some(Overlay::Pick { .. }) => Mode::Pick,
             Some(Overlay::Confirm { .. }) => Mode::Confirm,
             Some(Overlay::Input { .. }) => Mode::Insert,
-            // The two overlays that change mode part-way through: search
-            // starts on the query line and moves to its results, ask starts
-            // on the question and moves to the answer. Deriving the mode from
-            // that state rather than storing it is what stops a pane from
-            // being in one mode while it draws the other.
+            // The overlays that change mode part-way through: search starts
+            // on the query line and moves to its results, ask starts on the
+            // question and moves to the answer, help starts browsing and
+            // moves to its filter line on `/`. Deriving the mode from that
+            // state rather than storing it is what stops a pane from being
+            // in one mode while it draws the other.
             Some(Overlay::Search(pane)) if pane.typing() => Mode::Prompt,
             Some(Overlay::Ask(pane)) if pane.typing() => Mode::Prompt,
+            Some(Overlay::Help(pane)) if pane.editing => Mode::Prompt,
+            Some(Overlay::Help(_)) => Mode::Help,
             Some(Overlay::Finder(_) | Overlay::Command(_)) => Mode::Prompt,
             Some(
                 Overlay::Search(_)
@@ -1727,6 +1773,16 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 }
             }
         }
+        Msg::KeysWritten { label, result } => {
+            model.inflight = model.inflight.saturating_sub(1);
+            match result {
+                Ok(()) => model.info(format!(
+                    "{label} — picked up within a second, nothing to restart"
+                )),
+                Err(error) => model.fail(format!("{label}: {error}")),
+            }
+            Vec::new()
+        }
         Msg::LiveUpdatesStopped(why) => {
             model.fail(format!(
                 "live updates stopped ({why}) — the list is no longer refreshing itself"
@@ -1741,6 +1797,14 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                     // bindings; carrying it over would resolve a chord the
                     // user never started.
                     model.pending.clear();
+                    // The key reference's own rows are cached (`help.rs`'s
+                    // module docs explain why), and a cache the reload path
+                    // forgot to invalidate is exactly the staleness this
+                    // whole feature exists to rule out — the point of
+                    // generating the list from the live keymap is lost if
+                    // "live" stops being true the moment the overlay that
+                    // shows it is actually open.
+                    reload_help(model);
                     if announce {
                         model.info("key bindings reloaded");
                     }
@@ -2279,6 +2343,8 @@ enum Typed {
     Finder,
     /// The `:` command line.
     Command,
+    /// The key reference's filter (task 102).
+    HelpFilter,
 }
 
 /// Apply `edit` to whichever text field is up, and issue whatever the change
@@ -2321,6 +2387,9 @@ fn edit_prompt(model: &mut Model, edit: TextEdit) -> Vec<Cmd> {
             apply_edit(&mut pane.question, edit);
             Typed::Nothing
         }
+        Some(Overlay::Help(pane)) if pane.editing => {
+            once(apply_edit(&mut pane.filter, edit), Typed::HelpFilter)
+        }
         _ => Typed::Nothing,
     };
     match typed {
@@ -2332,6 +2401,10 @@ fn edit_prompt(model: &mut Model, edit: TextEdit) -> Vec<Cmd> {
         Typed::Finder => find_now(model),
         Typed::Command => {
             refresh_command(model);
+            Vec::new()
+        }
+        Typed::HelpFilter => {
+            refresh_help(model);
             Vec::new()
         }
     }
@@ -2388,10 +2461,8 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
             model.quit = true;
             Vec::new()
         }
-        Action::Help => {
-            model.overlay = Some(Overlay::Help);
-            Vec::new()
-        }
+        Action::Help => open_help(model),
+        Action::HelpRebind => open_help_rebind(model),
         Action::ManualOpen => open_manual(model),
         Action::ManualBack => manual_jump(model, Jump::Back),
         Action::ManualForward => manual_jump(model, Jump::Forward),
@@ -2482,8 +2553,10 @@ fn active_cursor(model: &Model) -> Option<Cursor> {
     match &model.overlay {
         Some(Overlay::Pick { .. }) => Some(Cursor::Pick),
         Some(overlay) if overlay.list_cursor().is_some() => Some(Cursor::Overlay),
-        // A confirm, a prompt or the help screen has nothing to scroll, and
-        // must not scroll what is behind it.
+        // A confirm or a prompt has nothing to scroll, and must not scroll
+        // what is behind it. The help screen used to land here too, before
+        // task 102 gave it a row cursor of its own — `list_cursor()` now
+        // answers `Some` for it, so it is caught by the arm above instead.
         Some(_) => None,
         None => match model.screen {
             Screen::Viewer => Some(Cursor::Scroll),
@@ -2650,8 +2723,14 @@ enum Leave {
 fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
     if let Some(overlay) = model.overlay.take() {
         // The help screen was not collecting anything, so "cancelled" would
-        // be a lie; the others were.
-        if !matches!(overlay, Overlay::Help) {
+        // be a lie; the others were. Half true since task 102: browsing it
+        // still collects nothing, but a half-typed filter is exactly the
+        // thing every other typing surface here calls cancelled.
+        let collecting = match &overlay {
+            Overlay::Help(pane) => pane.editing,
+            _ => true,
+        };
+        if collecting {
             model.info("cancelled");
         }
         let stop = cancels(&overlay);
@@ -2726,7 +2805,7 @@ fn streams_of(overlay: &Overlay) -> &'static [Stream] {
         Overlay::Finder(_) => &[Stream::Find],
         Overlay::Ask(_) => &[Stream::Ask],
         Overlay::Report(_) => &[Stream::Report],
-        Overlay::Help
+        Overlay::Help(_)
         | Overlay::Pick { .. }
         | Overlay::Confirm { .. }
         | Overlay::Input { .. }
@@ -3161,11 +3240,178 @@ fn open_html(model: &mut Model) -> Vec<Cmd> {
 }
 
 // ---------------------------------------------------------------------------
+// the key reference (task 102)
+// ---------------------------------------------------------------------------
+
+/// `?` — the key reference, at whichever mode is current.
+fn open_help(model: &mut Model) -> Vec<Cmd> {
+    let mode = model.mode();
+    model.overlay = Some(Overlay::Help(Box::new(HelpPane::new(mode, &model.keymap))));
+    Vec::new()
+}
+
+/// Recompute the key reference's rows after its mode or filter changes, and
+/// reset the cursor to the top of the new set.
+///
+/// The two-step borrow `refresh_command` also uses: [`help::rows`] wants
+/// `&Keymap` and the pane's own `mode`/`filter` at once, which a single
+/// `model.overlay.as_mut()` cannot offer alongside `&model.keymap` borrowed
+/// at the same time.
+fn refresh_help(model: &mut Model) {
+    let Some(Overlay::Help(pane)) = model.overlay.as_ref() else {
+        return;
+    };
+    let rows = help::rows(pane.mode, &pane.filter, &model.keymap);
+    if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+        pane.rows = rows;
+        // Reset rather than clamped: a mode switch or a filter edit changes
+        // *what* is at every index, not just how many, so whatever survived
+        // at the old cursor position is unlikely to be the row somebody
+        // meant to still be looking at.
+        pane.cursor = 0;
+    }
+}
+
+/// Recompute the key reference's rows after `keys.toml` reloads underneath
+/// it, clamping the cursor rather than resetting it.
+///
+/// Not [`refresh_help`]: a mode switch or a filter edit is the *person
+/// looking at this screen* asking for a different list, where jumping to
+/// the top is the right answer for a set of rows that is now about
+/// something else entirely. A `keys.toml` reload is not that — it can land
+/// at any moment mid-browse, was not asked for by whoever is looking at
+/// this overlay, and typically changes at most one row. Resetting to the
+/// top on every one of those would make browsing the key reference while
+/// rebinding things from a second terminal (this very overlay's own `c`
+/// row action, run from *this* terminal, reloads the same way) actively
+/// hostile. The cursor's *index* survives, not necessarily the row at
+/// it — a reload that removes a binding above it shifts a different action
+/// underneath, the same trade every other list here makes — and if the
+/// list shrank past the old index, it clamps to the new last row.
+fn reload_help(model: &mut Model) {
+    let Some(Overlay::Help(pane)) = model.overlay.as_ref() else {
+        return;
+    };
+    let rows = help::rows(pane.mode, &pane.filter, &model.keymap);
+    if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+        pane.rows = rows;
+        let count = help::binding_count(pane);
+        pane.cursor = pane.cursor.min(count.saturating_sub(1));
+    }
+}
+
+/// `<tab>`/`<c-i>` (forward) and `<c-o>` (back) on the key reference: cycle
+/// which mode's chain it shows, wrapping through every configurable mode.
+///
+/// The same two direction bindings the manual's jump list uses in this
+/// layer, made context-sensitive here rather than given bindings of their
+/// own — the collision `keymap::mod`'s defaults document, and the same
+/// answer `open_search` already gives the sibling collision on `/`.
+fn cycle_help_mode(model: &mut Model, jump: Jump) -> Vec<Cmd> {
+    let Some(Overlay::Help(pane)) = model.overlay.as_mut() else {
+        return Vec::new();
+    };
+    let modes = Mode::CONFIGURABLE;
+    let Some(idx) = modes.iter().position(|candidate| *candidate == pane.mode) else {
+        return Vec::new();
+    };
+    pane.mode = match jump {
+        Jump::Forward => modes[(idx + 1) % modes.len()],
+        Jump::Back => modes[(idx + modes.len() - 1) % modes.len()],
+    };
+    refresh_help(model);
+    Vec::new()
+}
+
+/// `c` on the key reference: open a rebind for the highlighted row, the
+/// command line pre-filled with `keys set <chord> <action>`.
+///
+/// The mode flag is only spelled out when it would change anything: `keys
+/// set`'s own default is `normal`, so a row from that mode's own chain does
+/// not need `--mode normal` to say what is already true.
+fn open_help_rebind(model: &mut Model) -> Vec<Cmd> {
+    let Some(Overlay::Help(pane)) = model.overlay.as_ref() else {
+        return Vec::new();
+    };
+    let Some(action) = help::selected(pane) else {
+        model.fail("nothing highlighted to rebind");
+        return Vec::new();
+    };
+    let mode = pane.mode;
+    let Some(chord) = model.keymap.chords_for(mode, action).into_iter().next() else {
+        return Vec::new();
+    };
+    // `chords_for` walks `mode`'s whole chain, so the chord it found can
+    // live in a farther layer than the one being browsed — most rows do,
+    // since a mode's own key reference mostly shows what it *inherits*.
+    // Rebinding has to target the layer that actually owns the binding, not
+    // the layer being looked at: prefilling the browsed mode would not
+    // replace anything, only add a shadow next to a binding still live
+    // everywhere that layer is inherited.
+    let Some(owner) = owning_mode(&model.keymap, mode, action, &chord) else {
+        return Vec::new();
+    };
+    if !Mode::CONFIGURABLE.contains(&owner) {
+        // Global's two bindings are the way out from every mode and are
+        // deliberately not rebindable (`DEFAULTS`'s own comment). Failing
+        // here says why, instead of opening a command line that
+        // `keys_file::edit`'s reserved-chord check would refuse anyway.
+        model.fail(format!(
+            "{} is bound in every mode and cannot be rebound",
+            action.id()
+        ));
+        return Vec::new();
+    }
+    let mode_flag = if owner == Mode::Normal {
+        String::new()
+    } else {
+        // `=`-joined: `command::tokenize` only recognizes `--name=value` as
+        // a value-carrying flag — `--mode help` (space separated) tokenizes
+        // as an empty `--mode` flag followed by a stray `help` word, which
+        // `check_flags` refuses as `MissingFlagValue`. Caught by
+        // `every_colon_line_an_authored_page_shows_parses_and_uses_an_honoured_range`
+        // against the manual's own `:keys set --mode viewer …` example
+        // before it ever reached this line's own behavior.
+        format!(" --mode={}", owner.id())
+    };
+    let input = format!("keys set {chord} {}{mode_flag}", action.id());
+    model.overlay = Some(Overlay::Command(Box::new(CommandPane {
+        input,
+        ..CommandPane::default()
+    })));
+    refresh_command(model);
+    model.info("rebind — edit and press Enter, or Esc to cancel");
+    Vec::new()
+}
+
+/// Which mode in `browsing`'s chain actually binds `chord` to `action` in
+/// its own layer, as opposed to inheriting it from farther out.
+///
+/// [`Keymap::chords_for`] walks the same chain but only answers "does a
+/// chord reach `browsing`", not "which layer declared it" — the second
+/// question is what [`open_help_rebind`] needs, since editing the layer
+/// that is merely on screen would shadow an inherited binding rather than
+/// replace it.
+fn owning_mode(keymap: &Keymap, browsing: Mode, action: Action, chord: &Chord) -> Option<Mode> {
+    browsing
+        .chain()
+        .iter()
+        .copied()
+        .find(|&layer| keymap.layer(layer).any(|(c, a)| c == chord && a == action))
+}
+
+// ---------------------------------------------------------------------------
 // the manual (task 103)
 // ---------------------------------------------------------------------------
 
-/// `K` — the manual, at its front page.
+/// `K` — the manual, at its front page, or — from the key reference (task
+/// 102) — at the page documenting the highlighted row.
 fn open_manual(model: &mut Model) -> Vec<Cmd> {
+    if let Some(Overlay::Help(pane)) = model.overlay.as_ref() {
+        if let Some(action) = help::selected(pane) {
+            return open_manual_at(model, action.id());
+        }
+    }
     open_manual_at(model, manual::START)
 }
 
@@ -3259,6 +3505,13 @@ fn announce_manual(model: &mut Model) {
 
 /// `<c-o>` / `<c-i>`.
 fn manual_jump(model: &mut Model, jump: Jump) -> Vec<Cmd> {
+    // The key reference's own mode-cycling, task 102: `<tab>`/`<c-i>` and
+    // `<c-o>` are this layer's manual-jump bindings, made context-sensitive
+    // here rather than given a binding of their own — the same collision
+    // `open_search` already resolves for the sibling `/`.
+    if matches!(model.overlay, Some(Overlay::Help(_))) {
+        return cycle_help_mode(model, jump);
+    }
     let Some(manual) = model.manual.as_mut() else {
         return Vec::new();
     };
@@ -3506,6 +3759,15 @@ fn open_search(model: &mut Model) -> Vec<Cmd> {
     // there would cover the text it was pressed to search.
     if model.screen == Screen::Manual && model.overlay.is_none() {
         return prompt_manual(model, Scope::Page);
+    }
+    // The key reference's own rows, task 102: `/` starts a live filter over
+    // them rather than opening a second overlay on top. Silent on the status
+    // line like every other key this overlay's own cursor and mode-cycling
+    // already answer — a hint on every press of `/`, `<tab>` or `j` would be
+    // noise none of Help's other in-place moves write either.
+    if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+        pane.editing = true;
+        return Vec::new();
     }
     if let Some(Overlay::Search(pane)) = model.overlay.as_mut() {
         pane.focus = SearchFocus::Query;
@@ -3913,6 +4175,29 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         };
         return set_option(model, option, value);
     }
+    if verb == "keys set" {
+        // Same rule as `set` just above: left open on a bad chord/action/mode
+        // (`complain` writes into the command pane's own error line) and
+        // only closed once the write has actually landed. A hand-written
+        // case rather than the generic too-many-arguments check just below,
+        // for the same reason `set` is: both positionals are declared
+        // optional so this custom "needs two arguments" message can fire,
+        // and neither `run_action` nor `open_report` know how to edit a
+        // file.
+        let [chord, action] = invocation.positionals.as_slice() else {
+            return complain(
+                model,
+                "keys set needs two arguments: a chord and an action".to_owned(),
+            );
+        };
+        let mode = invocation
+            .flags
+            .iter()
+            .find(|flag| flag.name == "mode")
+            .and_then(|flag| flag.value.as_deref())
+            .unwrap_or("normal");
+        return set_keybinding(model, &keys_path_from_env(), mode, chord, action);
+    }
     // More arguments than the verb declares. Derived from the registry rather
     // than "action-backed verbs take none", which is what this was before task
     // 94 declared verbs that take one: `command::parse` collects trailing words
@@ -3936,11 +4221,12 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         );
     }
     if let Some(flag) = invocation.flags.first() {
-        // Defence, not a path anything reaches today: `command::parse`
-        // rejects a flag no verb declares, and no verb declares one. Worded
-        // for the case that *would* arrive first — a declared flag this
-        // dispatch has not learned — rather than claiming the verb has no
-        // such flag, which by then would be false.
+        // Defence, not a path anything else reaches today: `command::parse`
+        // rejects a flag no verb declares, and `keys set`'s own `--mode` is
+        // handled above, before positionals or flags are checked generically
+        // at all. Worded for the case that *would* arrive first — a declared
+        // flag this dispatch has not learned — rather than claiming the verb
+        // has no such flag, which by then would be false.
         return complain(model, format!("{verb} --{}: not wired up yet", flag.name));
     }
     // The daemon verbs, after the argument guards rather than before them: these
@@ -4024,6 +4310,96 @@ fn set_option(model: &mut Model, option: &str, value: &str) -> Vec<Cmd> {
     close_command(model);
     model.info(format!("{option} set to {pct}"));
     Vec::new()
+}
+
+/// `:keys set <chord> <action> [--mode <mode>]` (task 102) — `keys.toml`'s
+/// TUI-side counterpart to `mail keys set`, and the verb the key
+/// reference's `c` row action pre-fills.
+///
+/// Edits the file directly rather than going through the daemon: a key
+/// binding is a property of the terminal in front of whoever is pressing
+/// keys, not of the mailbox, the same reason `mail keys set` is a local file
+/// edit and not an RPC (`keys_cli`'s own module docs). `model.keymap` itself
+/// is not touched here — a running `mail tui` re-reads `keys.toml` within a
+/// second and swaps its bindings live, the same reload path a
+/// `mail keys set` run from a second terminal already relies on.
+///
+/// Only validates and dispatches [`Cmd::WriteKeybinding`]; [`write_keybinding`]
+/// does the actual read/edit/write, off this function and off [`update`],
+/// for the reason that command's own doc gives.
+///
+/// Takes `path` as a parameter rather than resolving `$RMAIL_KEYS` itself,
+/// the same split `keys_cli::set` keeps between "which file" and "edit this
+/// file" — `$RMAIL_KEYS` is process-global and `tests` runs alongside
+/// everything else in this test binary, so the boundary that reads it stays
+/// at the caller.
+fn set_keybinding(
+    model: &mut Model,
+    path: &std::path::Path,
+    mode: &str,
+    chord: &str,
+    action: &str,
+) -> Vec<Cmd> {
+    let Some(mode) = Mode::from_id(mode) else {
+        return complain(model, format!("unknown mode: {mode}"));
+    };
+    let chord = match Chord::parse(chord) {
+        Ok(chord) => chord,
+        Err(error) => return complain(model, error.to_string()),
+    };
+    let Some(action) = Action::from_id(action) else {
+        return complain(model, format!("unknown action: {action}"));
+    };
+
+    let label = format!(
+        "bound {chord} to {} in {} mode ({})",
+        action.id(),
+        mode.id(),
+        path.display()
+    );
+    close_command(model);
+    model.inflight += 1;
+    vec![Cmd::WriteKeybinding {
+        path: path.to_path_buf(),
+        mode,
+        chord,
+        action,
+        label,
+    }]
+}
+
+/// The blocking half of [`Cmd::WriteKeybinding`]: read `keys.toml` (or
+/// treat it as empty if absent — the normal first-run state, the same
+/// reading `keys_cli::set` gives it), edit in the one binding, and write it
+/// back. `crate::keymap::file` is the one place the edit itself is
+/// implemented; this calls it rather than growing a second copy.
+///
+/// `keys_file::read_bounded` rather than `std::fs::read_to_string`: this
+/// runs on a blocking-pool thread behind [`Model::inflight`], which nothing
+/// but [`Msg::KeysWritten`] arriving ever releases — a path that never
+/// reaches EOF (a device file, a fifo someone pointed `$RMAIL_KEYS` at)
+/// would hang the read forever and strand the counter with it. See
+/// `read_bounded`'s own doc for why `keys_cli::set`, a short-lived CLI
+/// process, does not need the same guard.
+///
+/// # Errors
+///
+/// A human-readable reason the read, the edit or the write failed.
+pub fn write_keybinding(
+    path: &std::path::Path,
+    mode: Mode,
+    chord: &Chord,
+    action: Action,
+) -> Result<(), String> {
+    let existing = match keys_file::read_bounded(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let updated =
+        keys_file::edit(&existing, mode, chord, Some(action)).map_err(|error| error.to_string())?;
+    keys_file::write_atomic(path, &updated)
+        .map_err(|error| format!("writing {}: {error}", path.display()))
 }
 
 /// `pct`, and its counterpart `other` (the other of `folder-width`/
@@ -4547,9 +4923,12 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Row(Box<command::Invocation>),
         /// The row under the cursor is a manual link.
         ManualLink,
+        /// The highlighted key reference row (task 102).
+        Run(Action),
         /// There is no row cursor here, so "use the highlighted row" is
-        /// "close this" — which is what `<enter>` has meant on the `?`
-        /// overlay since task 83.
+        /// "close this" — what `<enter>` meant on the whole `?` overlay
+        /// through task 102, and still means when nothing is highlighted
+        /// (an empty filter's match set, or the manual sharing this layer).
         Close,
         Nothing,
     }
@@ -4568,10 +4947,7 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
             .map_or(Chosen::Nothing, |invocation| {
                 Chosen::Row(Box::new(invocation))
             }),
-        // Task 102 gives the key reference a row cursor of its own; until it
-        // does, `<enter>` there closes it, exactly as before this action was
-        // bound to that key.
-        Some(Overlay::Help) => Chosen::Close,
+        Some(Overlay::Help(pane)) => help::selected(pane).map_or(Chosen::Close, Chosen::Run),
         None if model.screen == Screen::Manual => Chosen::ManualLink,
         _ => Chosen::Nothing,
     };
@@ -4581,6 +4957,16 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Chosen::Quick(action) => run_quick(model, action),
         Chosen::Row(invocation) => run_report_row(model, *invocation),
         Chosen::ManualLink => follow_manual_link(model),
+        // Not `run_named` for this one action: `open_help_rebind` reads the
+        // key reference's own `pane` (the highlighted action, and which
+        // mode it is bound in) to build the line it pre-fills, and
+        // `run_named`'s whole point is to close the triggering overlay
+        // *before* the action runs — which for every other action is
+        // exactly right (it should see the screen it is about to reveal,
+        // not the overlay asking it to run), but here would mean this
+        // action finds the overlay it needs already gone.
+        Chosen::Run(Action::HelpRebind) => open_help_rebind(model),
+        Chosen::Run(action) => run_named(model, action),
         Chosen::Close => leave(model, Leave::ThenNothing),
         Chosen::Nothing => Vec::new(),
     }
@@ -4628,6 +5014,9 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         Finder,
         Command,
         AskQuestion,
+        /// The key reference's filter (task 102) — `<enter>` stops editing
+        /// it and returns to browsing the (already live-filtered) rows.
+        HelpFilterDone,
         Nothing,
     }
     // The manual's search line first, and unconditionally: it is the only
@@ -4645,6 +5034,7 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         Some(Overlay::Finder(_)) => Which::Finder,
         Some(Overlay::Command(_)) => Which::Command,
         Some(Overlay::Ask(pane)) if pane.typing() => Which::AskQuestion,
+        Some(Overlay::Help(pane)) if pane.editing => Which::HelpFilterDone,
         _ => Which::Nothing,
     };
     match which {
@@ -4653,6 +5043,12 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         Which::Finder => activate_finder(model),
         Which::Command => submit_command(model),
         Which::AskQuestion => ask_now(model),
+        Which::HelpFilterDone => {
+            if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+                pane.editing = false;
+            }
+            Vec::new()
+        }
     }
 }
 

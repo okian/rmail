@@ -63,7 +63,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound;
 
-pub use continuations::{Continuation, Leads};
+pub use continuations::{common_id_prefix, Continuation, Leads};
 
 /// The largest count a user can type. Beyond this, further digits are
 /// absorbed rather than accumulated: a held-down `9` is a stuck key, not a
@@ -339,6 +339,7 @@ actions! {
     Cancel        => "cancel",              "close the overlay, selection or viewer";
     Quit          => "quit",                "quit from anywhere";
     Help          => "help",                "this help";
+    HelpRebind    => "help.rebind",         "rebind the highlighted key";
     CommandOpen   => "command",             "the : command line: run any verb by name";
     ManualOpen    => "manual",              "the manual: guides, concepts and the generated reference";
     ManualBack    => "manual.back",         "back to the manual page you came from";
@@ -724,6 +725,12 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     // task 102 refines it to land on the page documenting the highlighted row
     // rather than the front page.
     (Mode::Help, "K", Action::ManualOpen),
+    // Task 102's third row action, alongside `<enter>` and `K`: open a
+    // rebind for the highlighted binding. Still bound in the manual, which
+    // shares this layer, but inert there: `open_help_rebind` requires an
+    // open `?` overlay to read a highlighted row from, and the manual has
+    // no such overlay — only a screen — so it always finds none.
+    (Mode::Help, "c", Action::HelpRebind),
     // `/` is "search what is in front of me" in every mode that binds it; on
     // the manual that is this page rather than the mailbox (`open_search`
     // dispatches on the screen, the same way `cursor.down` dispatches on
@@ -785,8 +792,11 @@ impl Keymap {
 
     /// A map with no bindings at all — what a test builds on when it wants to
     /// exercise the engine rather than the default bindings. Nothing in the
-    /// TUI wants a keyboard that does nothing, so it is not compiled in.
-    #[cfg(test)]
+    /// TUI itself wants a keyboard that does nothing; `pub`, not
+    /// `#[cfg(test)]`, because `cfg(test)` is per-crate and `rmail_cli`'s own
+    /// `tui::help` test suite (task 102) needs this same isolated fixture
+    /// across the crate boundary, where a test-only item in this crate does
+    /// not exist at all.
     #[must_use]
     pub fn empty() -> Self {
         Self {

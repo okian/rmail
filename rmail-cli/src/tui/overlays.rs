@@ -618,7 +618,10 @@ pub fn verb_words(input: &str) -> String {
 }
 
 /// Whether every character of `needle` appears in `haystack`, in order.
-fn is_subsequence(needle: &str, haystack: &str) -> bool {
+///
+/// `pub(crate)`: task 102's key reference filter reuses this rather than a
+/// second copy — the same subsequence test, over different fields.
+pub(crate) fn is_subsequence(needle: &str, haystack: &str) -> bool {
     let mut chars = haystack.chars();
     needle
         .chars()

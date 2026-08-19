@@ -554,7 +554,7 @@ fn a_finder_command_row_runs_the_action_it_names() {
     batch(&mut model, generation, vec![command], true);
 
     press(&mut model, Key::Enter);
-    assert!(matches!(model.overlay, Some(Overlay::Help)));
+    assert!(matches!(model.overlay, Some(Overlay::Help(_))));
 }
 
 #[test]
@@ -651,7 +651,7 @@ fn the_command_line_runs_the_best_match_when_the_line_names_no_verb() {
     keys(&mut model, "hel");
     press(&mut model, Key::Enter);
     assert!(
-        matches!(model.overlay, Some(Overlay::Help)),
+        matches!(model.overlay, Some(Overlay::Help(_))),
         "the command line closes and the command runs against the screen \
          behind it"
     );
