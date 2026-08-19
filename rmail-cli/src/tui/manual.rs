@@ -194,6 +194,7 @@ pub const PAGES: &[Page] = &[
         title: "A tour of the screen",
         body: Body::Authored(include_str!("manual/pages/tour.md")),
         documents: &[
+            "command",
             "cursor.down",
             "cursor.up",
             "cursor.top",

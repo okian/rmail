@@ -70,6 +70,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 /// `--token` did nothing.
 type Conn = crate::client::Client;
 
+use super::history;
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
 use super::model::{wire, AskEvent, Cmd, Effect, FinderEvent, Msg, SearchEvent, Stream};
@@ -139,6 +140,12 @@ pub struct GrpcExec {
     /// be drawn.
     explaining: Mutex<Option<AbortHandle>>,
     ticking: Mutex<Option<AbortHandle>>,
+    /// The command-history write. Superseding, because `write_atomic`'s temp
+    /// path is per-*process*: two commands in quick succession would
+    /// otherwise have two tasks writing the same temp file and renaming it,
+    /// and the whole list travels in each one anyway — so the newest is
+    /// always the complete answer and the older is never worth finishing.
+    saving: Mutex<Option<AbortHandle>>,
     opener: CommandOpener,
     cancel: CancellationToken,
     /// Cancels `cancel` when this struct is dropped.
@@ -183,6 +190,7 @@ impl GrpcExec {
             asking: Mutex::new(None),
             explaining: Mutex::new(None),
             ticking: Mutex::new(None),
+            saving: Mutex::new(None),
             opener: CommandOpener::platform(),
             _guard: cancel.clone().drop_guard(),
             cancel,
@@ -527,6 +535,30 @@ impl CmdExec for GrpcExec {
                     Stream::Explain => &self.explaining,
                 };
                 abort(slot);
+            }
+            Cmd::SaveHistory { entries } => {
+                // `spawn_blocking`, because this is the one command whose
+                // work is a filesystem write rather than an RPC, and a
+                // synchronous write on a runtime thread is exactly what
+                // CLAUDE.md's "never block the runtime" is about. Failure is
+                // logged and dropped: a history file that cannot be written
+                // must not take the command line down with it, and the next
+                // recorded line writes the whole list again anyway.
+                let path = history::path_from_env();
+                self.spawn_superseding(&self.saving, async move {
+                    let written = tokio::task::spawn_blocking(move || {
+                        let result = history::write(&path, &entries);
+                        (path, result)
+                    })
+                    .await;
+                    if let Ok((path, Err(error))) = written {
+                        tracing::warn!(
+                            error = %error,
+                            path = %path.display(),
+                            "could not write the command history",
+                        );
+                    }
+                });
             }
             Cmd::Countdown { until } => {
                 self.spawn_superseding(&self.ticking, async move {

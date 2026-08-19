@@ -577,13 +577,54 @@ fn the_ai_panel_takes_a_column_and_leaves_the_list_visible() {
 }
 
 #[test]
-fn the_palette_renders_ids_bindings_and_help_together() {
+fn the_command_line_renders_verbs_bindings_and_help_together() {
     let mut model = loaded();
     press(&mut model, Key::ctrl('k'));
     type_in(&mut model, "archive");
     let screen = screen(&model);
-    assert!(screen.contains("message.archive"), "{screen}");
+    assert!(screen.contains("message archive"), "{screen}");
     assert!(screen.contains("archive"), "{screen}");
+}
+
+#[test]
+fn the_fallback_marker_appears_only_while_the_fallback_is_live() {
+    // The marker says "Enter runs this row". Typing the verb out in full
+    // means Enter runs the *line*, so pointing at a row would be pointing at
+    // something Enter is not going to do.
+    let mut model = loaded();
+    press(&mut model, Key::ctrl('k'));
+    type_in(&mut model, "message arch");
+    assert!(
+        screen(&model).contains("> message archive"),
+        "{}",
+        screen(&model)
+    );
+
+    // `archive` on its own is not a verb — `message archive` is — so the
+    // line only stops being a fallback once the whole path is typed.
+    type_in(&mut model, "ive");
+    let full = screen(&model);
+    assert!(full.contains("message archive"), "{full}");
+    assert!(
+        !full.contains("> message archive"),
+        "the line names the verb itself now: {full}"
+    );
+}
+
+#[test]
+fn a_parse_error_is_shown_in_the_command_line_in_red() {
+    let dark = Theme::dark();
+    let mut model = loaded();
+    press(&mut model, Key::ctrl('k'));
+    type_in(&mut model, "message copy \"unterminated");
+    press(&mut model, Key::Enter);
+    let screen = screen(&model);
+    assert!(screen.contains("unterminated quote"), "{screen}");
+    assert!(
+        !chars_matching(&model, 120, 30, dark.err).is_empty(),
+        "the complaint is in the error style: {screen}"
+    );
+    assert!(model.overlay.is_some(), "and the overlay stays open");
 }
 
 #[test]
@@ -940,33 +981,27 @@ fn dark_theme_finder_kind_label_matches_the_historical_color() {
 }
 
 #[test]
-fn dark_theme_palette_chords_match_the_historical_color() {
+fn dark_theme_command_chords_match_the_historical_color() {
     let dark = Theme::dark();
     let mut model = loaded();
     press(&mut model, Key::ctrl('k'));
-    // "message" id-starts-with-matches every `message.*` action (archive,
-    // copy, delete, …), alphabetically tied-broken by id
-    // (`palette_matches`'s own rule) — so row 0 is `message.archive`
-    // (chord `a`) and row 1 is `message.copy` (chord `c`). Moving the
-    // cursor to row 1 leaves row 0 unaffected by `List::highlight_style`,
-    // so its chord column is genuinely `theme.warn`, not `theme.sel_focus`
-    // patched over it.
+    // "message" prefix-matches every `message *` verb (archive, copy,
+    // delete, …), alphabetically tie-broken by path (`command_matches`'s own
+    // rule) — so row 0 is `message archive`, chord `a`.
     //
-    // `Overlay::Palette` is `Mode::Prompt` (`model.rs`'s `mode()`), whose
-    // chain is `[Prompt, Global]` — `Prompt` binds `<down>`/`<up>` to the
-    // cursor, but *not* `j`/`k`, which fall through as ordinary typed text
-    // (that is what lets a search contain the letter `j`). `Key::Down` is
-    // the binding that actually exists here; `Key::Char('j')` would have
-    // silently become part of the query instead of moving anything.
+    // No cursor is moved off it first, and none needs to be: task 89's list
+    // draws no selected row at all. That is precisely what makes this
+    // measurable — `List::highlight_style` overrides a row's own span styling
+    // wholesale, so under task 85's palette this assertion could only be made
+    // about a row the cursor was *not* on.
     type_in(&mut model, "message");
-    press(&mut model, Key::Down);
-    // `warn` (plain yellow) is what the palette's chord column has always
-    // used — distinct from `match_hl` (yellow **and bold**), which is a
-    // fuzzy-match highlight, not a key binding.
+    // `warn` (plain yellow) is what the chord column has always used —
+    // distinct from `match_hl` (yellow **and bold**), which is a fuzzy-match
+    // highlight, not a key binding.
     let chords = chars_matching(&model, 120, 30, dark.warn);
     assert!(
         chords.contains('a'),
-        "expected message.archive's chord `a`, styled `warn`, got {chords:?}: {}",
+        "expected message archive's chord `a`, styled `warn`, got {chords:?}: {}",
         screen(&model)
     );
 }

@@ -1803,3 +1803,67 @@ fn find_short(node: &clap::Command, short: char) -> Option<&clap::Arg> {
     node.get_arguments()
         .find(|arg| arg.get_short() == Some(short))
 }
+
+/// Every `:` line an authored page shows in a fence parses, and carries only
+/// a range the TUI actually honours.
+///
+/// The sibling of
+/// [`every_shell_command_an_authored_page_shows_is_one_this_binary_accepts`],
+/// and the same gap: task 89's pages gained `:'<,'>message archive` in
+/// fences, and `shell_lines` only reads lines beginning `mail`. Both happen
+/// to be right today; nothing kept them so. A `%` or a count in one of these
+/// would be a page documenting a range the model refuses.
+#[test]
+fn every_colon_line_an_authored_page_shows_parses_and_uses_an_honoured_range() {
+    let mut checked = 0_usize;
+    for page in PAGES {
+        let Body::Authored(source) = page.body else {
+            continue;
+        };
+        for (line_no, line) in fenced_lines(source, ':') {
+            checked += 1;
+            let at = format!("{}:{line_no}", page.anchor);
+            let typed = line.trim_start_matches(':');
+            match command::parse(typed) {
+                Ok(command::Resolution::Invocation(invocation)) => {
+                    assert!(
+                        !matches!(
+                            invocation.range,
+                            Some(command::Range::All | command::Range::Count(_))
+                        ),
+                        "{at}: `{line}` shows a range this TUI refuses — see \
+                         `model::unsupported_range`"
+                    );
+                }
+                other => panic!("{at}: `{line}` does not resolve to a verb: {other:?}"),
+            }
+        }
+    }
+    assert!(
+        checked >= 3,
+        "only {checked} colon lines were seen — the scan stopped finding them"
+    );
+}
+
+/// The lines inside `source`'s fences that begin with `lead`, with their
+/// 1-based source line numbers.
+fn fenced_lines(source: &str, lead: char) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut fenced = false;
+    for (idx, raw) in source.lines().enumerate() {
+        if raw.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        // Column zero, deliberately, and not `trim()`: a `:` is also the
+        // finder's mailbox sigil, and `search-vs-finder` shows a table of
+        // those. An indented fenced line is a table row; a flush-left one
+        // beginning with `:` is a command line. That is the convention this
+        // scan is, and the reason the sigil table is indented.
+        if fenced && raw.starts_with(lead) {
+            let line = raw.trim_end();
+            out.push((idx + 1, line[..annotation(line)].trim_end().to_owned()));
+        }
+    }
+    out
+}

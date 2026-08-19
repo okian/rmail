@@ -404,7 +404,7 @@ fn a_typo_in_a_multi_segment_verb_suggests_that_verb_not_an_unrelated_short_one(
     // easy to find scattered through almost any longer typo, so `search`
     // "matched" a `message archive` missing only its final letter. Ranking
     // by tier (prefix, then substring, then one-directional subsequence)
-    // the same way `overlays::palette_matches` does fixes it — checked
+    // the same way `overlays::command_matches` does fixes it — checked
     // here against exactly that regression, not just the passing case.
     for (typo, expected) in [
         ("message archiv", "message archive"),

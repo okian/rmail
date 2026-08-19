@@ -47,9 +47,9 @@ claim it does.
 A leading sigil narrows what is searched, and is stripped before matching:
 
 ```
->foo   commands        #foo   tags
-@foo   contacts        /foo   saved searches
-:foo   mailboxes       foo    the current scope
+  >foo   commands        #foo   tags
+  @foo   contacts        /foo   saved searches
+  :foo   mailboxes       foo    the current scope
 ```
 
 ## Where to read next

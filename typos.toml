@@ -118,3 +118,8 @@ iy = "iy"
 cancl = "cancl"
 archiv = "archiv"
 mesage = "mesage"
+
+# A deliberately truncated `help`, typed into the `:` command line's tests to
+# exercise the abbreviation path — the line Enter falls back from. The whole
+# point of the string is that it is *not* a complete word.
+hel = "hel"

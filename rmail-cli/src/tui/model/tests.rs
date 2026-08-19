@@ -2610,3 +2610,725 @@ fn helpgrep_with_a_pattern_closes_an_overlay_it_was_dispatched_from() {
         manual::Location::Grep("Key reference".to_owned())
     );
 }
+
+// ---------------------------------------------------------------------------
+// the `:` command line (task 89)
+// ---------------------------------------------------------------------------
+
+fn command_pane(model: &Model) -> &CommandPane {
+    match model.overlay.as_ref() {
+        Some(Overlay::Command(pane)) => pane,
+        other => panic!("expected the command overlay, found {other:?}"),
+    }
+}
+
+/// Open the command line and type `line` into it.
+fn command(model: &mut Model, line: &str) -> Vec<Cmd> {
+    press(model, Key::Char(':'));
+    keys(model, line)
+}
+
+#[test]
+fn colon_opens_the_command_line_in_prompt_mode() {
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    assert_eq!(
+        model.mode(),
+        Mode::Prompt,
+        "keys are text here, so a `d` types rather than deletes"
+    );
+    // The proof that it is text: `d` is `message.delete` in Normal.
+    keys(&mut model, "d");
+    assert_eq!(command_pane(&model).input, "d");
+}
+
+#[test]
+fn ctrl_k_opens_the_same_overlay_as_colon() {
+    // `Action::PaletteOpen` is kept as a documented alias — renaming an
+    // action id breaks a `keys.toml` somebody has already written.
+    let mut model = loaded();
+    press(&mut model, Key::ctrl('k'));
+    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+}
+
+#[test]
+fn a_verb_with_no_arguments_delegates_straight_to_run_action() {
+    // The whole point of the task: the 39 behaviours the keyboard reaches
+    // keep exactly one implementation. `help` opens the same overlay whether
+    // it arrives as `?` or as `:help`.
+    let mut by_key = loaded();
+    press(&mut by_key, Key::Char('?'));
+
+    let mut by_line = loaded();
+    command(&mut by_line, "help");
+    press(&mut by_line, Key::Enter);
+
+    assert!(matches!(by_key.overlay, Some(Overlay::Help)));
+    assert_eq!(by_line.overlay, by_key.overlay);
+    assert_eq!(by_line.screen, by_key.screen);
+}
+
+#[test]
+fn a_dotted_verb_and_a_spaced_one_are_the_same_line() {
+    for line in ["message.archive", "message archive"] {
+        let mut model = loaded();
+        let cmds = command(&mut model, line);
+        let cmds = [cmds, press(&mut model, Key::Enter)].concat();
+        assert!(
+            cmds.iter().any(|cmd| matches!(cmd, Cmd::Move { .. })),
+            "{line:?} issued {cmds:?}"
+        );
+    }
+}
+
+#[test]
+fn a_parse_error_keeps_the_overlay_open_with_the_text_still_there() {
+    let mut model = loaded();
+    command(&mut model, "message copy \"unterminated");
+    assert!(press(&mut model, Key::Enter).is_empty());
+    let pane = command_pane(&model);
+    assert!(
+        pane.error
+            .as_deref()
+            .is_some_and(|why| why.contains("unterminated quote")),
+        "{:?}",
+        pane.error
+    );
+    assert_eq!(
+        pane.input, "message copy \"unterminated",
+        "the offending text is still there to fix"
+    );
+}
+
+#[test]
+fn a_parse_error_clears_as_soon_as_the_line_is_edited() {
+    let mut model = loaded();
+    command(&mut model, "message copy \"unterminated");
+    press(&mut model, Key::Enter);
+    assert!(command_pane(&model).error.is_some());
+    press(&mut model, Key::Backspace);
+    assert!(
+        command_pane(&model).error.is_none(),
+        "an error about text that is being fixed is an error about text that \
+         is no longer there"
+    );
+}
+
+#[test]
+fn an_interior_node_names_its_children_rather_than_failing() {
+    // `manual` is a real verb *and* has children, so it resolves rather than
+    // reporting them — which is why the case below uses `cursor`, a path no
+    // verb sits at.
+    let mut model = loaded();
+    command(&mut model, "cursor");
+    press(&mut model, Key::Enter);
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("needs one of"), "{why}");
+    assert!(why.contains("down"), "{why}");
+    assert!(why.contains("up"), "{why}");
+}
+
+#[test]
+fn a_verb_given_an_argument_it_does_not_take_is_refused_by_name() {
+    let mut model = loaded();
+    command(&mut model, "message archive now");
+    press(&mut model, Key::Enter);
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("takes no arguments"), "{why}");
+    assert!(why.contains("now"), "{why}");
+}
+
+#[test]
+fn opening_the_command_line_over_a_selection_prefills_the_range() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    assert!(model.visual.is_some());
+    press(&mut model, Key::Char(':'));
+    assert_eq!(command_pane(&model).input, "'<,'>");
+}
+
+#[test]
+fn without_a_selection_the_command_line_opens_empty() {
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    assert_eq!(command_pane(&model).input, "");
+}
+
+#[test]
+fn the_selection_range_acts_on_the_whole_selection() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    press(&mut model, Key::Char('j'));
+    press(&mut model, Key::Char(':'));
+    keys(&mut model, "message archive");
+    let cmds = press(&mut model, Key::Enter);
+    let moves = cmds
+        .iter()
+        .filter(|cmd| matches!(cmd, Cmd::Move { .. }))
+        .count();
+    assert_eq!(moves, 2, "both selected rows: {cmds:?}");
+}
+
+#[test]
+fn a_selection_range_with_no_selection_is_refused_rather_than_narrowed() {
+    let mut model = loaded();
+    command(&mut model, "'<,'>message archive");
+    let cmds = press(&mut model, Key::Enter);
+    // The line parsed, so it is recorded — see `record_command`. Nothing
+    // that touches mail is issued, which is the property under test.
+    assert!(
+        cmds.iter()
+            .all(|cmd| matches!(cmd, Cmd::SaveHistory { .. })),
+        "{cmds:?}"
+    );
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("visual selection"), "{why}");
+}
+
+#[test]
+fn the_ranges_with_no_model_support_say_so_rather_than_acting_on_one_row() {
+    // Acting on the row under the cursor when `%` was typed would be a range
+    // that looked honoured and was not — the worst of the three answers.
+    for (line, expected) in [("%message archive", "%"), ("20message archive", "count")] {
+        let mut model = loaded();
+        command(&mut model, line);
+        let cmds = press(&mut model, Key::Enter);
+        assert!(
+            cmds.iter()
+                .all(|cmd| matches!(cmd, Cmd::SaveHistory { .. })),
+            "{line:?} issued {cmds:?}"
+        );
+        let why = command_pane(&model).error.clone().unwrap_or_default();
+        assert!(why.contains(expected), "{line:?}: {why}");
+    }
+}
+
+#[test]
+fn a_bang_skips_the_confirmation_and_only_that() {
+    let mut without = loaded();
+    command(&mut without, "message delete");
+    press(&mut without, Key::Enter);
+    assert!(
+        matches!(without.overlay, Some(Overlay::Confirm { .. })),
+        "delete asks first"
+    );
+
+    let mut with = loaded();
+    command(&mut with, "message delete!");
+    let cmds = press(&mut with, Key::Enter);
+    assert!(with.overlay.is_none(), "no question was asked");
+    assert!(
+        cmds.iter().any(|cmd| matches!(cmd, Cmd::Delete { .. })),
+        "and the delete went out: {cmds:?}"
+    );
+}
+
+#[test]
+fn helpgrep_carries_its_pattern_into_the_manual() {
+    // The one argument-carrying verb `run_action` cannot reach: its
+    // signature takes a count, not a string.
+    let mut model = loaded();
+    command(&mut model, "helpgrep archive");
+    press(&mut model, Key::Enter);
+    assert_eq!(model.screen, Screen::Manual);
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Grep("archive".to_owned())
+    );
+}
+
+#[test]
+fn manual_grep_is_the_same_verb_by_its_other_spelling() {
+    let mut model = loaded();
+    command(&mut model, "manual grep archive");
+    press(&mut model, Key::Enter);
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Grep("archive".to_owned())
+    );
+}
+
+#[test]
+fn a_bare_helpgrep_typed_on_the_command_line_raises_the_prompt() {
+    let mut model = loaded();
+    command(&mut model, "helpgrep");
+    press(&mut model, Key::Enter);
+    assert_eq!(model.screen, Screen::Manual);
+    assert!(manual(&model).typing(), "the prompt is up");
+}
+
+#[test]
+fn manual_opens_the_front_page_and_takes_no_page_name() {
+    let mut bare = loaded();
+    command(&mut bare, "manual");
+    press(&mut bare, Key::Enter);
+    assert_eq!(manual(&bare).at, manual::Location::start());
+
+    // Deliberately refused rather than accepted: `manual` cannot declare a
+    // positional without shadowing `manual grep` — see `command::explicit`'s
+    // own docs — and accepting an argument the grammar never mentions is
+    // exactly what that guard exists to prevent. `open_manual_at` is still
+    // the seam for a page name; task 102's `K` is what calls it.
+    let mut named = loaded();
+    command(&mut named, "manual archive");
+    press(&mut named, Key::Enter);
+    let why = command_pane(&named).error.clone().unwrap_or_default();
+    assert!(why.contains("takes no arguments"), "{why}");
+}
+
+#[test]
+fn an_unquoted_multi_word_pattern_reaches_helpgrep_whole() {
+    // Searching only the first word and dropping the rest would be a silent
+    // truncation of what was typed.
+    let mut model = loaded();
+    command(&mut model, "helpgrep undo window");
+    press(&mut model, Key::Enter);
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Grep("undo window".to_owned())
+    );
+}
+
+// --- completion ------------------------------------------------------------
+
+#[test]
+fn tab_completes_to_what_the_registry_can_say_for_certain() {
+    let mut model = loaded();
+    command(&mut model, "message arc");
+    press(&mut model, Key::Tab);
+    assert_eq!(command_pane(&model).input, "message archive ");
+}
+
+#[test]
+fn tab_stops_at_the_shared_prefix_when_more_than_one_verb_matches() {
+    // `help` and `helpgrep` are different verbs sharing a prefix, so
+    // completing to either would be a keystroke that did the wrong thing
+    // rather than one that did nothing. This is the case that goes through
+    // `longest_common_prefix`; a single-candidate line does not.
+    let mut model = loaded();
+    command(&mut model, "he");
+    press(&mut model, Key::Tab);
+    assert_eq!(
+        command_pane(&model).input,
+        "help",
+        "the shared prefix, and no further"
+    );
+}
+
+#[test]
+fn tab_opens_a_segment_that_is_already_typed_in_full() {
+    // Without the separator, Tab stalls on `message` — the completer answers
+    // `message` again, which is not longer than what is already there.
+    let mut model = loaded();
+    command(&mut model, "mess");
+    press(&mut model, Key::Tab);
+    assert_eq!(command_pane(&model).input, "message ");
+}
+
+#[test]
+fn tab_works_on_a_line_that_opened_with_a_range() {
+    // The state the command line is documented to open in. The range is a
+    // separator, not part of the first word — counting it as typed text made
+    // Tab dead here for every first segment.
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    press(&mut model, Key::Char(':'));
+    keys(&mut model, "message arc");
+    press(&mut model, Key::Tab);
+    assert_eq!(command_pane(&model).input, "'<,'>message archive ");
+}
+
+#[test]
+fn tab_on_a_line_ending_in_a_flag_leaves_it_alone() {
+    // The registry's completer drops flags before it looks at anything, so it
+    // answers about the verb — and substituting that over the flag is how
+    // `:search --x` once became `search search`.
+    let mut model = loaded();
+    command(&mut model, "search --x");
+    press(&mut model, Key::Tab);
+    assert_eq!(command_pane(&model).input, "search --x");
+}
+
+#[test]
+fn tab_with_nothing_to_add_leaves_the_line_alone() {
+    let mut model = loaded();
+    command(&mut model, "zzzznope");
+    press(&mut model, Key::Tab);
+    assert_eq!(command_pane(&model).input, "zzzznope");
+}
+
+// --- history ---------------------------------------------------------------
+
+#[test]
+fn a_run_line_is_recorded_and_written() {
+    let mut model = loaded();
+    command(&mut model, "help");
+    let cmds = press(&mut model, Key::Enter);
+    assert_eq!(model.history.entries(), ["help"]);
+    let saved = cmds.iter().find_map(|cmd| match cmd {
+        Cmd::SaveHistory { entries } => Some(entries.clone()),
+        _ => None,
+    });
+    assert_eq!(saved.as_deref(), Some(&["help".to_owned()][..]));
+}
+
+#[test]
+fn a_line_that_did_not_parse_is_not_recorded() {
+    let mut model = loaded();
+    command(&mut model, "message copy \"unterminated");
+    let cmds = press(&mut model, Key::Enter);
+    assert!(model.history.entries().is_empty());
+    assert!(
+        !cmds
+            .iter()
+            .any(|cmd| matches!(cmd, Cmd::SaveHistory { .. })),
+        "and nothing was written: {cmds:?}"
+    );
+}
+
+#[test]
+fn a_secret_line_is_never_recorded_and_never_reaches_a_write() {
+    // Driven through `record_command`, not through `<enter>`: `token` has no
+    // TUI verb today, so that line never parses, and a test that typed it
+    // would pass with the redaction rule deleted. `record_command` is the
+    // seam every recorded line goes through, so this is where the rule can be
+    // made to fail.
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    for line in [
+        "token create --name claude",
+        "account login --client-id abc 1",
+        "webhook add --secret-env WH x",
+        "'<,'>token create",
+    ] {
+        record_command(&mut model, line);
+        assert!(
+            model.history.entries().is_empty(),
+            "{line:?} was recorded: {:?}",
+            model.history.entries()
+        );
+        assert!(!model.pending_history, "{line:?} asked for a write");
+    }
+    // ...and an ordinary line does reach both, so the assertions above are
+    // about the rule rather than about `record_command` doing nothing.
+    record_command(&mut model, "message archive");
+    assert_eq!(model.history.entries(), ["message archive"]);
+    assert!(model.pending_history);
+}
+
+#[test]
+fn up_and_down_walk_the_history() {
+    let mut model = loaded();
+    model.history = History::new(vec!["help".to_owned(), "manual".to_owned()]);
+    press(&mut model, Key::Char(':'));
+
+    press(&mut model, Key::Up);
+    assert_eq!(command_pane(&model).input, "manual", "newest first");
+    press(&mut model, Key::Up);
+    assert_eq!(command_pane(&model).input, "help");
+    press(&mut model, Key::Up);
+    assert_eq!(
+        command_pane(&model).input,
+        "help",
+        "and stops at the oldest"
+    );
+
+    press(&mut model, Key::Down);
+    assert_eq!(command_pane(&model).input, "manual");
+    press(&mut model, Key::Down);
+    assert_eq!(
+        command_pane(&model).input,
+        "",
+        "back past the newest is the line as it was typed"
+    );
+}
+
+#[test]
+fn the_history_walk_is_filtered_by_what_was_already_typed() {
+    let mut model = loaded();
+    model.history = History::new(vec![
+        "message archive".to_owned(),
+        "help".to_owned(),
+        "message move".to_owned(),
+    ]);
+    press(&mut model, Key::Char(':'));
+    keys(&mut model, "mess");
+    press(&mut model, Key::Up);
+    assert_eq!(command_pane(&model).input, "message move");
+    press(&mut model, Key::Up);
+    assert_eq!(
+        command_pane(&model).input,
+        "message archive",
+        "help skipped"
+    );
+    press(&mut model, Key::Down);
+    press(&mut model, Key::Down);
+    assert_eq!(
+        command_pane(&model).input,
+        "mess",
+        "and the seed comes back, not an empty line"
+    );
+}
+
+#[test]
+fn typing_after_a_history_walk_starts_a_new_one() {
+    let mut model = loaded();
+    model.history = History::new(vec!["help".to_owned()]);
+    press(&mut model, Key::Char(':'));
+    press(&mut model, Key::Up);
+    assert_eq!(command_pane(&model).input, "help");
+    press(&mut model, Key::Backspace);
+    assert_eq!(command_pane(&model).input, "hel");
+    assert!(
+        command_pane(&model).browse.is_none(),
+        "the line is the typist's again"
+    );
+}
+
+#[test]
+fn up_and_down_still_move_a_cursor_everywhere_else() {
+    // The history walk is the command line's alone; `cursor.up` has to keep
+    // meaning what it means in every other overlay.
+    let mut model = loaded();
+    press(&mut model, Key::Char('j'));
+    assert_eq!(model.message_idx, 1);
+    press(&mut model, Key::Up);
+    assert_eq!(model.message_idx, 0);
+}
+
+#[test]
+fn the_fallback_carries_the_range_and_the_bang_the_line_had() {
+    // `:'<,'>arch` and `:del!` mean what they look like they mean: the
+    // fallback runs the ranked verb, not a bare version of it.
+    let mut ranged = loaded();
+    press(&mut ranged, Key::Char('v'));
+    press(&mut ranged, Key::Char('j'));
+    press(&mut ranged, Key::Char(':'));
+    keys(&mut ranged, "message arch");
+    let cmds = press(&mut ranged, Key::Enter);
+    assert_eq!(
+        cmds.iter()
+            .filter(|cmd| matches!(cmd, Cmd::Move { .. }))
+            .count(),
+        2,
+        "the range survived the fallback: {cmds:?}"
+    );
+
+    let mut banged = loaded();
+    command(&mut banged, "message del!");
+    let cmds = press(&mut banged, Key::Enter);
+    assert!(banged.overlay.is_none(), "the bang survived the fallback");
+    assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Delete { .. })));
+}
+
+#[test]
+fn an_empty_line_asks_for_a_verb_rather_than_running_the_first_row() {
+    // The list is every verb there is, in path order; running whichever
+    // sorts first would be a bare Enter doing something nobody named.
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    let pane = command_pane(&model);
+    assert!(!pane.matches.is_empty());
+    assert!(!pane.fallback_is_live(), "so no row is marked");
+    let cmds = press(&mut model, Key::Enter);
+    assert!(cmds.is_empty(), "{cmds:?}");
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("needs a verb"), "{why}");
+}
+
+#[test]
+fn a_line_refused_after_parsing_is_still_recorded() {
+    // It parsed, so it is exactly the line somebody wants `<up>` to bring
+    // back and fix — unlike one that never left the overlay.
+    let mut model = loaded();
+    command(&mut model, "%message archive");
+    press(&mut model, Key::Enter);
+    assert!(command_pane(&model).error.is_some());
+    assert_eq!(model.history.entries(), ["%message archive"]);
+}
+
+#[test]
+fn colon_from_a_list_overlay_replaces_it_and_stops_what_it_was_streaming() {
+    // `:` is bound in `Menu`, and a binding that does nothing in the layer it
+    // was added to is not a binding.
+    let mut model = loaded();
+    let cmds = {
+        press(&mut model, Key::Char('/'));
+        keys(&mut model, "invoice")
+    };
+    // The *last* one: every keystroke issues a search, and a frame from a
+    // superseded generation is dropped on arrival.
+    let generation = cmds
+        .iter()
+        .rev()
+        .find_map(|cmd| match cmd {
+            Cmd::Search { generation, .. } => Some(*generation),
+            _ => None,
+        })
+        .expect("the query issued a search");
+    // A hit has to land before `<enter>` will leave the query line — an
+    // empty result list has nothing to walk.
+    update(
+        &mut model,
+        Msg::Search {
+            generation,
+            event: SearchEvent::Hit(Box::new(Hit {
+                message_id: 10,
+                subject: "Quarterly invoice".to_owned(),
+                from: "Alice".to_owned(),
+                date: None,
+                snippet: "your invoice".to_owned(),
+                highlights: Vec::new(),
+                sources: vec!["lexical".to_owned()],
+            })),
+        },
+    );
+    press(&mut model, Key::Enter);
+    assert_eq!(model.mode(), Mode::Menu, "the results are up");
+
+    let cmds = press(&mut model, Key::Char(':'));
+    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    assert!(
+        cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::CancelStream {
+                which: Stream::Search
+            }
+        )),
+        "the search it replaced was cancelled: {cmds:?}"
+    );
+}
+
+#[test]
+fn opening_the_command_line_over_a_modal_that_is_not_a_list_is_refused() {
+    // A folder picker or a confirmation owns the keyboard: replacing one with
+    // a command line would answer a question nobody answered.
+    //
+    // Driven through `run_action` rather than by pressing `:`, and that is
+    // the point: `:` is bound in `Normal` and `Menu` only, so a keypress can
+    // never reach `open_command` with a `Confirm` up, and a test that pressed
+    // it would be green for *any* body of `open_command` — including one that
+    // replaced the overlay unconditionally. This exercises the refusal
+    // itself, which is what a `keys.toml` binding `:` in `Confirm` reaches.
+    for opener in [Action::CommandOpen, Action::PaletteOpen] {
+        let mut model = loaded();
+        press(&mut model, Key::Char('d'));
+        assert!(matches!(model.overlay, Some(Overlay::Confirm { .. })));
+        assert!(run_action(&mut model, opener, None).is_empty());
+        assert!(
+            matches!(model.overlay, Some(Overlay::Confirm { .. })),
+            "{opener:?} replaced the question"
+        );
+
+        let mut model = loaded();
+        press(&mut model, Key::Char('c'));
+        assert!(matches!(model.overlay, Some(Overlay::Pick { .. })));
+        run_action(&mut model, opener, None);
+        assert!(
+            matches!(model.overlay, Some(Overlay::Pick { .. })),
+            "{opener:?} replaced the picker"
+        );
+    }
+}
+
+#[test]
+fn a_selection_that_outlived_the_list_does_not_prefill_a_range() {
+    // The anchor survives leaving the list, but `Model::selection` does not —
+    // so a prefilled `'<,'>` in the viewer would be a range nothing could
+    // honour, and the verb would quietly act on one message instead.
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    press(&mut model, Key::Char('j'));
+    // Through `open_message_by_id`, which is how a selection reaches the
+    // viewer at all: `<enter>` on the list refuses while one is up, and a
+    // search hit is the path task 103's note describes.
+    open_message_by_id(&mut model, 10);
+    update(
+        &mut model,
+        Msg::Opened {
+            message_id: 10,
+            result: Ok(OpenMessage {
+                id: 10,
+                ..OpenMessage::default()
+            }),
+        },
+    );
+    assert_eq!(model.screen, Screen::Viewer);
+    assert!(model.visual.is_some(), "the anchor outlived the list");
+    assert!(!model.is_selecting(), "but the range did not");
+
+    press(&mut model, Key::Char(':'));
+    assert_eq!(command_pane(&model).input, "", "so nothing is prefilled");
+}
+
+#[test]
+fn a_range_typed_in_the_viewer_is_refused_rather_than_narrowed_to_one() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    open_message_by_id(&mut model, 10);
+    update(
+        &mut model,
+        Msg::Opened {
+            message_id: 10,
+            result: Ok(OpenMessage {
+                id: 10,
+                ..OpenMessage::default()
+            }),
+        },
+    );
+    assert_eq!(model.screen, Screen::Viewer);
+    // Typed by hand: nothing prefills it here, which is the previous test.
+    command(&mut model, "'<,'>message archive");
+    let cmds = press(&mut model, Key::Enter);
+    assert!(
+        cmds.iter()
+            .all(|cmd| matches!(cmd, Cmd::SaveHistory { .. })),
+        "nothing was archived: {cmds:?}"
+    );
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("message list"), "{why}");
+}
+
+#[test]
+fn a_range_on_a_verb_that_acts_on_no_message_is_refused() {
+    // A range names a set of messages, and `help` acts on none — accepting
+    // one and ignoring it is the same "looked honoured and was not" the `%`
+    // refusal exists to avoid.
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    press(&mut model, Key::Char(':'));
+    keys(&mut model, "help");
+    press(&mut model, Key::Enter);
+    assert!(model.overlay.is_some(), "the command line is still up");
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("does not act on one"), "{why}");
+
+    // ...while a verb that does act on mail takes the same range.
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    press(&mut model, Key::Char(':'));
+    keys(&mut model, "message archive");
+    let cmds = press(&mut model, Key::Enter);
+    assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Move { .. })));
+}
+
+#[test]
+fn the_fallback_refuses_a_line_carrying_a_flag() {
+    // `:message archive --force` is refused by the parser. `:arch --force`
+    // must be refused too, or the abbreviation is less strict than the
+    // spelling — the flag would be dropped and the archive would happen.
+    let mut model = loaded();
+    command(&mut model, "arch --force");
+    let cmds = press(&mut model, Key::Enter);
+    assert!(
+        !cmds.iter().any(|cmd| matches!(cmd, Cmd::Move { .. })),
+        "{cmds:?}"
+    );
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("flags cannot be guessed"), "{why}");
+    assert!(
+        model.history.entries().is_empty(),
+        "and it was not recorded"
+    );
+}

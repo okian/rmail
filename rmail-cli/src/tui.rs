@@ -63,6 +63,7 @@
 //! session.
 
 pub mod grpc;
+pub mod history;
 pub mod html;
 pub mod manual;
 pub mod model;
@@ -154,6 +155,20 @@ pub async fn run(socket: &Path, args: TuiArgs) -> Result<()> {
 
     let mut model = Model::for_account(args.account);
     apply_theme_arg(&mut model, args.theme.as_deref());
+    // Read once, here, rather than polled like `keys.toml`: a history is
+    // this session's own record, and a second rmail writing its file while
+    // this one is running should not reorder the list under somebody's
+    // `<up>`. Unreadable is an empty history, never a startup failure — see
+    // `history`'s own docs.
+    // `spawn_blocking`, not a direct read: this is filesystem work on a
+    // runtime thread, and it happens with the terminal already in raw mode —
+    // where a blocking `open` is a wedged session rather than a slow start.
+    // The write path goes the same way, in `grpc`.
+    let history_path = history::path_from_env();
+    let lines = tokio::task::spawn_blocking(move || history::read(&history_path))
+        .await
+        .unwrap_or_default();
+    model.history = history::History::new(lines);
 
     let result = drive::run_loop(model, &mut rx, &tx, &exec, |model| {
         terminal.draw(|frame| view::render(model, frame))?;

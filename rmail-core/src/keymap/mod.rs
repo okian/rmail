@@ -336,6 +336,7 @@ actions! {
     Cancel        => "cancel",              "close the overlay, selection or viewer";
     Quit          => "quit",                "quit from anywhere";
     Help          => "help",                "this help";
+    CommandOpen   => "command",             "the : command line: run any verb by name";
     ManualOpen    => "manual",              "the manual: guides, concepts and the generated reference";
     ManualBack    => "manual.back",         "back to the manual page you came from";
     ManualForward => "manual.forward",      "forward again, after going back";
@@ -356,7 +357,7 @@ actions! {
     SearchOpen    => "search",              "search this mailbox (~ semantic, = lexical)";
     SearchExplain => "search.explain",      "why did this result match";
     FinderOpen    => "finder",              "jump to anything (>#@/: scope it)";
-    PaletteOpen   => "palette",             "run a command by name";
+    PaletteOpen   => "palette",             "the : command line (alias of command)";
     AskOpen       => "ask",                 "ask a question about this mailbox";
     AiPanel       => "ai.panel",            "show or hide the AI panel";
     AiQuick       => "ai.quick",            "AI actions for this message";
@@ -609,6 +610,12 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Normal, "<enter>", Action::Open),
     (Mode::Normal, "q", Action::Back),
     (Mode::Normal, "?", Action::Help),
+    // Task 89's command line. Bound in `Normal` and `Menu` only: `Viewer` and
+    // `Visual` inherit `Normal`, and neither shadows `:` — a second literal
+    // entry for each would be two more rows that must never disagree with
+    // this one. `Menu` restates it for the reason it restates `j`/`k`: its
+    // chain stops at `Global`, so nothing reaches it from `Normal`.
+    (Mode::Normal, ":", Action::CommandOpen),
     // vim's `K` — "look this up" — for the manual (task 103). `?` stays the
     // key reference; `K` is the prose behind it.
     (Mode::Normal, "K", Action::ManualOpen),
@@ -665,6 +672,7 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Menu, "x", Action::SearchExplain),
     (Mode::Menu, "u", Action::OutboxCancel),
     // Back to the query line of whichever overlay is up.
+    (Mode::Menu, ":", Action::CommandOpen),
     (Mode::Menu, "/", Action::SearchOpen),
     (Mode::Menu, "q", Action::Cancel),
     (Mode::Pick, "j", Action::CursorDown),

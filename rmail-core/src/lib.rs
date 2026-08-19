@@ -66,5 +66,5 @@ pub use storage::{Database, StorageError};
 pub use telemetry::{LogFormat, TelemetryError};
 pub use transport::{
     config_path_from_env, connect_uds, db_path_from_env, default_config_path, default_db_path,
-    default_socket_path, socket_path_from_env, DB_ENV, SOCKET_ENV,
+    default_socket_path, socket_path_from_env, CONFIG_ENV, DB_ENV, SOCKET_ENV,
 };

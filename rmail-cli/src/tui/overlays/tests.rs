@@ -163,10 +163,10 @@ fn finder_pane(model: &Model) -> &FinderPane {
     }
 }
 
-fn palette_pane(model: &Model) -> &PalettePane {
+fn command_pane(model: &Model) -> &CommandPane {
     match model.overlay.as_ref() {
-        Some(Overlay::Palette(pane)) => pane,
-        other => panic!("expected the palette overlay, found {other:?}"),
+        Some(Overlay::Command(pane)) => pane,
+        other => panic!("expected the command overlay, found {other:?}"),
     }
 }
 
@@ -581,63 +581,115 @@ fn a_finder_kind_this_build_does_not_know_is_never_acted_on() {
 }
 
 // ---------------------------------------------------------------------------
-// palette
+// the command line's ranked matches
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_palette_resolves_typed_text_to_action_ids() {
+fn the_command_line_resolves_typed_text_to_verbs() {
     let mut model = loaded();
     press(&mut model, Key::ctrl('k'));
     assert_eq!(
-        palette_pane(&model).matches.len(),
-        Action::ALL.len(),
-        "an empty palette lists everything — it is a discovery surface, not only a shortcut"
+        command_pane(&model).matches.len(),
+        command::children_of(&[]).len(),
+        "an empty line lists every verb — it is a discovery surface, not only \
+         a shortcut"
     );
 
     keys(&mut model, "arch");
-    let matches = &palette_pane(&model).matches;
+    let matches = &command_pane(&model).matches;
     assert_eq!(
-        matches.first().map(|entry| entry.action),
-        Some(Action::Archive)
+        matches.first().map(|entry| entry.verb.as_str()),
+        Some("message archive")
     );
     assert!(
-        matches
-            .iter()
-            .all(|entry| entry.action != Action::CursorTop),
+        matches.iter().all(|entry| entry.verb != "cursor top"),
         "a command that matches nothing typed is not offered"
     );
 }
 
 #[test]
-fn the_palette_runs_the_highlighted_command() {
+fn the_ranked_list_ignores_the_range_the_bang_and_the_flags() {
+    // Ranking runs on every keystroke, including on lines the parser would
+    // reject outright, so what it reads is the verb-shaped part of the line
+    // and nothing else.
+    let keymap = Keymap::defaults();
+    let plain = command_matches("message archive", &keymap);
+    for line in [
+        "'<,'>message archive",
+        "%message archive",
+        "20message archive",
+        "message archive!",
+        "message archive --dry-run",
+        "MESSAGE.ARCHIVE",
+    ] {
+        assert_eq!(
+            command_matches(line, &keymap)
+                .first()
+                .map(|e| e.verb.clone()),
+            plain.first().map(|e| e.verb.clone()),
+            "{line:?} ranked differently"
+        );
+    }
+}
+
+#[test]
+fn the_command_line_runs_the_best_match_when_the_line_names_no_verb() {
+    // Task 85's palette, through the same pane: `help` is not a verb path
+    // anybody typed in full, and Enter still runs it.
     let mut model = loaded();
     press(&mut model, Key::ctrl('k'));
-    keys(&mut model, "help");
+    keys(&mut model, "hel");
     press(&mut model, Key::Enter);
     assert!(
         matches!(model.overlay, Some(Overlay::Help)),
-        "the palette closes and the command runs against the screen behind it"
+        "the command line closes and the command runs against the screen \
+         behind it"
     );
 }
 
 #[test]
-fn the_palette_says_so_when_nothing_matches() {
+fn the_command_line_says_so_when_nothing_matches() {
     let mut model = loaded();
     press(&mut model, Key::ctrl('k'));
     keys(&mut model, "zzzznope");
-    assert!(palette_pane(&model).matches.is_empty());
+    assert!(command_pane(&model).matches.is_empty());
     assert!(press(&mut model, Key::Enter).is_empty());
-    assert!(model.status.contains("no command"), "{}", model.status);
+    let pane = command_pane(&model);
+    assert!(
+        pane.error
+            .as_deref()
+            .is_some_and(|why| why.contains("no command")),
+        "{:?}",
+        pane.error
+    );
+    assert!(model.overlay.is_some(), "and the overlay stays open");
 }
 
 #[test]
-fn every_palette_entry_names_a_command_this_build_can_run() {
-    // The palette's whole vocabulary is the action registry, so this is the
-    // property that keeps a palette row from being a dead end.
-    let entries = palette_matches("", &Keymap::defaults());
-    for entry in &entries {
-        assert_eq!(Action::from_id(entry.action.id()), Some(entry.action));
+fn every_command_entry_names_a_verb_this_build_can_run() {
+    // The list's whole vocabulary is the verb registry, so this is the
+    // property that keeps a row from being a dead end.
+    for entry in command_matches("", &Keymap::defaults()) {
+        let path: Vec<&str> = entry.verb.split(' ').collect();
+        assert!(
+            command::verb_at(&path).is_some(),
+            "{:?} is not in the registry",
+            entry.verb
+        );
     }
+}
+
+#[test]
+fn a_verb_no_chord_reaches_is_still_offered_without_a_key_column() {
+    // `helpgrep` has no binding at all — it exists only in the grammar. The
+    // palette could not offer it, because its vocabulary was `Action::ALL`;
+    // this list's is the registry, which is strictly wider.
+    let entries = command_matches("helpgrep", &Keymap::defaults());
+    let found = entries
+        .iter()
+        .find(|entry| entry.verb == "helpgrep")
+        .expect("helpgrep is a verb");
+    assert!(found.chords.is_empty(), "{:?}", found.chords);
 }
 
 // ---------------------------------------------------------------------------

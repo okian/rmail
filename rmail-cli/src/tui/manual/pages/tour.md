@@ -33,10 +33,31 @@ finished saying hello.
 
 ## Reaching everything else
 
-{{keys:palette}} runs any command by name, which is the answer to "there must
-be a key for this and I do not know it". It ranks what you type against every
-command's name and description, so typing a word from the description finds
-the verb even when you cannot remember its spelling.
+{{keys:command}} opens the command line, which is the answer to "there must
+be a key for this and I do not know it". Type a verb and press Enter; the
+ranked list underneath matches on the verb's own name and on its description,
+so a word from the description finds it even when you cannot remember the
+spelling, and Enter runs the best match when what you typed is not a verb in
+full. {{keys:palette}} opens the same line — the name is kept because
+renaming an action would break a keys.toml somebody has already written.
+
+Tab completes as far as the registry can be certain, and no further: two
+verbs sharing a prefix stop at the prefix rather than one of them being
+chosen for you. Up and Down walk what you have run before, filtered by
+whatever is already on the line.
+
+A verb takes the arguments it declares, and three things can precede or
+follow it:
+
+- {{cmd:helpgrep}} invoice — an argument, for the verbs that take one.
+- '<,'> — the visual selection, so the verb acts on all of it. Opening the
+  line while a selection is up fills this in for you. % and a leading count
+  are part of the grammar and are refused here rather than half-honoured:
+  nothing in this screen can address "every row listed" yet, and acting on
+  one row instead would be a range that looked obeyed and was not.
+- A trailing !, which skips the confirmation and nothing else — so
+  {{cmd:message delete}}! expunges without asking. It never changes what a
+  command does.
 
 The three other doors out of the message list are [[search-vs-finder]] for
 finding mail, [[bulk]] for acting on more than one message, and this manual —

@@ -2009,6 +2009,12 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     Action::InputSubmit,
     Action::InputBackspace,
     Action::PaletteOpen,
+    // Task 89's command line, local for the same reason the palette it
+    // replaces is: opening it reaches nothing. What is *typed* into it
+    // reaches whatever the dispatched verb reaches, and that verb's own row
+    // is what declares it — a `:` that claimed every capability at once
+    // would make this table say nothing.
+    Action::CommandOpen,
     Action::PromptAccept,
     Action::PromptComplete,
     Action::MenuAccept,

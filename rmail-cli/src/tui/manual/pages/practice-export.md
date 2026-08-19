@@ -32,5 +32,6 @@ could touch the database rather than the index, copy the database file too.
 
 ## The narrower habit
 
-Before a bulk action wider than a screen, list what it will hit first — the
-same query, run once to look and once to act. See [[bulk]].
+Before a bulk action wider than a screen, look at what it will hit first —
+the selection is visible, which is most of the point of making one. See
+[[bulk]].

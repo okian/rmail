@@ -67,6 +67,7 @@
 #[cfg(test)]
 mod tests;
 
+use rmail_core::command::{self, Verb};
 use rmail_core::keymap::{Action, Keymap, Mode};
 use rmail_core::query::parse::OPERATORS;
 
@@ -454,85 +455,166 @@ impl FinderPane {
 }
 
 // ---------------------------------------------------------------------------
-// palette
+// the command line
 // ---------------------------------------------------------------------------
 
-/// One command the palette offers.
+/// One verb the command line offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaletteEntry {
-    /// What running it does.
-    pub action: Action,
+pub struct CommandEntry {
+    /// The verb's path as it is typed, space separated.
+    pub verb: String,
+    /// The action it runs with no arguments, if it has one. `None` for a verb
+    /// the grammar is the only way to reach.
+    pub action: Option<Action>,
     /// How it is bound in the message list, for the right-hand column.
     pub chords: String,
+    /// One line of help.
+    pub describe: String,
 }
 
-/// `Ctrl-K` — run a command by name.
+/// Where an `<up>`/`<down>` walk through the history currently stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Browse {
+    /// What was typed before the walk began, and the prefix it filters on.
+    /// Restored when the walk comes back past its start.
+    pub seed: String,
+    /// Index into `History::matching(seed)` — 0 is the most recent match.
+    pub at: usize,
+}
+
+/// `:` — the command line.
+///
+/// It replaces task 85's `PalettePane`, and `Action::PaletteOpen` still opens
+/// it: the palette's job — "run a command by name, ranked, without knowing
+/// its key" — is this pane's ranked match list, and the id stays because
+/// renaming one breaks a `keys.toml` somebody has already written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PalettePane {
-    /// What has been typed.
+pub struct CommandPane {
+    /// What has been typed, without the leading `:`.
     pub input: String,
-    /// Cursor within [`PalettePane::matches`].
-    pub cursor: usize,
-    /// The current matches, recomputed on every keystroke.
-    pub matches: Vec<PaletteEntry>,
+    /// The ranked verbs matching it, recomputed on every keystroke.
+    pub matches: Vec<CommandEntry>,
+    /// Why the last `<enter>` did not run anything. Shown in the line itself
+    /// and cleared by the next edit, so a parse error leaves the overlay open
+    /// with the offending text still there to fix.
+    pub error: Option<String>,
+    /// The history walk in progress, if any.
+    pub browse: Option<Browse>,
 }
 
-impl PalettePane {
-    /// The highlighted command.
+impl CommandPane {
+    /// The verb `<enter>` falls back to when the typed line names none — the
+    /// best-ranked match, which is the row the list draws first.
     #[must_use]
-    pub fn entry(&self) -> Option<&PaletteEntry> {
-        self.matches.get(self.cursor)
+    pub fn best(&self) -> Option<&CommandEntry> {
+        self.matches.first()
+    }
+
+    /// Whether the typed line names no verb of its own, so `<enter>` would
+    /// run [`CommandPane::best`] instead.
+    ///
+    /// Asked of the registry rather than tracked as a field, because the
+    /// answer is a function of the input and a field would be a second copy
+    /// of it — free to be stale for exactly one frame after a keystroke,
+    /// which is the frame somebody presses Enter in.
+    ///
+    /// An *empty* line is not a live fallback even though it also names no
+    /// verb: the list is then every verb there is, in path order, and
+    /// pointing at whichever sorts first would be pointing at something
+    /// `<enter>` does not do — a bare `<enter>` asks for a verb.
+    #[must_use]
+    pub fn fallback_is_live(&self) -> bool {
+        !self.matches.is_empty()
+            && matches!(
+                command::parse(self.input.trim()),
+                Err(command::CommandError::UnknownVerb { .. })
+            )
     }
 }
 
-/// Rank every action against `input`.
+/// Rank every verb in the registry against `input`.
 ///
-/// Resolution is local and total: the palette's target vocabulary is
-/// [`Action::ALL`], the same stable ids `keys.toml` binds and `mail keys`
-/// prints, so "which command did they mean" is answered without a round trip
-/// and works with the daemon unreachable. An empty input lists everything,
-/// which is what makes the palette a discovery surface rather than only a
-/// shortcut.
+/// This is task 85's `palette_matches` generalized: the vocabulary widened
+/// from [`Action::ALL`] to `rmail_core::command`'s registry — which is every
+/// action *plus* the verbs no chord reaches — and the ranking is unchanged.
+/// Resolution stays local and total, so "which command did they mean" is
+/// still answered with the daemon unreachable, and an empty input still lists
+/// everything, which is what makes this a discovery surface rather than only
+/// a shortcut.
 ///
-/// Three tiers, so an exact-ish id beats a coincidental word in a help
-/// string: a prefix of the id, then a subsequence of the id, then a
-/// substring of the description. Ties break on the id so the order is stable
-/// across frames — a list that reshuffles between keystrokes is unusable.
+/// Four tiers, so an exact-ish path beats a coincidental word in a help
+/// string: a prefix of the path, then a substring of it, then a subsequence
+/// of it, then a substring of the description. Ties break on the path so the
+/// order is stable across frames — a list that reshuffles between keystrokes
+/// is unusable.
 #[must_use]
-pub fn palette_matches(input: &str, keymap: &Keymap) -> Vec<PaletteEntry> {
-    let needle = input.trim().to_lowercase();
-    let mut scored: Vec<(u8, &'static str, Action)> = Vec::new();
-    for action in Action::ALL {
-        let id = action.id();
-        let describe = action.describe().to_lowercase();
+pub fn command_matches(input: &str, keymap: &Keymap) -> Vec<CommandEntry> {
+    let needle = verb_words(input);
+    let mut scored: Vec<(u8, String, &'static Verb)> = Vec::new();
+    for verb in command::children_of(&[]) {
+        let path = verb.canonical();
+        let describe = verb.describe().to_lowercase();
         let tier = if needle.is_empty() {
             3
-        } else if id.starts_with(&needle) {
+        } else if path.starts_with(&needle) {
             0
-        } else if id.contains(&needle) {
+        } else if path.contains(&needle) {
             1
-        } else if is_subsequence(&needle, id) {
+        } else if is_subsequence(&needle, &path) {
             2
         } else if describe.contains(&needle) {
             3
         } else {
             continue;
         };
-        scored.push((tier, id, *action));
+        scored.push((tier, path, verb));
     }
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     scored
         .into_iter()
-        .map(|(_, _, action)| PaletteEntry {
-            chords: keymap
-                .chords_for(Mode::Normal, action)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" / "),
-            action,
+        .map(|(_, path, verb)| CommandEntry {
+            chords: verb
+                .action
+                .map(|action| {
+                    keymap
+                        .chords_for(Mode::Normal, action)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                })
+                .unwrap_or_default(),
+            action: verb.action,
+            describe: verb.describe(),
+            verb: path,
         })
         .collect()
+}
+
+/// The part of a typed line that names a verb, lowercased and space
+/// separated: no range, no trailing bang, no flags, and dots read as spaces.
+///
+/// Ranking happens on every keystroke, including on lines the parser would
+/// reject outright, so this is deliberately forgiving where
+/// `rmail_core::command::parse` is strict — its job is to decide what the
+/// typist is reaching for, not whether they have typed it correctly yet.
+#[must_use]
+pub fn verb_words(input: &str) -> String {
+    let rest = input.trim().trim_start_matches(':').trim_start();
+    let rest = rest
+        .strip_prefix("'<,'>")
+        .or_else(|| rest.strip_prefix('%'))
+        .unwrap_or(rest);
+    let rest = rest
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start();
+    rest.split_whitespace()
+        .take_while(|word| !word.starts_with('-'))
+        .flat_map(|word| word.trim_end_matches('!').split('.'))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Whether every character of `needle` appears in `haystack`, in order.

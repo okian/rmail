@@ -188,6 +188,16 @@ fn split_path(text: &str) -> Vec<&str> {
 /// (see [`registry`]), so both have to be written here or `manual grep`
 /// would stop resolving.
 ///
+/// Task 89 tried to add a third — `manual` with an optional `page`, so
+/// `:manual archive` could carry one — and
+/// `no_real_verb_that_takes_positionals_is_shadowed_by_a_longer_one` refused
+/// it: a verb taking positionals must not be a strict prefix of another, or
+/// the one word that collides (`grep`, here) silently means the longer verb
+/// instead of being that argument. Declaring it anyway to serve a
+/// convenience would have made the guard advisory. The page-name seam is
+/// therefore still `rmail_cli::tui::model::open_manual_at`, called directly,
+/// which is what task 102's `K`-on-a-key-reference-row does.
+///
 /// A function, not a `const` slice: [`Verb::path`] is a `Vec`, which cannot
 /// appear in a `const` initializer at all (`Vec::new` allocates), so a
 /// `const EXPLICIT: &[Verb] = &[]` can never actually gain an entry no
@@ -713,7 +723,7 @@ fn check_positionals(verb: &Verb, positionals: &[String]) -> Result<(), CommandE
 }
 
 /// The registry's closest canonical path to `attempted`, ranked the way
-/// `overlays::palette_matches` (task 85) ranks the command palette — reusing
+/// `overlays::command_matches` (task 85) ranks the command palette — reusing
 /// "is this roughly what was meant" rather than this module inventing a
 /// second notion of fuzzy closeness: a prefix match beats a substring match
 /// beats "every character of `attempted`, in order, somewhere in the

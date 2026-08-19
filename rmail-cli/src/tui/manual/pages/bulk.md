@@ -35,9 +35,19 @@ those, the bulk surfaces are per-domain rather than general:
 general bulk-preview-and-undo layer, so where one of those does not fit, the
 honest move is a smaller selection.
 
-The verb grammar itself has vim's ranges — a leading selection, a leading
-percent, a leading count — but nothing in this build reads a typed one: see
-[[manual]] on what a verb's colon spelling is and is not.
+The command line takes vim's selection range, which is how a verb acts on
+everything selected rather than on the row under the cursor:
+
+```
+:'<,'>message archive
+:'<,'>message toggle-read
+```
+
+Opening it with {{keys:command}} while a selection is up fills the range in
+already. The other two range forms — % for everything listed, and a leading
+count — are part of the grammar and are refused rather than half-honoured:
+nothing here can address those sets yet, and acting on one row instead would
+be a range that looked obeyed and was not.
 
 ## Where to read next
 

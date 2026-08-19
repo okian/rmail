@@ -54,12 +54,16 @@ pub mod wire;
 #[cfg(test)]
 mod tests;
 
+use rmail_core::command;
+use rmail_core::parity::Command as Capability;
+
+use super::history::History;
 use super::manual;
 use super::overlays;
 use super::overlays::{
-    complete_operator, palette_matches, AiSummary, AskPane, AskPhase, Citation, Explanation,
-    FinderItem, FinderKind, FinderPane, Hit, OutboxPane, OutboxRow, PalettePane, QuickAction,
-    QuickPane, SearchFocus, SearchPane, UndoToast,
+    command_matches, complete_operator, AiSummary, AskPane, AskPhase, Browse, Citation,
+    CommandPane, Explanation, FinderItem, FinderKind, FinderPane, Hit, OutboxPane, OutboxRow,
+    QuickAction, QuickPane, SearchFocus, SearchPane, UndoToast,
 };
 use super::theme::Theme;
 pub use crate::keymap::Key;
@@ -489,8 +493,10 @@ pub enum Overlay {
     Search(Box<SearchPane>),
     /// `Ctrl-P` — the fuzzy finder.
     Finder(Box<FinderPane>),
-    /// `Ctrl-K` — the command palette.
-    Palette(Box<PalettePane>),
+    /// `:` — the command line (task 89). `Ctrl-K` opens the same overlay:
+    /// the palette's ranked "run a command by name" is this pane's match
+    /// list.
+    Command(Box<CommandPane>),
     /// `A` — the ask pane.
     Ask(Box<AskPane>),
     /// `O` — the outbox pseudo-folder.
@@ -509,13 +515,18 @@ impl Overlay {
         Some(match self {
             Self::Search(pane) => (pane.cursor, pane.hits.len()),
             Self::Finder(pane) => (pane.cursor, pane.items.len()),
-            Self::Palette(pane) => (pane.cursor, pane.matches.len()),
             Self::Ask(pane) => (pane.cursor, pane.citations.len()),
             Self::Outbox(pane) => (pane.cursor, pane.rows.len()),
             Self::Quick(pane) => (pane.cursor, QuickAction::ALL.len()),
-            Self::Help | Self::Pick { .. } | Self::Confirm { .. } | Self::Input { .. } => {
-                return None
-            }
+            // The command line is absent on purpose: its `<up>`/`<down>`
+            // walk the history rather than a list, which is what `:` means
+            // everywhere else it exists. Its ranked matches are a preview
+            // with no cursor — `<tab>` is what puts one into the line.
+            Self::Help
+            | Self::Pick { .. }
+            | Self::Confirm { .. }
+            | Self::Input { .. }
+            | Self::Command(_) => return None,
         })
     }
 
@@ -525,11 +536,14 @@ impl Overlay {
         match self {
             Self::Search(pane) => pane.cursor = at,
             Self::Finder(pane) => pane.cursor = at,
-            Self::Palette(pane) => pane.cursor = at,
             Self::Ask(pane) => pane.cursor = at,
             Self::Outbox(pane) => pane.cursor = at,
             Self::Quick(pane) => pane.cursor = at,
-            Self::Help | Self::Pick { .. } | Self::Confirm { .. } | Self::Input { .. } => {}
+            Self::Help
+            | Self::Pick { .. }
+            | Self::Confirm { .. }
+            | Self::Input { .. }
+            | Self::Command(_) => {}
         }
     }
 }
@@ -856,6 +870,18 @@ pub enum Cmd {
         /// Unix seconds to stop at.
         until: i64,
     },
+    /// Write the `:` command line's history to its file.
+    ///
+    /// A [`Cmd`] rather than a write inside [`update`] for the reason every
+    /// other side effect is one: `update` is pure, synchronous and clockless,
+    /// and a filesystem call in it would be all three of those things
+    /// undone. The whole list travels rather than the new line, so the writer
+    /// needs no state of its own and a dropped write is corrected by the next
+    /// one instead of leaving a gap.
+    SaveHistory {
+        /// Every recorded line, oldest first.
+        entries: Vec<String>,
+    },
     /// Stop a stream nobody is reading any more.
     ///
     /// Leaving an overlay is the one case the generation stamp does not
@@ -946,6 +972,14 @@ pub struct Model {
     /// The message the `.` menu aimed the panel at, if any. Holds the panel
     /// still until the user deliberately moves off it.
     summary_pinned: Option<i64>,
+    /// The `:` command line's history, oldest first.
+    pub history: History,
+    /// Whether [`Model::history`] has a line the file does not.
+    ///
+    /// A flag rather than a write, because `update` is pure and synchronous:
+    /// the write is a [`Cmd`], issued by whichever call next has a `Vec<Cmd>`
+    /// to put it in, so the model never touches a filesystem.
+    pub pending_history: bool,
     /// The undo-send countdown, when a scheduled send is still inside its
     /// window.
     pub toast: Option<UndoToast>,
@@ -1021,6 +1055,8 @@ impl Model {
             summary_for: None,
             summary_failed: None,
             summary_pinned: None,
+            history: History::default(),
+            pending_history: false,
             toast: None,
             generation: 0,
             visual: None,
@@ -1071,7 +1107,7 @@ impl Model {
             // being in one mode while it draws the other.
             Some(Overlay::Search(pane)) if pane.typing() => Mode::Prompt,
             Some(Overlay::Ask(pane)) if pane.typing() => Mode::Prompt,
-            Some(Overlay::Finder(_) | Overlay::Palette(_)) => Mode::Prompt,
+            Some(Overlay::Finder(_) | Overlay::Command(_)) => Mode::Prompt,
             Some(Overlay::Search(_) | Overlay::Ask(_) | Overlay::Outbox(_) | Overlay::Quick(_)) => {
                 Mode::Menu
             }
@@ -1216,6 +1252,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     // prefix the user typed for a screen that is no longer there.
     if model.mode() != mode_before {
         model.pending.clear();
+    }
+    // Folded in here rather than at each recording site: `record_command`
+    // sets a flag and this is the one place that turns it into work, so
+    // there is exactly one write per `update` however many lines it recorded.
+    if std::mem::take(&mut model.pending_history) {
+        cmds.push(Cmd::SaveHistory {
+            entries: model.history.entries().to_vec(),
+        });
     }
     cmds
 }
@@ -1827,8 +1871,8 @@ enum Typed {
     Search,
     /// The finder prompt.
     Finder,
-    /// The palette input.
-    Palette,
+    /// The `:` command line.
+    Command,
 }
 
 /// Apply `edit` to whichever text field is up, and issue whatever the change
@@ -1856,7 +1900,17 @@ fn edit_prompt(model: &mut Model, edit: TextEdit) -> Vec<Cmd> {
             once(apply_edit(&mut pane.query, edit), Typed::Search)
         }
         Some(Overlay::Finder(pane)) => once(apply_edit(&mut pane.query, edit), Typed::Finder),
-        Some(Overlay::Palette(pane)) => once(apply_edit(&mut pane.input, edit), Typed::Palette),
+        Some(Overlay::Command(pane)) => {
+            // An edit ends a history walk and clears the last complaint: the
+            // line is the typist's again, and an error about text they have
+            // started fixing is an error about text that is no longer there.
+            let changed = apply_edit(&mut pane.input, edit);
+            if changed {
+                pane.browse = None;
+                pane.error = None;
+            }
+            once(changed, Typed::Command)
+        }
         Some(Overlay::Ask(pane)) if pane.typing() => {
             apply_edit(&mut pane.question, edit);
             Typed::Nothing
@@ -1870,8 +1924,8 @@ fn edit_prompt(model: &mut Model, edit: TextEdit) -> Vec<Cmd> {
         Typed::Nothing => Vec::new(),
         Typed::Search => search_now(model),
         Typed::Finder => find_now(model),
-        Typed::Palette => {
-            refresh_palette(model);
+        Typed::Command => {
+            refresh_command(model);
             Vec::new()
         }
     }
@@ -1952,7 +2006,7 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
         Action::SearchOpen => open_search(model),
         Action::SearchExplain => toggle_explain(model),
         Action::FinderOpen => open_finder(model),
-        Action::PaletteOpen => open_palette(model),
+        Action::CommandOpen | Action::PaletteOpen => open_command(model),
         Action::AskOpen => open_ask(model, String::new()),
         Action::AiPanel => toggle_ai_panel(model),
         Action::AiQuick => open_quick(model),
@@ -2095,6 +2149,14 @@ fn set_cursor(model: &mut Model, cursor: Cursor, at: usize) {
 }
 
 fn move_cursor(model: &mut Model, direction: Direction, count: Option<u32>) -> Vec<Cmd> {
+    // The command line's `<up>`/`<down>` are its history, not a cursor —
+    // vim's meaning of those keys on a `:` line, and the reason the pane
+    // reports no list cursor at all. Handled here rather than by a binding of
+    // its own so `cursor.up` keeps meaning "the previous thing" wherever it
+    // is pressed, which is what a shared vocabulary is for.
+    if browse_history(model, direction) {
+        return Vec::new();
+    }
     let Some(cursor) = active_cursor(model) else {
         return Vec::new();
     };
@@ -2246,7 +2308,7 @@ fn streams_of(overlay: &Overlay) -> &'static [Stream] {
         | Overlay::Pick { .. }
         | Overlay::Confirm { .. }
         | Overlay::Input { .. }
-        | Overlay::Palette(_)
+        | Overlay::Command(_)
         | Overlay::Outbox(_)
         | Overlay::Quick(_) => &[],
     }
@@ -2788,7 +2850,7 @@ fn open_manual_grep(model: &mut Model) -> Vec<Cmd> {
     // typing into, so the *key* path refuses rather than opening one: whatever
     // that modal is, it is what the keyboard belongs to. The argument-carrying
     // path takes the modal down first instead — it was dispatched *by* one
-    // (the palette today, task 89's command line next), which is a modal
+    // (task 89's command line), which is a modal
     // asking to be replaced rather than one being talked over.
     if model.overlay.is_some() {
         return Vec::new();
@@ -3184,39 +3246,363 @@ fn activate_finder(model: &mut Model) -> Vec<Cmd> {
     }
 }
 
-/// `Ctrl-K` — the command palette.
-fn open_palette(model: &mut Model) -> Vec<Cmd> {
-    if !screen_is_clear(model) {
+/// `:` — the command line. `Ctrl-K` opens the same overlay.
+fn open_command(model: &mut Model) -> Vec<Cmd> {
+    // `:` is bound in `Menu` as well as `Normal`, so a list overlay is the
+    // one thing it may open *over* — and it replaces that overlay rather
+    // than stacking on it, taking whatever it was streaming down with it.
+    // The alternative reading, "refuse while anything is up", makes the
+    // binding dead in the layer it was deliberately added to; the reading
+    // after that, "restore the menu on Esc", is an overlay stack this model
+    // does not have and would leave a restored search pane holding results
+    // whose stream was cancelled. A modal that answers `:` is a modal asking
+    // to be replaced — the same call `open_manual_grep_for` makes when it is
+    // dispatched from one.
+    let stop = if model.mode() == Mode::Menu {
+        model.overlay.take().map(|overlay| cancels(&overlay))
+    } else if screen_is_clear(model) {
+        None
+    } else {
         return Vec::new();
+    };
+    // vim's own behaviour, and the reason `'<,'>` is spelled the way it is:
+    // opening `:` over a selection means "act on this", so the range is
+    // already there rather than something to remember to type.
+    // `is_selecting`, not `visual.is_some()`: the anchor outlives leaving the
+    // list (task 103), so the raw field is set in the viewer too — and there
+    // `Model::selection` returns `None`, so a prefilled `'<,'>` would be a
+    // range nothing could honour. `Model::is_selecting`'s own docs name this
+    // as the mistake that once let `a` archive the viewer's message while `r`
+    // refused, citing a selection drawn nowhere.
+    let input = if model.is_selecting() {
+        SELECTION_RANGE.to_owned()
+    } else {
+        String::new()
+    };
+    model.overlay = Some(Overlay::Command(Box::new(CommandPane {
+        input,
+        ..CommandPane::default()
+    })));
+    refresh_command(model);
+    model.info("command — type a verb, Enter runs it, Tab completes");
+    stop.unwrap_or_default()
+}
+
+/// The range prefix a `:` opened over a visual selection starts with.
+const SELECTION_RANGE: &str = "'<,'>";
+
+fn refresh_command(model: &mut Model) {
+    let Some(Overlay::Command(pane)) = model.overlay.as_ref() else {
+        return;
+    };
+    let matches = command_matches(&pane.input.clone(), &model.keymap);
+    if let Some(Overlay::Command(pane)) = model.overlay.as_mut() {
+        pane.matches = matches;
     }
-    model.overlay = Some(Overlay::Palette(Box::default()));
-    refresh_palette(model);
-    model.info("palette — type a command, Enter runs it");
+}
+
+/// `Enter` on the command line.
+///
+/// Three outcomes, and the overlay only closes on the first: the line names a
+/// verb and it runs; the line names *no* verb, in which case the best-ranked
+/// match runs, which is what keeps task 85's palette — type a fuzzy name,
+/// press Enter — working through the same pane; or the line does not parse at
+/// all, and the complaint is rendered inside the line with the offending text
+/// still there to fix.
+///
+/// The fallback is deliberately narrow. Only [`CommandError::UnknownVerb`]
+/// takes it, because that is the one failure that means "you have not
+/// finished naming it yet". A malformed range or an unterminated quote is a
+/// line whose *shape* is wrong, and quietly running something else because
+/// the verb inside it happened to rank first would be a keystroke doing what
+/// nobody asked.
+fn submit_command(model: &mut Model) -> Vec<Cmd> {
+    let Some(Overlay::Command(pane)) = model.overlay.as_ref() else {
+        return Vec::new();
+    };
+    let line = pane.input.trim().to_owned();
+    match command::parse(&line) {
+        Ok(command::Resolution::Invocation(invocation)) => {
+            record_command(model, &line);
+            run_invocation(model, *invocation)
+        }
+        Ok(command::Resolution::Children { path, children }) => {
+            let mut names: Vec<String> = children
+                .iter()
+                .filter_map(|verb| verb.path.get(path.len()).map(|s| (*s).to_owned()))
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            complain(
+                model,
+                format!("{} needs one of: {}", path.join(" "), names.join(", ")),
+            )
+        }
+        Err(command::CommandError::UnknownVerb { .. }) if carries_a_flag(&line) => complain(
+            model,
+            format!("{line:?} names no command, and its flags cannot be guessed"),
+        ),
+        Err(command::CommandError::UnknownVerb { .. }) => match best_match(model) {
+            Some(verb) => {
+                record_command(model, &line);
+                run_best(model, &verb)
+            }
+            None => complain(model, format!("no command matches {line:?}")),
+        },
+        Err(error) => complain(model, error.to_string()),
+    }
+}
+
+/// Whether `line` carries a flag.
+///
+/// The fallback rebuilds `range + verb + bang` and nothing else, because a
+/// fuzzy verb cannot tell an abbreviation from an argument — so a line with a
+/// flag on it must be refused rather than run without it. `:message archive
+/// --force` is already refused by the parser; `:arch --force` has to be
+/// refused here, or the abbreviation is *less* strict than the spelling.
+fn carries_a_flag(line: &str) -> bool {
+    line.split_whitespace().any(|word| word.starts_with('-'))
+}
+
+/// Show `why` inside the command line, leaving the overlay up.
+fn complain(model: &mut Model, why: String) -> Vec<Cmd> {
+    if let Some(Overlay::Command(pane)) = model.overlay.as_mut() {
+        pane.error = Some(why);
+    }
     Vec::new()
 }
 
-fn refresh_palette(model: &mut Model) {
-    let Some(Overlay::Palette(pane)) = model.overlay.as_ref() else {
-        return;
-    };
-    let matches = palette_matches(&pane.input.clone(), &model.keymap);
-    if let Some(Overlay::Palette(pane)) = model.overlay.as_mut() {
-        pane.matches = matches;
-        pane.cursor = pane.cursor.min(pane.matches.len().saturating_sub(1));
+/// The best-ranked match's verb path, if the pane has one.
+fn best_match(model: &Model) -> Option<String> {
+    match model.overlay.as_ref() {
+        Some(Overlay::Command(pane)) => pane.best().map(|entry| entry.verb.clone()),
+        _ => None,
     }
 }
 
-/// `Enter` in the palette: run the highlighted command.
-fn run_palette(model: &mut Model) -> Vec<Cmd> {
-    let chosen = match model.overlay.as_ref() {
-        Some(Overlay::Palette(pane)) => pane.entry().map(|entry| entry.action),
-        _ => return Vec::new(),
+/// Run the ranked fallback: the verb itself, with whatever range and bang the
+/// typed line carried, and nothing else — so `:'<,'>arch` and `:del!` mean
+/// what they look like they mean.
+///
+/// Re-parsed rather than dispatched from the [`CommandEntry`] directly, so
+/// this path and the exact-match path above are the same code from here on —
+/// a fallback with its own dispatch would be a second place for `'<,'>` and
+/// `!` to be honoured, free to drift from the first.
+fn run_best(model: &mut Model, verb: &str) -> Vec<Cmd> {
+    let (prefix, bang) = match model.overlay.as_ref() {
+        Some(Overlay::Command(pane)) => (
+            range_prefix(&pane.input),
+            pane.input.trim_end().ends_with('!'),
+        ),
+        _ => (String::new(), false),
     };
-    let Some(action) = chosen else {
-        model.fail("no command matches");
-        return Vec::new();
+    let bang = if bang { "!" } else { "" };
+    match command::parse(&format!("{prefix}{verb}{bang}")) {
+        Ok(command::Resolution::Invocation(invocation)) => run_invocation(model, *invocation),
+        // Unreachable: `verb` came out of the registry, so it resolves. A
+        // status line saying so beats an `unwrap` that cannot be reasoned
+        // about from the call site.
+        _ => complain(model, format!("{verb:?} did not resolve")),
+    }
+}
+
+/// The range `input` opens with, as typed — what a fallback dispatch has to
+/// carry over. Empty when there is none.
+fn range_prefix(input: &str) -> String {
+    let rest = input.trim_start();
+    if let Some(kept) = rest.strip_prefix(SELECTION_RANGE) {
+        return input[..input.len() - kept.len()].to_owned();
+    }
+    if let Some(kept) = rest.strip_prefix('%') {
+        return input[..input.len() - kept.len()].to_owned();
+    }
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return String::new();
+    }
+    input[..input.len() - rest.len() + digits].to_owned()
+}
+
+/// Record `line` in the history, and rewrite the file when it took.
+///
+/// Called once the line *parses*, not once it succeeds. A verb refused for
+/// its range or its arguments is exactly the line somebody wants `<up>` to
+/// bring back and fix; a line that did not parse at all never left the
+/// overlay, so there is nothing to recall.
+fn record_command(model: &mut Model, line: &str) {
+    if model.history.record(line) {
+        model.pending_history = true;
+    }
+}
+
+/// Dispatch a parsed `:` line.
+///
+/// The delegation this task exists for: a verb that carries an [`Action`] and
+/// was typed with no arguments is [`run_action`], unchanged. The 39
+/// behaviours the keyboard already reaches keep exactly one implementation,
+/// and a `:` line cannot drift from the key that runs the same thing.
+///
+/// What is *not* delegated is everything the action signature cannot express:
+/// [`run_action`] takes a count and nothing else, so an argument-carrying
+/// verb is dispatched here by name. Two exist today, both task 103's.
+fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd> {
+    let verb = invocation.verb.join(" ");
+    if let Some(why) = unsupported_range(model, &verb, invocation.range) {
+        return complain(model, why);
+    }
+    // Argument-carrying verbs first: these are the ones an `Action` cannot
+    // carry, so they are named rather than delegated.
+    if matches!(verb.as_str(), "manual grep" | "helpgrep") {
+        // Joined rather than `positionals.first()`: an unquoted multi-word
+        // pattern is what somebody types, and searching only its first word
+        // while dropping the rest is the silent-truncation answer. It is
+        // also what `:helpgrep` means in vim, where the pattern is the rest
+        // of the line.
+        let pattern = invocation.positionals.join(" ");
+        close_command(model);
+        return open_manual_grep_for(model, &pattern);
+    }
+    if !invocation.positionals.is_empty() {
+        return complain(
+            model,
+            format!(
+                "{verb} takes no arguments, and was given {}",
+                invocation.positionals.join(" ")
+            ),
+        );
+    }
+    if let Some(flag) = invocation.flags.first() {
+        // Defence, not a path anything reaches today: `command::parse`
+        // rejects a flag no verb declares, and no verb declares one. Worded
+        // for the case that *would* arrive first — a declared flag this
+        // dispatch has not learned — rather than claiming the verb has no
+        // such flag, which by then would be false.
+        return complain(model, format!("{verb} --{}: not wired up yet", flag.name));
+    }
+    let Some(action) = invocation.action else {
+        return complain(model, format!("{verb} is not something this TUI runs"));
     };
-    run_command(model, action)
+    close_command(model);
+    let mut cmds = run_action(model, action, None);
+    // `!` means "skip the confirmation", and only that. Applied here rather
+    // than inside each action for the same reason the range is: an action
+    // that opened a `Confirm` is the *only* thing a bang changes, and one
+    // implementation of that is one place it can be wrong.
+    if invocation.bang && matches!(model.overlay, Some(Overlay::Confirm { .. })) {
+        cmds.extend(accept_confirm(model));
+    }
+    cmds
+}
+
+/// Why this range cannot be honoured, or `None` when it can.
+///
+/// `'<,'>` is honoured by delegation and needs no code of its own: every
+/// bulk-capable action already reads [`Model::selection`], so a `:` line
+/// carrying the selection range does exactly what the key does with the same
+/// selection up. The other two have no model support at all — nothing here
+/// can address "every row listed" or "N rows down" — and saying so is the
+/// only honest answer. Silently acting on one message instead would be a
+/// range that looked honoured and was not.
+fn unsupported_range(model: &Model, verb: &str, range: Option<command::Range>) -> Option<String> {
+    match range {
+        None => None,
+        Some(command::Range::Selection) if !model.is_selecting() => {
+            Some("'<,'> needs a visual selection on the message list".to_owned())
+        }
+        // A range names a set of *messages*, so a verb that reaches no
+        // capability at all reaches no message either, and a range on it is
+        // not something to quietly ignore. Derived from the parity table
+        // rather than from a list here, so a verb gaining a capability gains
+        // the range with it.
+        Some(command::Range::Selection) if !acts_on_mail(verb) => Some(format!(
+            "'<,'> is a set of messages, and {verb} does not act on one"
+        )),
+        Some(command::Range::Selection) => None,
+        Some(command::Range::All) => {
+            Some("% is not supported yet: select the rows and use '<,'>".to_owned())
+        }
+        Some(command::Range::Count(_)) => {
+            Some("a count range is not supported yet: select the rows and use '<,'>".to_owned())
+        }
+    }
+}
+
+/// Whether a verb acts on mail, and so has something for a range to mean.
+///
+/// Read off `parity::Command`: a verb whose action reaches a capability acts
+/// on the mailbox, and one that reaches none — `help`, `cursor.down`,
+/// `manual` — is local to this screen. That is exactly the distinction
+/// `LOCAL_ACTIONS` already draws, so there is no second list to keep in step.
+fn acts_on_mail(verb: &str) -> bool {
+    let path: Vec<&str> = verb.split(' ').collect();
+    command::verb_at(&path).is_some_and(|verb| {
+        verb.capability.is_some()
+            || verb
+                .action
+                .is_some_and(|action| Capability::for_action(action).next().is_some())
+    })
+}
+
+/// Take the command line down before running what it named.
+///
+/// Not tidiness: every action reads [`Model::mode`], and one run against an
+/// overlay that is still up would ask the *command line* what `cursor.down`
+/// means rather than the screen it is about to reveal.
+fn close_command(model: &mut Model) {
+    model.overlay = None;
+}
+
+/// Walk the history, filtered by whatever was typed before the walk began.
+///
+/// `<up>` from an empty line walks everything; from `mess` it walks only the
+/// lines that start with it, which is what makes a long invocation
+/// recoverable by its first word rather than by counting presses.
+fn browse_history(model: &mut Model, direction: Direction) -> bool {
+    // Destructured rather than `model.history.clone()`: this runs on every
+    // `<up>`, and cloning five hundred strings to read a prefix off them is
+    // work proportional to the history for a keystroke that is not.
+    let Model {
+        history, overlay, ..
+    } = model;
+    let Some(Overlay::Command(pane)) = overlay.as_mut() else {
+        return false;
+    };
+    let seed = match &pane.browse {
+        Some(browse) => browse.seed.clone(),
+        None => pane.input.clone(),
+    };
+    let matches = history.matching(&seed);
+    if matches.is_empty() {
+        return true;
+    }
+    let at = pane.browse.as_ref().map(|browse| browse.at);
+    let next = match (direction, at) {
+        (Direction::Up, None) => Some(0),
+        (Direction::Up, Some(at)) => Some((at + 1).min(matches.len() - 1)),
+        (Direction::Down, None) => None,
+        (Direction::Down, Some(0)) => None,
+        (Direction::Down, Some(at)) => Some(at - 1),
+    };
+    match next {
+        Some(at) => {
+            // `at` came from `min(len - 1)` or from `at - 1`, so it indexes
+            // a row that exists; the seed is the answer for the branch that
+            // cannot happen rather than an `unwrap` nobody can check.
+            pane.input = truncated(
+                matches
+                    .get(at)
+                    .map_or_else(|| seed.clone(), |line| (*line).to_owned()),
+            );
+            pane.browse = Some(Browse { seed, at });
+        }
+        None => {
+            pane.input = truncated(seed);
+            pane.browse = None;
+        }
+    }
+    pane.error = None;
+    refresh_command(model);
+    true
 }
 
 /// Run `id` as a command, if this build has one by that name.
@@ -3225,15 +3611,15 @@ fn run_command_id(model: &mut Model, id: &str) -> Vec<Cmd> {
         model.fail(format!("this build has no command {id:?}"));
         return Vec::new();
     };
-    run_command(model, action)
+    run_named(model, action)
 }
 
 /// Close the overlay, then do the named thing.
 ///
 /// Closing first is not tidiness: every action reads `Model::mode()`, and one
-/// run against a palette that is still up would ask the *palette* what
+/// run against an overlay that is still up would ask the *overlay* what
 /// `cursor.down` means rather than the screen it is about to reveal.
-fn run_command(model: &mut Model, action: Action) -> Vec<Cmd> {
+fn run_named(model: &mut Model, action: Action) -> Vec<Cmd> {
     model.overlay = None;
     run_action(model, action, None)
 }
@@ -3492,7 +3878,7 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
     enum Which {
         SearchQuery,
         Finder,
-        Palette,
+        Command,
         AskQuestion,
         Nothing,
     }
@@ -3509,7 +3895,7 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
     let which = match model.overlay.as_ref() {
         Some(Overlay::Search(pane)) if pane.typing() => Which::SearchQuery,
         Some(Overlay::Finder(_)) => Which::Finder,
-        Some(Overlay::Palette(_)) => Which::Palette,
+        Some(Overlay::Command(_)) => Which::Command,
         Some(Overlay::Ask(pane)) if pane.typing() => Which::AskQuestion,
         _ => Which::Nothing,
     };
@@ -3517,7 +3903,7 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         Which::Nothing => Vec::new(),
         Which::SearchQuery => focus_results(model),
         Which::Finder => activate_finder(model),
-        Which::Palette => run_palette(model),
+        Which::Command => submit_command(model),
         Which::AskQuestion => ask_now(model),
     }
 }
@@ -3528,6 +3914,9 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
 /// completing an operator into it would type text the finder matches
 /// literally.
 fn prompt_complete(model: &mut Model) -> Vec<Cmd> {
+    if matches!(model.overlay, Some(Overlay::Command(_))) {
+        return complete_command(model);
+    }
     let completed = match model.overlay.as_ref() {
         Some(Overlay::Search(pane)) if pane.typing() => complete_operator(&pane.query),
         _ => None,
@@ -3539,6 +3928,129 @@ fn prompt_complete(model: &mut Model) -> Vec<Cmd> {
         pane.query = completed;
     }
     search_now(model)
+}
+
+/// `Tab` on the command line: extend the line by as much as the registry can
+/// say for certain.
+///
+/// `command::complete` is the registry's own positional completer — verb
+/// segments while a path is being typed, then that verb's flags once it
+/// resolves — so this is the same answer `mail` would give and not a second
+/// one. It appends the candidates' longest common prefix, plus a space when
+/// exactly one candidate remains and it is a leaf: two verbs sharing a
+/// prefix must not have one of them silently chosen, which would be a
+/// keystroke that did the wrong thing rather than one that did nothing.
+fn complete_command(model: &mut Model) -> Vec<Cmd> {
+    let Some(Overlay::Command(pane)) = model.overlay.as_ref() else {
+        return Vec::new();
+    };
+    let input = pane.input.clone();
+    // A line whose last word is a flag has nothing here to complete: the
+    // registry's completer drops flags before it looks at anything, so it
+    // would answer about the *verb* and the answer would be substituted over
+    // the flag — which is how `:search --x` once became `search search`.
+    if input
+        .split_whitespace()
+        .last()
+        .is_some_and(|word| word.starts_with('-'))
+    {
+        return Vec::new();
+    }
+    let candidates = command::complete(&input);
+    let Some(first) = candidates.first() else {
+        return Vec::new();
+    };
+    // One candidate settles the segment, so it gets a separator either way: a
+    // space after a leaf ends the verb, and a space after a group starts its
+    // next segment. Several candidates settle only their shared prefix, and
+    // adding anything after that would be choosing between them.
+    let settled = candidates.len() == 1;
+    let common = if settled {
+        first.text.clone()
+    } else {
+        longest_common_prefix(&candidates)
+    };
+    let typed = trailing_token(&input);
+    // `settled` and no longer than what is there is not "nothing to do": it
+    // is the segment already typed in full, which still wants its separator.
+    // Without that, `<tab>` stalls on `message` rather than opening
+    // `message archive`.
+    if common.len() <= typed.len() && !settled {
+        return Vec::new();
+    }
+    let head = input
+        .get(..input.len() - typed.len())
+        .unwrap_or_default()
+        .to_owned();
+    let tail = if settled { " " } else { "" };
+    let completed = format!("{head}{common}{tail}");
+    if completed == input {
+        return Vec::new();
+    }
+    set_command_line(model, completed);
+    Vec::new()
+}
+
+/// Put `line` on the command line, bounded, and recompute what it matches.
+///
+/// Bounded for the reason [`apply_edit`] bounds a typed one: a history file
+/// line is only bounded by the whole file's size, and a pane holding an
+/// unbounded string is re-sanitized and re-wrapped on every frame.
+fn set_command_line(model: &mut Model, line: String) {
+    if let Some(Overlay::Command(pane)) = model.overlay.as_mut() {
+        pane.input = truncated(line);
+        pane.browse = None;
+        pane.error = None;
+    }
+    refresh_command(model);
+}
+
+/// `line`, cut at [`MAX_INPUT`] characters on a character boundary.
+fn truncated(mut line: String) -> String {
+    if let Some((at, _)) = line.char_indices().nth(MAX_INPUT) {
+        line.truncate(at);
+    }
+    line
+}
+
+/// The longest prefix every candidate shares.
+fn longest_common_prefix(candidates: &[command::Candidate]) -> String {
+    let mut common = candidates
+        .first()
+        .map(|c| c.text.clone())
+        .unwrap_or_default();
+    for candidate in candidates.iter().skip(1) {
+        let shared = common
+            .char_indices()
+            .zip(candidate.text.chars())
+            .take_while(|((_, a), b)| a == b)
+            .count();
+        common.truncate(
+            common
+                .char_indices()
+                .nth(shared)
+                .map_or(common.len(), |(at, _)| at),
+        );
+    }
+    common
+}
+
+/// The whitespace- or dot-delimited token at the end of `input` — what a
+/// completion replaces. Empty when the line ends in a separator, which means
+/// the completion is appended rather than substituted.
+///
+/// The range counts as a separator, because `command::complete` strips it
+/// before it looks at anything: without that, the `'<,'>` a `:` opened over a
+/// selection is read as part of the first word, `message` never looks longer
+/// than `'<,'>mess`, and `<tab>` is dead in exactly the state the command
+/// line is documented to open in.
+fn trailing_token(input: &str) -> &str {
+    let after_range = range_prefix(input).len();
+    let rest = input.get(after_range..).unwrap_or_default();
+    let at = rest.rfind([' ', '.']).map_or(0, |at| {
+        at + rest[at..].chars().next().map_or(1, char::len_utf8)
+    });
+    rest.get(at..).unwrap_or_default()
 }
 
 /// The message an action applies to, and its subject.

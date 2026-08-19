@@ -29,7 +29,7 @@ use crate::keymap::{Action, Mode};
 use super::manual;
 use super::model::{Focus, Level, Model, Overlay, Scope, Screen, FLAGGED, SEEN};
 use super::overlays::{
-    self, AskPane, AskPhase, FinderPane, OutboxPane, PalettePane, QuickAction, QuickPane,
+    self, AskPane, AskPhase, CommandPane, FinderPane, OutboxPane, QuickAction, QuickPane,
     SearchFocus, SearchPane, UndoToast,
 };
 use super::theme::Theme;
@@ -74,7 +74,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
         }
         Some(Overlay::Search(pane)) => render_search(&model.theme, pane, frame, area),
         Some(Overlay::Finder(pane)) => render_finder(&model.theme, pane, frame, area),
-        Some(Overlay::Palette(pane)) => render_palette(&model.theme, pane, frame, area),
+        Some(Overlay::Command(pane)) => render_command(&model.theme, pane, frame, area),
         Some(Overlay::Ask(pane)) => render_ask(&model.theme, pane, frame, area),
         Some(Overlay::Outbox(pane)) => render_outbox(&model.theme, pane, frame, area),
         Some(Overlay::Quick(pane)) => render_quick(&model.theme, pane, frame, area),
@@ -787,7 +787,8 @@ fn render_finder(theme: &Theme, pane: &FinderPane, frame: &mut Frame, area: Rect
     );
 }
 
-fn render_palette(theme: &Theme, pane: &PalettePane, frame: &mut Frame, area: Rect) {
+/// The `:` command line, and the verbs it currently matches.
+fn render_command(theme: &Theme, pane: &CommandPane, frame: &mut Frame, area: Rect) {
     let area = centered_pct(area, 70, 66);
     frame.render_widget(Clear, area);
     let rows = Layout::default()
@@ -797,37 +798,49 @@ fn render_palette(theme: &Theme, pane: &PalettePane, frame: &mut Frame, area: Re
             theme,
             frame,
             area,
-            &format!("commands — {} match", pane.matches.len()),
+            &format!("command — {} match", pane.matches.len()),
         ));
 
-    frame.render_widget(
-        Paragraph::new(prompt_line(
-            theme,
-            ":",
-            &pane.input,
-            "Enter runs · Esc closes",
-        )),
-        rows[0],
+    // The complaint takes the hint column rather than a row of its own, so a
+    // parse error does not reflow the list under it.
+    // Sanitized, because a complaint quotes what was typed — a positional or a
+    // flag name reaches it verbatim — and a pasted bidi override or an
+    // invisible must not reach the terminal through an error message. The
+    // typed line itself goes through `prompt_line`, which sanitizes; this is
+    // the other half of the same rule.
+    let hint = pane.error.as_deref().map_or_else(
+        || "Enter runs · Tab completes · Esc closes".to_owned(),
+        overlays::safe_line,
     );
+    let mut line = prompt_line(theme, ":", &pane.input, &hint);
+    if pane.error.is_some() {
+        if let Some(last) = line.spans.last_mut() {
+            last.style = theme.err;
+        }
+    }
+    frame.render_widget(Paragraph::new(line), rows[0]);
 
+    // A marker rather than a selected row: there is no cursor here to move,
+    // and a `List::highlight_style` on row 0 would look exactly like one.
+    // It appears only while the fallback is live — when the line already
+    // names a verb, Enter runs *that*, and pointing at a ranked row would be
+    // pointing at something Enter is not going to do.
+    let fallback = pane.fallback_is_live();
     let items: Vec<ListItem> = pane
         .matches
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(row, entry)| {
+            let marker = if fallback && row == 0 { "> " } else { "  " };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{:<22}", entry.action.id()), theme.emphasis),
+                Span::styled(marker, theme.accent),
+                Span::styled(format!("{:<22}", entry.verb), theme.emphasis),
                 Span::styled(format!("{:<12}", entry.chords), theme.warn),
-                Span::styled(entry.action.describe(), theme.muted),
+                Span::styled(entry.describe.clone(), theme.muted),
             ]))
         })
         .collect();
-    let mut state = ListState::default();
-    state.select((!pane.matches.is_empty()).then_some(pane.cursor));
-    frame.render_stateful_widget(
-        List::new(items).highlight_style(selected_style(theme, true)),
-        rows[1],
-        &mut state,
-    );
+    frame.render_widget(List::new(items), rows[1]);
 }
 
 fn render_ask(theme: &Theme, pane: &AskPane, frame: &mut Frame, area: Rect) {

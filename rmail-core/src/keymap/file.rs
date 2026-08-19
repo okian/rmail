@@ -458,11 +458,34 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     // a mode the user chose.
     let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
     let temp: PathBuf = path.with_extension(format!("toml.tmp.{}", std::process::id()));
-    std::fs::write(&temp, contents)?;
+    // Created `0600` and *then* relaxed to whatever the destination had,
+    // rather than written with `fs::write` and chmod-ed after: `fs::write`
+    // creates at `0666 & ~umask`, normally `0644`, so the file's whole
+    // content existed world-readable for the window before the chmod. That
+    // is a real window for a `keys.toml`, and a worse one for the command
+    // history this also writes — see `rmail_cli::tui::history`.
+    write_private(&temp, contents)?;
     if let Some(permissions) = permissions {
         // Best effort: failing to restore the mode must not abort an
         // otherwise-good write.
         let _ = std::fs::set_permissions(&temp, permissions);
     }
     std::fs::rename(&temp, path)
+}
+
+/// Write `contents` to a freshly-created `path`, never readable by anyone but
+/// its owner while it is being written.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
 }

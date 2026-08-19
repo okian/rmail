@@ -78,15 +78,14 @@ this binary's own argument parser.
 
 ## What a colon spelling is
 
-A verb rendered as :message archive is a name, not an instruction to type it.
-The key namespace and the verb grammar are one vocabulary — a dot and a space
-are the same separator — so every action has a name in this form whether or
-not anything reads one from a prompt.
+A verb rendered as :message archive is both a name and something you can
+type. The key namespace and the verb grammar are one vocabulary — a dot and a
+space are the same separator — so every action has a name in this form, and
+{{keys:command}} is the line that reads one.
 
-This build has no command line that does. {{keys:palette}} runs a verb by
-name, and every verb with a key has that key; the typed line, its arguments
-and its vim-style ranges are the next thing to land, and these pages name
-verbs in the spelling it will use.
+A verb with no arguments dispatches to exactly the same code its key does, so
+a command and its binding cannot drift. What the line adds is everything a
+key cannot carry: an argument, a range, and a trailing bang. See [[tour]].
 
 ## Pages that reach the daemon
 

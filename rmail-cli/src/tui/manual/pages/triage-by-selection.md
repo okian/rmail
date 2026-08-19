@@ -17,9 +17,12 @@ one, press {{keys:visual.toggle}}, move down to the last, and archive the whole
 range in one keystroke. A mixed selection gets one intent applied to all of
 it, so there is nothing to check afterwards — see [[bulk]].
 
-If the run is longer than the screen, extend the selection by scrolling
-rather than reaching for something wider — see [[bulk]] on why the per-domain
-bulk surfaces are what exist instead of a general one.
+Once the range is right, {{keys:command}} opens with '<,'> already typed, so
+the whole selection is one line away:
+
+```
+:'<,'>message archive
+```
 
 ## Mark what is left
 

@@ -117,7 +117,8 @@ open, and otherwise on the row under the cursor.
 - {{keys:search.explain}} on a result says why it matched.
 - {{keys:finder}} is the fuzzy jump-to-anything: > scopes it to commands,
   # to tags, @ to people, / to saved searches, : to folders.
-- {{keys:palette}} runs a command by name.
+- {{keys:command}} is the command line: any verb by name, with an argument,
+  a range or a trailing bang. {{keys:palette}} opens the same line.
 - {{keys:ask}} asks a question about the mailbox and streams an answer with
   citations. The daemon decides whether that answer was grounded in mail it
   actually retrieved; the model never gets to vouch for itself.
