@@ -2422,6 +2422,49 @@ fn opening_the_manual_at_a_named_page_goes_straight_there() {
 }
 
 #[test]
+fn opening_the_manual_at_an_action_id_lands_on_the_page_documenting_it() {
+    // Task 102's `K` on a key-reference row has an `Action::id` and no
+    // anchor, and task 89's `:manual message.archive` is the same string
+    // typed by hand — so this resolves through the manual's declared
+    // action-to-page mapping rather than through a second one derived here.
+    let mut model = loaded();
+    let cmds = open_manual_at(&mut model, "message.archive");
+    assert!(cmds.is_empty());
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Page("archive".to_owned())
+    );
+}
+
+#[test]
+fn opening_the_manual_at_a_verb_path_is_the_same_as_at_its_action_id() {
+    // Dots and spaces are one separator everywhere else in this vocabulary;
+    // a page name is the one place they could have stopped being.
+    let mut model = loaded();
+    open_manual_at(&mut model, "message archive");
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Page("archive".to_owned())
+    );
+}
+
+#[test]
+fn a_name_that_is_both_a_page_and_an_action_opens_that_page() {
+    // `manual` is the one string that is both. This pins the *outcome* and
+    // says so: it cannot distinguish anchor-first from id-first, because the
+    // two agree — `manual::tests`'
+    // `a_page_anchor_that_is_also_a_documented_id_resolves_to_its_own_page`
+    // is the check that keeps them agreeing, and it is where a future
+    // collision fails.
+    let mut model = loaded();
+    open_manual_at(&mut model, "manual");
+    assert_eq!(
+        manual(&model).at,
+        manual::Location::Page("manual".to_owned())
+    );
+}
+
+#[test]
 fn opening_the_manual_at_a_page_that_does_not_exist_is_refused_by_name() {
     let mut model = loaded();
     let cmds = open_manual_at(&mut model, "nowhere");

@@ -2677,7 +2677,7 @@ fn open_manual(model: &mut Model) -> Vec<Cmd> {
     open_manual_at(model, manual::START)
 }
 
-/// Put the manual on screen at the page `anchor` names.
+/// Put the manual on screen at the page `name` addresses.
 ///
 /// The seam the rest of the TUI reaches the manual through, and the one an
 /// [`Action`] cannot express on its own — [`run_action`] takes a count, not a
@@ -2685,17 +2685,30 @@ fn open_manual(model: &mut Model) -> Vec<Cmd> {
 /// 102's `K`-on-a-key-reference-row needs it to land on the page documenting
 /// that action.
 ///
+/// `name` is a page anchor, or — for that second caller — an [`Action::id`]
+/// or a verb path, which [`manual::home_of`] resolves to the page declaring
+/// itself that action's home. A row of the key reference carries an action id
+/// and no anchor, and deriving one from the id would be a second mapping to
+/// keep in step with the first.
+///
+/// An anchor wins over an action id where a string could be both. Nothing
+/// spells one of each today, and the page set is the thing a reader typed a
+/// name *at*.
+///
 /// # Errors, of a sort
 ///
-/// An anchor the registry does not have is refused on the status line rather
-/// than opened: [`manual::doc`] is total and would render a "no such page"
-/// page, which is the right answer for a link inside the manual and the wrong
-/// one for a caller that got a name wrong.
-pub fn open_manual_at(model: &mut Model, anchor: &str) -> Vec<Cmd> {
-    if manual::page(anchor).is_none() {
-        model.fail(format!("this build has no manual page called {anchor:?}"));
+/// A name that is neither is refused on the status line rather than opened:
+/// [`manual::doc`] is total and would render a "no such page" page, which is
+/// the right answer for a link inside the manual and the wrong one for a
+/// caller that got a name wrong.
+pub fn open_manual_at(model: &mut Model, name: &str) -> Vec<Cmd> {
+    let Some(anchor) = manual::page(name)
+        .or_else(|| manual::home_of(name))
+        .map(|page| page.anchor)
+    else {
+        model.fail(format!("this build has no manual page called {name:?}"));
         return Vec::new();
-    }
+    };
     // The manual is a *screen*, so an overlay left up would cover the thing
     // the caller just asked to show. Taking it also stops whatever it was
     // streaming, which is `leave`'s rule for closing one.

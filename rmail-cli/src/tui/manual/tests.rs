@@ -13,6 +13,8 @@
 //! exemption `tui::model::tests` and `tui::view::tests` take.
 #![allow(clippy::panic)]
 
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::keymap::{Chord, Keymap};
 
@@ -135,12 +137,21 @@ fn every_registry_verb_has_its_own_row_on_the_command_index() {
     );
 }
 
-/// The scan above is only as strong as its generator, so this is the test that
-/// proves the generator is what carries it: strip the command index out of the
-/// page set and coverage collapses. Without this, a `generate_commands` that
-/// printed nothing at all would fail
-/// `every_registry_verb_is_documented_somewhere` for a reason nobody reading
-/// it could locate.
+/// The scan above is only as strong as its generator, so this is the test
+/// that proves the generator is what carries it: strip the command index out
+/// of the page set and coverage collapses.
+///
+/// Task 104's acceptance predicted this would "fail by name once authored
+/// prose covers everything", and it does not — forty pages later it is still
+/// green, for a reason worth recording rather than deleting: authored prose
+/// names a verb with `{{cmd:…}}`, which renders `:message archive`, and names
+/// an action with `{{keys:…}}`, which renders a *chord*. So the ~22 verbs a
+/// page only ever names by key — `cursor up`, `visual toggle`, `manual back`,
+/// `input submit` — appear in no authored line at all, and the generated
+/// index is still doing the work. What task 104 actually added is
+/// [`every_action_and_verb_has_exactly_one_documenting_page`], which is a
+/// stronger statement in a different direction; it does not subsume this one,
+/// so this one stays.
 #[test]
 fn it_is_the_generated_index_that_makes_verb_coverage_hold() {
     let keymap = keymap();
@@ -156,9 +167,163 @@ fn it_is_the_generated_index_that_makes_verb_coverage_hold() {
     assert!(
         uncovered > 0,
         "every verb is named by authored prose, so the generated index is no \
-         longer what the coverage check depends on — update the check's \
-         docstring and task 104's acceptance rather than deleting this test"
+         longer what the coverage check depends on — update this docstring \
+         rather than deleting the test"
     );
+}
+
+/// Task 104's `Action`/[`Verb`] → anchor mapping, discharged as a bijection
+/// rather than as coverage.
+///
+/// The mapping task 102's `K`-on-a-row needs, and the one thing "every
+/// registry verb has a page anchor" never actually was: 103 discharged that
+/// clause as "its spelling appears on some page", which answers *whether* a
+/// verb is documented and not *where*. This answers where, in both
+/// directions — every action and verb has exactly one home, and every
+/// declared home is a real action or verb.
+#[test]
+fn every_action_and_verb_has_exactly_one_documenting_page() {
+    let mut claimed: BTreeMap<Vec<String>, Vec<&str>> = BTreeMap::new();
+    for page in PAGES {
+        for id in page.documents {
+            claimed.entry(split_path(id)).or_default().push(page.anchor);
+        }
+    }
+    for (id, pages) in &claimed {
+        assert_eq!(
+            pages.len(),
+            1,
+            "{} is claimed by {pages:?} — an id has one home, or `home_of` \
+             answers whichever page happens to be listed first",
+            id.join(" ")
+        );
+        let path: Vec<&str> = id.iter().map(String::as_str).collect();
+        assert!(
+            Action::from_id(&id.join(".")).is_some() || command::verb_at(&path).is_some(),
+            "{} is documented by {pages:?} and is neither an action nor a \
+             verb",
+            id.join(" ")
+        );
+    }
+    for action in Action::ALL {
+        assert!(
+            home_of(action.id()).is_some(),
+            "no page declares itself the home of `{}` — add its id to that \
+             page's `documents`",
+            action.id()
+        );
+    }
+    for verb in command::children_of(&[]) {
+        assert!(
+            home_of(&verb.canonical()).is_some(),
+            "no page declares itself the home of `:{}`",
+            verb.canonical()
+        );
+    }
+}
+
+/// A declaration that the page does not back up is worse than none: it sends
+/// a reader to a page that never mentions what they asked about.
+///
+/// "Backed up" means the page's own source cites the id in a `{{keys:…}}` or
+/// `{{cmd:…}}` marker outside a fence — the same two forms the reconciliation
+/// above already resolves against the live registries, so a page cannot
+/// satisfy this with prose that merely spells the id out.
+#[test]
+fn a_pages_declared_documentation_is_backed_by_its_own_prose() {
+    for page in PAGES {
+        if page.documents.is_empty() {
+            continue;
+        }
+        let Body::Authored(source) = page.body else {
+            panic!(
+                "{} is generated and declares {:?} — a generated page is a \
+                 derivation of a registry, not a home for one of its rows",
+                page.anchor, page.documents
+            );
+        };
+        let cited = cited_ids(source);
+        for id in page.documents {
+            assert!(
+                cited.contains(&split_path(id)),
+                "{} claims to document `{id}` and never names it",
+                page.anchor
+            );
+        }
+    }
+}
+
+/// Every id a page names with `{{keys:…}}` or `{{cmd:…}}` outside a fence,
+/// split the way the verb registry splits a path.
+///
+/// Reads the parsed blocks rather than the raw source for the same reason
+/// [`footer`] does: a marker shown *inside* a fence is documentation of the
+/// syntax, not a claim about a key — `PAGES`' own `manual` page writes
+/// several.
+fn cited_ids(source: &str) -> BTreeSet<Vec<String>> {
+    let mut cited = BTreeSet::new();
+    for block in parse_blocks(source) {
+        let text = match block {
+            Block::Heading { text, .. } | Block::Bullet { text, .. } | Block::Para(text) => text,
+            Block::Code(_) | Block::Blank => continue,
+        };
+        for marker in ["{{keys:", "{{cmd:"] {
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(marker) {
+                let after = at + marker.len();
+                let Some(end) = rest.get(after..).and_then(|tail| tail.find("}}")) else {
+                    break;
+                };
+                let path = rest.get(after..after + end).unwrap_or_default().trim();
+                cited.insert(split_path(path));
+                rest = rest.get(after + end + 2..).unwrap_or_default();
+            }
+        }
+    }
+    cited
+}
+
+/// `model::open_manual_at` resolves a page anchor first and a documented id
+/// second, so an anchor that is *also* a documented id must resolve the same
+/// way both ways round or the precedence silently decides which page a reader
+/// gets.
+///
+/// Today `manual` is the only such string and the two agree, which is why the
+/// behavioural test in `model::tests` cannot tell the two orderings apart —
+/// this is the check that can, and it fails the day task 105's new vocabulary
+/// introduces an action id spelled like some other page's anchor.
+#[test]
+fn a_page_anchor_that_is_also_a_documented_id_resolves_to_its_own_page() {
+    for page in PAGES {
+        if let Some(home) = home_of(page.anchor) {
+            assert_eq!(
+                home.anchor, page.anchor,
+                "`{}` is a page anchor and is documented by `{}` — \
+                 `open_manual_at` prefers the anchor, so a reader asking for \
+                 the action lands somewhere else",
+                page.anchor, home.anchor
+            );
+        }
+    }
+}
+
+/// [`home_of`] answers the same page whichever separator the caller uses,
+/// because task 102's `K` has an [`Action::id`] and task 89's `:` has a verb
+/// path, and they are the same thing spelled two ways.
+#[test]
+fn home_of_resolves_an_action_id_and_a_verb_path_to_the_same_page() {
+    for action in Action::ALL {
+        let by_id = home_of(action.id()).map(|page| page.anchor);
+        let by_path = home_of(&action.id().replace('.', " ")).map(|page| page.anchor);
+        assert_eq!(by_id, by_path, "{}", action.id());
+    }
+    assert_eq!(
+        home_of("message.archive").map(|page| page.anchor),
+        Some("archive")
+    );
+    assert_eq!(home_of("helpgrep").map(|page| page.anchor), Some("manual"));
+    assert_eq!(home_of("no.such.thing"), None);
+    assert_eq!(home_of(""), None);
 }
 
 /// Task 103's second and third criteria at once: a `[[link]]` that resolves to
@@ -204,20 +369,92 @@ fn every_action_id_is_documented_somewhere() {
     }
 }
 
-/// Task 104's own acceptance criterion, enforced here because this is where
-/// the enforcement belongs — the generated capability page makes it true for
-/// every page set, authored or not.
+/// Task 104's own acceptance criterion, scanning **authored** pages only.
+///
+/// Task 103 wrote this over every page, which could not fail: the generated
+/// capability page enumerates [`Capability::ALL`] by construction, so forty
+/// pages mentioning no capability at all would still have passed. Narrowing
+/// the scan is what makes it a statement about prose.
+///
+/// A capability counts as named when an authored page renders its
+/// `Service.Method` — which happens either from a `{{capability:…}}` marker
+/// or from the page's derived "reaches" footer, and the footer is itself
+/// derived from the `{{cmd:…}}` verbs the page names. Both are therefore
+/// claims the page actually made about a command it discusses, rather than a
+/// row in a table.
 #[test]
 fn every_capability_with_a_tui_surface_is_documented() {
-    let lines = all_lines(&keymap());
+    let keymap = keymap();
+    let authored: Vec<String> = PAGES
+        .iter()
+        .filter(|page| matches!(page.body, Body::Authored(_)))
+        .flat_map(|page| page_lines(page, &keymap))
+        .collect();
     for capability in Capability::ALL {
         if capability.actions().is_empty() {
             continue;
         }
+        let rendered = format!("{}.{}", short_service(*capability), capability.method());
         assert!(
-            names(&lines, capability.name()),
-            "{} has a TUI action but no manual page names it",
+            names(&authored, &rendered),
+            "{} has a TUI action and no authored page names it — cite a \
+             command that reaches it, or name it with a capability marker",
             capability.name()
+        );
+    }
+}
+
+/// The generated page is still what documents every capability no key or
+/// command reaches, and this is what says so: strip the authored pages out
+/// and the coverage holds anyway — which is exactly the property the narrowed
+/// scan above stops depending on.
+///
+/// Asserted over [`Capability::ALL`] rather than over the TUI-surfaced
+/// subset, because the generated page's claim is the wider one and a check
+/// scoped to the narrow set would say less than the page does.
+#[test]
+fn the_generated_page_covers_every_capability() {
+    let keymap = keymap();
+    let generated: Vec<String> = PAGES
+        .iter()
+        .filter(|page| matches!(page.body, Body::Generated(_)))
+        .flat_map(|page| page_lines(page, &keymap))
+        .collect();
+    for capability in Capability::ALL {
+        assert!(
+            names(&generated, capability.name()),
+            "{} is in no generated page",
+            capability.name()
+        );
+    }
+}
+
+/// A page whose heading and whose registry title disagree shows two
+/// different names for itself in the same frame — the pane title comes from
+/// [`Page::title`] and the first line of the page comes from its own source.
+///
+/// [`START`] is the declared exception: its heading is the product's name,
+/// which is what a front page opens with, and "Start here" is what a link to
+/// it should read as. One page where those are legitimately different is a
+/// reason for an exception, not for no check.
+#[test]
+fn every_authored_page_heads_itself_with_its_own_title() {
+    for page in PAGES {
+        let Body::Authored(source) = page.body else {
+            continue;
+        };
+        if page.anchor == START {
+            continue;
+        }
+        let heading = source
+            .lines()
+            .find_map(|line| line.strip_prefix("# "))
+            .unwrap_or_else(|| panic!("{} opens with no heading", page.anchor));
+        assert_eq!(
+            heading.trim(),
+            page.title,
+            "{}'s heading and its registry title disagree",
+            page.anchor
         );
     }
 }
@@ -1187,8 +1424,9 @@ fn no_authored_page_writes_a_list_shape_the_renderer_does_not_support() {
     // whose renders are indistinguishable from legitimate output — a
     // rendered-pair scan skipped one of them entirely (it looks at a
     // hang-indented line, not a bullet line) and could not see the other at
-    // all. Neither is in the two shipped pages; task 104 is about to write
-    // forty more, and this is what tells its author which is which.
+    // all. Neither is in any shipped page, and this is what kept them out of
+    // task 104's forty — both were written by hand while drafting them and
+    // both were caught here rather than by reading the render.
     for page in PAGES {
         let Body::Authored(source) = page.body else {
             continue;
@@ -1298,4 +1536,270 @@ fn no_authored_prose_renders_a_space_inside_a_parenthesis() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// authored shell transcripts, reconciled against `clap`
+// ---------------------------------------------------------------------------
+
+/// Every `mail …` line an authored page shows in a fence is one this binary
+/// would actually accept.
+///
+/// The gap this closes is the one that made task 104's first draft wrong in
+/// seventeen places: `{{cmd:…}}` and `{{capability:…}}` are checked against
+/// the registries, but a fenced transcript is prose the suite never read — so
+/// `mail rule backtest`, a verb that does not exist, and `mail webhook add
+/// --url …`, a flag that is a positional, both rendered happily. A manual
+/// whose worked examples do not run is worse than one with no worked
+/// examples, because the reader blames themselves.
+///
+/// Checked against `Cli::command()` — the same tree that parses an argv, so a
+/// renamed flag fails here the moment it compiles — rather than by running
+/// anything: the values in these lines are placeholders, and a check that
+/// needed real ones could only ever have been a second, hand-written list.
+/// Verb path, long and short options, option-vs-positional, and the presence
+/// of every required argument are all read off that tree. Values are not, so
+/// a placeholder `<id>` standing where an integer goes is out of scope here
+/// and is what the `--help` output remains authoritative for.
+#[test]
+fn every_shell_command_an_authored_page_shows_is_one_this_binary_accepts() {
+    use clap::CommandFactory as _;
+
+    let mut root = crate::Cli::command();
+    // Propagates `#[arg(global = true)]` down every subcommand, which is
+    // where `--socket`, `--token` and `--format` live. Without it every
+    // documented line carrying one would be reported as an unknown flag.
+    root.build();
+    // Every failure, not the first: a page's transcripts tend to be wrong
+    // together, and fixing them one panic at a time is how the seventeenth
+    // gets missed.
+    let mut wrong: Vec<String> = Vec::new();
+    let mut checked = 0_usize;
+    for page in PAGES {
+        let Body::Authored(source) = page.body else {
+            continue;
+        };
+        for (line_no, line) in shell_lines(source) {
+            checked += 1;
+            if let Err(why) = accepts(&root, &tokenize(&line)) {
+                wrong.push(format!("{}:{line_no}: `{line}` — {why}", page.anchor));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // A tokenizer that quietly matched nothing would make the assertion above
+    // vacuous, and the shape of these pages is what decides how many lines it
+    // sees — so this is a floor, not a fixed count.
+    assert!(
+        checked >= 40,
+        "only {checked} shell lines were checked — `shell_lines` stopped \
+         seeing the transcripts it is supposed to reconcile"
+    );
+}
+
+/// The `mail …` command lines inside `source`'s fences, with their 1-based
+/// source line numbers.
+///
+/// Continuation backslashes are joined first, so a wrapped invocation is
+/// checked whole. A leading `VAR=value` is dropped: `RUST_LOG=debug mail
+/// daemon start` is a shell line about `mail daemon start`.
+fn shell_lines(source: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut fenced = false;
+    let mut pending: Option<(usize, String)> = None;
+    for (idx, raw) in source.lines().enumerate() {
+        if raw.trim_start().starts_with("```") {
+            fenced = !fenced;
+            pending = None;
+            continue;
+        }
+        if !fenced {
+            continue;
+        }
+        let line = raw.trim();
+        let (at, mut joined) = match pending.take() {
+            Some((at, mut prefix)) => {
+                prefix.push(' ');
+                prefix.push_str(line);
+                (at, prefix)
+            }
+            None => (idx + 1, line.to_owned()),
+        };
+        if let Some(head) = joined.strip_suffix('\\') {
+            pending = Some((at, head.trim_end().to_owned()));
+            continue;
+        }
+        joined.truncate(annotation(&joined));
+        let words: Vec<&str> = joined.split_whitespace().collect();
+        let first = words
+            .iter()
+            .position(|word| !(word.contains('=') && !word.starts_with('-')));
+        if let Some(first) = first {
+            if words.get(first) == Some(&"mail") {
+                out.push((at, words[first..].join(" ")));
+            }
+        }
+    }
+    out
+}
+
+/// Where a fenced line stops being a command and starts being an annotation:
+/// a shell comment, or the aligned gloss these pages put in the right-hand
+/// column of a listing.
+///
+/// The gloss is two-or-more spaces outside quotes, which is the convention
+/// the pages already use and the only one that can be told apart from an
+/// argument. Inside quotes it means nothing — `mail search "a  b"` is one
+/// argument with two spaces in it, and truncating there would report a
+/// working command line as broken.
+fn annotation(line: &str) -> usize {
+    let mut quote: Option<char> = None;
+    let mut run = 0_usize;
+    for (at, ch) in line.char_indices() {
+        match quote {
+            Some(open) => {
+                if ch == open {
+                    quote = None;
+                }
+                run = 0;
+            }
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                run = 0;
+            }
+            None if ch == '#' && run > 0 => return at.saturating_sub(run),
+            None if ch == ' ' => {
+                run += 1;
+                if run == 2 {
+                    return at - 1;
+                }
+            }
+            None => run = 0,
+        }
+    }
+    line.len()
+}
+
+/// Split a command line on whitespace, keeping quoted runs together.
+fn tokenize(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for ch in line.chars() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                started = true;
+            }
+            None if ch.is_whitespace() => {
+                if started || !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if started || !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Whether `tokens` — `mail`, then a command line — is one `root` accepts.
+fn accepts(root: &clap::Command, tokens: &[String]) -> Result<(), String> {
+    let mut node = root;
+    let mut at = 1;
+    while let Some(sub) = tokens.get(at).and_then(|word| node.find_subcommand(word)) {
+        node = sub;
+        at += 1;
+    }
+    let path = tokens[..at].join(" ");
+    if node.is_subcommand_required_set() {
+        return Err(format!(
+            "`{path}` is a grouping and needs one of: {}",
+            node.get_subcommands()
+                .map(clap::Command::get_name)
+                .filter(|name| *name != "help")
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let mut given: BTreeSet<&str> = BTreeSet::new();
+    let mut positionals = 0_usize;
+    while at < tokens.len() {
+        let token = tokens[at].as_str();
+        at += 1;
+        let arg = if let Some(long) = token.strip_prefix("--") {
+            let (name, inline) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            let arg =
+                find_long(node, name).ok_or_else(|| format!("`{path}` has no `--{name}` flag"))?;
+            if inline.is_none() && arg.get_action().takes_values() {
+                at += 1;
+            }
+            arg
+        } else if token.len() > 1 && token.starts_with('-') {
+            let short = token.chars().nth(1).unwrap_or('-');
+            let arg = find_short(node, short)
+                .ok_or_else(|| format!("`{path}` has no `-{short}` flag"))?;
+            if token.len() == 2 && arg.get_action().takes_values() {
+                at += 1;
+            }
+            arg
+        } else {
+            positionals += 1;
+            continue;
+        };
+        given.insert(arg.get_id().as_str());
+    }
+
+    let slots: usize = node
+        .get_arguments()
+        .filter(|arg| arg.is_positional())
+        .map(|arg| arg.get_num_args().map_or(1, |range| range.max_values()))
+        .sum();
+    if positionals > slots {
+        return Err(format!(
+            "`{path}` takes {slots} positional argument(s) and {positionals} were given"
+        ));
+    }
+    let mut required_positionals = 0_usize;
+    for arg in node.get_arguments().filter(|arg| arg.is_required_set()) {
+        if arg.is_positional() {
+            required_positionals += 1;
+            continue;
+        }
+        if !given.contains(arg.get_id().as_str()) {
+            return Err(format!(
+                "`{path}` requires `--{}`",
+                arg.get_long().unwrap_or_else(|| arg.get_id().as_str())
+            ));
+        }
+    }
+    if positionals < required_positionals {
+        return Err(format!(
+            "`{path}` requires {required_positionals} positional argument(s), not {positionals}"
+        ));
+    }
+    Ok(())
+}
+
+fn find_long<'a>(node: &'a clap::Command, name: &str) -> Option<&'a clap::Arg> {
+    node.get_arguments().find(|arg| {
+        arg.get_long() == Some(name)
+            || arg
+                .get_all_aliases()
+                .is_some_and(|aliases| aliases.contains(&name))
+    })
+}
+
+fn find_short(node: &clap::Command, short: char) -> Option<&clap::Arg> {
+    node.get_arguments()
+        .find(|arg| arg.get_short() == Some(short))
 }

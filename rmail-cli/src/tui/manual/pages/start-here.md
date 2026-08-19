@@ -8,20 +8,74 @@ whether you press a key, type a command, or ask an AI agent over MCP.
 This manual is compiled into the binary. It needs no network, no daemon and
 no files on disk, so it still works on the day the daemon will not start.
 
-## Where to go
+## Getting started
 
+- [[tour]]
+- [[typing]]
+- [[daemon]]
+- [[offline]]
 - [[manual]]
+
+## Concepts
+
+- [[search-vs-finder]]
+- [[saved-vs-smart]]
+- [[archive]]
+- [[bulk]]
+- [[index]]
+- [[undo]]
+- [[grounded]]
+- [[ai-cost]]
+- [[privacy]]
+
+## Worked examples
+
+- [[triage-by-selection]]
+- [[rule-from-mistake]]
+- [[halve-the-ai-bill]]
+- [[add-oauth-account]]
+- [[find-the-clause]]
+- [[digest-to-slack]]
+- [[recover-interrupted-rebuild]]
+
+## Practices
+
+Each of these is one habit and the one sentence that justifies it.
+
+- [[practice-triage]]
+- [[practice-search]]
+- [[practice-tags]]
+- [[practice-notes]]
+- [[practice-rules]]
+- [[practice-budget]]
+- [[practice-sending]]
+- [[practice-followups]]
+- [[practice-index]]
+- [[practice-export]]
+- [[practice-accounts]]
+- [[practice-tokens]]
+- [[practice-webhooks]]
+- [[practice-notifications]]
+- [[practice-keymap]]
+- [[practice-attachments]]
+
+## Reference
+
 - [[keys]]
 - [[commands]]
 - [[modes]]
 - [[capabilities]]
+- [[keys-toml]]
+- [[config-file]]
+- [[troubleshooting]]
 
 ## The shape of the screen
 
 Folders on the left, the message list in the middle, a preview on the right,
 a status line underneath. Opening a message ({{keys:open}}) replaces all
 three with a full-width viewer, because a third of an 80-column terminal is
-not enough to read mail in. {{keys:back}} comes back out.
+not enough to read mail in. {{keys:back}} comes back out. [[tour]] is the
+whole of it.
 
 ## Moving around
 

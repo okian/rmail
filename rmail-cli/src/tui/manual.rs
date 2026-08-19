@@ -58,10 +58,14 @@
 //!   paid twice per keystroke: once by `model::cursor_span` for the row count,
 //!   once by the frame. It is bounded by the page set rather than by anything
 //!   a peer controls, which is the property that matters here — but a
-//!   [`Location::Grep`] renders *every* page to search it, so task 104's ~40
-//!   pages is the point to actually measure rather than reason about, and to
-//!   cache behind an explicit invalidation if the number says so. Nothing in
-//!   the tree measures it today.
+//!   [`Location::Grep`] renders *every* page to search it, which task 103
+//!   left as the thing to measure once task 104 had written the pages rather
+//!   than to reason about. Measured, at 45 pages, unoptimised, in the test
+//!   container: 6.3 ms for a whole grep render and 0.13–0.25 ms for one page,
+//!   so the worst frame — the hit list, rendered twice — is ~13 ms of debug
+//!   build and a small fraction of that optimised. That is inside the frame
+//!   budget without a cache, and a cache is what would have to be invalidated
+//!   on every `keys.toml` reload, so there is none.
 //! - [`grep`] — `(pattern, &Keymap) -> Vec<GrepHit>` across every page. The
 //!   durable half of `:helpgrep`: task 90's Report consumes exactly this,
 //!   whether or not it keeps [`Location::Grep`]'s page as the presentation.
@@ -151,44 +155,338 @@ pub struct Page {
     pub title: &'static str,
     /// Where its markdown comes from.
     pub body: Body,
+    /// The [`Action`] ids and verb paths this page is the documented home
+    /// of — the `Action`/[`Verb`] → anchor mapping task 102's `K`-on-a-row
+    /// needs, and the thing [`home_of`] looks up.
+    ///
+    /// Declared rather than derived from the page's own `{{keys:…}}`
+    /// markers, because "the first page that happens to mention it" is not
+    /// the same question as "where should somebody be sent to read about
+    /// it": [`START`] names nearly every action in its own summary, and a
+    /// derivation would make the index the home of all of them. A
+    /// declaration cannot drift into a lie either — [`tests`] refuses an
+    /// entry the page does not actually cite, refuses two pages claiming
+    /// one id, and refuses an action or verb no page claims at all, so the
+    /// mapping is total in both directions.
+    ///
+    /// Dots and spaces are the same separator here as everywhere else, so
+    /// one entry claims an [`Action::id`] and the [`Verb`] derived from it
+    /// at once. `helpgrep` is the one entry that is a verb and no action.
+    pub documents: &'static [&'static str],
 }
 
 /// Every page, in the order the index lists them.
 ///
-/// Task 104 authors the rest; the two prose pages here are the ones the
-/// engine cannot do without — an index to reach everything else from, and a
-/// page describing the manual's own navigation, which is the one thing a
-/// reader cannot look up somewhere else first.
+/// Authored prose first, grouped the way [`START`] groups it — getting
+/// started, concepts, worked examples, practices, then the two reference
+/// pages that are prose — and the four [`Generated`] pages last. The order
+/// is the reading order, not an implementation detail: nothing else decides
+/// which page [`home_of`] returns when more than one could.
 pub const PAGES: &[Page] = &[
     Page {
         anchor: START,
         title: "Start here",
         body: Body::Authored(include_str!("manual/pages/start-here.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "tour",
+        title: "A tour of the screen",
+        body: Body::Authored(include_str!("manual/pages/tour.md")),
+        documents: &[
+            "cursor.down",
+            "cursor.up",
+            "cursor.top",
+            "cursor.bottom",
+            "focus.toggle",
+            "focus.folders",
+            "focus.messages",
+            "open",
+            "back",
+            "cancel",
+            "quit",
+            "palette",
+        ],
+    },
+    Page {
+        anchor: "typing",
+        title: "Typing, choosing and confirming",
+        body: Body::Authored(include_str!("manual/pages/typing.md")),
+        documents: &[
+            "prompt.accept",
+            "prompt.complete",
+            "menu.accept",
+            "pick.accept",
+            "confirm.accept",
+            "input.submit",
+            "input.backspace",
+        ],
+    },
+    Page {
+        anchor: "daemon",
+        title: "The daemon",
+        body: Body::Authored(include_str!("manual/pages/daemon.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "offline",
+        title: "Working offline",
+        body: Body::Authored(include_str!("manual/pages/offline.md")),
+        documents: &[],
     },
     Page {
         anchor: "manual",
         title: "Reading the manual",
         body: Body::Authored(include_str!("manual/pages/manual.md")),
+        documents: &[
+            "help",
+            "manual",
+            "manual.back",
+            "manual.forward",
+            "manual.next-match",
+            "manual.prev-match",
+            "manual.grep",
+            "helpgrep",
+        ],
+    },
+    Page {
+        anchor: "search-vs-finder",
+        title: "Search or finder",
+        body: Body::Authored(include_str!("manual/pages/search-vs-finder.md")),
+        documents: &["search", "search.explain", "finder"],
+    },
+    Page {
+        anchor: "saved-vs-smart",
+        title: "Saved searches and smart folders",
+        body: Body::Authored(include_str!("manual/pages/saved-vs-smart.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "archive",
+        title: "Archive, move, delete",
+        body: Body::Authored(include_str!("manual/pages/archive.md")),
+        documents: &[
+            "message.archive",
+            "message.move",
+            "message.copy",
+            "message.delete",
+        ],
+    },
+    Page {
+        anchor: "bulk",
+        title: "Acting on many messages",
+        body: Body::Authored(include_str!("manual/pages/bulk.md")),
+        documents: &["visual.toggle", "visual.swap-ends"],
+    },
+    Page {
+        anchor: "index",
+        title: "The index",
+        body: Body::Authored(include_str!("manual/pages/index.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "undo",
+        title: "Undo, and what cannot be undone",
+        body: Body::Authored(include_str!("manual/pages/undo.md")),
+        documents: &["outbox", "outbox.cancel"],
+    },
+    Page {
+        anchor: "grounded",
+        title: "Grounded answers",
+        body: Body::Authored(include_str!("manual/pages/grounded.md")),
+        documents: &["ask"],
+    },
+    Page {
+        anchor: "ai-cost",
+        title: "What the AI costs",
+        body: Body::Authored(include_str!("manual/pages/ai-cost.md")),
+        documents: &["ai.panel", "ai.quick"],
+    },
+    Page {
+        anchor: "privacy",
+        title: "Privacy and what leaves the machine",
+        body: Body::Authored(include_str!("manual/pages/privacy.md")),
+        documents: &["message.open-html"],
+    },
+    Page {
+        anchor: "triage-by-selection",
+        title: "Worked example: triage by selection",
+        body: Body::Authored(include_str!("manual/pages/triage-by-selection.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "rule-from-mistake",
+        title: "Worked example: a rule from a mistake",
+        body: Body::Authored(include_str!("manual/pages/rule-from-mistake.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "halve-the-ai-bill",
+        title: "Worked example: halve the AI bill",
+        body: Body::Authored(include_str!("manual/pages/halve-the-ai-bill.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "add-oauth-account",
+        title: "Worked example: add a Gmail account",
+        body: Body::Authored(include_str!("manual/pages/add-oauth-account.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "find-the-clause",
+        title: "Worked example: find the clause",
+        body: Body::Authored(include_str!("manual/pages/find-the-clause.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "digest-to-slack",
+        title: "Worked example: a digest into Slack",
+        body: Body::Authored(include_str!("manual/pages/digest-to-slack.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "recover-interrupted-rebuild",
+        title: "Worked example: recover an interrupted rebuild",
+        body: Body::Authored(include_str!("manual/pages/recover-interrupted-rebuild.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-triage",
+        title: "Practice: triage in one pass",
+        body: Body::Authored(include_str!("manual/pages/practice-triage.md")),
+        documents: &["message.toggle-read", "message.toggle-flag"],
+    },
+    Page {
+        anchor: "practice-search",
+        title: "Practice: say which kind of search you mean",
+        body: Body::Authored(include_str!("manual/pages/practice-search.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-tags",
+        title: "Practice: tag for retrieval",
+        body: Body::Authored(include_str!("manual/pages/practice-tags.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-notes",
+        title: "Practice: write down why",
+        body: Body::Authored(include_str!("manual/pages/practice-notes.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-rules",
+        title: "Practice: write the rule after the second mistake",
+        body: Body::Authored(include_str!("manual/pages/practice-rules.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-budget",
+        title: "Practice: set the cap before turning AI on",
+        body: Body::Authored(include_str!("manual/pages/practice-budget.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-sending",
+        title: "Practice: let the undo window do the checking",
+        body: Body::Authored(include_str!("manual/pages/practice-sending.md")),
+        documents: &["message.reply", "message.forward"],
+    },
+    Page {
+        anchor: "practice-followups",
+        title: "Practice: arm the reminder when you send",
+        body: Body::Authored(include_str!("manual/pages/practice-followups.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-index",
+        title: "Practice: let the index catch up",
+        body: Body::Authored(include_str!("manual/pages/practice-index.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-export",
+        title: "Practice: export before you rebuild",
+        body: Body::Authored(include_str!("manual/pages/practice-export.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-accounts",
+        title: "Practice: one account per trust boundary",
+        body: Body::Authored(include_str!("manual/pages/practice-accounts.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-tokens",
+        title: "Practice: the narrowest token that works",
+        body: Body::Authored(include_str!("manual/pages/practice-tokens.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-webhooks",
+        title: "Practice: send the link, not the mail",
+        body: Body::Authored(include_str!("manual/pages/practice-webhooks.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-notifications",
+        title: "Practice: raise the threshold until it is quiet",
+        body: Body::Authored(include_str!("manual/pages/practice-notifications.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-keymap",
+        title: "Practice: bind in the layer you stand in",
+        body: Body::Authored(include_str!("manual/pages/practice-keymap.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "practice-attachments",
+        title: "Practice: ask the attachment",
+        body: Body::Authored(include_str!("manual/pages/practice-attachments.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "keys-toml",
+        title: "keys.toml",
+        body: Body::Authored(include_str!("manual/pages/keys-toml.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "config-file",
+        title: "The config file",
+        body: Body::Authored(include_str!("manual/pages/config-file.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "troubleshooting",
+        title: "Troubleshooting",
+        body: Body::Authored(include_str!("manual/pages/troubleshooting.md")),
+        documents: &[],
     },
     Page {
         anchor: "keys",
         title: "Key reference",
         body: Body::Generated(Generated::Keys),
+        documents: &[],
     },
     Page {
         anchor: "commands",
         title: "Command index",
         body: Body::Generated(Generated::Commands),
+        documents: &[],
     },
     Page {
         anchor: "modes",
         title: "Modes and layers",
         body: Body::Generated(Generated::Modes),
+        documents: &[],
     },
     Page {
         anchor: "capabilities",
         title: "Capabilities",
         body: Body::Generated(Generated::Capabilities),
+        documents: &[],
     },
 ];
 
@@ -199,6 +497,33 @@ pub const START: &str = "start-here";
 #[must_use]
 pub fn page(anchor: &str) -> Option<&'static Page> {
     PAGES.iter().find(|page| page.anchor == anchor)
+}
+
+/// The page documenting `id` — an [`Action::id`] or a verb path.
+///
+/// The `Action`/[`Verb`] → anchor mapping task 104's acceptance asks for, and
+/// the lookup behind [`crate::tui::model::open_manual_at`] accepting an
+/// action id where a page name would go: `:manual message.archive` and
+/// task 102's `K` on a key-reference row are the same question, and neither
+/// has an anchor to hand.
+///
+/// Dots and spaces are the same separator, exactly as
+/// [`rmail_core::command`]'s parser treats them, so `message.archive` and
+/// `message archive` resolve to the same page. `None` only for a string that
+/// is neither an action nor a verb — every real one has a home, which
+/// [`tests`]' `every_action_and_verb_has_exactly_one_documenting_page` is
+/// what keeps true.
+#[must_use]
+pub fn home_of(id: &str) -> Option<&'static Page> {
+    let wanted = split_path(id);
+    if wanted.is_empty() {
+        return None;
+    }
+    PAGES.iter().find(|page| {
+        page.documents
+            .iter()
+            .any(|declared| split_path(declared) == wanted)
+    })
 }
 
 // ---------------------------------------------------------------------------
