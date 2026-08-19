@@ -131,7 +131,12 @@ async fn a_stale_pid_file_never_signals_the_process_it_names() {
 
     // A real, live, unrelated process — standing in for whatever inherited the
     // recycled pid.
-    let mut victim = tokio::process::Command::new("/bin/sleep")
+    // Unqualified, for the OS to resolve against `PATH` — the same reason
+    // `daemon_binary` leaves its own fallback unqualified. A hardcoded
+    // directory is a platform assumption: coreutils lives in `/usr/bin` on
+    // macOS and `/bin` on most Linux, and `start_reports_a_daemon_that_exits_immediately`
+    // spent a release failing here because `/bin/false` does not exist on a Mac.
+    let mut victim = tokio::process::Command::new("sleep")
         .arg("30")
         .spawn()
         .unwrap();
@@ -216,9 +221,12 @@ async fn start_reports_a_daemon_that_exits_immediately() {
     let started = std::time::Instant::now();
     // 30s of timeout the test must *not* spend: if `start` had dropped the
     // `Child` it could only report "did not answer within 30s".
-    let error = with_daemon_bin("/bin/false", || start(&socket, Duration::from_secs(30)))
+    // `false`, unqualified: `daemon_binary` hands the value straight to
+    // `Command::new`, which resolves a name with no separator against `PATH`.
+    // `/bin/false` does not exist on macOS, where coreutils is in `/usr/bin`.
+    let error = with_daemon_bin("false", || start(&socket, Duration::from_secs(30)))
         .await
-        .expect_err("/bin/false serves nothing");
+        .expect_err("`false` serves nothing");
     let _ = std::fs::remove_file(pid_path(&socket));
 
     assert_eq!(ExitCode::of(&error), ExitCode::FailedPrecondition);
