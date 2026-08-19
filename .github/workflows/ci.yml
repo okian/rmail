@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # So a red pipeline can be re-run against an unchanged tree — which is how you
+  # tell a real regression from a flaky external fetch without pushing an empty
+  # commit to find out.
+  workflow_dispatch:
   schedule:
     # New RUSTSEC advisories land on their own schedule, not this repo's —
     # without a periodic run, the supply-chain gate only ever re-checks
@@ -12,50 +16,55 @@ on:
     - cron: "0 6 * * 1"
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A superseded push to a PR branch is wasted work and should die. A run on
+  # `main` is the record of whether `main` is green, so it must not be cancelled
+  # by the next merge or — as `cancel-in-progress: true` allowed, since a
+  # scheduled run carries `refs/heads/main` too — by the weekly advisory scan
+  # happening to fire mid-run.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Least privilege: nothing in this pipeline writes to the repo, publishes a
+# package, or comments on a PR. Without this block `GITHUB_TOKEN` arrives with
+# whatever the repository default is, which for older repos is write-all.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # A CI failure you cannot reproduce locally is worth far more with a stack
+  # than without one, and the cost is nothing on a passing run.
+  RUST_BACKTRACE: 1
 
 jobs:
-  gate:
-    name: fmt · clippy · buf · test · build · bench · supply-chain
-    runs-on: macos-latest
+  # ---------------------------------------------------------------------------
+  # Everything below used to be one job on `macos-latest`. That was wrong twice
+  # over: macOS runners bill at ten times the Linux rate and are the slowest
+  # tier available, and a single job meant a rustfmt typo was only discovered
+  # *after* paying for a model download and sixteen hundred tests. The work is
+  # now split by what it checks, running in parallel, on Linux — except the one
+  # job that genuinely cannot: macOS packaging.
+  # ---------------------------------------------------------------------------
+
+  lint:
+    name: fmt · clippy · buf
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install protoc
-        run: brew install protobuf
+          cache-key: lint
 
       - name: Install buf
         uses: bufbuild/buf-setup-action@v1
         with:
           github_token: ${{ github.token }}
 
-      - name: Install nextest, cargo-deny, cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest,cargo-deny,cargo-audit
-
-      # The local embedding backend reads its weights from here. Cached across
-      # runs so the model is fetched once rather than on every job, and so the
-      # tests that exercise the real model actually run — without it they
-      # detect an empty cache and skip, which is the same as not having them.
-      - name: Cache embedding model
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/rmail/models
-          key: rmail-models-bge-small-en-v1.5
-
+      # First, and deliberately: it is the cheapest check in the pipeline and
+      # the most common reason for a red run.
       - name: rustfmt
         run: cargo fmt --all -- --check
 
@@ -67,42 +76,181 @@ jobs:
 
       # Compares the current proto tree against `proto/buf-baseline.binpb`, a
       # committed `buf build` image snapshot — regenerate it via
-      # `scripts/update-buf-baseline.sh` once a breaking change is
-      # deliberately accepted (new `rmail.v2` package, etc.). There is no
-      # `main` branch or remote for `--against '.git#branch=main'` to resolve
-      # in this repo's history, so the committed-image form is the baseline
-      # that's actually available; it also has the advantage of working
+      # `scripts/update-buf-baseline.sh` once a breaking change is deliberately
+      # accepted (new `rmail.v2` package, etc.). The committed-image form is
+      # used rather than `--against '.git#branch=main'` because it works
       # identically for a contributor running this locally with no network
       # access to a registry.
       - name: buf breaking
         run: buf breaking --against proto/buf-baseline.binpb
 
+  test:
+    name: test (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Memory, not cores — the same bound `scripts/docker-test.sh` documents at
+      # length and defaults to 3 for a ~12 GB Docker VM. Every integration test
+      # in `rmaild/tests/` (there are around forty) statically links the whole
+      # dependency tree, rPGP's crypto stack included, and one `cc` for one of
+      # those peaks in the low gigabytes. `ubuntu-latest` is 4 vCPU / 16 GB, so
+      # cargo's default of one job per core is ~4 GB per link — the same ratio
+      # that the 3-job container run on 11.65 GB was killed at. It surfaces as
+      # `rustc ... (signal: 9, SIGKILL: kill)`, which names neither memory nor
+      # the linker, so the cost of guessing wrong here is an afternoon.
+      #
+      # This does not transfer from the old macOS-only job having survived at
+      # its default: that ran Apple's linker, which is dramatically thriftier
+      # than GNU ld on links this size.
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test
+          tools: nextest
+
+      # -----------------------------------------------------------------------
+      # The embedding weights, and why this is three steps rather than one env
+      # var on the test command.
+      #
+      # `model_available()` in `rmail-core/src/embed/local/tests.rs` is true if
+      # `RMAIL_ONNX_TESTS=1` *or* the model is already on disk. Setting that
+      # variable on the test run — which is what this workflow used to do —
+      # therefore did not mean "the weights are present", it meant "every
+      # model-backed test may go to the network". nextest runs each test in its
+      # own process in parallel, so on a cold cache four processes raced to
+      # populate one hf-hub cache directory and whichever lost failed:
+      #
+      #   FAIL  embed::local::tests::an_unprovisioned_cache_with_downloading_on_is_allowed_to_fetch
+      #   PASS  embed::local::tests::a_poisoned_session_is_recovered_rather_than_refused_forever
+      #   PASS  embed::local::tests::concurrent_embeds_do_not_starve_the_blocking_pool
+      #
+      # Two siblings doing the same download passing in the same run is what
+      # rules out "no egress" and points at the race.
+      #
+      # Worse, it could not heal: `actions/cache` only writes at post-job time
+      # on success, so a job that died in the test step never saved the weights
+      # it had just downloaded, and the next run started cold and raced again.
+      # Hence the split restore/save pair — the weights are banked the moment
+      # they exist, before anything that might fail.
+      # -----------------------------------------------------------------------
+      - name: Restore embedding weights
+        id: weights
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/rmail/models
+          key: rmail-models-bge-small-en-v1.5-v1
+
+      # One process, one download, no race. This is the *only* place in the
+      # pipeline permitted to fetch weights; every later test finds them on disk
+      # and `cached()` returns true without the variable being set at all.
+      # `--no-tests=fail` because a filter that silently matches nothing would
+      # report success and hand the whole suite back its cold-cache race.
+      - name: Provision embedding weights
+        id: provision
+        if: steps.weights.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          RMAIL_ONNX_TESTS: "1"
+        run: |
+          cargo nextest run --locked --all-features -p rmail-core --lib \
+            --no-tests=fail --no-capture \
+            -E 'test(=embed::local::tests::an_unprovisioned_cache_with_downloading_on_is_allowed_to_fetch)'
+
+      - name: Save embedding weights
+        if: steps.weights.outputs.cache-hit != 'true' && steps.provision.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/rmail/models
+          key: rmail-models-bge-small-en-v1.5-v1
+
+      # Hugging Face being unreachable is not a regression in this repo, so it
+      # degrades the four model-backed tests to their own self-skip path and
+      # annotates the run, rather than failing a build that has nothing wrong
+      # with it. The tests that assert the *absence* of a model — the
+      # precondition path, the half-written cache, the empty batch — are
+      # unconditional and still run either way.
+      - name: Decide whether the model-backed tests can run
+        id: model
+        # Via `env:` rather than `${{ }}` inside the script: interpolating
+        # directly into a `run:` block is the shape that becomes a script
+        # injection the moment one of the interpolated values is attacker-
+        # controlled, and it is not worth keeping the habit even where the
+        # values are a cache hit flag and a step outcome.
+        env:
+          CACHE_HIT: ${{ steps.weights.outputs.cache-hit }}
+          PROVISION: ${{ steps.provision.outcome }}
+        run: |
+          if [ "$CACHE_HIT" = "true" ] || [ "$PROVISION" = "success" ]; then
+            echo "onnx=1" >> "$GITHUB_OUTPUT"
+            echo "Embedding weights are present; model-backed tests will run."
+          else
+            echo "onnx=0" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Embedding weights unavailable::Could not provision bge-small-en-v1.5, so the four model-backed tests in rmail-core::embed::local self-skipped. Semantic-search behaviour is UNVERIFIED in this run. Re-run the job once Hugging Face is reachable."
+          fi
+
+      # `--no-fail-fast`: the previous configuration cancelled on the first
+      # failure ("Cancelling due to test failure: 2 tests still running",
+      # 2859 of 4741 never run), so a push with three unrelated breakages cost
+      # three round trips to discover. A full run costs a few minutes more and
+      # reports all of them once.
       - name: test
-        run: cargo nextest run --locked --all-features --workspace
         env:
-          # Allow the one-time weight download on a cold cache. Opt-in because
-          # a unit test may not decide to pull a few hundred megabytes onto a
-          # developer's metered connection.
-          RMAIL_ONNX_TESTS: "1"
+          RMAIL_ONNX_TESTS: ${{ steps.model.outputs.onnx }}
+        run: cargo nextest run --locked --all-features --workspace --no-fail-fast
 
-      # prd.md's regression guard: "CI runs the golden set; a drop in NDCG
-      # fails the build." The `test` step above already ran this — it is an
-      # ordinary integration test, hermetic and containerized like the rest —
-      # but relevance is the product's headline claim, and a drop in it
-      # deserves its own red step in the CI UI rather than one failure among
-      # sixteen hundred. `--no-capture` so the per-query NDCG breakdown lands
-      # in the log on a pass too, which is what makes a *gradual* slide
-      # visible across runs instead of only the moment it crosses the floor.
+      # prd.md's regression guard: "CI runs the golden set; a drop in NDCG fails
+      # the build." The `test` step above already ran this — it is an ordinary
+      # integration test — but relevance is the product's headline claim, and a
+      # drop in it deserves its own red step in the CI UI rather than being one
+      # failure among sixteen hundred. `--no-capture` so the per-query NDCG
+      # breakdown lands in the log on a pass too, which is what makes a
+      # *gradual* slide visible across runs instead of only the moment it
+      # crosses the floor.
       - name: relevance regression guard (golden set)
-        run: cargo nextest run --locked --all-features -p rmaild --test eval_service --no-capture
+        if: steps.model.outputs.onnx == '1'
         env:
           RMAIL_ONNX_TESTS: "1"
+        run: cargo nextest run --locked --all-features -p rmaild --test eval_service --no-capture
 
-      # The documented degraded build: no ONNX, semantic search falls back to
-      # deterministic hashed vectors. It has its own `#[cfg]` paths, so a build
-      # that only ever compiles with every feature on does not cover it.
-      - name: test without the local model backend
-        run: cargo nextest run --locked --no-default-features --workspace
+  test-minimal:
+    # The documented degraded build: no ONNX, semantic search falls back to
+    # deterministic hashed vectors. It has its own `#[cfg]` paths, so a build
+    # that only ever compiles with every feature on does not cover it. Its own
+    # job, and its own cargo cache namespace — a feature-set change rebuilds the
+    # world, so sharing a cache with the all-features jobs would mean the two
+    # evicted each other on every run.
+    name: test (no default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Same bound as the all-features job, one job higher: without `onnx` there
+      # is no `fastembed`/`ort` in the tree, so each link is meaningfully
+      # smaller. See that job for why this is set at all.
+      CARGO_BUILD_JOBS: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: no-default-features
+          tools: nextest
+
+      - name: test
+        run: cargo nextest run --locked --no-default-features --workspace --no-fail-fast
+
+  build:
+    name: build release · benches
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release
 
       - name: build release
         run: cargo build --locked --release
@@ -111,33 +259,107 @@ jobs:
       # (tasks 25-33, 59) don't exist yet, so there's nothing to run a
       # meaningful sample against on a shared, variably-loaded CI runner. The
       # gate here is "the harness still compiles" — an actual perf run is a
-      # `cargo bench` a developer invokes locally; see `rmail-core/benches/
-      # search_budgets.rs` for what is and isn't wired to real code today.
+      # `cargo bench` a developer invokes locally; see
+      # `rmail-core/benches/search_budgets.rs` for what is and isn't wired to
+      # real code today.
       - name: compile perf benchmarks
         run: cargo bench -p rmail-core --bench search_budgets --locked --no-run
 
-      # macOS release packaging: builds rmaild + mail already happened above;
-      # this proves the packaging script actually turns them into a
-      # distributable bundle, not just that it parses.
-      - name: package macOS release (smoke test)
+  package-macos:
+    # The one job that cannot move to Linux: it produces a macOS bundle with
+    # ad-hoc-codesigned Mach-O binaries. It builds its own release binaries
+    # because `--skip-build` consumes whatever is already in the target dir, and
+    # now that this is a separate job there is nothing there — and a macOS
+    # bundle could not be assembled from the Linux job's artifacts anyway. That
+    # makes this a genuine second-platform release build, not just a packaging
+    # smoke test.
+    #
+    # arm64 only: `--universal` needs `rustup target add x86_64-apple-darwin`
+    # and doubles the build, and the script documents that CI does not claim to
+    # cover every architecture combination.
+    name: package macOS release
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-release
+
+      - name: build release
+        run: cargo build --locked --release
+
+      - name: package
         run: scripts/package-macos.sh --skip-build
 
-      # Supply-chain gate, last because it's the slowest external fetch (a
-      # fresh clone of the RustSec advisory DB) and everything above is cheap
-      # to fail on first. `deny.toml` documents every allowed license and
-      # every ignored advisory with a reason; nothing here is a blanket
-      # bypass. `--locked`: a supply-chain check is only meaningful against
-      # the lockfile this job actually built and tested with — without it,
+      # The bundle is the actual deliverable; keeping it makes a CI run
+      # something you can install from rather than only a pass/fail signal.
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: rmail-macos-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  supply-chain:
+    # Last conceptually, and independent in practice: it reads `Cargo.lock` and
+    # crate metadata, so it needs no build and no protoc, and there is no reason
+    # for it to queue behind the test suite. `deny.toml` and `.cargo/audit.toml`
+    # document every allowed license and every ignored advisory with a reason;
+    # nothing here is a blanket bypass.
+    name: supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: supply-chain
+          # `cargo deny` and `cargo audit` read `Cargo.lock` and crate metadata;
+          # neither runs a build script, so protoc would be an `apt-get update`
+          # spent on nothing.
+          protoc: "false"
+          tools: cargo-deny,cargo-audit
+
+      # `--locked`: a supply-chain check is only meaningful against the lockfile
+      # the rest of the pipeline actually built and tested with — without it,
       # `cargo deny`'s own `cargo metadata` call could silently re-resolve a
-      # looser `Cargo.toml` constraint to a newer, unreviewed version and
-      # scan that instead.
+      # looser `Cargo.toml` constraint to a newer, unreviewed version and scan
+      # that instead.
       - name: cargo deny check
         run: cargo deny --all-features --locked check
 
       # No CLI flags: `.cargo/audit.toml` carries the ignore list and
       # `deny = ["warnings"]` (auto-discovered by `cargo audit`), so this runs
       # identically here and on a contributor's machine. `cargo audit` always
-      # reads `Cargo.lock` as committed — no separate `--locked` flag exists
-      # because there is nothing here that would otherwise re-resolve it.
+      # reads `Cargo.lock` as committed — there is no `--locked` flag because
+      # there is nothing here that would otherwise re-resolve it.
       - name: cargo audit
         run: cargo audit
+
+  # One required status check for branch protection. Without this, protecting
+  # `main` means naming all six jobs in the ruleset and updating it by hand
+  # every time the pipeline gains or loses one — and a job that is *skipped*
+  # rather than passing satisfies a naive required-check rule, which this does
+  # not accept.
+  ci:
+    name: ci
+    if: always()
+    needs: [lint, test, test-minimal, build, package-macos, supply-chain]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify every gate passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq .
+          if echo "$RESULTS" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null; then
+            echo "All gates passed."
+          else
+            echo "::error title=CI gate failed::One or more jobs did not succeed."
+            exit 1
+          fi

@@ -1,0 +1,88 @@
+name: Set up the Rust toolchain
+description: >-
+  Toolchain, protoc, a warm cargo cache, and any cargo-installed tools — the
+  things every job in this pipeline needs before it can run a single cargo
+  command.
+
+# Six jobs each needed the same handful of setup steps. Duplicated inline, a
+# change to any of them (a new component, a different cache strategy, a protoc
+# bump) had to be made six times and was silently wrong in whichever copy got
+# missed. The pipeline splits by *what it checks*; setup is not one of those
+# things, so it lives here once.
+inputs:
+  components:
+    description: Extra rustup components, comma-separated (e.g. "rustfmt, clippy").
+    required: false
+    default: ""
+  tools:
+    description: >-
+      Cargo tools to install as prebuilt binaries, comma-separated (e.g.
+      "nextest,cargo-deny"). Empty installs nothing.
+    required: false
+    default: ""
+  cache-key:
+    description: >-
+      Cargo cache namespace, which should be unique per job. Two jobs that
+      compile different feature sets must not share one: cargo rebuilds the
+      world when features change, so they would overwrite each other's target
+      directory on every run and neither would ever get a warm cache.
+    required: false
+    default: default
+  protoc:
+    description: >-
+      Whether this job needs protoc. True for anything that compiles, since
+      `rmail-proto/build.rs` shells out to it. False for jobs that only read
+      `Cargo.lock` and crate metadata, which saves them an `apt-get update`.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    # `tonic-build` shells out to protoc from `rmail-proto/build.rs`, so this is
+    # a hard prerequisite of *compiling*, not merely of the proto lint job.
+    # Installed from each platform's own package manager rather than via a
+    # marketplace action: it adds no third-party dependency to the supply chain
+    # of the very pipeline whose job includes auditing this repo's supply chain.
+    - name: Install protoc (Linux)
+      if: inputs.protoc == 'true' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends protobuf-compiler
+        protoc --version
+
+    - name: Install protoc (macOS)
+      if: inputs.protoc == 'true' && runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install protobuf
+        protoc --version
+
+    # No `rust-toolchain.toml` in this repo, so `stable` is what a contributor
+    # gets locally and `stable` is therefore what CI must check against.
+    # `Cargo.toml`'s `rust-version = "1.80"` is the *floor* this workspace
+    # promises, not the version it is developed on; enforcing that floor needs
+    # its own pinned job and is not what this gate is for.
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        # Write the cache only from `main`; every other ref restores from it.
+        # A repository gets 10 GB of Actions cache in total, and six jobs each
+        # saving a multi-hundred-megabyte target directory on every push to
+        # every PR branch evicts the useful entries within a handful of PRs —
+        # after which no job ever starts warm and the cache costs upload time
+        # while saving nothing. Branch caches are the ones worth losing.
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Install cargo tools
+      if: inputs.tools != ''
+      uses: taiki-e/install-action@v2
+      with:
+        tool: ${{ inputs.tools }}
