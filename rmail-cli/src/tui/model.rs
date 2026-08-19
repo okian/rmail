@@ -66,6 +66,7 @@ use super::overlays::{
     QuickAction, QuickPane, SearchFocus, SearchPane, Toast, UndoToast,
 };
 use super::report::{self, ReportColumn, ReportFill, ReportPane, ReportRow};
+use super::status::{Daemon, Health, Subsystem};
 use super::theme::Theme;
 pub use crate::keymap::Key;
 use crate::keymap::{Action, Keymap, Mode, Pending, Resolution};
@@ -739,6 +740,18 @@ pub enum Msg {
     },
     /// A second passed while an undo countdown was running, unix seconds.
     Tick(i64),
+    /// One subsystem's standing, from the heartbeat (task 92).
+    ///
+    /// Deliberately not a [`Msg::Done`]: nobody asked for it and nothing
+    /// counted it into [`Model::inflight`], so reporting it as a finished
+    /// request would decrement a counter it never incremented — the same
+    /// reason [`Msg::LiveUpdatesStopped`] is its own variant.
+    Daemon {
+        /// Which subsystem answered.
+        subsystem: Subsystem,
+        /// What it said, or why it could not be asked.
+        result: Result<Health, String>,
+    },
     /// One frame of a Report's answer (task 90).
     Report {
         /// Which request it belongs to. A frame from a superseded one is
@@ -984,6 +997,19 @@ pub enum Cmd {
         /// Every recorded line, oldest first.
         entries: Vec<String>,
     },
+    /// Start the daemon heartbeat (task 92): poll `SyncService.Status`,
+    /// `IndexService.Status`, `AiService.GetUsage` and
+    /// `AiPolicyService.GetSpend` on a timer and report each as a
+    /// [`Msg::Daemon`].
+    ///
+    /// "Start", not "do once", because [`update`] has no clock — the same
+    /// reason [`Cmd::Countdown`] is shaped this way. Issued once when the
+    /// account is known; the executor supersedes an earlier one rather than
+    /// running two.
+    Heartbeat {
+        /// The account whose sync and spend to ask about.
+        account_id: i64,
+    },
     /// `ClientAuthService.AuthStatus` — the `:auth status` report.
     AuthStatus {
         /// Which report this is, so a frame from a superseded run is
@@ -1111,6 +1137,13 @@ pub struct Model {
     /// is [`Model::message_idx`], so extending the selection is the ordinary
     /// cursor movement and needs no second set of bindings.
     pub visual: Option<usize>,
+    /// What the heartbeat has learned about the daemon's subsystems.
+    ///
+    /// Never counted into [`Model::inflight`]: that counter is what the busy
+    /// marker reads, and it means "work the *user* asked for". A five-second
+    /// poll incrementing it would pin the marker on forever — see
+    /// `tui::status`' module docs.
+    pub daemon: Daemon,
     /// The bindings in force. Replaced wholesale when `keys.toml` changes;
     /// never patched, so a half-applied reload cannot exist.
     pub keymap: Keymap,
@@ -1192,6 +1225,7 @@ impl Model {
             toasts: VecDeque::new(),
             generation: 0,
             visual: None,
+            daemon: Daemon::default(),
             keymap: Keymap::defaults(),
             pending: Pending::default(),
             inflight: 0,
@@ -1491,10 +1525,14 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                     // toast's sake: an undo window is seconds long, and a
                     // countdown nobody sees until they think to open a pane
                     // is not an undo offer at all.
+                    // The heartbeat starts here for the same reason the event
+                    // stream does, and is counted for neither of the same
+                    // reasons: nobody asked for it and it never finishes.
                     vec![
                         Cmd::LoadFolders { account_id },
                         Cmd::Watch { account_id },
                         Cmd::LoadOutbox { account_id },
+                        Cmd::Heartbeat { account_id },
                     ]
                 }
                 Err(error) => {
@@ -1709,6 +1747,23 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 }
             }
             apply_note(model, note);
+            Vec::new()
+        }
+        Msg::Daemon { subsystem, result } => {
+            // No `inflight` arithmetic in either direction. A heartbeat that
+            // decremented on arrival would drive the counter below zero on the
+            // first tick, which `saturating_sub` would hide rather than fix.
+            model.daemon.set(
+                subsystem,
+                match result {
+                    Ok(health) => health,
+                    // Recorded on the indicator rather than shouted on the
+                    // status line: nobody asked, and a daemon that went away
+                    // must not overwrite the answer to whatever the user *did*
+                    // ask, once every five seconds, forever.
+                    Err(error) => Health::failed(error),
+                },
+            );
             Vec::new()
         }
         Msg::Report { generation, event } => {

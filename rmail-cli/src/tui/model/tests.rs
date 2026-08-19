@@ -97,6 +97,9 @@ fn boot_loads_accounts_then_folders_then_messages() {
             Cmd::LoadFolders { account_id: 7 },
             Cmd::Watch { account_id: 7 },
             Cmd::LoadOutbox { account_id: 7 },
+            // Task 92's heartbeat, counted for neither of the reasons `Watch`
+            // is not: nobody asked for it and it never finishes.
+            Cmd::Heartbeat { account_id: 7 },
         ],
         "the event stream starts as soon as there is an account to watch, and the \
          outbox is listed once so a live undo window is visible without asking"
@@ -200,6 +203,9 @@ fn account_flag_selects_that_account_rather_than_the_first() {
             Cmd::LoadFolders { account_id: 9 },
             Cmd::Watch { account_id: 9 },
             Cmd::LoadOutbox { account_id: 9 },
+            // Task 92's heartbeat, counted for neither of the reasons `Watch`
+            // is not: nobody asked for it and it never finishes.
+            Cmd::Heartbeat { account_id: 9 },
         ]
     );
 }

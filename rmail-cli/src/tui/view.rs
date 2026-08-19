@@ -27,12 +27,13 @@ use ratatui::Frame;
 use crate::keymap::{Action, Mode};
 
 use super::manual;
-use super::model::{Focus, Level, Model, Overlay, Scope, Screen, FLAGGED, SEEN};
+use super::model::{Focus, Model, Overlay, Scope, Screen, FLAGGED, SEEN};
 use super::overlays::{
     self, AskPane, AskPhase, CommandPane, FinderPane, OutboxPane, QuickAction, QuickPane,
     SearchFocus, SearchPane, Toast,
 };
 use super::report::{ReportColumn, ReportPane, ReportTone};
+use super::status;
 use super::theme::Theme;
 use super::whichkey::{self, Band, Kind};
 
@@ -107,6 +108,14 @@ const PREVIEW_BREAKPOINT: u16 = 100;
 /// Below this width the folder column is dropped too: messages alone,
 /// 1-pane.
 const FOLDER_BREAKPOINT: u16 = 60;
+
+/// The columns the status bar's message zone keeps before an optional zone is
+/// dropped to make room.
+///
+/// The message is the one zone that flexes, and it is also the one carrying
+/// whatever just failed — so an indicator zone that squeezed it to nothing
+/// would have hidden the sentence explaining why the indicator went red.
+const MIN_MESSAGE: u16 = 24;
 
 /// The list screen's three panes, collapsing as `area` narrows.
 ///
@@ -490,86 +499,134 @@ fn ink_style(theme: &Theme, ink: manual::Ink) -> Style {
     }
 }
 
+/// Task 92's status bar: fixed-width zones, and one that flexes.
+///
+/// The zones are laid out with `Layout` rather than concatenated into a line,
+/// because `Model::status` is unbounded — an SMTP server's verbatim rejection
+/// reaches it — and a `Paragraph` that does not wrap pushes everything after a
+/// long message off the row. Splitting first gives each fixed fact a width
+/// nothing else can encroach on, so the mode is in the same columns whether or
+/// not anything failed and a stopped indexer is visible while a
+/// two-hundred-character rejection is on screen.
+///
+/// Zones are dropped from the right as the terminal narrows, in reverse order
+/// of how much they say: the focus hint first (task 93's, and only ever a hint),
+/// then the daemon indicators, then the scope. The mode, the message, the busy
+/// marker and the pending keys are never dropped — those four are the ones a
+/// keyboard's behaviour depends on.
 fn render_status(model: &Model, frame: &mut Frame, area: Rect) {
     let theme = &model.theme;
-    let level_style = match model.level {
-        Level::Info => theme.ok,
-        Level::Error => theme.err,
-    };
-    // The busy marker is the whole point of tracking `inflight`: the user can
-    // see that something is in flight *and* keep using the UI while it is.
-    let busy = if model.inflight > 0 {
-        format!(" [{} in flight]", model.inflight)
+    let bar = status::bar(model);
+
+    let mode_width = u16::try_from(status::MODE_WIDTH).unwrap_or(u16::MAX);
+    let scope_width = u16::try_from(bar.scope.chars().count() + 1).unwrap_or(u16::MAX);
+    let daemon_width =
+        u16::try_from(status::INDICATOR_WIDTH * bar.daemon.len()).unwrap_or(u16::MAX);
+    let inflight_width = u16::try_from(bar.inflight.chars().count() + 1).unwrap_or(u16::MAX);
+    let pending_width = u16::try_from(bar.pending.chars().count() + 1).unwrap_or(u16::MAX);
+    // `status::bar` answers "the folder pane has focus"; whether that pane is
+    // being drawn is this module's question, because it is the only one that
+    // knows the width. A hint about a pane the reader can see is noise.
+    let eligible = !bar.focus_hint.is_empty() && panes_width(model, area.width) < FOLDER_BREAKPOINT;
+    let hint_width = if eligible {
+        u16::try_from(bar.focus_hint.chars().count() + 1).unwrap_or(u16::MAX)
     } else {
-        String::new()
+        0
     };
-    // The mode, and what has been typed towards a binding but not resolved.
-    // vim shows both for the same reason: a half-typed `3g` that is invisible
-    // is indistinguishable from a keyboard that has stopped responding, and
-    // the user's next move — mashing keys — is the one thing that makes it
-    // worse.
-    let mode = match model.mode() {
-        Mode::Visual => " -- VISUAL --",
-        Mode::Insert | Mode::Prompt => " -- INSERT --",
-        Mode::Menu => " -- SELECT --",
-        _ => "",
+
+    // The focus hint is not subject to `MIN_MESSAGE`, and that is the whole
+    // point of it: it is only eligible at a width where the folder pane is *not
+    // drawn*, and at that width a `Focus::Folders` state makes `j`/`k` move a
+    // cursor nobody can see. That is a fact about what the keyboard is doing,
+    // and those are the facts this bar never drops — so it is dropped only when
+    // it does not fit at all.
+    let mut fixed = mode_width + inflight_width + pending_width;
+    let hint = hint_width > 0 && fixed + hint_width < area.width;
+    if hint {
+        fixed += hint_width;
+    }
+    // The two informative zones, widest first, each kept only if the message
+    // still has room. Scope before daemon: which folder you are in explains
+    // more of what is on screen than whether the indexer is idle.
+    let scope = fixed + scope_width + MIN_MESSAGE <= area.width;
+    if scope {
+        fixed += scope_width;
+    }
+    let daemon = fixed + daemon_width + MIN_MESSAGE <= area.width;
+
+    let mut constraints = vec![Constraint::Length(mode_width)];
+    if scope {
+        constraints.push(Constraint::Length(scope_width));
+    }
+    constraints.push(Constraint::Min(0));
+    if daemon {
+        constraints.push(Constraint::Length(daemon_width));
+    }
+    constraints.push(Constraint::Length(inflight_width));
+    constraints.push(Constraint::Length(pending_width));
+    if hint {
+        constraints.push(Constraint::Length(hint_width));
+    }
+    let zones = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    let mut zone = zones.iter();
+    let mut next = |frame: &mut Frame, line: Line<'static>| {
+        if let Some(area) = zone.next() {
+            frame.render_widget(Paragraph::new(line), *area);
+        }
     };
-    let pending = if model.pending.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", model.pending.label())
-    };
-    // `render_panes` drops the folder column below `FOLDER_BREAKPOINT` (see
-    // its own doc comment) without touching `Model::focus` — the model has
-    // no terminal size to react to, by this module's own rule. Left alone,
-    // a `Focus::Folders` state at that width points at a pane nothing draws:
-    // `j`/`k` would move the folder cursor and `<enter>` would open a
-    // folder, with no pane on screen showing focus at all to explain either.
-    // This is the other half of that trade — not preventing the state, only
-    // making it legible.
-    //
-    // Reserved as its own right-hand column rather than appended to `line`:
-    // `model.status` is unbounded (task 85 — an SMTP server's verbatim
-    // rejection, a recipient address) and this `Paragraph` does not wrap, so
-    // a hint appended after it would be exactly what a long status pushes
-    // off the edge of the row it exists to explain. Splitting `area` first
-    // gives the hint a width nothing else can encroach on.
-    let focus_hint = if model.screen == Screen::List
-        && model.focus == Focus::Folders
-        && panes_width(model, area.width) < FOLDER_BREAKPOINT
-    {
-        "focus: folders (<tab>)"
-    } else {
-        ""
-    };
-    let hint_width = focus_hint.len() as u16;
-    let (status_area, hint_area) = if hint_width == 0 || hint_width >= area.width {
-        (area, None)
-    } else {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(hint_width)])
-            .split(area);
-        (columns[0], Some(columns[1]))
-    };
-    let line = Line::from(vec![
-        // Sanitized here rather than at each call site: the status line is
-        // the one surface every part of the TUI writes to, and task 85 is
-        // what first puts third-party text into it — an SMTP server's verbatim
-        // rejection (`OutboxRow::last_error`), a recipient address, a folder
-        // name. One place covers every present and future caller.
-        Span::styled(overlays::safe_line(&model.status), level_style),
-        Span::styled(busy, theme.muted),
-        Span::styled(mode, theme.mode_indicator),
-        Span::styled(pending, theme.warn),
-    ]);
-    frame.render_widget(Paragraph::new(line), status_area);
-    if let Some(hint_area) = hint_area {
-        frame.render_widget(
-            Paragraph::new(Span::styled(focus_hint, theme.warn)),
-            hint_area,
+
+    next(frame, Line::styled(bar.mode.clone(), theme.mode_indicator));
+    if scope {
+        next(
+            frame,
+            Line::styled(overlays::safe_line(&bar.scope), theme.muted),
         );
     }
+    next(
+        frame,
+        Line::styled(
+            // Sanitized here rather than at each call site: the status line is
+            // the one surface every part of the TUI writes to, and third-party
+            // text reaches it — an SMTP server's verbatim rejection
+            // (`OutboxRow::last_error`), a recipient address, a folder name.
+            // One place covers every present and future caller.
+            overlays::safe_line(&bar.message),
+            if bar.failed { theme.err } else { theme.ok },
+        ),
+    );
+    if daemon {
+        next(frame, Line::from(indicator_spans(theme, &bar.daemon)));
+    }
+    next(frame, Line::styled(bar.inflight.clone(), theme.muted));
+    next(frame, Line::styled(bar.pending.clone(), theme.warn));
+    if hint {
+        next(frame, Line::styled(bar.focus_hint.clone(), theme.warn));
+    }
+}
+
+/// The daemon zone: a glyph and a label per subsystem.
+///
+/// Both, not either: the glyph is what survives a monochrome terminal and a
+/// red-green colour-blind reader, which is the same reason task 90's report rows
+/// carry one. The `:` command each indicator expands into is deliberately not
+/// drawn here — it is a sentence and this is a fixed zone — and reaches the
+/// reader through the manual instead, which is where a command somebody has to
+/// type belongs.
+fn indicator_spans(theme: &Theme, indicators: &[status::Indicator]) -> Vec<Span<'static>> {
+    indicators
+        .iter()
+        .flat_map(|indicator| {
+            let style = tone_style(theme, indicator.state.tone());
+            [
+                Span::styled(format!(" {}", indicator.state.glyph()), style),
+                Span::styled(indicator.which.label().to_owned(), style),
+            ]
+        })
+        .collect()
 }
 
 /// The key reference, read out of the keymap rather than written alongside it.

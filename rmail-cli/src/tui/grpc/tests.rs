@@ -273,6 +273,15 @@ async fn load_accounts_folders_and_messages_come_back_as_model_types() {
         },
         tx.clone(),
     );
+    // `SyncService.Status` answers two questions at once, so this command sends
+    // two messages — see `a_folder_listing_also_reports_the_sync_indicator`.
+    match next(&mut rx, "the sync indicator").await {
+        Msg::Daemon {
+            subsystem: Subsystem::Sync,
+            ..
+        } => {}
+        other => unreachable!("expected the sync indicator first, got {other:?}"),
+    }
     let folders: Vec<Folder> = match next(&mut rx, "folders").await {
         Msg::Folders(Ok(folders)) => folders,
         other => unreachable!("expected folders, got {other:?}"),
@@ -512,6 +521,91 @@ async fn a_move_removes_the_row_and_the_listing_agrees() {
         other => unreachable!("expected messages, got {other:?}"),
     }
 
+    daemon.stop().await;
+}
+
+/// Task 92's supersession clause, at the layer it lives in.
+///
+/// `SyncService.Status` is both the folder listing and the sync indicator's own
+/// answer, so one call reports both — which is what lets a reload preempt the
+/// heartbeat's next tick instead of the two racing to say the same thing. A
+/// model test cannot see this: it is entirely about what the executor sends.
+#[tokio::test]
+async fn a_folder_listing_also_reports_the_sync_indicator() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::LoadFolders {
+            account_id: daemon.account_id,
+        },
+        tx.clone(),
+    );
+
+    // The health first, so the indicator is fresh even for a reader that
+    // stopped consuming folder listings.
+    match next(&mut rx, "the sync indicator").await {
+        Msg::Daemon {
+            subsystem: Subsystem::Sync,
+            result: Ok(health),
+        } => {
+            assert_eq!(health.state, crate::tui::status::HealthState::Ok);
+            assert!(
+                health.detail.contains("folder"),
+                "a fresh daemon is not paused and has folders: {health:?}"
+            );
+        }
+        other => unreachable!("expected the sync indicator, got {other:?}"),
+    }
+    match next(&mut rx, "the folder listing").await {
+        Msg::Folders(Ok(folders)) => assert_eq!(folders.len(), 2, "{folders:?}"),
+        other => unreachable!("expected the folder listing, got {other:?}"),
+    }
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
+/// Task 92's heartbeat, through the daemon.
+///
+/// Four RPCs this daemon actually serves, four indicators — the thing a model
+/// test structurally cannot prove. Ordering is asserted only as a set, because
+/// the point of four messages rather than one is that a slow subsystem does not
+/// hold up the others.
+#[tokio::test]
+async fn the_heartbeat_reports_every_subsystem_it_claims_to_ask_about() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Heartbeat {
+            account_id: daemon.account_id,
+        },
+        tx.clone(),
+    );
+
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..Subsystem::ALL.len() {
+        match next(&mut rx, "a heartbeat answer").await {
+            Msg::Daemon { subsystem, result } => {
+                assert!(
+                    result.is_ok(),
+                    "{subsystem:?} could not be asked: {result:?}"
+                );
+                seen.insert(format!("{subsystem:?}"));
+            }
+            other => unreachable!("expected a heartbeat answer, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        Subsystem::ALL.len(),
+        "every subsystem answered exactly once in the first round: {seen:?}"
+    );
+
+    exec.shutdown();
     daemon.stop().await;
 }
 

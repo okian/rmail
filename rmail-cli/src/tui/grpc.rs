@@ -44,19 +44,22 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use rmail_proto::v1::account_service_client::AccountServiceClient;
+use rmail_proto::v1::ai_policy_service_client::AiPolicyServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
 use rmail_proto::v1::client_auth_service_client::ClientAuthServiceClient;
 use rmail_proto::v1::compose_service_client::ComposeServiceClient;
 use rmail_proto::v1::finder_service_client::FinderServiceClient;
+use rmail_proto::v1::index_service_client::IndexServiceClient;
 use rmail_proto::v1::mail_service_client::MailServiceClient;
 use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::send_scheduler_service_client::SendSchedulerServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
     ask_chunk, AskRequest, AuthStatusRequest, CancelRequest, ClearPasswordRequest, CopyRequest,
-    DeleteRequest, EventKind, ExplainRequest, FindRequest, GetMessageRequest, GetSummaryRequest,
-    ListAccountsRequest, ListMessagesRequest, ListOutboxRequest, MoveRequest, SearchRequest,
-    SetFlagsRequest, SuggestReplyRequest, SyncStatusRequest, WatchEventsRequest,
+    DeleteRequest, EventKind, ExplainRequest, FindRequest, GetMessageRequest, GetSpendRequest,
+    GetSummaryRequest, GetUsageRequest, IndexStatusRequest, ListAccountsRequest,
+    ListMessagesRequest, ListOutboxRequest, MoveRequest, SearchRequest, SetFlagsRequest,
+    SuggestReplyRequest, SyncStatusRequest, WatchEventsRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
@@ -78,6 +81,7 @@ use super::model::{
     wire, AskEvent, Cmd, Effect, FinderEvent, Msg, ReportEvent, SearchEvent, Stream,
 };
 use super::report::{ReportFill, ReportRow, ReportTone};
+use super::status::{Health, Subsystem};
 
 /// Deadline for a unary RPC. Generous: these are local reads over a Unix
 /// socket, and the ones that reach IMAP (move/copy/delete) are several
@@ -116,6 +120,15 @@ const OUTBOX_PAGE: i32 = 200;
 /// How often the undo countdown ticks.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How often the daemon heartbeat polls (task 92).
+///
+/// Five seconds is four local reads over a Unix socket — it costs the daemon
+/// almost nothing and is well inside the time somebody would spend wondering
+/// whether the indexer had stopped. Shorter would not make the answer more
+/// useful; longer would mean a paused subsystem could sit unreported for as
+/// long as somebody would reasonably keep looking at the bar.
+const HEARTBEAT: Duration = Duration::from_secs(5);
+
 /// Runs the TUI's commands against a live `rmaild`.
 pub struct GrpcExec {
     mail: MailServiceClient<Conn>,
@@ -127,6 +140,8 @@ pub struct GrpcExec {
     ai: AiServiceClient<Conn>,
     scheduler: SendSchedulerServiceClient<Conn>,
     auth: ClientAuthServiceClient<Conn>,
+    index: IndexServiceClient<Conn>,
+    policy: AiPolicyServiceClient<Conn>,
     /// The task feeding the search overlay, so the next keystroke can abort
     /// it. One slot per stream kind: a search and a find can be outstanding
     /// at once (they are different overlays), but two searches cannot.
@@ -150,6 +165,10 @@ pub struct GrpcExec {
     /// supersession of the first, and `Esc` needs exactly one thing to abort
     /// whether the report was streaming or not.
     reporting: Mutex<Option<AbortHandle>>,
+    /// The daemon heartbeat's loop. Superseding, so switching account restarts
+    /// it rather than leaving two loops polling for two accounts — and so
+    /// `shutdown` has one handle to stop.
+    beating: Mutex<Option<AbortHandle>>,
     ticking: Mutex<Option<AbortHandle>>,
     /// The command-history write. Superseding, because `write_atomic`'s temp
     /// path is per-*process*: two commands in quick succession would
@@ -208,12 +227,15 @@ impl GrpcExec {
             finder: FinderServiceClient::new(channel.clone()),
             ai: AiServiceClient::new(channel.clone()),
             scheduler: SendSchedulerServiceClient::new(channel.clone()),
-            auth: ClientAuthServiceClient::new(channel),
+            auth: ClientAuthServiceClient::new(channel.clone()),
+            index: IndexServiceClient::new(channel.clone()),
+            policy: AiPolicyServiceClient::new(channel),
             searching: Mutex::new(None),
             finding: Mutex::new(None),
             asking: Mutex::new(None),
             explaining: Mutex::new(None),
             reporting: Mutex::new(None),
+            beating: Mutex::new(None),
             ticking: Mutex::new(None),
             saving: Mutex::new(None),
             opener: CommandOpener::platform(),
@@ -297,18 +319,31 @@ impl CmdExec for GrpcExec {
             }
             Cmd::LoadFolders { account_id } => {
                 let mut client = self.sync.clone();
+                // One RPC, two messages. `SyncService.Status` is both the
+                // folder listing and the sync indicator's own answer, and this
+                // command is what a `WatchEvents` push triggers — so the
+                // indicator is refreshed by the push rather than waiting out
+                // the heartbeat's next tick, which is what the acceptance means
+                // by "superseded by `WatchEvents` where those already push".
+                // Sending the health first keeps that true even if the model
+                // stops reading `Msg::Folders` for some reason.
+                let reporter = out.clone();
                 self.spawn(out, async move {
-                    Msg::Folders(
-                        call(client.status(SyncStatusRequest { account_id }))
-                            .await
-                            .map(|r| {
-                                r.into_inner()
-                                    .folders
-                                    .into_iter()
-                                    .map(wire::folder)
-                                    .collect()
-                            }),
-                    )
+                    let response = call(client.status(SyncStatusRequest { account_id })).await;
+                    let _ = reporter.send(Msg::Daemon {
+                        subsystem: Subsystem::Sync,
+                        result: response
+                            .as_ref()
+                            .map(|response| wire::sync_health(response.get_ref()))
+                            .map_err(Clone::clone),
+                    });
+                    Msg::Folders(response.map(|r| {
+                        r.into_inner()
+                            .folders
+                            .into_iter()
+                            .map(wire::folder)
+                            .collect()
+                    }))
                 });
             }
             Cmd::LoadMessages { mailbox_id } => {
@@ -550,6 +585,34 @@ impl CmdExec for GrpcExec {
                     Msg::Outbox {
                         now: now_unix(),
                         result,
+                    }
+                });
+            }
+            Cmd::Heartbeat { account_id } => {
+                let mut sync = self.sync.clone();
+                let mut index = self.index.clone();
+                let mut ai = self.ai.clone();
+                let mut policy = self.policy.clone();
+                self.spawn_superseding(&self.beating, async move {
+                    loop {
+                        // Four independent messages rather than one combined
+                        // answer, so a slow subsystem does not hold up the
+                        // three that already replied — and so one failing
+                        // leaves the other three's last-known state on the bar
+                        // instead of blanking all four.
+                        heartbeat(
+                            &mut sync,
+                            &mut index,
+                            &mut ai,
+                            &mut policy,
+                            account_id,
+                            &out,
+                        )
+                        .await;
+                        // After, not before: the first round runs the moment
+                        // the account is known, which is when somebody is
+                        // most likely to be looking at the bar.
+                        tokio::time::sleep(HEARTBEAT).await;
                     }
                 });
             }
@@ -833,6 +896,56 @@ async fn stream_ask(
         generation,
         event: AskEvent::Failed("the daemon ended the answer early".to_owned()),
     });
+}
+
+/// One round of the heartbeat: ask the four subsystems and report each one.
+///
+/// Nothing here touches `inflight`, in either direction. That counter is what
+/// the busy marker reads and it means "work the user asked for"; a five-second
+/// poll incrementing it would pin the marker on forever, and decrementing it
+/// would drive it below zero on the first tick.
+///
+/// A failure is reported as a failure rather than dropped: a daemon that has
+/// gone away is exactly what the indicator zone exists to show, and silence
+/// would leave the last healthy answer on screen indefinitely.
+async fn heartbeat(
+    sync: &mut SyncServiceClient<Conn>,
+    index: &mut IndexServiceClient<Conn>,
+    ai: &mut AiServiceClient<Conn>,
+    policy: &mut AiPolicyServiceClient<Conn>,
+    account_id: i64,
+    out: &UnboundedSender<Msg>,
+) {
+    let report = |subsystem: Subsystem, result: Result<Health, String>| {
+        let _ = out.send(Msg::Daemon { subsystem, result });
+    };
+    report(
+        Subsystem::Sync,
+        call(sync.status(SyncStatusRequest { account_id }))
+            .await
+            .map(|response| wire::sync_health(&response.into_inner())),
+    );
+    report(
+        Subsystem::Index,
+        call(index.status(IndexStatusRequest {}))
+            .await
+            .map(|response| wire::index_health(&response.into_inner())),
+    );
+    report(
+        Subsystem::Ai,
+        call(ai.get_usage(GetUsageRequest {}))
+            .await
+            .map(|response| wire::ai_health(&response.into_inner())),
+    );
+    report(
+        Subsystem::Spend,
+        // The account's own budget rather than the global one: the bar is
+        // about the mailbox on screen, and `GetSpend` treats 0 as "every call
+        // whichever account made it", which is a different question.
+        call(policy.get_spend(GetSpendRequest { account_id }))
+            .await
+            .map(|response| wire::spend_health(&response.into_inner())),
+    );
 }
 
 /// The `:auth status` report: the daemon's gate, then this client's own

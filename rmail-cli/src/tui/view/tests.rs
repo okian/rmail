@@ -16,7 +16,7 @@ use ratatui::Terminal;
 use super::*;
 use crate::keymap::Key;
 use crate::tui::model::{
-    update, Account, Confirmed, Folder, InputFor, MessageRow, Msg, OpenMessage, PickFor,
+    update, Account, Confirmed, Folder, InputFor, Level, MessageRow, Msg, OpenMessage, PickFor,
 };
 use crate::tui::overlays::UndoToast;
 use crate::tui::theme::ThemeName;
@@ -176,12 +176,16 @@ fn the_viewer_shows_headers_the_body_and_the_html_offer() {
 
 #[test]
 fn the_busy_marker_appears_only_while_something_is_in_flight() {
+    // Task 92 turned the marker into a fixed zone, so it is a glyph and a count
+    // rather than the sentence `2 in flight`: a zone wide enough for the words
+    // is a zone taken permanently from the message beside it. `tui::status`'
+    // own tests cover the zone; this one covers the marker being *conditional*.
     let mut model = loaded();
-    assert!(!screen(&model).contains("in flight"));
+    assert!(!screen(&model).contains('⧗'));
 
     model.inflight = 2;
     assert!(
-        screen(&model).contains("2 in flight"),
+        screen(&model).contains("⧗2"),
         "the user can see work is happening — and keep using the UI anyway"
     );
 }

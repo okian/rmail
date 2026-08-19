@@ -38,6 +38,20 @@ Anything that needs mail reports the failure on the status line instead of
 tearing the screen down. [[offline]] draws the same line from the other side —
 daemon running, network gone.
 
+## Watching it from inside the client
+
+The client asks four questions every five seconds — is sync paused, what is the
+index queue doing, is the AI loop running, how much has been spent today — and
+draws the answers as the four indicators on the bottom row ([[tour]] lists the
+glyphs). They are a poll rather than a subscription because none of those four
+pushes; where something does push, the client uses that instead. Reloading the
+folder list answers the sync question on the way past, so the indicator is fresh
+the moment a reload happens rather than up to five seconds later.
+
+The poll is deliberately outside the busy marker. That marker counts work *you*
+asked for, and a heartbeat incrementing it would leave it lit forever — which
+would make the one signal it carries useless.
+
 ## Trusting the local socket
 
 Over the Unix socket the daemon reads the connecting process's uid from the

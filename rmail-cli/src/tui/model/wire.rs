@@ -32,9 +32,9 @@ mod tests;
 
 use rmail_proto::v1::{
     Account as ProtoAccount, Attachment, AuthStatusResponse, Citation as ProtoCitation,
-    CreateDraftRequest, DraftAddress, FindResult, FolderStatus, FullMessage, ItemKind,
-    Message as ProtoMessage, OutboxEntry, OutboxState, RankExplanation, RetrievalTrace, SearchHit,
-    Summary,
+    CreateDraftRequest, DraftAddress, FindResult, FolderStatus, FullMessage, GetSpendResponse,
+    IndexStatusResponse, ItemKind, Message as ProtoMessage, OutboxEntry, OutboxState,
+    RankExplanation, RetrievalTrace, SearchHit, Summary, SyncStatusResponse, UsageStats,
 };
 
 use rmail_core::command;
@@ -43,6 +43,7 @@ use crate::tui::overlays::{
     valid_byte_ranges, AiSummary, Citation, Explanation, FinderItem, FinderKind, Hit, OutboxRow,
 };
 use crate::tui::report::{ReportRow, ReportTone};
+use crate::tui::status::{Health, HealthState};
 
 use super::{Account, DraftKind, Folder, MessageRow, OpenMessage};
 
@@ -556,4 +557,126 @@ fn clear_password() -> Option<command::Invocation> {
         Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// the daemon heartbeat (task 92)
+// ---------------------------------------------------------------------------
+
+/// `SyncService.Status` as an indicator.
+///
+/// Paused is the only state this RPC distinguishes, and it is deliberately
+/// `Warn` rather than `Bad`: an operator paused it, and a bar that shouted
+/// about a state somebody chose teaches people to ignore the bar.
+#[must_use]
+pub fn sync_health(response: &SyncStatusResponse) -> Health {
+    let folders = response.folders.len();
+    if response.paused {
+        return Health::new(HealthState::Paused, format!("paused · {folders} folder(s)"));
+    }
+    Health::new(HealthState::Ok, format!("{folders} folder(s)"))
+}
+
+/// `IndexService.Status` as an indicator.
+///
+/// The order of the checks is the order of severity, and `dead` outranks
+/// `paused`: a quarantined job is work that will never happen without
+/// somebody's attention, while a paused worker is waiting for exactly that
+/// attention already. Reporting the pause and hiding the dead jobs would hide
+/// the reason to look.
+#[must_use]
+pub fn index_health(response: &IndexStatusResponse) -> Health {
+    let working = response.queue_ready + response.queue_leased;
+    if response.queue_dead > 0 {
+        return Health::new(
+            HealthState::Strained,
+            format!("{} quarantined · queue {working}", response.queue_dead),
+        );
+    }
+    if response.paused {
+        return Health::new(HealthState::Paused, format!("paused · queue {working}"));
+    }
+    if working > 0 {
+        return Health::new(HealthState::Busy, format!("queue {working}"));
+    }
+    Health::new(
+        HealthState::Ok,
+        format!("{} message(s) indexed", response.messages),
+    )
+}
+
+/// `AiService.GetUsage` as an indicator.
+///
+/// `enabled` is checked before `paused` because the proto says the two are not
+/// the same and must not be conflated: a daemon with `ai.enabled = false` never
+/// spawns the dispatch loop, so `paused` stays false, and an indicator reading
+/// that as "running" would be wrong in the one direction that matters — it
+/// would send somebody to `resume` something no RPC can start.
+#[must_use]
+pub fn ai_health(stats: &UsageStats) -> Health {
+    if !stats.enabled {
+        return Health::new(HealthState::Off, "disabled in config");
+    }
+    let queue = stats.queue.as_ref();
+    let dead = queue.map_or(0, |queue| queue.dead);
+    let working = queue.map_or(0, |queue| queue.ready + queue.leased);
+    if dead > 0 {
+        return Health::new(
+            HealthState::Strained,
+            format!("{dead} quarantined · queue {working}"),
+        );
+    }
+    if stats.paused {
+        return Health::new(HealthState::Paused, format!("paused · queue {working}"));
+    }
+    let today = stats.today.as_ref().map_or(0.0, |today| today.cost_usd);
+    if working > 0 {
+        return Health::new(
+            HealthState::Busy,
+            format!("queue {working} · {}", usd(today)),
+        );
+    }
+    Health::new(HealthState::Ok, format!("{} today", usd(today)))
+}
+
+/// `AiPolicyService.GetSpend` as an indicator.
+///
+/// Measured against the caps actually in force, and against the *hard* cap
+/// first: at or above it the daemon blocks dispatch, which is a fault a bar has
+/// to be able to show as one rather than as "nearly there". A scope with no cap
+/// at all reads `Ok` and says so — unlimited is a configuration, not a warning,
+/// and drawing it as one would make the zone permanently yellow on a default
+/// install.
+#[must_use]
+pub fn spend_health(response: &GetSpendResponse) -> Health {
+    let Some(all) = response.all.as_ref() else {
+        return Health::new(HealthState::Unknown, "no spend reported");
+    };
+    let spent = all.daily.as_ref().map_or(0.0, |daily| daily.usd);
+    let caps = all.caps.as_ref().and_then(|caps| caps.daily.as_ref());
+    let hard = caps.and_then(|daily| daily.hard_usd);
+    let soft = caps.and_then(|daily| daily.soft_usd);
+    let against = |cap: f64| format!("{} of {} today", usd(spent), usd(cap));
+    if let Some(hard) = hard.filter(|hard| spent >= *hard) {
+        return Health::new(HealthState::Failed, format!("{} — blocked", against(hard)));
+    }
+    if let Some(soft) = soft.filter(|soft| spent >= *soft) {
+        return Health::new(
+            HealthState::Strained,
+            format!("{} — downgrading", against(soft)),
+        );
+    }
+    match hard.or(soft) {
+        Some(cap) => Health::new(HealthState::Ok, against(cap)),
+        None => Health::new(HealthState::Ok, format!("{} today · no cap", usd(spent))),
+    }
+}
+
+/// A dollar figure, at cent precision.
+///
+/// Cents rather than the provider's own precision: the bar has a fixed zone,
+/// and a spend of `$0.0000123` rendered in full is a number that pushes the
+/// zone after it off the row to say nothing.
+fn usd(amount: f64) -> String {
+    format!("${amount:.2}")
 }

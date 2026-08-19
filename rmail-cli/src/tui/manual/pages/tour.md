@@ -72,6 +72,33 @@ The three other doors out of the message list are [[search-vs-finder]] for
 finding mail, [[bulk]] for acting on more than one message, and this manual —
 {{keys:manual}} from anywhere, described in [[manual]].
 
+## The bottom of the screen
+
+The last row is zones, not a sentence, and only one of them moves:
+
+- The mode, always in the same columns — one per layer, so a picker says
+  `-- PICK --` and a confirmation says `-- CONFIRM --` rather than both looking
+  like the message list.
+- The account, the open folder, and how many of its loaded rows are unread. That
+  last figure counts what this client has fetched, not the whole folder: no RPC
+  in the API reports a folder's unread total, and a number labelled as one would
+  be wrong by however much of the folder is not on screen.
+- The message — whatever just happened. The only zone that flexes, which is why
+  a two-hundred-character rejection from a mail server no longer pushes
+  everything after it off the row.
+- Four daemon indicators: sync, index, ai and spend. Each carries a glyph as
+  well as a colour, so a monochrome terminal still tells a paused subsystem from
+  a broken one: `✓` fine, `↻` working, `‖` paused, `·` switched off in config,
+  `!` past a soft limit, `✗` blocked or unreachable, `?` not yet asked.
+- `⧗3` when three requests *you* made are outstanding. The five-second poll
+  behind the indicators deliberately does not count here — a marker that was
+  always on would tell you nothing.
+- Whatever is half-typed towards a binding, count included.
+
+Narrow the terminal and the informative zones go first — the indicators, then
+the account and folder. The mode, the message, the busy marker and the pending
+keys never go: those four are the ones the keyboard's behaviour depends on.
+
 ## Where to read next
 
 - [[daemon]] — what is running behind the screen, and what happens when it
