@@ -80,3 +80,4 @@ configured password offers {{cmd:auth clear}} on Enter.
 - [[troubleshooting]] — the symptoms this page's answers usually arrive as.
 - [[offline]] — what still works with the network gone.
 - [[reports]] — the screen every row-shaped answer arrives on.
+- [[daemon-control]] — the commands that read and change what it is doing.

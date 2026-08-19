@@ -62,6 +62,7 @@
 //! timeout so it observes the stop flag promptly and does not outlive the
 //! session.
 
+pub mod commands;
 pub mod grpc;
 pub mod history;
 pub mod html;

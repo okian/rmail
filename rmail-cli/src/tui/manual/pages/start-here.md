@@ -25,6 +25,7 @@ no files on disk, so it still works on the day the daemon will not start.
 - [[index]]
 - [[undo]]
 - [[reports]]
+- [[daemon-control]]
 - [[grounded]]
 - [[ai-cost]]
 - [[privacy]]

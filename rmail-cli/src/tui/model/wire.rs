@@ -32,9 +32,11 @@ mod tests;
 
 use rmail_proto::v1::{
     Account as ProtoAccount, Attachment, AuthStatusResponse, Citation as ProtoCitation,
-    CreateDraftRequest, DraftAddress, FindResult, FolderStatus, FullMessage, GetSpendResponse,
-    IndexStatusResponse, ItemKind, Message as ProtoMessage, OutboxEntry, OutboxState,
-    RankExplanation, RetrievalTrace, SearchHit, Summary, SyncStatusResponse, UsageStats,
+    CreateDraftRequest, DayUsage, DraftAddress, FindResult, FinderStatusResponse, FolderStatus,
+    FullMessage, GetSpendResponse, IndexDrift, IndexGcReport, IndexKind, IndexProgress,
+    IndexStatusResponse, ItemKind, ListEntitiesResponse, Message as ProtoMessage, OutboxEntry,
+    OutboxState, RankExplanation, RetrievalTrace, SearchHit, Summary, SyncFolderResponse,
+    SyncStatusResponse, UsageStats,
 };
 
 use rmail_core::command;
@@ -679,4 +681,413 @@ pub fn spend_health(response: &GetSpendResponse) -> Health {
 /// zone after it off the row to say nothing.
 fn usd(amount: f64) -> String {
     format!("${amount:.2}")
+}
+
+// ---------------------------------------------------------------------------
+// the daemon-observability reports (task 94)
+// ---------------------------------------------------------------------------
+
+/// A daemon timestamp the way a report draws one: local zone, fixed width, and
+/// "never" for the zero the protos use to mean "not yet".
+///
+/// Local because these are read where the reader is, which is `view::short_date`'s
+/// own reasoning for message dates; the format differs because a report column
+/// has room for the year and a message list does not.
+fn when(unix_seconds: i64) -> String {
+    if unix_seconds == 0 {
+        return "never".to_owned();
+    }
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix_seconds, 0).map_or_else(
+        || "unreadable".to_owned(),
+        |at| {
+            at.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        },
+    )
+}
+
+/// `IndexService.Status` as a table: one row per pipeline stage, then the queue.
+///
+/// Coverage is a percentage rather than the raw `indexed/eligible` pair, and a
+/// *disabled* stage reports its state instead of a figure: the proto is explicit
+/// that a disabled stage reports zero coverage precisely so the number stays
+/// honest, and drawing `0%` beside `off` would read as a stage that is on and
+/// failing.
+#[must_use]
+pub fn index_status_rows(response: &IndexStatusResponse) -> Vec<ReportRow> {
+    let mut rows: Vec<ReportRow> = response
+        .kinds
+        .iter()
+        .map(|kind| {
+            let state = if kind.enabled { "on" } else { "off" };
+            let coverage = if kind.enabled {
+                format!("{:.0}%", kind.coverage * 100.0)
+            } else {
+                "—".to_owned()
+            };
+            let tone = if kind.quarantined > 0 {
+                ReportTone::Warn
+            } else if kind.enabled {
+                ReportTone::Plain
+            } else {
+                ReportTone::Muted
+            };
+            ReportRow::new([
+                index_kind(kind.kind),
+                state.to_owned(),
+                coverage,
+                kind.pending.to_string(),
+                kind.quarantined.to_string(),
+            ])
+            .toned(tone)
+        })
+        .collect();
+    // The queue is not a stage and is not drawn as one: it is the shared
+    // machinery every stage runs through, and a row pretending to be a fifth
+    // stage would make the coverage column meaningless for it.
+    let queue_tone = if response.queue_dead > 0 || response.paused {
+        ReportTone::Warn
+    } else {
+        ReportTone::Ok
+    };
+    rows.push(
+        ReportRow::new([
+            "queue".to_owned(),
+            if response.paused { "paused" } else { "running" }.to_owned(),
+            format!("{} msgs", response.messages),
+            format!("{} ready", response.queue_ready),
+            format!("{} dead", response.queue_dead),
+        ])
+        .toned(queue_tone),
+    );
+    rows
+}
+
+/// The stage name an `IndexKind` discriminant means.
+///
+/// An unknown discriminant renders as itself rather than being guessed at: a
+/// newer daemon adding a stage should show up as a row somebody can ask about,
+/// not as whichever known stage sorts first.
+fn index_kind(kind: i32) -> String {
+    match IndexKind::try_from(kind) {
+        Ok(IndexKind::Extract) => "extract".to_owned(),
+        Ok(IndexKind::Lexical) => "lexical".to_owned(),
+        Ok(IndexKind::Entities) => "entities".to_owned(),
+        Ok(IndexKind::Semantic) => "semantic".to_owned(),
+        Ok(IndexKind::Unspecified) | Err(_) => format!("kind {kind}"),
+    }
+}
+
+/// One `IndexProgress` frame as a snapshot of counters.
+///
+/// A snapshot, so the frame *replaces*: `IndexProgress` reports running totals,
+/// and appending them would draw one row per tick — a scrolling log of the same
+/// five numbers rather than the five numbers.
+#[must_use]
+pub fn index_progress_rows(progress: &IndexProgress) -> Vec<ReportRow> {
+    let counter = |name: &str, value: i64, tone: ReportTone| {
+        ReportRow::new([name.to_owned(), value.to_string()]).toned(tone)
+    };
+    vec![
+        counter("enqueued", progress.enqueued, ReportTone::Plain),
+        counter("completed", progress.completed, ReportTone::Ok),
+        counter(
+            "failed",
+            progress.failed,
+            if progress.failed > 0 {
+                ReportTone::Bad
+            } else {
+                ReportTone::Muted
+            },
+        ),
+        counter(
+            "remaining",
+            progress.remaining,
+            if progress.remaining > 0 {
+                ReportTone::Muted
+            } else {
+                ReportTone::Ok
+            },
+        ),
+        // Dropped is not failed: a job dropped because its message is gone is
+        // the queue tidying up after a delete, and colouring it as a failure
+        // would make an ordinary rebuild look broken.
+        counter("dropped", progress.dropped, ReportTone::Muted),
+    ]
+}
+
+/// `IndexService.Verify` as a table of what is adrift.
+///
+/// The verdict, then only the non-zero counters. A table of thirteen zeroes is a
+/// table nobody reads; the verdict is what `clean` is for, and it is the
+/// daemon's own rather than re-derived from the counters here.
+#[must_use]
+pub fn index_drift_rows(drift: &IndexDrift) -> Vec<ReportRow> {
+    let checks: [(&str, i64); 12] = [
+        ("content hash", drift.content_hash_drift),
+        ("extract missing", drift.extract_missing),
+        ("lexical missing", drift.lexical_missing),
+        ("lexical orphaned", drift.lexical_orphaned),
+        ("entity orphaned", drift.entity_orphaned),
+        ("chunks unembedded", drift.chunks_unembedded),
+        ("chunks unvectored", drift.chunks_unvectored),
+        ("chunks wrong model", drift.chunks_wrong_model),
+        ("chunks stale", drift.chunks_stale),
+        ("vectors orphaned", drift.vectors_orphaned),
+        ("message vectors stale", drift.message_vectors_stale),
+        ("quarantined", drift.quarantined),
+    ];
+    let mut rows = vec![ReportRow::new([
+        "verdict".to_owned(),
+        if drift.clean { "clean" } else { "drifted" }.to_owned(),
+    ])
+    .toned(if drift.clean {
+        ReportTone::Ok
+    } else {
+        ReportTone::Warn
+    })];
+    rows.extend(
+        checks
+            .iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(name, count)| {
+                ReportRow::new([(*name).to_owned(), count.to_string()]).toned(ReportTone::Warn)
+            }),
+    );
+    rows
+}
+
+/// `IndexService.Gc` as a table of what it reclaimed.
+///
+/// Every category, including the zeroes: this report is the answer to "what did
+/// that just delete", and a category omitted because it was zero is
+/// indistinguishable from one this client does not know about.
+#[must_use]
+pub fn index_gc_rows(report: &IndexGcReport) -> Vec<ReportRow> {
+    [
+        ("entities", report.entities),
+        ("vectors", report.vectors),
+        ("lexical rows", report.lexical_rows),
+        ("content rows", report.content_rows),
+        ("cached results", report.cache_results),
+        ("cached embeddings", report.cache_embeddings),
+        ("cached query plans", report.cache_query_plans),
+    ]
+    .iter()
+    .map(|(name, count)| {
+        ReportRow::new([(*name).to_owned(), count.to_string()]).toned(if *count > 0 {
+            ReportTone::Plain
+        } else {
+            ReportTone::Muted
+        })
+    })
+    .collect()
+}
+
+/// `IndexService.ListEntities` as a table.
+#[must_use]
+pub fn index_entity_rows(response: &ListEntitiesResponse) -> Vec<ReportRow> {
+    response
+        .entities
+        .iter()
+        .map(|entity| {
+            ReportRow::new([
+                entity.kind.clone(),
+                entity.value.clone(),
+                entity.mentions.to_string(),
+                entity.messages.to_string(),
+            ])
+        })
+        .collect()
+}
+
+/// `SyncService.Status` as a table: one row per folder, then the account.
+#[must_use]
+pub fn sync_status_rows(response: &SyncStatusResponse) -> Vec<ReportRow> {
+    let mut rows: Vec<ReportRow> = response
+        .folders
+        .iter()
+        .map(|folder| {
+            ReportRow::new([
+                folder.name.clone(),
+                folder.message_count.to_string(),
+                if folder.full_sync_done {
+                    "all"
+                } else {
+                    "partial"
+                }
+                .to_owned(),
+                folder.last_sync_at.map_or_else(|| "never".to_owned(), when),
+            ])
+            .toned(if folder.full_sync_done {
+                ReportTone::Plain
+            } else {
+                ReportTone::Muted
+            })
+        })
+        .collect();
+    rows.push(
+        ReportRow::new([
+            "— account —".to_owned(),
+            String::new(),
+            if response.paused { "paused" } else { "syncing" }.to_owned(),
+            String::new(),
+        ])
+        .toned(if response.paused {
+            ReportTone::Warn
+        } else {
+            ReportTone::Ok
+        }),
+    );
+    rows
+}
+
+/// `SyncService.SyncFolder` as a table: what the pass actually did.
+///
+/// A folder that failed keeps its counters — whatever it managed before the
+/// error is true — and reports the failure in the strategy column, which is the
+/// one a reader is already looking at to understand what the pass did.
+#[must_use]
+pub fn sync_now_rows(response: &SyncFolderResponse) -> Vec<ReportRow> {
+    response
+        .folders
+        .iter()
+        .map(|folder| {
+            let failure = folder.error.as_deref().filter(|error| !error.is_empty());
+            let row = ReportRow::new([
+                folder.mailbox_name.clone(),
+                match failure {
+                    Some(error) => format!("failed: {error}"),
+                    None => folder.strategy.clone(),
+                },
+                folder.new_messages.to_string(),
+                folder.flag_updates.to_string(),
+                folder.expunged.to_string(),
+            ]);
+            match failure {
+                Some(_) => row.toned(ReportTone::Bad),
+                None => row,
+            }
+        })
+        .collect()
+}
+
+/// `AiService.GetUsage` as the dispatch-loop view.
+#[must_use]
+pub fn ai_status_rows(stats: &UsageStats) -> Vec<ReportRow> {
+    let queue = stats.queue.unwrap_or_default();
+    let mut rows = vec![
+        ReportRow::new([
+            "subsystem".to_owned(),
+            if stats.enabled {
+                "enabled".to_owned()
+            } else {
+                "disabled in config".to_owned()
+            },
+        ])
+        .toned(if stats.enabled {
+            ReportTone::Ok
+        } else {
+            ReportTone::Muted
+        }),
+        ReportRow::new([
+            "dispatch".to_owned(),
+            if stats.paused { "paused" } else { "running" }.to_owned(),
+        ])
+        .toned(if stats.paused {
+            ReportTone::Warn
+        } else {
+            ReportTone::Ok
+        }),
+    ];
+    for (name, count, watch) in [
+        ("queue ready", queue.ready, false),
+        ("queue leased", queue.leased, false),
+        ("queue backing off", queue.backing_off, false),
+        ("queue done", queue.done, false),
+        ("queue error", queue.error, true),
+        ("queue quarantined", queue.dead, true),
+    ] {
+        rows.push(ReportRow::new([name.to_owned(), count.to_string()]).toned(
+            if watch && count > 0 {
+                ReportTone::Warn
+            } else {
+                ReportTone::Plain
+            },
+        ));
+    }
+    rows
+}
+
+/// `AiService.GetUsage` as the spend view.
+///
+/// The caps come from `UsageStats` rather than from `AiPolicyService.GetSpend`:
+/// this verb reaches one RPC and reports what that RPC says, and folding in a
+/// second service's answer would make `:ai cost` disagree with `mail ai cost`
+/// for reasons no reader could see. Task 96's `:ai budget status` is the
+/// per-class view.
+#[must_use]
+pub fn ai_cost_rows(stats: &UsageStats) -> Vec<ReportRow> {
+    let window = |name: &str, usage: Option<&DayUsage>, cap: f64| {
+        let usage = usage.cloned().unwrap_or_default();
+        let tokens = usage.input_tokens
+            + usage.output_tokens
+            + usage.cache_creation_input_tokens
+            + usage.cache_read_input_tokens;
+        // A cap of zero is "no cap" on this RPC, not "spend nothing", so it is
+        // never compared against — reading it literally would report every
+        // uncapped daemon as permanently over budget.
+        let over = cap > 0.0 && usage.cost_usd >= cap;
+        ReportRow::new([
+            name.to_owned(),
+            format!("${:.2}", usage.cost_usd),
+            if cap > 0.0 {
+                format!("${cap:.2}")
+            } else {
+                "none".to_owned()
+            },
+            format!("{tokens} in {} call(s)", usage.requests),
+        ])
+        .toned(if over {
+            ReportTone::Bad
+        } else {
+            ReportTone::Plain
+        })
+    };
+    vec![
+        window("today", stats.today.as_ref(), stats.daily_cost_cap_usd),
+        window(
+            "this month",
+            stats.month.as_ref(),
+            stats.monthly_cost_cap_usd,
+        ),
+    ]
+}
+
+/// `FinderService.IndexStatus` as a table.
+#[must_use]
+pub fn finder_status_rows(response: &FinderStatusResponse) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new(["entries".to_owned(), response.entries.to_string()]),
+        ReportRow::new(["bytes".to_owned(), response.bytes.to_string()]),
+        ReportRow::new(["pending".to_owned(), response.pending.to_string()]).toned(
+            if response.pending > 0 {
+                ReportTone::Muted
+            } else {
+                ReportTone::Ok
+            },
+        ),
+        // Rejected entries are ones the index refused to hold — worth colouring,
+        // because a finder that silently drops a tenth of the mailbox looks like
+        // a finder that simply cannot find things.
+        ReportRow::new(["rejected".to_owned(), response.rejected.to_string()]).toned(
+            if response.rejected > 0 {
+                ReportTone::Warn
+            } else {
+                ReportTone::Ok
+            },
+        ),
+        ReportRow::new(["refreshed".to_owned(), when(response.refreshed_at)]),
+    ]
 }

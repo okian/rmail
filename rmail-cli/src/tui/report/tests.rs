@@ -775,8 +775,8 @@ fn enter_on_a_mutating_row_asks_first_and_y_runs_it() {
                          not asked again"
                     );
                     assert_eq!(
-                        over.invocation.verb,
-                        ["auth", "status"],
+                        over.as_ref().map(|over| over.invocation.verb.clone()),
+                        Some(vec!["auth".to_owned(), "status".to_owned()]),
                         "and the question carries the report it was asked over"
                     );
                 }

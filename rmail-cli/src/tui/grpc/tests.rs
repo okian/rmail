@@ -29,6 +29,7 @@ use tokio::sync::oneshot;
 
 use super::*;
 use crate::tui::model::{Folder, MessageRow, OpenMessage};
+use crate::tui::report::ReportFill;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -521,6 +522,195 @@ async fn a_move_removes_the_row_and_the_listing_agrees() {
         other => unreachable!("expected messages, got {other:?}"),
     }
 
+    daemon.stop().await;
+}
+
+/// Task 94's verbs, through the daemon rather than through the model.
+///
+/// The layer a table test structurally cannot reach: that each `Cmd` names an
+/// RPC this daemon actually serves, and that its answer maps onto rows. One
+/// test rather than seventeen because the interesting failure is uniform — a
+/// misnamed method or a response shape the mapping does not fit — and a
+/// per-verb test would spend seventeen daemon startups proving the same thing.
+#[tokio::test]
+async fn every_daemon_report_verb_reaches_an_rpc_and_comes_back_as_rows() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    let unary = [
+        ("index status", Cmd::IndexStatus { generation: 1 }),
+        ("index verify", Cmd::IndexVerify { generation: 2 }),
+        ("index gc", Cmd::IndexGc { generation: 3 }),
+        (
+            "index entities",
+            Cmd::IndexEntities {
+                generation: 4,
+                kind: "email".to_owned(),
+            },
+        ),
+        (
+            "sync status",
+            Cmd::SyncStatusReport {
+                generation: 5,
+                account_id: daemon.account_id,
+            },
+        ),
+        (
+            "ai status",
+            Cmd::AiUsage {
+                generation: 6,
+                costs: false,
+            },
+        ),
+        (
+            "ai cost",
+            Cmd::AiUsage {
+                generation: 7,
+                costs: true,
+            },
+        ),
+        ("finder status", Cmd::FinderStatus { generation: 8 }),
+    ];
+    for (verb, cmd) in unary {
+        let generation = match &cmd {
+            Cmd::IndexStatus { generation }
+            | Cmd::IndexVerify { generation }
+            | Cmd::IndexGc { generation }
+            | Cmd::IndexEntities { generation, .. }
+            | Cmd::SyncStatusReport { generation, .. }
+            | Cmd::AiUsage { generation, .. }
+            | Cmd::FinderStatus { generation } => *generation,
+            other => unreachable!("not a unary report: {other:?}"),
+        };
+        exec.exec(cmd, tx.clone());
+        match next(&mut rx, verb).await {
+            Msg::Report {
+                generation: got,
+                event:
+                    ReportEvent::Frame {
+                        fill: ReportFill::Replace,
+                        rows,
+                        complete: true,
+                    },
+            } => {
+                assert_eq!(got, generation, "{verb} answered under another stamp");
+                // `index entities` on a seeded-but-unindexed daemon is legitimately
+                // empty; every other one of these reports at least one row.
+                if verb != "index entities" {
+                    assert!(!rows.is_empty(), "{verb} answered with no rows");
+                }
+            }
+            other => unreachable!("{verb}: expected one complete frame, got {other:?}"),
+        }
+    }
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
+/// The streaming half: a rebuild reports progress and finishes.
+///
+/// `Rebuild` over a seeded mailbox with the semantic stage off is fast, which is
+/// why this is the streaming verb under test — `Reindex` and `AnalyzeMessage`
+/// share the drain loop, and `AnalyzeMessage` needs a model provider this
+/// harness deliberately does not configure.
+#[tokio::test]
+async fn a_streamed_rebuild_reports_progress_and_completes() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(Cmd::IndexRebuild { generation: 9 }, tx.clone());
+
+    // Frames until one says complete. Bounded, so a daemon that never finished
+    // fails the test rather than hanging it.
+    let mut frames = 0;
+    let mut finished = false;
+    for _ in 0..64 {
+        match next(&mut rx, "a rebuild frame").await {
+            Msg::Report {
+                generation: 9,
+                event: ReportEvent::Frame { rows, complete, .. },
+            } => {
+                frames += 1;
+                assert!(!rows.is_empty(), "a progress frame carries counters");
+                if complete {
+                    finished = true;
+                    break;
+                }
+            }
+            Msg::Report {
+                generation: 9,
+                event: ReportEvent::Failed(error),
+            } => unreachable!("the rebuild failed: {error}"),
+            other => unreachable!("expected a rebuild frame, got {other:?}"),
+        }
+    }
+    assert!(finished, "the rebuild never reported a terminal frame");
+    assert!(frames >= 1);
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
+/// A control verb answers with a fact, and the fact reaches the status line.
+#[tokio::test]
+async fn the_daemon_control_verbs_answer_with_a_labelled_fact() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    for (cmd, expected) in [
+        (
+            Cmd::IndexSetPaused {
+                pause: crate::tui::commands::Pause::Stop,
+            },
+            "indexer stopped",
+        ),
+        (
+            Cmd::IndexSetPaused {
+                pause: crate::tui::commands::Pause::Start,
+            },
+            "indexer started",
+        ),
+        (
+            Cmd::SyncSetPaused {
+                account_id: daemon.account_id,
+                pause: crate::tui::commands::Pause::Stop,
+            },
+            "sync stopped",
+        ),
+        (
+            Cmd::SyncSetPaused {
+                account_id: daemon.account_id,
+                pause: crate::tui::commands::Pause::Start,
+            },
+            "sync started",
+        ),
+    ] {
+        exec.exec(cmd, tx.clone());
+        match next(&mut rx, expected).await {
+            Msg::Done { label, result } => {
+                assert_eq!(label, expected);
+                assert!(result.is_ok(), "{expected}: {result:?}");
+            }
+            other => unreachable!("expected a fact, got {other:?}"),
+        }
+    }
+
+    // `FinderRebuild` reports its own count in the label, which is the whole
+    // answer — a generic "done" would drop it.
+    exec.exec(Cmd::FinderRebuild, tx.clone());
+    match next(&mut rx, "the finder rebuild").await {
+        Msg::Done { label, result } => {
+            assert!(label.contains("entries"), "{label}");
+            assert!(result.is_ok(), "{result:?}");
+        }
+        other => unreachable!("expected a fact, got {other:?}"),
+    }
+
+    exec.shutdown();
     daemon.stop().await;
 }
 

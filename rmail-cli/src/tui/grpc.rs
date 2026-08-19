@@ -55,11 +55,14 @@ use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::send_scheduler_service_client::SendSchedulerServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::{
-    ask_chunk, AskRequest, AuthStatusRequest, CancelRequest, ClearPasswordRequest, CopyRequest,
-    DeleteRequest, EventKind, ExplainRequest, FindRequest, GetMessageRequest, GetSpendRequest,
-    GetSummaryRequest, GetUsageRequest, IndexStatusRequest, ListAccountsRequest,
-    ListMessagesRequest, ListOutboxRequest, MoveRequest, SearchRequest, SetFlagsRequest,
-    SuggestReplyRequest, SyncStatusRequest, WatchEventsRequest,
+    analyze_event, ask_chunk, AnalyzeMessageRequest, AskRequest, AuthStatusRequest, CancelRequest,
+    ClearPasswordRequest, CopyRequest, DeleteRequest, EventKind, ExplainRequest, FindRequest,
+    FinderRebuildRequest, FinderStatusRequest, GetMessageRequest, GetSpendRequest,
+    GetSummaryRequest, GetUsageRequest, IndexGcRequest, IndexProgress, IndexStatusRequest,
+    ListAccountsRequest, ListEntitiesRequest, ListMessagesRequest, ListOutboxRequest, MoveRequest,
+    PauseRequest, RebuildRequest, ReindexMode, ReindexRequest, ResumeRequest, RetryFailedRequest,
+    SearchRequest, SetFlagsRequest, SetIndexPausedRequest, SetPausedRequest, SuggestReplyRequest,
+    SyncFolderRequest, SyncMode, SyncStatusRequest, VerifyIndexRequest, WatchEventsRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
@@ -74,6 +77,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 /// `--token` did nothing.
 type Conn = crate::client::Client;
 
+use super::commands;
 use super::history;
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
@@ -119,6 +123,14 @@ const OUTBOX_PAGE: i32 = 200;
 
 /// How often the undo countdown ticks.
 const TICK: Duration = Duration::from_secs(1);
+
+/// How many entities `:index entities` asks for.
+///
+/// A page, not the table: an extracted-entity table on a real mailbox has
+/// hundreds of thousands of rows, and the Report caps at `report::MAX_ROWS`
+/// anyway — asking for more than can be drawn is bytes over a socket nobody
+/// will read.
+const ENTITY_PAGE: i64 = 200;
 
 /// How often the daemon heartbeat polls (task 92).
 ///
@@ -638,6 +650,234 @@ impl CmdExec for GrpcExec {
                     }
                 });
             }
+            Cmd::IndexStatus { generation } => {
+                let mut client = self.index.clone();
+                self.report(generation, out, async move {
+                    call(client.status(IndexStatusRequest {}))
+                        .await
+                        .map(|r| wire::index_status_rows(&r.into_inner()))
+                });
+            }
+            Cmd::IndexReindex {
+                generation,
+                mode,
+                mailbox_id,
+            } => {
+                let mut client = self.index.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    let request = ReindexRequest {
+                        mode: match mode {
+                            commands::Reindex::Drain => ReindexMode::Drain as i32,
+                            commands::Reindex::Selection => ReindexMode::Selection as i32,
+                        },
+                        mailbox_id,
+                        ..ReindexRequest::default()
+                    };
+                    drain_progress(client.reindex(request), sink).await
+                });
+            }
+            Cmd::IndexRebuild { generation } => {
+                let mut client = self.index.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    // `confirm: true` is honest here rather than a rubber stamp:
+                    // the model asked before issuing this at all (or the caller
+                    // typed a bang, which is what `mail index rebuild --yes`
+                    // means), so by the time the request is built the question
+                    // has an answer. The daemon's own `FAILED_PRECONDITION`
+                    // guard stays the backstop for a client that skipped it.
+                    drain_progress(
+                        client.rebuild(RebuildRequest {
+                            confirm: true,
+                            ..RebuildRequest::default()
+                        }),
+                        sink,
+                    )
+                    .await
+                });
+            }
+            Cmd::IndexVerify { generation } => {
+                let mut client = self.index.clone();
+                self.report(generation, out, async move {
+                    call(client.verify(VerifyIndexRequest {}))
+                        .await
+                        .map(|r| wire::index_drift_rows(&r.into_inner()))
+                });
+            }
+            Cmd::IndexGc { generation } => {
+                let mut client = self.index.clone();
+                self.report(generation, out, async move {
+                    // False, which is `mail index gc`'s own default: the
+                    // caches invalidate structurally, so a sweep is not needed
+                    // in normal operation — and each discarded query plan is a
+                    // paid model call that would be paid again. The CLI opts in
+                    // with `--purge-caches`; a TUI verb spelled the same as a
+                    // CLI one has to default the same way.
+                    call(client.gc(IndexGcRequest {
+                        purge_search_caches: false,
+                    }))
+                    .await
+                    .map(|r| wire::index_gc_rows(&r.into_inner()))
+                });
+            }
+            Cmd::IndexEntities { generation, kind } => {
+                let mut client = self.index.clone();
+                self.report(generation, out, async move {
+                    // The kind is passed through unvalidated: the daemon's own
+                    // refusal lists every kind it knows, and a second copy of
+                    // that list here is a copy that goes stale the first time
+                    // the extractor learns a new one.
+                    call(client.list_entities(ListEntitiesRequest {
+                        kind,
+                        value: None,
+                        limit: ENTITY_PAGE,
+                    }))
+                    .await
+                    .map(|r| wire::index_entity_rows(&r.into_inner()))
+                });
+            }
+            Cmd::IndexSetPaused { pause } => {
+                let mut client = self.index.clone();
+                self.spawn(out, async move {
+                    Msg::Done {
+                        label: paused_label("indexer", pause),
+                        result: call(client.set_paused(SetIndexPausedRequest {
+                            paused: pause.paused(),
+                        }))
+                        .await
+                        .map(|_| Effect::None),
+                    }
+                });
+            }
+            Cmd::SyncStatusReport {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.sync.clone();
+                self.report(generation, out, async move {
+                    call(client.status(SyncStatusRequest { account_id }))
+                        .await
+                        .map(|r| wire::sync_status_rows(&r.into_inner()))
+                });
+            }
+            Cmd::SyncNow {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.sync.clone();
+                self.report(generation, out, async move {
+                    // `mailbox_id: None` is every folder, and `Auto` is the mode
+                    // `mail sync` uses without `--full`: a TUI verb spelled the
+                    // same as a CLI one has to mean the same thing.
+                    call(client.sync_folder(SyncFolderRequest {
+                        account_id,
+                        mailbox_id: None,
+                        mode: SyncMode::Auto as i32,
+                    }))
+                    .await
+                    .map(|r| wire::sync_now_rows(&r.into_inner()))
+                });
+            }
+            Cmd::SyncSetPaused { account_id, pause } => {
+                let mut client = self.sync.clone();
+                self.spawn(out, async move {
+                    let result = match pause {
+                        commands::Pause::Stop => call(client.pause(PauseRequest { account_id }))
+                            .await
+                            .map(|_| Effect::None),
+                        commands::Pause::Start => call(client.resume(ResumeRequest { account_id }))
+                            .await
+                            .map(|_| Effect::None),
+                    };
+                    Msg::Done {
+                        label: paused_label("sync", pause),
+                        result,
+                    }
+                });
+            }
+            Cmd::AiUsage { generation, costs } => {
+                let mut client = self.ai.clone();
+                self.report(generation, out, async move {
+                    call(client.get_usage(GetUsageRequest {})).await.map(|r| {
+                        let stats = r.into_inner();
+                        if costs {
+                            wire::ai_cost_rows(&stats)
+                        } else {
+                            wire::ai_status_rows(&stats)
+                        }
+                    })
+                });
+            }
+            Cmd::AiSetPaused { pause } => {
+                let mut client = self.ai.clone();
+                self.spawn(out, async move {
+                    Msg::Done {
+                        label: paused_label("AI dispatch", pause),
+                        result: call(client.set_paused(SetPausedRequest {
+                            paused: pause.paused(),
+                        }))
+                        .await
+                        .map(|_| Effect::None),
+                    }
+                });
+            }
+            Cmd::AiRetry => {
+                let mut client = self.ai.clone();
+                self.spawn(out, async move {
+                    let result = call(client.retry_failed(RetryFailedRequest {})).await;
+                    match result {
+                        // The count is the whole answer, so it goes in the label
+                        // rather than being dropped for a generic "done".
+                        Ok(response) => Msg::Done {
+                            label: format!("{} job(s) requeued", response.into_inner().revived),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "ai retry".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::AiProcess {
+                generation,
+                message_id,
+            } => {
+                let mut client = self.ai.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    analyze(
+                        client.analyze_message(AnalyzeMessageRequest { message_id }),
+                        sink,
+                    )
+                    .await
+                });
+            }
+            Cmd::FinderStatus { generation } => {
+                let mut client = self.finder.clone();
+                self.report(generation, out, async move {
+                    call(client.index_status(FinderStatusRequest {}))
+                        .await
+                        .map(|r| wire::finder_status_rows(&r.into_inner()))
+                });
+            }
+            Cmd::FinderRebuild => {
+                let mut client = self.finder.clone();
+                self.spawn(out, async move {
+                    let result = call(client.rebuild_index(FinderRebuildRequest {})).await;
+                    match result {
+                        Ok(response) => Msg::Done {
+                            label: format!(
+                                "finder index rebuilt — {} entries",
+                                response.into_inner().entries
+                            ),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "finder rebuild".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
             Cmd::CancelStream { which } => {
                 let slot = match which {
                     Stream::Search => &self.searching,
@@ -896,6 +1136,192 @@ async fn stream_ask(
         generation,
         event: AskEvent::Failed("the daemon ended the answer early".to_owned()),
     });
+}
+
+impl GrpcExec {
+    /// Run a unary request and deliver its rows as one complete Report frame.
+    ///
+    /// Through the superseding slot for the reason `Cmd::AuthStatus` explains:
+    /// `Esc` needs one thing to abort whichever kind of report is running, and
+    /// `r` supersedes by *issuing* rather than by cancelling, which only works
+    /// if the previous request is in a slot the new one replaces.
+    fn report<F>(&self, generation: u64, out: UnboundedSender<Msg>, work: F)
+    where
+        F: Future<Output = Result<Vec<ReportRow>, String>> + Send + 'static,
+    {
+        self.spawn_superseding(&self.reporting, async move {
+            let event = match work.await {
+                Ok(rows) => ReportEvent::Frame {
+                    fill: ReportFill::Replace,
+                    rows,
+                    complete: true,
+                },
+                Err(error) => ReportEvent::Failed(error),
+            };
+            let _ = out.send(Msg::Report { generation, event });
+        });
+    }
+
+    /// Run a streaming request, handing it a sink that stamps every frame.
+    ///
+    /// The sink exists so a stream's own loop cannot forget the generation: it
+    /// takes rows and a `complete` flag and nothing else, so there is no way to
+    /// send an unstamped frame from inside one.
+    fn stream_report<F, Fut>(&self, generation: u64, out: UnboundedSender<Msg>, work: F)
+    where
+        F: FnOnce(ReportSink) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        self.spawn_superseding(&self.reporting, async move {
+            work(ReportSink { generation, out }).await;
+        });
+    }
+}
+
+/// Where a streamed report's frames go.
+struct ReportSink {
+    generation: u64,
+    out: UnboundedSender<Msg>,
+}
+
+impl ReportSink {
+    /// One frame of rows. A snapshot, so it replaces — see
+    /// `wire::index_progress_rows`.
+    fn rows(&self, rows: Vec<ReportRow>, complete: bool) {
+        let _ = self.out.send(Msg::Report {
+            generation: self.generation,
+            event: ReportEvent::Frame {
+                fill: ReportFill::Replace,
+                rows,
+                complete,
+            },
+        });
+    }
+
+    /// The stream failed. Rows already delivered are kept by the pane.
+    fn failed(&self, error: String) {
+        let _ = self.out.send(Msg::Report {
+            generation: self.generation,
+            event: ReportEvent::Failed(error),
+        });
+    }
+}
+
+/// Drain an `IndexProgress` stream into a Report.
+///
+/// The last frame the daemon sends carries `done`, and it is what completes the
+/// report. A stream that ends *without* one is reported as a failure rather than
+/// as a finished pass: `Reindex` and `Rebuild` both promise a terminal frame, so
+/// its absence means the connection went away mid-pass and the counters on
+/// screen are not a total.
+async fn drain_progress<S>(request: S, sink: ReportSink)
+where
+    S: Future<Output = Result<tonic::Response<tonic::Streaming<IndexProgress>>, tonic::Status>>,
+{
+    let mut stream = match request.await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    loop {
+        match stream.next().await {
+            Some(Ok(progress)) => {
+                let done = progress.done;
+                sink.rows(wire::index_progress_rows(&progress), done);
+                if done {
+                    return;
+                }
+            }
+            Some(Err(status)) => return sink.failed(status.message().to_owned()),
+            None => return sink.failed("the daemon ended the pass early".to_owned()),
+        }
+    }
+}
+
+/// Drain an `AnalyzeMessage` stream into a Report.
+///
+/// The prose the model streams is deliberately *not* drawn: this verb exists to
+/// drive the pipeline over one message and say whether it worked, and the
+/// analysis itself is what the AI panel shows once it is cached. So the report
+/// counts tokens as they arrive — which is the only visible sign a model call is
+/// alive — and the terminal frame reports what it cost.
+async fn analyze<S>(request: S, sink: ReportSink)
+where
+    S: Future<
+        Output = Result<
+            tonic::Response<tonic::Streaming<rmail_proto::v1::AnalyzeEvent>>,
+            tonic::Status,
+        >,
+    >,
+{
+    let mut stream = match request.await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    let mut tokens = 0_u64;
+    let mut tools = 0_u64;
+    loop {
+        let row = |state: &str, tokens: u64, tools: u64, complete: bool| {
+            vec![
+                ReportRow::new(["state", state]).toned(if complete {
+                    ReportTone::Ok
+                } else {
+                    ReportTone::Muted
+                }),
+                ReportRow::new(["tokens", &tokens.to_string()]),
+                ReportRow::new(["tool calls", &tools.to_string()]),
+            ]
+        };
+        match stream.next().await {
+            Some(Ok(event)) => match event.event {
+                Some(analyze_event::Event::Token(_)) => {
+                    tokens += 1;
+                    sink.rows(row("analysing…", tokens, tools, false), false);
+                }
+                Some(analyze_event::Event::ToolUseStart(_)) => {
+                    tools += 1;
+                    sink.rows(row("analysing…", tokens, tools, false), false);
+                }
+                Some(analyze_event::Event::Usage(usage)) => {
+                    // Tokens the *provider* counted, which is not the same
+                    // number as the frames streamed above — a token frame can
+                    // carry several tokens' worth of text. Reported as its own
+                    // row rather than replacing the count, so neither figure is
+                    // presented as the other.
+                    let mut rows = row("analysing…", tokens, tools, false);
+                    rows.push(ReportRow::new([
+                        "billed tokens".to_owned(),
+                        (usage.input_tokens
+                            + usage.output_tokens
+                            + usage.cache_creation_input_tokens
+                            + usage.cache_read_input_tokens)
+                            .to_string(),
+                    ]));
+                    sink.rows(rows, false);
+                }
+                Some(analyze_event::Event::Done(_)) => {
+                    return sink.rows(row("analysed", tokens, tools, true), true);
+                }
+                // A frame this build does not know: counted as progress rather
+                // than dropped silently, so a newer daemon's extra event kind
+                // still reads as "something is happening".
+                None => sink.rows(row("analysing…", tokens, tools, false), false),
+            },
+            Some(Err(status)) => return sink.failed(status.message().to_owned()),
+            None => return sink.failed("the daemon ended the analysis early".to_owned()),
+        }
+    }
+}
+
+/// What a pause verb says while it is outstanding.
+///
+/// One place, so `indexer`, `sync` and `AI dispatch` cannot end up phrased three
+/// ways for the same operation.
+fn paused_label(what: &str, pause: commands::Pause) -> String {
+    if pause.paused() {
+        format!("{what} stopped")
+    } else {
+        format!("{what} started")
+    }
 }
 
 /// One round of the heartbeat: ask the four subsystems and report each one.

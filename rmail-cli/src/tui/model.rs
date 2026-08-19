@@ -57,6 +57,7 @@ mod tests;
 use rmail_core::command;
 use rmail_core::parity::Command as Capability;
 
+use super::commands::{self, Answer, Target};
 use super::history::History;
 use super::manual;
 use super::overlays;
@@ -65,7 +66,7 @@ use super::overlays::{
     CommandPane, Explanation, FinderItem, FinderKind, FinderPane, Hit, OutboxPane, OutboxRow,
     QuickAction, QuickPane, SearchFocus, SearchPane, Toast, UndoToast,
 };
-use super::report::{self, ReportColumn, ReportFill, ReportPane, ReportRow};
+use super::report::{self, ReportFill, ReportPane, ReportRow};
 use super::status::{Daemon, Health, Subsystem};
 use super::theme::Theme;
 pub use crate::keymap::Key;
@@ -571,7 +572,11 @@ pub enum Confirmed {
         /// down with it is not a mechanism tasks 94 onward can use: a
         /// suggestion list whose rows accept inline would close itself on the
         /// first acceptance.
-        over: Box<ReportPane>,
+        ///
+        /// `None` when the question was asked of a *typed* line rather than of
+        /// a report row — task 94's `:index rebuild`, which asks before it
+        /// starts. There is no report behind that one to put back.
+        over: Option<Box<ReportPane>>,
     },
 }
 
@@ -1018,6 +1023,97 @@ pub enum Cmd {
     },
     /// `ClientAuthService.ClearPassword` — remove the password gate.
     AuthClear,
+    /// `IndexService.Status` — the `:index status` report.
+    IndexStatus {
+        /// Which report this is.
+        generation: u64,
+    },
+    /// `IndexService.Reindex` — a streamed pass over the queue.
+    IndexReindex {
+        /// Which report this is.
+        generation: u64,
+        /// Drain what is queued, or re-enqueue the open folder.
+        mode: commands::Reindex,
+        /// The folder to re-enqueue, for [`commands::Reindex::Selection`].
+        mailbox_id: Option<i64>,
+    },
+    /// `IndexService.Rebuild` — a streamed rebuild from scratch.
+    IndexRebuild {
+        /// Which report this is.
+        generation: u64,
+    },
+    /// `IndexService.Verify` — the drift report.
+    IndexVerify {
+        /// Which report this is.
+        generation: u64,
+    },
+    /// `IndexService.Gc` — reclaim orphaned rows.
+    IndexGc {
+        /// Which report this is.
+        generation: u64,
+    },
+    /// `IndexService.ListEntities` — the extracted-entity listing.
+    IndexEntities {
+        /// Which report this is.
+        generation: u64,
+        /// Which kind to list, as typed. Validated by the daemon, not here.
+        kind: String,
+    },
+    /// `IndexService.SetPaused` — stop or start the background worker.
+    IndexSetPaused {
+        /// Which way.
+        pause: commands::Pause,
+    },
+    /// `SyncService.Status` as a report of its own, rather than as the folder
+    /// listing [`Cmd::LoadFolders`] reads from the same RPC.
+    SyncStatusReport {
+        /// Which report this is.
+        generation: u64,
+        /// Whose folders.
+        account_id: i64,
+    },
+    /// `SyncService.SyncFolder` — a pass over every folder now.
+    SyncNow {
+        /// Which report this is.
+        generation: u64,
+        /// Whose folders.
+        account_id: i64,
+    },
+    /// `SyncService.Pause`/`Resume`.
+    SyncSetPaused {
+        /// Whose sync.
+        account_id: i64,
+        /// Which way.
+        pause: commands::Pause,
+    },
+    /// `AiService.GetUsage` — the `:ai status` and `:ai cost` reports.
+    AiUsage {
+        /// Which report this is.
+        generation: u64,
+        /// Whether to render the spend view rather than the loop view.
+        costs: bool,
+    },
+    /// `AiService.SetPaused` — stop or start the dispatch loop.
+    AiSetPaused {
+        /// Which way.
+        pause: commands::Pause,
+    },
+    /// `AiService.RetryFailed` — move quarantined jobs back to pending.
+    AiRetry,
+    /// `AiService.AnalyzeMessage` — a streamed analysis of one message.
+    AiProcess {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+    },
+    /// `FinderService.IndexStatus`.
+    FinderStatus {
+        /// Which report this is.
+        generation: u64,
+    },
+    /// `FinderService.RebuildIndex`.
+    FinderRebuild,
     /// Stop a stream nobody is reading any more.
     ///
     /// Leaving an overlay is the one case the generation stamp does not
@@ -2564,7 +2660,9 @@ fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
         // asking to leave the screen it was asked on, and the report's own
         // stream is still the one running.
         if let Overlay::Confirm {
-            then: Confirmed::Invoke { over, .. },
+            then: Confirmed::Invoke {
+                over: Some(over), ..
+            },
             ..
         } = overlay
         {
@@ -3815,13 +3913,26 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         };
         return set_option(model, option, value);
     }
-    if !invocation.positionals.is_empty() {
+    // More arguments than the verb declares. Derived from the registry rather
+    // than "action-backed verbs take none", which is what this was before task
+    // 94 declared verbs that take one: `command::parse` collects trailing words
+    // whatever a verb declares (task 89's own note says so), so a verb that
+    // accepted them silently would be the "quietly accepts an argument it never
+    // mentions" the grammar's docs call out.
+    let declared = command::verb_at(&path_of(&invocation)).map_or(0, |verb| verb.positionals.len());
+    if invocation.positionals.len() > declared {
         return complain(
             model,
-            format!(
-                "{verb} takes no arguments, and was given {}",
-                invocation.positionals.join(" ")
-            ),
+            match declared {
+                0 => format!(
+                    "{verb} takes no arguments, and was given {}",
+                    invocation.positionals.join(" ")
+                ),
+                n => format!(
+                    "{verb} takes {n} argument(s), and was given {}",
+                    invocation.positionals.len()
+                ),
+            },
         );
     }
     if let Some(flag) = invocation.flags.first() {
@@ -3832,17 +3943,12 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         // such flag, which by then would be false.
         return complain(model, format!("{verb} --{}: not wired up yet", flag.name));
     }
-    // Task 90's verbs, after the argument guards rather than before them: these
+    // The daemon verbs, after the argument guards rather than before them: these
     // reach a capability with no `Action` behind them, so there is nothing to
-    // delegate to and they are named here — and a flag neither of them declares
-    // has to be refused rather than silently dropped on the way past.
-    // `auth status` answers with rows and opens a report; `auth clear` answers
-    // with a fact and does not.
-    if verb == "auth clear" {
-        return run_auth_clear(model);
-    }
+    // delegate to — and a flag none of them declares has to be refused rather
+    // than silently dropped on the way past.
     if invocation.action.is_none() && invocation.capability.is_some() {
-        return open_report(model, invocation);
+        return run_daemon_command(model, invocation);
     }
     let Some(action) = invocation.action else {
         return complain(model, format!("{verb} is not something this TUI runs"));
@@ -3970,6 +4076,14 @@ fn unsupported_range(model: &Model, verb: &str, range: Option<command::Range>) -
     }
 }
 
+/// An invocation's verb path as the registry indexes it.
+///
+/// Borrowed from the invocation's own segments rather than re-split from the
+/// joined string, so there is no second place that decides where a path breaks.
+fn path_of(invocation: &command::Invocation) -> Vec<&str> {
+    invocation.verb.iter().map(String::as_str).collect()
+}
+
 /// Whether a verb acts on mail, and so has something for a range to mean.
 ///
 /// Read off `parity::Command`: a verb whose action reaches a capability acts
@@ -4052,45 +4166,73 @@ fn browse_history(model: &mut Model, direction: Direction) -> bool {
 // reports
 // ---------------------------------------------------------------------------
 
-/// The title, columns and request a reporting verb answers with, or `None`
-/// when this build has no report for it.
+/// Dispatch a verb that reaches a capability with no [`Action`] behind it —
+/// task 90's seam, and the one place tasks 94 onward plug into.
 ///
-/// The seam tasks 94 onward extend. Keyed on the verb path rather than on the
-/// capability because the *presentation* is a client decision — how wide a
-/// column is, what the border says — and two verbs over one capability may
-/// well want different ones. One function rather than one per caller so
-/// opening a report and re-running it cannot disagree about either.
-fn report_spec(verb: &str, generation: u64) -> Option<(String, Vec<ReportColumn>, Cmd)> {
-    match verb {
-        "auth status" => Some((
-            "auth — access to rmail's own API".to_owned(),
-            vec![
-                ReportColumn::new("setting", 21),
-                ReportColumn::new("state", 48),
-            ],
-            Cmd::AuthStatus { generation },
-        )),
-        _ => None,
-    }
-}
-
-/// Open a report for `invocation`, or say why this build has none for it.
-fn open_report(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd> {
+/// The verb's answer is looked up in `tui::commands`, which is pure data; this
+/// is the only code that turns one into an overlay, a request or a refusal. So
+/// the confirmation gate, the generation stamp and the Report exist once
+/// regardless of how many verbs the table grows to.
+fn run_daemon_command(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd> {
     let verb = invocation.verb.join(" ");
     let generation = model.generation + 1;
-    let Some((title, columns, cmd)) = report_spec(&verb, generation) else {
+    let Some(answer) = commands::answer(&invocation, &target_of(model), generation) else {
         return complain(
             model,
-            format!("{verb} reaches the daemon, but this build has no report for it"),
+            format!("{verb} reaches the daemon, but this build has no answer for it"),
         );
     };
+    let request = match answer {
+        Answer::Refused(why) => return complain(model, format!("{verb}: {why}")),
+        Answer::Rows(request) | Answer::Fact(request) => request,
+    };
+    // The question comes before anything else is touched, and it carries the
+    // whole invocation with a bang on it — so answering `y` re-enters here and
+    // takes the same path a typed `!` would, rather than a second one that
+    // could drift from it.
+    if let Some(prompt) = request.confirm.clone() {
+        close_command(model);
+        model.overlay = Some(Overlay::Confirm {
+            prompt,
+            then: Confirmed::Invoke {
+                invocation: Box::new(command::Invocation {
+                    bang: true,
+                    ..invocation
+                }),
+                over: None,
+            },
+        });
+        return Vec::new();
+    }
     model.generation = generation;
     close_command(model);
+    if request.columns.is_empty() {
+        // A fact. Counted into `inflight`, unlike the heartbeat: somebody asked
+        // for this one.
+        model.inflight += 1;
+        model.info(request.title);
+        return vec![request.cmd];
+    }
     model.overlay = Some(Overlay::Report(Box::new(ReportPane::new(
-        invocation, title, columns, generation,
+        invocation,
+        request.title,
+        request.columns,
+        generation,
     ))));
     model.info(format!("{verb} — r re-runs · Esc closes"));
-    vec![cmd]
+    vec![request.cmd]
+}
+
+/// What the screen can offer a verb that needs a target.
+fn target_of(model: &Model) -> Target {
+    Target {
+        account_id: model.current_account().map_or(0, |account| account.id),
+        mailbox_id: model.open_folder,
+        // `target_message` is what every message-shaped action already reads,
+        // so `:ai process` acts on the same message `.` would analyse rather
+        // than on a second notion of "the current one".
+        message_id: target_message(model),
+    }
 }
 
 /// `r` — run this report's own `:` line again.
@@ -4105,25 +4247,41 @@ fn open_report(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd> {
 /// `restart_search` spells out — the *superseding request* is what cancels the
 /// old stream (`tui::grpc`'s `reporting` slot aborts the task it replaces), and
 /// an explicit cancel is needed only where no new request follows.
+///
+/// A re-run never asks again, whatever the verb's own `confirm` says: the
+/// question was answered to open this report, and asking it on every `r` would
+/// make `r` the wrong key to press.
 fn rerun_report(model: &mut Model) -> Vec<Cmd> {
     let Some(Overlay::Report(pane)) = model.overlay.as_ref() else {
         return Vec::new();
     };
     let verb = pane.invocation.verb.join(" ");
+    let invocation = command::Invocation {
+        bang: true,
+        ..pane.invocation.clone()
+    };
     let generation = model.generation + 1;
-    let Some((_, _, cmd)) = report_spec(&verb, generation) else {
-        // Unreachable: the pane exists because `report_spec` answered for this
-        // verb when it opened, and the registry does not change at runtime. A
-        // status line saying so beats an `unwrap` nobody can check from here.
-        model.fail(format!("{verb} can no longer be re-run"));
-        return Vec::new();
+    let request = match commands::answer(&invocation, &target_of(model), generation) {
+        Some(Answer::Rows(request) | Answer::Fact(request)) => request,
+        // A report open for a verb whose answer has become unavailable: the
+        // account went away under a `:sync status`, say. Reported rather than
+        // silently doing nothing, and the rows already on screen are left
+        // alone because they were true when they arrived.
+        Some(Answer::Refused(why)) => {
+            model.fail(format!("{verb}: {why}"));
+            return Vec::new();
+        }
+        None => {
+            model.fail(format!("{verb} can no longer be re-run"));
+            return Vec::new();
+        }
     };
     model.generation = generation;
     if let Some(Overlay::Report(pane)) = model.overlay.as_mut() {
         pane.restart(generation);
     }
     model.info(format!("{verb} — re-running…"));
-    vec![cmd]
+    vec![request.cmd]
 }
 
 /// `<enter>` on a report row: run what the row carries, asking first when it
@@ -4139,7 +4297,7 @@ fn run_report_row(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         return Vec::new();
     };
     if !report::mutates(&invocation) || invocation.bang {
-        return run_row(model, invocation, over);
+        return run_row(model, invocation, Some(over));
     }
     let prompt = format!(":{} — run it? [y/N]", invocation.verb.join(" "));
     model.overlay = Some(Overlay::Confirm {
@@ -4149,7 +4307,7 @@ fn run_report_row(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
                 bang: true,
                 ..invocation
             }),
-            over,
+            over: Some(over),
         },
     });
     Vec::new()
@@ -4171,11 +4329,11 @@ fn run_report_row(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
 fn run_row(
     model: &mut Model,
     invocation: command::Invocation,
-    mut over: Box<ReportPane>,
+    over: Option<Box<ReportPane>>,
 ) -> Vec<Cmd> {
     let stale = report::mutates(&invocation);
     let cmds = run_invocation(model, invocation);
-    if model.overlay.is_none() {
+    if let (None, Some(mut over)) = (model.overlay.as_ref(), over) {
         over.stale = over.stale || stale;
         model.overlay = Some(Overlay::Report(over));
     }
@@ -4190,21 +4348,6 @@ fn report_summary(pane: &ReportPane) -> String {
         1 => format!("{verb} — 1 row · r re-runs"),
         n => format!("{verb} — {n} rows · r re-runs"),
     }
-}
-
-/// `:auth clear` — remove the password gate.
-///
-/// Not a report: it answers with a fact, not with rows, and the status line is
-/// where a one-line answer belongs. It is here because it is the mutating row
-/// `:auth status`'s report offers, and the confirmation that row goes through
-/// is [`run_report_row`]'s — typed bare on the command line it is confirmed by
-/// nothing, exactly as `mail auth clear` is, because a line somebody typed in
-/// full is already the deliberate act a confirmation asks for.
-fn run_auth_clear(model: &mut Model) -> Vec<Cmd> {
-    close_command(model);
-    model.inflight += 1;
-    model.info("clearing the password…");
-    vec![Cmd::AuthClear]
 }
 
 /// Run `id` as a command, if this build has one by that name.

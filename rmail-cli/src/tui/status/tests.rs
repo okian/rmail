@@ -735,16 +735,26 @@ fn an_indicator_names_its_command_only_when_this_build_has_it() {
 
 #[test]
 fn the_hint_is_the_verbs_own_canonical_spelling() {
-    // Proved against a verb this build *does* have, so the derivation is
-    // exercised rather than merely written: `auth status` is task 90's, and
-    // reaches the registry the same way an indicator's verb would.
-    let verb = rmail_core::command::verb_at(&["auth", "status"])
-        .unwrap_or_else(|| panic!("`auth status` is a declared verb"));
-    assert_eq!(verb.canonical(), "auth status");
-    assert!(
-        rmail_core::command::verb_at(Subsystem::Index.verb()).is_none(),
-        "and `index status` is task 94's, not this build's — which is what \\
-         makes the `Option` in `Indicator::expands` load-bearing"
+    // Task 94 declared three of the four, so those hints now name one — which
+    // is the derivation working rather than the hints being written down:
+    // nothing in `tui::status` changed when those verbs arrived.
+    let model = loaded();
+    let named: Vec<Option<String>> = bar(&model)
+        .daemon
+        .iter()
+        .map(|indicator| indicator.expands.clone())
+        .collect();
+    assert_eq!(
+        named,
+        [
+            Some(":sync status".to_owned()),
+            Some(":index status".to_owned()),
+            Some(":ai status".to_owned()),
+            // Task 96's, and still undeclared — which is what keeps the
+            // `Option` load-bearing rather than decorative.
+            None,
+        ],
+        "each hint is the verb's own canonical spelling, in indicator order"
     );
 }
 
