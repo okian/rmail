@@ -14,9 +14,10 @@ use ratatui::style::Color;
 use ratatui::Terminal;
 
 use super::*;
-use crate::keymap::Key;
+use crate::keymap::{Key, Mode};
 use crate::tui::model::{
     update, Account, Confirmed, Folder, InputFor, Level, MessageRow, Msg, OpenMessage, PickFor,
+    ReplyEvent,
 };
 use crate::tui::overlays::UndoToast;
 use crate::tui::theme::ThemeName;
@@ -195,10 +196,19 @@ fn the_help_overlay_lists_the_bindings_that_are_actually_in_force() {
     // Read out of the keymap rather than from a table beside it: task 83's
     // hand-written list was right while the bindings were a `match` nobody
     // could change, and became a list that lies the moment `keys.toml` could
-    // rebind anything.
-    let mut model = loaded();
-    model.overlay = Some(Overlay::Help);
-    let rendered = draw(&model, 120, 44).join("\n");
+    // rebind anything. Checked at the data layer, not the rendered buffer:
+    // task 102 made this list genuinely scrollable, so a wide enough spread
+    // of bindings — this one runs the full alphabet, on purpose — is no
+    // longer all on screen at once at any one terminal size, which is a
+    // rendering-and-viewport question with nothing to do with what this
+    // test actually claims ("the data is keymap-driven"). The claim past
+    // the fold is exactly what `pressing_g_on_the_key_reference_scrolls_to_a_
+    // binding_the_first_screen_never_shows` below covers instead, at the
+    // one place a scroll position is meaningful to assert about at all —
+    // the rendered buffer.
+    let model = loaded();
+    let pane = HelpPane::new(Mode::Normal, &model.keymap);
+    let rows = format!("{:?}", pane.rows);
 
     for (chords, description) in [
         ("j / <down>", "down"),
@@ -220,18 +230,36 @@ fn the_help_overlay_lists_the_bindings_that_are_actually_in_force() {
         ("v", "visual selection"),
     ] {
         assert!(
-            rendered.contains(chords),
-            "help is missing the chord {chords:?}"
+            rows.contains(chords),
+            "help is missing the chord {chords:?}: {rows}"
         );
         assert!(
-            rendered.contains(description),
-            "help is missing {description:?}"
+            rows.contains(description),
+            "help is missing {description:?}: {rows}"
         );
     }
+}
+
+#[test]
+fn pressing_g_on_the_key_reference_scrolls_to_a_binding_the_first_screen_never_shows() {
+    // `<c-c>` (quit) is not on the unscrolled first screen at all — the
+    // exact regression this pins: task 102's whole "scrollable" acceptance
+    // clause means the list widget's own viewport, not this function,
+    // decides what is visible, and only `G` jumping the row cursor to the
+    // end proves that mechanism is actually wired up rather than merely
+    // plausible from reading the code.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    let unscrolled = draw(&model, 120, 24).join("\n");
     assert!(
-        rendered.contains("mail keys set"),
-        "the help says how to change what it lists"
+        !unscrolled.contains("<c-c>"),
+        "the repro needs quit to actually start off screen: {unscrolled}"
     );
+
+    press(&mut model, Key::Char('G'));
+    let scrolled = draw(&model, 120, 24).join("\n");
+    assert!(scrolled.contains("<c-c>"), "{scrolled}");
+    assert!(scrolled.contains("quit"), "{scrolled}");
 }
 
 #[test]
@@ -239,12 +267,35 @@ fn a_rebound_key_shows_up_in_the_help() {
     let mut model = loaded();
     model.keymap =
         crate::keymap::file::parse("[normal]\n\"<c-d>\" = \"cursor.down\"\n", "keys.toml").unwrap();
-    model.overlay = Some(Overlay::Help);
+    model.overlay = Some(Overlay::Help(Box::new(HelpPane::new(
+        Mode::Normal,
+        &model.keymap,
+    ))));
     let rendered = draw(&model, 120, 44).join("\n");
     assert!(
         rendered.contains("j / <c-d> / <down>"),
         "the help lists the built-in bindings and not the user's:\n{rendered}"
     );
+}
+
+#[test]
+fn the_key_references_filter_line_shows_a_caret_while_typing() {
+    // Every other typing surface in this TUI (search, finder, the `:` line,
+    // ask, even the manual's own `/` search) renders through `prompt_line`:
+    // an accent sigil, the typed text, and a block cursor. This overlay's
+    // filter had fallen out of step with all of them — flat muted text with
+    // no cursor and no visible sign that keystrokes are now going into the
+    // filter rather than to the row actions below.
+    let mut model = loaded();
+    press(&mut model, Key::Char('?'));
+    press(&mut model, Key::Char('/'));
+    press(&mut model, Key::Char('a'));
+    press(&mut model, Key::Char('r'));
+    let rendered = draw(&model, 120, 24).join("\n");
+    // `prompt_line` renders the sigil as `"{sigil} "`, matching every other
+    // typing surface — not `"/ar"` glued together.
+    assert!(rendered.contains("/ ar"), "{rendered}");
+    assert!(rendered.contains('▏'), "no caret while typing:\n{rendered}");
 }
 
 #[test]
@@ -335,7 +386,10 @@ fn a_terminal_smaller_than_the_overlays_still_renders() {
     // `centered` clamps rather than subtracting into an underflow; ratatui's
     // own layout would panic on a `Rect` that does not fit its parent.
     let mut model = loaded();
-    model.overlay = Some(Overlay::Help);
+    model.overlay = Some(Overlay::Help(Box::new(HelpPane::new(
+        Mode::Normal,
+        &model.keymap,
+    ))));
     let rendered = draw(&model, 20, 5);
     assert_eq!(rendered.len(), 5);
 
@@ -382,7 +436,8 @@ fn generation(cmds: &[Cmd]) -> u64 {
         match cmd {
             Cmd::Search { generation, .. }
             | Cmd::Find { generation, .. }
-            | Cmd::Ask { generation, .. } => return *generation,
+            | Cmd::Ask { generation, .. }
+            | Cmd::DraftReply { generation, .. } => return *generation,
             _ => {}
         }
     }
@@ -525,6 +580,35 @@ fn the_ask_pane_renders_its_citations_and_says_whose_verdict_grounded_is() {
     assert!(
         screen.contains("NOT grounded") && screen.contains("daemon"),
         "an ungrounded answer is labelled as the daemon's verdict: {screen}"
+    );
+}
+
+#[test]
+fn the_reply_pane_renders_its_context_prose_and_the_drafted_id() {
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    let generation = generation(&{
+        type_in(&mut model, "reply --ai push to tuesday");
+        update(&mut model, Msg::Key(Key::Enter))
+    });
+    for event in [
+        ReplyEvent::Context("2 thread message(s)".to_owned()),
+        ReplyEvent::Token("Sounds good, see you then.".to_owned()),
+        ReplyEvent::Drafted {
+            draft_id: 42,
+            to: "alice@example.com".to_owned(),
+        },
+        ReplyEvent::Done,
+    ] {
+        update(&mut model, Msg::Reply { generation, event });
+    }
+
+    let screen = screen(&model);
+    assert!(screen.contains("2 thread message(s)"), "{screen}");
+    assert!(screen.contains("Sounds good, see you then."), "{screen}");
+    assert!(
+        screen.contains("draft 42") && screen.contains("alice@example.com"),
+        "the drafted id and recipient are the pane's own next-step hint: {screen}"
     );
 }
 
@@ -900,7 +984,10 @@ fn dark_theme_status_line_matches_the_historical_colors_for_each_level() {
 fn dark_theme_help_overlay_matches_the_historical_colors() {
     let dark = Theme::dark();
     let mut model = loaded();
-    model.overlay = Some(Overlay::Help);
+    model.overlay = Some(Overlay::Help(Box::new(HelpPane::new(
+        Mode::Normal,
+        &model.keymap,
+    ))));
     let emphasized = chars_matching(&model, 120, 30, dark.emphasis);
     // Every bound chord is rendered in `emphasis` — `a` (archive) is a
     // built-in default binding, so it is always present.
@@ -1151,7 +1238,7 @@ fn mono_theme_still_renders_without_panicking_for_every_overlay() {
     let mut model = loaded();
     model.theme = Theme::mono();
     for overlay in [
-        Overlay::Help,
+        Overlay::Help(Box::new(HelpPane::new(Mode::Normal, &model.keymap))),
         Overlay::Pick {
             what: PickFor::Copy,
             message_ids: vec![10],

@@ -43,6 +43,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 const RAW: &[u8] = b"From: =?UTF-8?Q?Zo=C3=AB?= <zoe@example.com>\r\n\
 To: me@example.com\r\n\
 Subject: =?UTF-8?B?SW52b2ljZSDigqwxMA==?=\r\n\
+Message-ID: <seed-1@example.com>\r\n\
 Content-Type: multipart/alternative; boundary=\"b\"\r\n\
 \r\n\
 --b\r\n\
@@ -55,6 +56,17 @@ Content-Type: text/html\r\n\
 \r\n\
 <p>Total: &euro;10</p>\r\n\
 --b--\r\n";
+
+/// A minimal message with no `Message-ID:` header — what
+/// `followup_new_refuses_a_message_with_no_message_id_header` seeds and acts
+/// on, so `Cmd::FollowupNew`'s own guard is exercised against a message that
+/// really has none rather than only against `RAW`'s.
+const RAW_NO_MESSAGE_ID: &[u8] = b"From: bob@example.com\r\n\
+To: me@example.com\r\n\
+Subject: no header\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hello\r\n";
 
 /// An `ImapMutator` that accepts everything without a network.
 ///
@@ -164,6 +176,7 @@ impl Daemon {
                         subject: parsed.subject.clone(),
                         from_addr: parsed.from_addr.clone(),
                         from_name: parsed.from_name.clone(),
+                        message_id: parsed.message_id.clone(),
                         date: Some(1_700_000_000),
                         body_text: parsed.body_text.clone(),
                         body_html: parsed.body_html.clone(),
@@ -218,6 +231,38 @@ impl Daemon {
             shutdown,
             handle,
         }
+    }
+
+    /// Insert one more message directly, bypassing every RPC — for the one
+    /// test that needs a message with no `Message-ID:` header, without
+    /// growing `start`'s own seed and shifting every other test's row
+    /// counts and folder listings out from under it. A second connection
+    /// onto the same file is safe: sqlite's WAL mode is what lets the daemon
+    /// keep serving while this one writes and drops.
+    fn insert_message_with_no_message_id_header(&self) -> i64 {
+        let db = Database::open(&self.db_path).expect("reopen db");
+        db.with_write(|c| {
+            let parsed = rmail_core::message::parse::parse_message(RAW_NO_MESSAGE_ID);
+            repo::insert_message(
+                c,
+                &NewMessage {
+                    account_id: self.account_id,
+                    mailbox_id: self.inbox_id,
+                    uid: 2,
+                    uidvalidity: 1,
+                    subject: parsed.subject,
+                    from_addr: parsed.from_addr,
+                    from_name: parsed.from_name,
+                    message_id: parsed.message_id,
+                    date: Some(1_700_000_100),
+                    body_text: parsed.body_text,
+                    body_html: parsed.body_html,
+                    raw: Some(RAW_NO_MESSAGE_ID.to_vec()),
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("insert the header-less message")
     }
 
     async fn exec(&self) -> GrpcExec {
@@ -714,6 +759,555 @@ async fn the_daemon_control_verbs_answer_with_a_labelled_fact() {
     daemon.stop().await;
 }
 
+/// Task 100's verbs, through the daemon rather than through the model — the
+/// same reason [`every_daemon_report_verb_reaches_an_rpc_and_comes_back_as_rows`]
+/// is one test rather than several: the interesting failure is uniform, a
+/// misnamed method or a response shape the mapping does not fit.
+///
+/// `Cmd::DraftReply` is not exercised here for the reason `Cmd::Ask` has no
+/// test in this file at all: both need a model provider this harness does
+/// not configure. `RetryFailed`, `SendNow` and `DraftNudge` are left to
+/// `commands::tests`' construction-level coverage for the same reason:
+/// `RetryFailed`/`SendNow` need a failed entry or a working SMTP relay this
+/// harness has neither of, and `DraftNudge` needs a model.
+///
+/// `DraftRevert` is left out too, once seeded state proved why: `seq: 0`
+/// ("the pre-rewrite original") turns out to mean exactly that — a draft that
+/// has never been through `RewriteDraft` has no revision `0` yet, so
+/// reverting one is, like rewriting it, a model-dependent path this harness
+/// cannot drive.
+#[tokio::test]
+async fn every_new_compose_and_send_scheduler_verb_reaches_a_real_rpc() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    // Seed a draft through the RPC the TUI's own `r` key already goes
+    // through, so the rest of this test has something real to act on.
+    exec.exec(
+        Cmd::Draft {
+            kind: crate::tui::model::DraftKind::Reply,
+            account_id: daemon.account_id,
+            from: "me@example.com".to_owned(),
+            to: "zoe@example.com".to_owned(),
+            message_id: daemon.message_id,
+        },
+        tx.clone(),
+    );
+    let draft_id = match next(&mut rx, "the seed draft").await {
+        Msg::Done {
+            result: Ok(Effect::Drafted(id)),
+            ..
+        } => id,
+        other => unreachable!("expected a draft, got {other:?}"),
+    };
+
+    exec.exec(
+        Cmd::DraftList {
+            generation: 1,
+            account_id: daemon.account_id,
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "draft list").await {
+        Msg::Report {
+            generation: 1,
+            event:
+                ReportEvent::Frame {
+                    rows,
+                    complete: true,
+                    ..
+                },
+        } => assert!(
+            rows.iter().any(|row| row.cells[0] == draft_id.to_string()),
+            "the seed draft should be listed: {rows:?}"
+        ),
+        other => unreachable!("draft list: {other:?}"),
+    }
+
+    exec.exec(
+        Cmd::DraftShow {
+            generation: 2,
+            draft_id,
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "draft show").await {
+        Msg::Report {
+            generation: 2,
+            event:
+                ReportEvent::Frame {
+                    rows,
+                    complete: true,
+                    ..
+                },
+        } => assert!(!rows.is_empty()),
+        other => unreachable!("draft show: {other:?}"),
+    }
+
+    exec.exec(
+        Cmd::DraftEdit {
+            generation: 3,
+            draft_id,
+            body: "edited body".to_owned(),
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "draft edit").await {
+        Msg::Report {
+            generation: 3,
+            event:
+                ReportEvent::Frame {
+                    rows,
+                    complete: true,
+                    ..
+                },
+        } => assert!(
+            rows.iter()
+                .any(|row| row.cells.iter().any(|cell| cell.contains("edited body"))),
+            "the new body should come back: {rows:?}"
+        ),
+        other => unreachable!("draft edit: {other:?}"),
+    }
+
+    exec.exec(
+        Cmd::DraftRender {
+            generation: 4,
+            draft_id,
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "draft render").await {
+        Msg::Report {
+            generation: 4,
+            event:
+                ReportEvent::Frame {
+                    rows,
+                    complete: true,
+                    ..
+                },
+        } => assert!(!rows.is_empty()),
+        other => unreachable!("draft render: {other:?}"),
+    }
+
+    exec.exec(
+        Cmd::DraftRevisions {
+            generation: 5,
+            draft_id,
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "draft revisions").await {
+        Msg::Report {
+            generation: 5,
+            event: ReportEvent::Frame { complete: true, .. },
+        } => {}
+        other => unreachable!("draft revisions: {other:?}"),
+    }
+
+    // -- send, then outbox metadata mutations ----------------------------
+    // `at: "in 1h"`, not the default (now plus the undo window, ~10s): the
+    // send worker is always running against this same daemon, and the
+    // reschedule/edit calls below need the entry to still be `scheduled`
+    // when they run rather than racing a real send.
+    exec.exec(
+        Cmd::ScheduleSend {
+            account_id: daemon.account_id,
+            draft_id,
+            at: "in 1h".to_owned(),
+            undo: None,
+        },
+        tx.clone(),
+    );
+    let outbox_id = match next(&mut rx, "the scheduled send").await {
+        Msg::Outbox {
+            result: Ok(rows), ..
+        } => {
+            let entry = rows.first().expect("a scheduled entry");
+            assert_eq!(entry.state, "scheduled");
+            // No undo deadline here, correctly: `OutboxPolicy::resolve` only
+            // sets one while `send_at` is inside the undo window ("a message
+            // scheduled for Friday is cancelable until Friday without one" —
+            // `rmail-core/src/outbox/policy.rs`), and this entry is deliberately
+            // scheduled an hour out to keep the reschedule/edit calls below
+            // from racing the real send worker. The immediate-send case that
+            // *does* carry a deadline is
+            // `scheduling_a_send_arms_the_same_undo_deadline_a_cancel_does`,
+            // kept as its own test for exactly that reason — it cannot safely
+            // run anything after the schedule without racing the same worker.
+            entry.id
+        }
+        other => unreachable!("schedule send: {other:?}"),
+    };
+
+    exec.exec(
+        Cmd::RescheduleSend {
+            outbox_id,
+            at: "in 1h".to_owned(),
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "reschedule").await {
+        Msg::Outbox { result: Ok(_), .. } => {}
+        other => unreachable!("reschedule: {other:?}"),
+    }
+
+    exec.exec(
+        Cmd::UpdateScheduledBody {
+            outbox_id,
+            body: "revised body".to_owned(),
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "update scheduled body").await {
+        Msg::Outbox { result: Ok(_), .. } => {}
+        other => unreachable!("update scheduled body: {other:?}"),
+    }
+
+    exec.exec(
+        Cmd::SuggestSendTime {
+            generation: 7,
+            account_id: daemon.account_id,
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "suggest send time").await {
+        Msg::Report {
+            generation: 7,
+            event:
+                ReportEvent::Frame {
+                    rows,
+                    complete: true,
+                    ..
+                },
+        } => assert!(!rows.is_empty()),
+        other => unreachable!("suggest send time: {other:?}"),
+    }
+
+    // -- follow-ups and preflight -----------------------------------------
+    exec.exec(
+        Cmd::FollowupNew {
+            message_id: daemon.message_id,
+            remind_in: "3d".to_owned(),
+            note: "circle back".to_owned(),
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "the new follow-up").await {
+        Msg::Done { result, .. } => assert!(result.is_ok(), "{result:?}"),
+        other => unreachable!("followup new: {other:?}"),
+    }
+
+    exec.exec(
+        Cmd::FollowupList {
+            generation: 8,
+            account_id: daemon.account_id,
+        },
+        tx.clone(),
+    );
+    let followup_id = match next(&mut rx, "followup list").await {
+        Msg::Report {
+            generation: 8,
+            event:
+                ReportEvent::Frame {
+                    rows,
+                    complete: true,
+                    ..
+                },
+        } => {
+            assert!(!rows.is_empty(), "the seeded follow-up should be listed");
+            rows[0].cells[0]
+                .parse::<i64>()
+                .unwrap_or_else(|_| unreachable!("expected a numeric id: {:?}", rows[0]))
+        }
+        other => unreachable!("followup list: {other:?}"),
+    };
+
+    exec.exec(
+        Cmd::Waiting {
+            generation: 9,
+            account_id: daemon.account_id,
+            overdue: false,
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "waiting").await {
+        Msg::Report {
+            generation: 9,
+            event:
+                ReportEvent::Frame {
+                    rows,
+                    complete: true,
+                    ..
+                },
+        } => assert!(!rows.is_empty(), "the same follow-up is waited-on"),
+        other => unreachable!("waiting: {other:?}"),
+    }
+
+    exec.exec(
+        Cmd::PreflightCheck {
+            generation: 10,
+            account_id: daemon.account_id,
+            draft_id,
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "preflight").await {
+        Msg::Report {
+            generation: 10,
+            event: ReportEvent::Frame { complete: true, .. },
+        } => {}
+        Msg::Report {
+            generation: 10,
+            event: ReportEvent::Failed(error),
+        } => unreachable!(
+            "preflight should answer even with no model provider configured, \
+             degrading gracefully rather than failing outright: {error}"
+        ),
+        other => unreachable!("preflight: {other:?}"),
+    }
+
+    exec.exec(Cmd::FollowupDismiss { id: followup_id }, tx.clone());
+    match next(&mut rx, "followup dismiss").await {
+        Msg::Done { result, .. } => assert!(result.is_ok(), "{result:?}"),
+        other => unreachable!("followup dismiss: {other:?}"),
+    }
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
+/// A daemon error on one of task 100's own RPCs reaches the report as a
+/// failure rather than being swallowed — `a_status_error_reaches_the_status_line_instead_of_being_swallowed`'s
+/// own claim, exercised against a verb this task added rather than one that
+/// predates it.
+#[tokio::test]
+async fn a_bad_draft_id_reaches_the_report_as_a_failure_not_a_panic() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::DraftShow {
+            generation: 1,
+            draft_id: 999_999,
+        },
+        tx,
+    );
+    match next(&mut rx, "the failed draft show").await {
+        Msg::Report {
+            generation: 1,
+            event: ReportEvent::Failed(error),
+        } => assert!(
+            error.to_lowercase().contains("not found") || error.contains("999999"),
+            "the daemon's own words survive the trip: {error:?}"
+        ),
+        other => unreachable!("expected a failed report, got {other:?}"),
+    }
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
+/// `Cmd::DraftDelete` actually deletes through `ComposeService`, not just
+/// through whatever the local model believes happened.
+#[tokio::test]
+async fn draft_delete_actually_deletes_through_the_daemon() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Draft {
+            kind: crate::tui::model::DraftKind::Reply,
+            account_id: daemon.account_id,
+            from: "me@example.com".to_owned(),
+            to: "zoe@example.com".to_owned(),
+            message_id: daemon.message_id,
+        },
+        tx.clone(),
+    );
+    let draft_id = match next(&mut rx, "the seed draft").await {
+        Msg::Done {
+            result: Ok(Effect::Drafted(id)),
+            ..
+        } => id,
+        other => unreachable!("expected a draft, got {other:?}"),
+    };
+
+    exec.exec(Cmd::DraftDelete { draft_id }, tx.clone());
+    match next(&mut rx, "the delete").await {
+        Msg::Done { result, .. } => assert!(result.is_ok(), "{result:?}"),
+        other => unreachable!("draft delete: {other:?}"),
+    }
+
+    let channel = rmail_core::connect_uds(&daemon.socket).await.unwrap();
+    let after = rmail_proto::v1::compose_service_client::ComposeServiceClient::new(channel)
+        .get_draft(rmail_proto::v1::GetDraftRequest { draft_id })
+        .await;
+    assert_eq!(
+        after.unwrap_err().code(),
+        tonic::Code::NotFound,
+        "deleted through the RPC, not just forgotten locally"
+    );
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn scheduling_a_send_arms_the_same_undo_deadline_a_cancel_does() {
+    // Its own test, deliberately: this is the one place in the suite that
+    // schedules a send inside the real undo window rather than an hour out,
+    // which means the real send worker this daemon always runs will fire it
+    // once that window closes. Reading `Msg::Outbox`'s result once and
+    // stopping — no reschedule, no edit, nothing after — is what keeps this
+    // safe against that worker rather than racing it.
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Draft {
+            kind: crate::tui::model::DraftKind::Reply,
+            account_id: daemon.account_id,
+            from: "me@example.com".to_owned(),
+            to: "zoe@example.com".to_owned(),
+            message_id: daemon.message_id,
+        },
+        tx.clone(),
+    );
+    let draft_id = match next(&mut rx, "the seed draft").await {
+        Msg::Done {
+            result: Ok(Effect::Drafted(id)),
+            ..
+        } => id,
+        other => unreachable!("expected a draft, got {other:?}"),
+    };
+
+    exec.exec(
+        Cmd::ScheduleSend {
+            account_id: daemon.account_id,
+            draft_id,
+            at: String::new(),
+            undo: None,
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "the scheduled send").await {
+        Msg::Outbox {
+            result: Ok(rows), ..
+        } => {
+            let entry = rows.first().expect("a scheduled entry");
+            assert_eq!(entry.state, "scheduled");
+            assert!(
+                entry.undo_deadline.is_some(),
+                "an immediate send is inside its own undo window by \
+                 construction — this is what lets `Msg::Outbox`'s own \
+                 `arm_toast` raise the countdown toast for a `:send` exactly \
+                 as it already does for a cancel, with no new toast code for \
+                 this task to add: {entry:?}"
+            );
+        }
+        other => unreachable!("schedule send: {other:?}"),
+    }
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
+/// `SendSchedulerService.RetryFailed` on an entry that is not failed is a
+/// precondition error the report shows, not a silent no-op — `RetryFailed`
+/// and `SendNow` are the two mutating outbox verbs the big fixture test above
+/// deliberately does not exercise, since neither has a safe happy path this
+/// harness can drive (one needs a failed entry, the other a working SMTP
+/// relay); this is the error path `RetryFailed` *can* prove without either.
+#[tokio::test]
+async fn retrying_a_send_that_never_failed_is_a_precondition_error() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Draft {
+            kind: crate::tui::model::DraftKind::Reply,
+            account_id: daemon.account_id,
+            from: "me@example.com".to_owned(),
+            to: "zoe@example.com".to_owned(),
+            message_id: daemon.message_id,
+        },
+        tx.clone(),
+    );
+    let draft_id = match next(&mut rx, "the seed draft").await {
+        Msg::Done {
+            result: Ok(Effect::Drafted(id)),
+            ..
+        } => id,
+        other => unreachable!("expected a draft, got {other:?}"),
+    };
+
+    exec.exec(
+        Cmd::ScheduleSend {
+            account_id: daemon.account_id,
+            draft_id,
+            at: "in 1h".to_owned(),
+            undo: None,
+        },
+        tx.clone(),
+    );
+    let outbox_id = match next(&mut rx, "the scheduled send").await {
+        Msg::Outbox {
+            result: Ok(rows), ..
+        } => rows.first().expect("a scheduled entry").id,
+        other => unreachable!("schedule send: {other:?}"),
+    };
+
+    exec.exec(Cmd::RetryFailed { outbox_id }, tx.clone());
+    match next(&mut rx, "the refused retry").await {
+        Msg::Outbox {
+            result: Err(error), ..
+        } => assert!(
+            error.to_lowercase().contains("fail")
+                || error.to_lowercase().contains("precondition")
+                || error.to_lowercase().contains("state"),
+            "the daemon's own reason survives the trip: {error:?}"
+        ),
+        other => unreachable!("expected a refused retry, got {other:?}"),
+    }
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
+/// `Cmd::FollowupNew` resolves the target message's RFC 5322 Message-ID
+/// before calling `CreateFollowup`, and refuses client-side rather than
+/// round-tripping when there is none to resolve.
+#[tokio::test]
+async fn followup_new_refuses_a_message_with_no_message_id_header() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+    let message_id = daemon.insert_message_with_no_message_id_header();
+
+    exec.exec(
+        Cmd::FollowupNew {
+            message_id,
+            remind_in: "3d".to_owned(),
+            note: String::new(),
+        },
+        tx,
+    );
+    match next(&mut rx, "the refused follow-up").await {
+        Msg::Done {
+            result: Err(error), ..
+        } => assert!(error.contains("Message-ID"), "{error}"),
+        other => unreachable!("expected a refused follow-up, got {other:?}"),
+    }
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
 /// Task 92's supersession clause, at the layer it lives in.
 ///
 /// `SyncService.Status` is both the folder listing and the sync indicator's own
@@ -898,6 +1492,54 @@ async fn shutdown_stops_the_event_stream_rather_than_leaving_it_running() {
     // therefore proof that task is gone.
     let closed = tokio::time::timeout(DEADLINE, async { while rx.recv().await.is_some() {} }).await;
     assert!(closed.is_ok(), "the WatchEvents task outlived shutdown");
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn cmd_write_keybinding_runs_through_the_real_executor_and_reports_back() {
+    // `Cmd::WriteKeybinding` reaches no RPC at all — every `model::tests`
+    // covering it hand-calls `write_keybinding` and hand-builds
+    // `Msg::KeysWritten`, which proves the dispatch and the message
+    // handling but nothing about the thing task 102's P1 fix actually
+    // delivered: that the write really runs through `spawn_blocking` behind
+    // the real executor and a real `Msg` comes back on the channel, rather
+    // than a swapped label or a dropped result compiling clean and never
+    // being caught. The daemon this harness starts is unused by the
+    // command itself; it is the only way this file constructs a
+    // [`GrpcExec`] at all.
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    let path = std::env::temp_dir().join(format!(
+        "rmail-grpc-tests-write-keybinding-{}-{}.toml",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    exec.exec(
+        Cmd::WriteKeybinding {
+            path: path.clone(),
+            mode: rmail_core::keymap::Mode::Normal,
+            chord: rmail_core::keymap::Chord::parse("z").expect("z parses"),
+            action: rmail_core::keymap::Action::CursorDown,
+            label: "bound z to cursor.down in normal mode".to_owned(),
+        },
+        tx.clone(),
+    );
+    match next(&mut rx, "keys written").await {
+        Msg::KeysWritten { label, result } => {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(label.contains("cursor.down"), "{label}");
+        }
+        other => unreachable!("expected KeysWritten, got {other:?}"),
+    }
+
+    let written = std::fs::read_to_string(&path).expect("the write actually landed on disk");
+    assert!(written.contains("cursor.down"), "{written}");
+    let _ = std::fs::remove_file(&path);
 
     daemon.stop().await;
 }

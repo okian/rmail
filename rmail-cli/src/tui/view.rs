@@ -24,13 +24,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::keymap::{Action, Mode};
-
+use super::help::{self, HelpPane};
 use super::manual;
 use super::model::{Focus, Model, Overlay, Scope, Screen, FLAGGED, SEEN};
 use super::overlays::{
     self, AskPane, AskPhase, CommandPane, FinderPane, OutboxPane, QuickAction, QuickPane,
-    SearchFocus, SearchPane, Toast,
+    ReplyPane, SearchFocus, SearchPane, Toast,
 };
 use super::report::{ReportColumn, ReportPane, ReportTone};
 use super::status;
@@ -83,7 +82,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
     render_status(model, frame, rows[3]);
 
     match &model.overlay {
-        Some(Overlay::Help) => render_help(model, frame, area),
+        Some(Overlay::Help(pane)) => render_help(&model.theme, pane, frame, area),
         Some(Overlay::Pick { what, idx, .. }) => render_pick(model, frame, area, *what, *idx),
         Some(Overlay::Confirm { prompt, .. }) => {
             render_modal(&model.theme, frame, area, "confirm", prompt);
@@ -95,6 +94,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
         Some(Overlay::Finder(pane)) => render_finder(&model.theme, pane, frame, area),
         Some(Overlay::Command(pane)) => render_command(&model.theme, pane, frame, area),
         Some(Overlay::Ask(pane)) => render_ask(&model.theme, pane, frame, area),
+        Some(Overlay::Reply(pane)) => render_reply(&model.theme, pane, frame, area),
         Some(Overlay::Outbox(pane)) => render_outbox(&model.theme, pane, frame, area),
         Some(Overlay::Quick(pane)) => render_quick(&model.theme, pane, frame, area),
         Some(Overlay::Report(pane)) => render_report(&model.theme, pane, frame, area),
@@ -637,37 +637,98 @@ fn indicator_spans(theme: &Theme, indicators: &[status::Indicator]) -> Vec<Span<
 /// who customised something — so the rows are generated from the bindings in
 /// force, and a rebind shows up here the moment it is loaded.
 ///
-/// Normal mode's chain, because that is the screen `?` is pressed from; the
-/// viewer and the overlays inherit or restate it.
-fn render_help(model: &Model, frame: &mut Frame, area: Rect) {
-    let theme = &model.theme;
-    let mut lines: Vec<Line> = Vec::new();
-    for action in Action::ALL {
-        let chords = model.keymap.chords_for(Mode::Normal, *action);
-        if chords.is_empty() {
-            continue;
-        }
-        let keys = chords
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" / ");
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {keys:<14}"), theme.emphasis),
-            Span::raw(action.describe()),
-        ]));
-    }
-    lines.push(Line::styled(
-        "  rebind with `mail keys set <chord> <action>` — no restart needed",
-        theme.muted,
-    ));
-
-    let area = centered(area, 72, u16::try_from(lines.len()).unwrap_or(u16::MAX) + 2);
+/// The `?` key reference (task 102): mode-aware (draws [`HelpPane::mode`],
+/// not always `Mode::Normal`), scrollable (a stock `List`, so nothing here
+/// is clipped past the terminal the way an unwrapped `Paragraph` would),
+/// grouped (a bold heading per [`help::Row::Group`]) and filterable
+/// (the footer row doubles as the `/` filter's own input line while
+/// [`HelpPane::editing`] is true).
+fn render_help(theme: &Theme, pane: &HelpPane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 84, 80);
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines).block(pane_block(theme, "keys — any of q, Esc or ? closes", true)),
-        area,
+
+    let title = format!("keys — {} mode — q/Esc closes", pane.mode.id());
+    let inner = inner(theme, frame, area, &title);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let items: Vec<ListItem> = pane
+        .rows
+        .iter()
+        .map(|row| match row {
+            help::Row::Group(label) => ListItem::new(Line::styled(
+                label.clone(),
+                theme.accent.add_modifier(Modifier::BOLD),
+            )),
+            help::Row::Binding {
+                chords, describe, ..
+            } => ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("  {:<14}", overlays::safe_line(chords)),
+                    theme.emphasis,
+                ),
+                Span::raw(*describe),
+            ])),
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    if let Some(position) = help_list_position(pane) {
+        state.select(Some(position));
+    }
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selected_style(theme, true)),
+        rows[0],
+        &mut state,
     );
+
+    // `prompt_line` while actually typing — the caret and the accent-styled
+    // sigil are what mark every other typing surface here (search, finder,
+    // the `:` line, ask) as one; this filter is the same kind of surface
+    // and had fallen out of step with them, plain muted text with no cursor
+    // and no visible cue that keystrokes are now going into it rather than
+    // to the row actions below.
+    let footer = if pane.editing {
+        prompt_line(theme, "/", &pane.filter, "<enter> keeps it · esc closes")
+    } else if pane.filter.is_empty() {
+        // At most 65 columns: `centered_pct(area, 84, 80)` on an 80-column
+        // terminal, minus the block's left and right borders, leaves
+        // exactly that much — and `Paragraph` has no `.wrap()`, so anything
+        // longer has its tail silently eaten rather than pinned by a test.
+        // `<c-o>` (the *other* direction `<tab>` cycles) is left off the
+        // hint on that budget; it is still live, just not named here.
+        Line::styled(
+            "<enter> runs · c rebinds · K manual · / filters · <tab> modes",
+            theme.muted,
+        )
+    } else {
+        Line::styled(
+            format!(
+                "filter: {} — / edits, esc closes",
+                overlays::safe_line(&pane.filter)
+            ),
+            theme.muted,
+        )
+    };
+    frame.render_widget(Paragraph::new(footer), rows[1]);
+}
+
+/// Where [`HelpPane::cursor`]'s binding sits among [`HelpPane::rows`] — what
+/// [`ListState::select`] needs, since the list draws group headings too and
+/// the cursor counts only the rows that are actually selectable.
+fn help_list_position(pane: &HelpPane) -> Option<usize> {
+    let mut seen = 0;
+    for (position, row) in pane.rows.iter().enumerate() {
+        if matches!(row, help::Row::Binding { .. }) {
+            if seen == pane.cursor {
+                return Some(position);
+            }
+            seen += 1;
+        }
+    }
+    None
 }
 
 fn render_pick(
@@ -1131,6 +1192,63 @@ fn ask_title(pane: &AskPane) -> &'static str {
         (AskPhase::Streaming, _) => "ask — answering…",
         (AskPhase::Done, true) => "ask — grounded in your mail (daemon-verified)",
         (AskPhase::Done, false) => "ask — NOT grounded (daemon's verdict)",
+    }
+}
+
+/// `:reply --ai` — simpler than [`render_ask`]: no typing phase, no
+/// citations, so two rows (a context line, then the streaming prose) are all
+/// this pane draws.
+fn render_reply(theme: &Theme, pane: &ReplyPane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 88, 84);
+    frame.render_widget(Clear, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner(theme, frame, area, reply_title(pane)));
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            overlays::safe_line(pane.context.as_deref().unwrap_or("reading the thread…")),
+            theme.muted,
+        )),
+        rows[0],
+    );
+
+    // Model-authored prose: neutralized, but with its paragraph breaks kept —
+    // the same reason `render_ask`'s own body is.
+    let mut body: Vec<Line> = overlays::safe_prose(&pane.body)
+        .lines()
+        .map(|line| Line::raw(line.to_owned()))
+        .collect();
+    if let Some(error) = pane.error.as_ref() {
+        body.push(Line::styled(
+            format!("({})", overlays::safe_line(error)),
+            theme.err,
+        ));
+    }
+    if let Some((id, to)) = &pane.drafted {
+        body.push(Line::styled(
+            format!(
+                "draft {id} created for {} — `mail draft rewrite {id}` to adjust, :send --draft={id} to schedule",
+                overlays::safe_line(to)
+            ),
+            theme.muted,
+        ));
+    }
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[1]);
+}
+
+/// The reply pane's title says what its one visible state is: still
+/// streaming, finished, or failed. The draft id and next steps live in the
+/// body instead of here, for the reason [`ask_title`] keeps citations out of
+/// its own title — a border title is not the place for text a stream wrote.
+fn reply_title(pane: &ReplyPane) -> &'static str {
+    if pane.error.is_some() {
+        "reply — failed"
+    } else if pane.done {
+        "reply — Esc closes"
+    } else {
+        "reply — drafting…"
     }
 }
 

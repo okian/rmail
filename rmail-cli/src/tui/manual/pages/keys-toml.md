@@ -85,6 +85,26 @@ An edit rewrites one line and leaves every other byte — comments included —
 where it was, then re-parses the result and refuses to write unless the only
 binding that changed is the one asked for.
 
+## Rebinding from the ? overlay
+
+{{keys:help.rebind}} on a highlighted row opens the command line pre-filled
+with {{cmd:keys set}} for that row's own chord and action — edit it and press
+Enter, or Esc to back out. `keys set` is the same edit `mail keys set` makes,
+reached without leaving the TUI to a shell:
+
+```
+:keys set <c-j> cursor.down             bind, in normal mode
+:keys set --mode=viewer j cursor.down   bind in another mode
+```
+
+No shell quoting here — the `:` line is typed straight into the TUI, not a
+shell, so `<` and `>` need none of the protection they need on a command
+line. `--mode` takes its value joined with `=`, the one spelling this
+grammar's flags accept.
+
+The mode defaults to `normal`, the same default `mail keys set --mode` has,
+so a row from that mode's own chain never needs to spell it out.
+
 ## Failure behaviour
 
 - A file that stops parsing does not clear your bindings. The error goes to

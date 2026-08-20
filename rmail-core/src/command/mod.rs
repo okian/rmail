@@ -226,6 +226,16 @@ fn split_path(text: &str) -> Vec<&str> {
 /// the first real verb to need [`Verb::description`]: neither of the other
 /// two sources `Verb::describe` prefers has anything to say about it.
 ///
+/// The fourth is task 102's `:keys set` — the command line's counterpart to
+/// `mail keys set`, reached from the key reference's `c` row action. Local to
+/// the grammar in the same way `:set` is (no action, no capability: it edits
+/// `keys.toml` directly, the same file `mail keys set` does), and the first
+/// verb here to actually declare a [`Flag`] — `--mode`, mirroring the CLI's
+/// own, defaulted to `normal` the same way when the row being rebound is one
+/// of Normal's own. [`check_flags`] already validates a flag against
+/// whatever a [`Verb`] declares; nothing else needed to grow for this to
+/// parse.
+///
 /// The last two are task 90's, and they are the first verbs here that reach a
 /// [`Capability`] with **no** [`Action`] behind them — the shape
 /// `tests::every_declared_verb_spells_its_capability_like_the_cli` was written
@@ -376,6 +386,29 @@ fn explicit() -> Vec<Verb> {
         required: false,
         rest: false,
     }];
+    /// A draft's row id, shown by `:draft list` and echoed onto the reply
+    /// pane once one is drafted. Optional for the same reason `KIND` is: the
+    /// `commands` match arm is where "no id, no answer" is actually
+    /// enforced, not the grammar.
+    const DRAFT_ID: &[Positional] = &[Positional {
+        name: "draft_id",
+        required: false,
+        rest: false,
+    }];
+    /// An outbox entry's row id, shown by the outbox pane. Optional for the
+    /// same reason `DRAFT_ID` is.
+    const OUTBOX_ID: &[Positional] = &[Positional {
+        name: "outbox_id",
+        required: false,
+        rest: false,
+    }];
+    /// A follow-up's row id, shown by `:followup list` and `:waiting`.
+    /// Optional for the same reason `DRAFT_ID` is.
+    const FOLLOWUP_ID: &[Positional] = &[Positional {
+        name: "id",
+        required: false,
+        rest: false,
+    }];
     vec![
         Verb {
             path: vec!["manual", "grep"],
@@ -430,6 +463,37 @@ fn explicit() -> Vec<Verb> {
             description: Some(
                 "resize a pane or the AI panel — both an option and a value are required",
             ),
+        },
+        Verb {
+            path: vec!["keys", "set"],
+            capability: None,
+            // No delegate, for the same reason `set` has none: a chord and
+            // an action are not something an `Action` can carry. Both
+            // positionals optional for the same reachability rule `set`'s
+            // own comment gives — `rmail_cli`'s dispatch is where "a chord
+            // and an action are both mandatory" is actually enforced.
+            action: None,
+            positionals: &[
+                Positional {
+                    name: "chord",
+                    required: false,
+                    rest: false,
+                },
+                Positional {
+                    name: "action",
+                    required: false,
+                    rest: false,
+                },
+            ],
+            // The one flag any verb in this registry declares today — the
+            // mode to bind in, mirroring `mail keys set`'s own `--mode`,
+            // defaulted the same way (`normal`) when absent.
+            flags: &[Flag {
+                name: "mode",
+                takes_value: true,
+            }],
+            cli_alias: None,
+            description: Some("bind a chord to an action in keys.toml"),
         },
         Verb {
             path: vec!["auth", "status"],
@@ -785,6 +849,329 @@ fn explicit() -> Vec<Verb> {
             cli_alias: None,
             description: None,
         },
+        // -- reply and drafts (task 100) -------------------------------------
+        Verb {
+            path: vec!["reply"],
+            capability: Some(Capability::ComposeDraftReply),
+            // No delegate: `--ai` decides between two entirely different
+            // things this verb can do — hand a message to `run_action` the
+            // way `r` already does, or stream a drafted reply — and an
+            // `Action` cannot carry that branch. `rmail_cli`'s dispatch is
+            // where it is made, before the generic daemon-verb routing this
+            // capability would otherwise take (the same early, hand-written
+            // case `keys set` is).
+            action: None,
+            // One catch-all, joined by the caller — `--ai "yes, but push to
+            // Tuesday"` needs its intent to survive as one argument the same
+            // way `helpgrep`'s `PATTERN` does, not split word by word.
+            positionals: PATTERN,
+            flags: &[
+                Flag {
+                    name: "ai",
+                    takes_value: false,
+                },
+                Flag {
+                    name: "reply-all",
+                    takes_value: false,
+                },
+            ],
+            cli_alias: None,
+            // `description` is dead here and stays unset: `Verb::describe`
+            // prefers `capability.summary()` whenever one is set, which
+            // `ComposeDraftReply` always is. What this verb does with `--ai`
+            // versus without it belongs in prose a reader actually reaches —
+            // see [[compose-and-send]] — not in a field nothing renders.
+            description: None,
+        },
+        Verb {
+            path: vec!["draft", "list"],
+            capability: Some(Capability::ComposeListDrafts),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["draft", "show"],
+            capability: Some(Capability::ComposeGetDraft),
+            action: None,
+            positionals: DRAFT_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["draft", "edit"],
+            capability: Some(Capability::ComposeUpdateDraft),
+            action: None,
+            positionals: DRAFT_ID,
+            flags: &[Flag {
+                name: "body",
+                takes_value: true,
+            }],
+            cli_alias: None,
+            // Dead, the same reason `reply`'s is: `ComposeUpdateDraft`
+            // always supplies a summary first.
+            description: None,
+        },
+        Verb {
+            path: vec!["draft", "delete"],
+            capability: Some(Capability::ComposeDeleteDraft),
+            action: None,
+            positionals: DRAFT_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["draft", "render"],
+            capability: Some(Capability::ComposeRenderDraft),
+            action: None,
+            positionals: DRAFT_ID,
+            flags: &[],
+            cli_alias: None,
+            // Dead, the same reason `reply`'s is: `ComposeRenderDraft`
+            // always supplies a summary first.
+            description: None,
+        },
+        Verb {
+            path: vec!["draft", "rewrite"],
+            capability: Some(Capability::ComposeRewriteDraft),
+            action: None,
+            positionals: DRAFT_ID,
+            // Mirrors `mail draft rewrite`'s own flags exactly — one
+            // vocabulary for tone, spelled the way
+            // `rmail_core::compose::reply::Tone::as_str` spells it, so a
+            // name that works in `keys.toml`, the CLI or here works
+            // everywhere.
+            flags: &[
+                Flag {
+                    name: "tone",
+                    takes_value: true,
+                },
+                Flag {
+                    name: "shorter",
+                    takes_value: false,
+                },
+                Flag {
+                    name: "longer",
+                    takes_value: false,
+                },
+                Flag {
+                    name: "instruction",
+                    takes_value: true,
+                },
+            ],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["draft", "revisions"],
+            capability: Some(Capability::ComposeListDraftRevisions),
+            action: None,
+            positionals: DRAFT_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["draft", "revert"],
+            capability: Some(Capability::ComposeSelectDraftRevision),
+            action: None,
+            // `seq` optional and defaulting to 0 (the original text) the same
+            // way `mail draft revert`'s own `--seq` does.
+            positionals: &[
+                Positional {
+                    name: "draft_id",
+                    required: false,
+                    rest: false,
+                },
+                Positional {
+                    name: "seq",
+                    required: false,
+                    rest: false,
+                },
+            ],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        // -- send and the outbox (task 100) ----------------------------------
+        //
+        // `SendSchedulerService.WatchOutbox` is deliberately not here. Every
+        // other verb below is a one-command-one-answer shape: issue a request,
+        // get a `Report` or a fact back. A live tail has no such shape, and the
+        // outbox pane (`O`) already re-lists on every mutation this file makes,
+        // which is what a `:` line watching the stream would exist to do.
+        Verb {
+            path: vec!["send"],
+            capability: Some(Capability::SendSchedulerScheduleSend),
+            action: None,
+            positionals: &[],
+            // `--draft` rather than an inline `--to`/`--subject`/`--body`
+            // surface `mail send` also accepts: a `:` line is one line, and
+            // every message this build sends is staged as a draft first (by
+            // `r`/`F`, `:reply --ai` or `:draft rewrite`) — there is always
+            // one to name by id.
+            flags: &[
+                Flag {
+                    name: "draft",
+                    takes_value: true,
+                },
+                Flag {
+                    name: "at",
+                    takes_value: true,
+                },
+                Flag {
+                    name: "undo",
+                    takes_value: true,
+                },
+            ],
+            cli_alias: None,
+            // Dead, the same reason `reply`'s is: `SendSchedulerScheduleSend`
+            // always supplies a summary first.
+            description: None,
+        },
+        Verb {
+            path: vec!["outbox", "retry"],
+            capability: Some(Capability::SendSchedulerRetryFailed),
+            action: None,
+            positionals: OUTBOX_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["outbox", "reschedule"],
+            capability: Some(Capability::SendSchedulerRescheduleSend),
+            action: None,
+            positionals: OUTBOX_ID,
+            flags: &[Flag {
+                name: "at",
+                takes_value: true,
+            }],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["outbox", "edit"],
+            capability: Some(Capability::SendSchedulerUpdateScheduledBody),
+            action: None,
+            positionals: OUTBOX_ID,
+            flags: &[Flag {
+                name: "body",
+                takes_value: true,
+            }],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["outbox", "send-now"],
+            capability: Some(Capability::SendSchedulerSendNow),
+            action: None,
+            positionals: OUTBOX_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["outbox", "suggest"],
+            capability: Some(Capability::SendSchedulerSuggestSendTime),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        // -- follow-ups and the pre-send guardian (task 100) -----------------
+        //
+        // `SendSchedulerService.TrackFollowup` is deliberately not here too:
+        // it judges a *sent* message's own body and recipients to pick a
+        // follow-up delay, and this client has no surface — no "the message
+        // I am looking at was one I sent" screen — that would let anyone name
+        // one to hand it. `followup new`'s own explicit `--in` is what a
+        // human names by hand instead.
+        Verb {
+            path: vec!["followup", "list"],
+            capability: Some(Capability::SendSchedulerListFollowups),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["followup", "new"],
+            capability: Some(Capability::SendSchedulerCreateFollowup),
+            action: None,
+            // No positional: the message is `target.message_id`, the same
+            // "act on what is on screen" rule `ai process` follows — a
+            // follow-up's RPC wants the message's own RFC 5322 Message-ID,
+            // not the row id typeable here, so resolving it from context
+            // instead of a typed argument avoids asking anybody to type a
+            // header by hand.
+            positionals: &[],
+            flags: &[
+                Flag {
+                    name: "in",
+                    takes_value: true,
+                },
+                Flag {
+                    name: "note",
+                    takes_value: true,
+                },
+            ],
+            // `mail followup add` vs. this grammar's `followup new` — the
+            // acceptance's own spelling, declared as a deliberate divergence
+            // rather than compared against a path it was never going to
+            // match.
+            cli_alias: Some("followup add"),
+            description: None,
+        },
+        Verb {
+            path: vec!["followup", "dismiss"],
+            capability: Some(Capability::SendSchedulerDismissFollowup),
+            action: None,
+            positionals: FOLLOWUP_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["waiting"],
+            capability: Some(Capability::SendSchedulerListWaitingOn),
+            action: None,
+            positionals: &[],
+            flags: &[Flag {
+                name: "overdue",
+                takes_value: false,
+            }],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["nudge"],
+            capability: Some(Capability::SendSchedulerDraftNudge),
+            action: None,
+            positionals: FOLLOWUP_ID,
+            flags: &[],
+            cli_alias: None,
+            // Dead, the same reason `reply`'s is: `SendSchedulerDraftNudge`
+            // always supplies a summary first.
+            description: None,
+        },
+        Verb {
+            path: vec!["preflight"],
+            capability: Some(Capability::SendSchedulerPreflightCheck),
+            action: None,
+            positionals: DRAFT_ID,
+            flags: &[],
+            cli_alias: None,
+            // Dead, the same reason `reply`'s is: `SendSchedulerPreflightCheck`
+            // always supplies a summary first.
+            description: None,
+        },
     ]
 }
 
@@ -993,8 +1380,11 @@ pub enum CommandError {
         /// Every flag the verb does accept, `--`-prefixed.
         valid: Vec<String>,
     },
-    /// A value-taking flag with nothing after it.
-    #[error("--{flag} needs a value")]
+    /// A value-taking flag with nothing after it — including the common
+    /// mistake of typing `--flag value` (space-separated) rather than this
+    /// grammar's `--flag=value`, which `tokenize` reads as an empty `--flag`
+    /// followed by a stray positional word.
+    #[error("--{flag} needs a value (write it as --{flag}=value)")]
     MissingFlagValue {
         /// The flag's name.
         flag: String,

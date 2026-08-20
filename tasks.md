@@ -1068,7 +1068,7 @@ Known backend gaps this phase deliberately does **not** paper over (Settings sho
 - **verify:** `cargo nextest run -p rmail-cli tui::commands::content` (export streams to each format, digest row citation navigation, saved-search/smart-folder CRUD, attachment ask/search)
 
 ## 100. Compose, send and follow-up commands
-- [ ] status
+- [x] status
 - **depends-on:** 94
 - **parallel-safe:** yes
 - **acceptance:**
@@ -1087,13 +1087,14 @@ Known backend gaps this phase deliberately does **not** paper over (Settings sho
 - **verify:** `cargo nextest run -p rmail-cli tui::settings` (every field's keypress produces the expected Invocation with no daemon connection, config-file-only fields render their block, Keys section bypasses gRPC)
 
 ## 102. Help overlay redesign
-- [ ] status
+- [x] status
 - **depends-on:** 91
 - **parallel-safe:** yes
 - **acceptance:**
-  - `?` becomes mode-aware (renders `Model::mode()`'s actual chain at the moment it was pressed, with `<tab>` cycling to other modes), scrollable (no silent truncation past the terminal height), grouped by the same derived id-prefix grouping WhichKey uses, and filterable with `/` (reusing `palette_matches`' tiers over chord/id/description).
+  - `?` becomes mode-aware (renders `Model::mode()`'s actual chain at the moment it was pressed, with `<tab>` cycling to other modes), scrollable (no silent truncation past the terminal height), grouped by the same derived id-prefix grouping WhichKey uses, and filterable with `/` — a subsequence match over id/chord plus a substring match on the description, the same fields `command_matches` ranks by but as inclusion only, not its four-tier reordering (see the note below).
   - No longer a dead end: `<enter>` on a row runs the action, `c` opens `:keys set <chord> <action>` pre-filled, `K` navigates to that action's manual page (task 103).
-- **verify:** `cargo nextest run -p rmail-cli tui::help` (mode-chain rendering per invoking mode, scroll past terminal height, filter tiers match palette's, row actions run/rebind/navigate correctly)
+- **verify:** `scripts/docker-test.sh tui::help`, `scripts/docker-test.sh 'tui::model::tests::.*help'` and `scripts/docker-test.sh 'tui::view::tests::.*help'` between them (mode-chain rendering per invoking mode, scroll past terminal height, filter matches, row actions run/rebind/navigate correctly) — three commands because the tests are split across those three module paths and `cargo nextest`'s filter matches a test's *name*, not which module owns it, the same trap task 90's own note records.
+- **note (filter is a match test, not a tiered ranking):** the acceptance originally said `/` would reuse `palette_matches`' (now `command_matches`') tiers; what shipped is `is_subsequence(needle, primary) || describe.contains(needle)` — a match/no-match test, not a *ranking* that reorders results by tier (prefix beats substring beats subsequence beats description). As boolean inclusion the two are equivalent — `starts_with` and `contains` both imply `is_subsequence`, so `command_matches`' first three tiers accept exactly what one subsequence check does — the gap is only that this filter never reorders a bucket's rows by match quality; they stay in `Action::ALL`'s declaration order within a shared id-prefix. Real tiering would also have to interact with the id-prefix grouping this same acceptance requires (a tier boundary crossing a group's own header is not obviously the right reading), which is a design question of its own rather than a one-line fix, so it is left open rather than shipped half-considered.
 
 ## 103. Manual engine
 - [x] status

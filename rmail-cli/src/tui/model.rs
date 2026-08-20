@@ -58,19 +58,21 @@ use rmail_core::command;
 use rmail_core::parity::Command as Capability;
 
 use super::commands::{self, Answer, Target};
+use super::help::{self, HelpPane};
 use super::history::History;
 use super::manual;
 use super::overlays;
 use super::overlays::{
     command_matches, complete_operator, AiSummary, AskPane, AskPhase, Browse, Citation,
     CommandPane, Explanation, FinderItem, FinderKind, FinderPane, Hit, OutboxPane, OutboxRow,
-    QuickAction, QuickPane, SearchFocus, SearchPane, Toast, UndoToast,
+    QuickAction, QuickPane, ReplyPane, SearchFocus, SearchPane, Toast, UndoToast,
 };
 use super::report::{self, ReportFill, ReportPane, ReportRow};
 use super::status::{Daemon, Health, Subsystem};
 use super::theme::Theme;
+use crate::keymap::file::{self as keys_file, keys_path_from_env};
 pub use crate::keymap::Key;
-use crate::keymap::{Action, Keymap, Mode, Pending, Resolution};
+use crate::keymap::{Action, Chord, Keymap, Mode, Pending, Resolution};
 
 /// The IMAP flag marking a message read.
 pub const SEEN: &str = "\\Seen";
@@ -484,8 +486,8 @@ pub enum InputFor {
 /// A modal layer drawn over the main screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
-    /// The `?` key binding reference.
-    Help,
+    /// The `?` key binding reference (task 102).
+    Help(Box<HelpPane>),
     /// Pick a destination folder.
     Pick {
         /// What the pick is for.
@@ -529,6 +531,8 @@ pub enum Overlay {
     Command(Box<CommandPane>),
     /// `A` — the ask pane.
     Ask(Box<AskPane>),
+    /// `:reply --ai` — the streamed-reply pane.
+    Reply(Box<ReplyPane>),
     /// `O` — the outbox pseudo-folder.
     Outbox(Box<OutboxPane>),
     /// `.` — the AI quick-action menu.
@@ -594,15 +598,21 @@ impl Overlay {
             Self::Outbox(pane) => (pane.cursor, pane.rows.len()),
             Self::Quick(pane) => (pane.cursor, QuickAction::ALL.len()),
             Self::Report(pane) => (pane.cursor, pane.rows.len()),
+            // Counts only `help::Row::Binding` entries — the group headers
+            // interspersed among them are not something a cursor can land
+            // on, so they must not be something its length counts either.
+            Self::Help(pane) => (pane.cursor, help::binding_count(pane)),
             // The command line is absent on purpose: its `<up>`/`<down>`
             // walk the history rather than a list, which is what `:` means
             // everywhere else it exists. Its ranked matches are a preview
             // with no cursor — `<tab>` is what puts one into the line.
-            Self::Help
-            | Self::Pick { .. }
+            // The reply pane is absent for the same reason the command line
+            // is: nothing in it is a list a cursor walks.
+            Self::Pick { .. }
             | Self::Confirm { .. }
             | Self::Input { .. }
-            | Self::Command(_) => return None,
+            | Self::Command(_)
+            | Self::Reply(_) => return None,
         })
     }
 
@@ -616,11 +626,12 @@ impl Overlay {
             Self::Outbox(pane) => pane.cursor = at,
             Self::Quick(pane) => pane.cursor = at,
             Self::Report(pane) => pane.cursor = at,
-            Self::Help
-            | Self::Pick { .. }
+            Self::Help(pane) => pane.cursor = at,
+            Self::Pick { .. }
             | Self::Confirm { .. }
             | Self::Input { .. }
-            | Self::Command(_) => {}
+            | Self::Command(_)
+            | Self::Reply(_) => {}
         }
     }
 }
@@ -686,6 +697,19 @@ pub enum Msg {
         /// What it did, or why it failed.
         result: Result<Effect, String>,
     },
+    /// [`Cmd::WriteKeybinding`] finished.
+    ///
+    /// Not a [`Msg::Done`]: that variant's [`Effect`] is a mail-side change
+    /// the model applies to its own rows, and a keybinding write is
+    /// neither — `model.keymap` is never touched here. A running `mail tui`
+    /// picks the edit up within a second through the same file-watch reload
+    /// path a `mail keys set` run from a second terminal already relies on.
+    KeysWritten {
+        /// What to say on success.
+        label: String,
+        /// The write's outcome.
+        result: Result<(), String>,
+    },
     /// The daemon's event log reported a change to the open folder. Carries
     /// no payload beyond "something changed" on purpose: the model re-reads
     /// local state rather than trying to patch rows from an event.
@@ -717,6 +741,13 @@ pub enum Msg {
         generation: u64,
         /// What arrived.
         event: AskEvent,
+    },
+    /// One frame of a `ComposeService.DraftReply` stream.
+    Reply {
+        /// Which reply it belongs to.
+        generation: u64,
+        /// What arrived.
+        event: ReplyEvent,
     },
     /// `SearchService.Explain` finished.
     Explained {
@@ -858,6 +889,31 @@ pub enum AskEvent {
         /// Why not, when it is not.
         refusal: String,
     },
+    /// The stream failed.
+    Failed(String),
+}
+
+/// What a `ComposeService.DraftReply` stream delivered.
+///
+/// The order is fixed by the proto: one context frame, then tokens, then the
+/// draft the daemon created from the finished prose, then done. See
+/// [`AskEvent`] for why a stream that ends with no done frame is reported as
+/// failed rather than treated as a complete answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyEvent {
+    /// What the drafter read before it wrote anything, pre-formatted.
+    Context(String),
+    /// A chunk of prose.
+    Token(String),
+    /// The draft the daemon created from the finished prose.
+    Drafted {
+        /// Its id.
+        draft_id: i64,
+        /// Its recipient(s), joined.
+        to: String,
+    },
+    /// The terminal frame.
+    Done,
     /// The stream failed.
     Failed(String),
 }
@@ -1008,6 +1064,36 @@ pub enum Cmd {
     SaveHistory {
         /// Every recorded line, oldest first.
         entries: Vec<String>,
+    },
+    /// Write one binding into `keys.toml` — `:keys set`'s (task 102)
+    /// blocking half.
+    ///
+    /// A [`Cmd`] rather than a write inside [`update`] for the reason
+    /// [`Cmd::SaveHistory`] is: `update` is pure, synchronous and clockless,
+    /// and `crate::keymap::file::write_atomic`'s `fsync` is none of those
+    /// things. Unlike history, a failed write here has to reach the person
+    /// who asked for it — there is no "the next line corrects it" — so this
+    /// one reports back through [`Msg::KeysWritten`] rather than only
+    /// logging.
+    ///
+    /// Not superseding (unlike most streamed work here): two of these in
+    /// flight at once run two independent read-edit-write cycles with no
+    /// lock between them, so the second's read can land before the first's
+    /// `rename`. `mail keys set` already carries the same exposure between
+    /// two terminals; this does not add to it, only widens who can trigger
+    /// it from inside one.
+    WriteKeybinding {
+        /// `keys.toml`'s path (env-overridable; see `keys_path_from_env`).
+        path: std::path::PathBuf,
+        /// Which mode's layer to bind in.
+        mode: Mode,
+        /// The chord to bind.
+        chord: Chord,
+        /// What it should run.
+        action: Action,
+        /// What to say on success; formatted before the write so a failure
+        /// can still explain what was attempted.
+        label: String,
     },
     /// Start the daemon heartbeat (task 92): poll `SyncService.Status`,
     /// `IndexService.Status`, `AiService.GetUsage` and
@@ -1256,6 +1342,193 @@ pub enum Cmd {
         /// What the answer should have been.
         expected: bool,
     },
+
+    // -- reply and drafts (task 100) -----------------------------------
+    /// `ComposeService.DraftReply` — a streamed reply, written from an
+    /// intent rather than typed by hand.
+    DraftReply {
+        /// Which reply this is.
+        generation: u64,
+        /// The message being replied to.
+        message_id: i64,
+        /// What the reply should say. May be empty.
+        intent: String,
+        /// Address everyone the parent addressed, not only its author.
+        reply_all: bool,
+    },
+    /// `ComposeService.ListDrafts` — the `:draft list` report.
+    DraftList {
+        /// Which report this is.
+        generation: u64,
+        /// Whose drafts.
+        account_id: i64,
+    },
+    /// `ComposeService.GetDraft` — the `:draft show` report.
+    DraftShow {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+    },
+    /// `ComposeService.UpdateDraft` — replace a draft's body.
+    DraftEdit {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+        /// Its new body.
+        body: String,
+    },
+    /// `ComposeService.DeleteDraft`.
+    DraftDelete {
+        /// Which draft.
+        draft_id: i64,
+    },
+    /// `ComposeService.RenderDraft` — what a draft renders to, unsent.
+    DraftRender {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+    },
+    /// `ComposeService.RewriteDraft`.
+    DraftRewrite {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+        /// The register to aim for, as typed. Validated by the daemon, not
+        /// here.
+        tone: Option<String>,
+        /// Aim shorter.
+        shorter: bool,
+        /// Aim longer.
+        longer: bool,
+        /// What to change, in the caller's own words.
+        instruction: String,
+    },
+    /// `ComposeService.ListDraftRevisions`.
+    DraftRevisions {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+    },
+    /// `ComposeService.SelectDraftRevision` — restore an earlier revision.
+    DraftRevert {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+        /// Which revision, 0 for the original text.
+        seq: i64,
+    },
+
+    // -- send and the outbox (task 100) ---------------------------------
+    /// `SendSchedulerService.ScheduleSend`. The same "mutate, then re-list,
+    /// then one [`Msg::Outbox`]" template [`Cmd::CancelSend`] uses, so
+    /// scheduling a send (re-)arms the undo toast exactly as cancelling one
+    /// does — the moment right after this succeeds is the moment "undo"
+    /// matters most.
+    ScheduleSend {
+        /// Whose draft.
+        account_id: i64,
+        /// The draft to send.
+        draft_id: i64,
+        /// A time expression, resolved daemon-side. Empty sends now (subject
+        /// to the account's undo window).
+        at: String,
+        /// An undo-window override, seconds. `None` uses the account default.
+        undo: Option<i64>,
+    },
+    /// `SendSchedulerService.RetryFailed`. Same template as
+    /// [`Cmd::ScheduleSend`].
+    RetryFailed {
+        /// Which entry.
+        outbox_id: i64,
+    },
+    /// `SendSchedulerService.RescheduleSend`. Same template as
+    /// [`Cmd::ScheduleSend`].
+    RescheduleSend {
+        /// Which entry.
+        outbox_id: i64,
+        /// A time expression, resolved daemon-side.
+        at: String,
+    },
+    /// `SendSchedulerService.UpdateScheduledBody`. Same template as
+    /// [`Cmd::ScheduleSend`].
+    UpdateScheduledBody {
+        /// Which entry.
+        outbox_id: i64,
+        /// Its new body.
+        body: String,
+    },
+    /// `SendSchedulerService.SendNow`. Same template as [`Cmd::ScheduleSend`].
+    SendNow {
+        /// Which entry.
+        outbox_id: i64,
+    },
+    /// `SendSchedulerService.SuggestSendTime` — the `:outbox suggest` report.
+    SuggestSendTime {
+        /// Which report this is.
+        generation: u64,
+        /// Whose outbox.
+        account_id: i64,
+    },
+
+    // -- follow-ups and the pre-send guardian (task 100) -----------------
+    /// `SendSchedulerService.ListFollowups` — the `:followup list` report.
+    FollowupList {
+        /// Which report this is.
+        generation: u64,
+        /// Whose follow-ups.
+        account_id: i64,
+    },
+    /// `SendSchedulerService.CreateFollowup`. Resolves `message_id`'s RFC
+    /// 5322 Message-ID via `MailService.Get` first — the request wants the
+    /// header the server knows the message by, and a row id is all a `:`
+    /// line can name.
+    FollowupNew {
+        /// The local message to follow up.
+        message_id: i64,
+        /// A time expression, or empty for `send.followup.default_delay`.
+        remind_in: String,
+        /// A note to carry on the reminder.
+        note: String,
+    },
+    /// `SendSchedulerService.DismissFollowup`.
+    FollowupDismiss {
+        /// Which follow-up.
+        id: i64,
+    },
+    /// `SendSchedulerService.ListWaitingOn` — the `:waiting` report.
+    Waiting {
+        /// Which report this is.
+        generation: u64,
+        /// Whose follow-ups.
+        account_id: i64,
+        /// Only entries already past their `remind_at`.
+        overdue: bool,
+    },
+    /// `SendSchedulerService.DraftNudge` — a drafted chase message. Sends
+    /// nothing; the daemon only writes the words.
+    DraftNudge {
+        /// Which report this is.
+        generation: u64,
+        /// The waiting-on entry to chase.
+        id: i64,
+    },
+    /// `SendSchedulerService.PreflightCheck` — the `:preflight` report.
+    PreflightCheck {
+        /// Which report this is.
+        generation: u64,
+        /// Whose draft — `PreflightCheckRequest.account_id` is required even
+        /// when `draft_id` is set.
+        account_id: i64,
+        /// The draft to check.
+        draft_id: i64,
+    },
+
     /// Stop a stream nobody is reading any more.
     ///
     /// Leaving an overlay is the one case the generation stamp does not
@@ -1282,6 +1555,8 @@ pub enum Stream {
     /// `SearchService.Explain` — superseded per cursor row, so it is a stream
     /// slot even though the RPC itself is unary.
     Explain,
+    /// `ComposeService.DraftReply`.
+    Reply,
     /// Whatever is feeding the Report overlay (task 90).
     ///
     /// One slot for every reporting verb rather than one per verb: only one
@@ -1544,21 +1819,24 @@ impl Model {
     #[must_use]
     pub fn mode(&self) -> Mode {
         match &self.overlay {
-            Some(Overlay::Help) => Mode::Help,
             Some(Overlay::Pick { .. }) => Mode::Pick,
             Some(Overlay::Confirm { .. }) => Mode::Confirm,
             Some(Overlay::Input { .. }) => Mode::Insert,
-            // The two overlays that change mode part-way through: search
-            // starts on the query line and moves to its results, ask starts
-            // on the question and moves to the answer. Deriving the mode from
-            // that state rather than storing it is what stops a pane from
-            // being in one mode while it draws the other.
+            // The overlays that change mode part-way through: search starts
+            // on the query line and moves to its results, ask starts on the
+            // question and moves to the answer, help starts browsing and
+            // moves to its filter line on `/`. Deriving the mode from that
+            // state rather than storing it is what stops a pane from being
+            // in one mode while it draws the other.
             Some(Overlay::Search(pane)) if pane.typing() => Mode::Prompt,
             Some(Overlay::Ask(pane)) if pane.typing() => Mode::Prompt,
+            Some(Overlay::Help(pane)) if pane.editing => Mode::Prompt,
+            Some(Overlay::Help(_)) => Mode::Help,
             Some(Overlay::Finder(_) | Overlay::Command(_)) => Mode::Prompt,
             Some(
                 Overlay::Search(_)
                 | Overlay::Ask(_)
+                | Overlay::Reply(_)
                 | Overlay::Outbox(_)
                 | Overlay::Quick(_)
                 | Overlay::Report(_),
@@ -1877,6 +2155,16 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 }
             }
         }
+        Msg::KeysWritten { label, result } => {
+            model.inflight = model.inflight.saturating_sub(1);
+            match result {
+                Ok(()) => model.info(format!(
+                    "{label} — picked up within a second, nothing to restart"
+                )),
+                Err(error) => model.fail(format!("{label}: {error}")),
+            }
+            Vec::new()
+        }
         Msg::LiveUpdatesStopped(why) => {
             model.fail(format!(
                 "live updates stopped ({why}) — the list is no longer refreshing itself"
@@ -1891,6 +2179,14 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                     // bindings; carrying it over would resolve a chord the
                     // user never started.
                     model.pending.clear();
+                    // The key reference's own rows are cached (`help.rs`'s
+                    // module docs explain why), and a cache the reload path
+                    // forgot to invalidate is exactly the staleness this
+                    // whole feature exists to rule out — the point of
+                    // generating the list from the live keymap is lost if
+                    // "live" stops being true the moment the overlay that
+                    // shows it is actually open.
+                    reload_help(model);
                     if announce {
                         model.info("key bindings reloaded");
                     }
@@ -2000,6 +2296,36 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             // draft", and two of them would make which one it meant depend on
             // the order two reports happened to answer in.
             model.rule_draft = Some(toml);
+            Vec::new()
+        }
+        Msg::Reply { generation, event } => {
+            let mut note = None;
+            if let Some(Overlay::Reply(pane)) = model.overlay.as_mut() {
+                if generation == pane.generation {
+                    match event {
+                        ReplyEvent::Context(context) => pane.context = Some(context),
+                        ReplyEvent::Token(token) => pane.push_token(generation, &token),
+                        ReplyEvent::Drafted { draft_id, to } => {
+                            pane.drafted = Some((draft_id, to));
+                        }
+                        ReplyEvent::Done => {
+                            pane.done = true;
+                            note = Some(Ok(match &pane.drafted {
+                                Some((id, to)) => format!(
+                                    "draft {id} created for {to} — `mail draft rewrite {id}` to adjust, :send --draft={id} to schedule"
+                                ),
+                                None => "drafted, but the daemon named no draft — check `:draft list`".to_owned(),
+                            }));
+                        }
+                        ReplyEvent::Failed(error) => {
+                            pane.done = true;
+                            pane.error = Some(error.clone());
+                            note = Some(Err(format!("reply: {error}")));
+                        }
+                    }
+                }
+            }
+            apply_note(model, note);
             Vec::new()
         }
         Msg::Daemon { subsystem, result } => {
@@ -2436,6 +2762,8 @@ enum Typed {
     Finder,
     /// The `:` command line.
     Command,
+    /// The key reference's filter (task 102).
+    HelpFilter,
 }
 
 /// Apply `edit` to whichever text field is up, and issue whatever the change
@@ -2478,6 +2806,9 @@ fn edit_prompt(model: &mut Model, edit: TextEdit) -> Vec<Cmd> {
             apply_edit(&mut pane.question, edit);
             Typed::Nothing
         }
+        Some(Overlay::Help(pane)) if pane.editing => {
+            once(apply_edit(&mut pane.filter, edit), Typed::HelpFilter)
+        }
         _ => Typed::Nothing,
     };
     match typed {
@@ -2489,6 +2820,10 @@ fn edit_prompt(model: &mut Model, edit: TextEdit) -> Vec<Cmd> {
         Typed::Finder => find_now(model),
         Typed::Command => {
             refresh_command(model);
+            Vec::new()
+        }
+        Typed::HelpFilter => {
+            refresh_help(model);
             Vec::new()
         }
     }
@@ -2545,10 +2880,8 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
             model.quit = true;
             Vec::new()
         }
-        Action::Help => {
-            model.overlay = Some(Overlay::Help);
-            Vec::new()
-        }
+        Action::Help => open_help(model),
+        Action::HelpRebind => open_help_rebind(model),
         Action::ManualOpen => open_manual(model),
         Action::ManualBack => manual_jump(model, Jump::Back),
         Action::ManualForward => manual_jump(model, Jump::Forward),
@@ -2640,8 +2973,10 @@ fn active_cursor(model: &Model) -> Option<Cursor> {
     match &model.overlay {
         Some(Overlay::Pick { .. }) => Some(Cursor::Pick),
         Some(overlay) if overlay.list_cursor().is_some() => Some(Cursor::Overlay),
-        // A confirm, a prompt or the help screen has nothing to scroll, and
-        // must not scroll what is behind it.
+        // A confirm or a prompt has nothing to scroll, and must not scroll
+        // what is behind it. The help screen used to land here too, before
+        // task 102 gave it a row cursor of its own — `list_cursor()` now
+        // answers `Some` for it, so it is caught by the arm above instead.
         Some(_) => None,
         None => match model.screen {
             Screen::Viewer => Some(Cursor::Scroll),
@@ -2808,8 +3143,14 @@ enum Leave {
 fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
     if let Some(overlay) = model.overlay.take() {
         // The help screen was not collecting anything, so "cancelled" would
-        // be a lie; the others were.
-        if !matches!(overlay, Overlay::Help) {
+        // be a lie; the others were. Half true since task 102: browsing it
+        // still collects nothing, but a half-typed filter is exactly the
+        // thing every other typing surface here calls cancelled.
+        let collecting = match &overlay {
+            Overlay::Help(pane) => pane.editing,
+            _ => true,
+        };
+        if collecting {
             model.info("cancelled");
         }
         let stop = cancels(&overlay);
@@ -2883,8 +3224,9 @@ fn streams_of(overlay: &Overlay) -> &'static [Stream] {
         Overlay::Search(_) => &[Stream::Search, Stream::Explain],
         Overlay::Finder(_) => &[Stream::Find],
         Overlay::Ask(_) => &[Stream::Ask],
+        Overlay::Reply(_) => &[Stream::Reply],
         Overlay::Report(_) => &[Stream::Report],
-        Overlay::Help
+        Overlay::Help(_)
         | Overlay::Pick { .. }
         | Overlay::Confirm { .. }
         | Overlay::Input { .. }
@@ -3251,6 +3593,39 @@ fn pick(model: &mut Model, what: PickFor) -> Vec<Cmd> {
     Vec::new()
 }
 
+/// `:reply --ai [intent]`: open the streaming reply pane and start it.
+///
+/// Not counted into [`Model::inflight`], for the reason [`ask_now`] is not:
+/// the pane's own "drafting…" state is what says this is running, the same
+/// way a superseded search's own state is.
+fn start_ai_reply(model: &mut Model, intent: String, reply_all: bool) -> Vec<Cmd> {
+    // `single_target`, not `target_message`, and closed first regardless of
+    // which way this goes: `reply(model)` is what bare `:reply` calls, and it
+    // is `single_target` that refuses a visual selection ("that acts on one
+    // message") rather than silently drafting from the row under the cursor.
+    // Two rules for what "the target" means on the same verb, one gated on a
+    // flag, would be a `--ai` that quietly acts on different mail than the
+    // line without it names.
+    close_command(model);
+    let Some(message_id) = single_target(model) else {
+        return Vec::new();
+    };
+    model.generation += 1;
+    let generation = model.generation;
+    model.overlay = Some(Overlay::Reply(Box::new(ReplyPane {
+        message_id,
+        generation,
+        ..ReplyPane::default()
+    })));
+    model.info("reply — drafting…");
+    vec![Cmd::DraftReply {
+        generation,
+        message_id,
+        intent,
+        reply_all,
+    }]
+}
+
 fn reply(model: &mut Model) -> Vec<Cmd> {
     let Some(id) = single_target(model) else {
         return Vec::new();
@@ -3319,11 +3694,178 @@ fn open_html(model: &mut Model) -> Vec<Cmd> {
 }
 
 // ---------------------------------------------------------------------------
+// the key reference (task 102)
+// ---------------------------------------------------------------------------
+
+/// `?` — the key reference, at whichever mode is current.
+fn open_help(model: &mut Model) -> Vec<Cmd> {
+    let mode = model.mode();
+    model.overlay = Some(Overlay::Help(Box::new(HelpPane::new(mode, &model.keymap))));
+    Vec::new()
+}
+
+/// Recompute the key reference's rows after its mode or filter changes, and
+/// reset the cursor to the top of the new set.
+///
+/// The two-step borrow `refresh_command` also uses: [`help::rows`] wants
+/// `&Keymap` and the pane's own `mode`/`filter` at once, which a single
+/// `model.overlay.as_mut()` cannot offer alongside `&model.keymap` borrowed
+/// at the same time.
+fn refresh_help(model: &mut Model) {
+    let Some(Overlay::Help(pane)) = model.overlay.as_ref() else {
+        return;
+    };
+    let rows = help::rows(pane.mode, &pane.filter, &model.keymap);
+    if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+        pane.rows = rows;
+        // Reset rather than clamped: a mode switch or a filter edit changes
+        // *what* is at every index, not just how many, so whatever survived
+        // at the old cursor position is unlikely to be the row somebody
+        // meant to still be looking at.
+        pane.cursor = 0;
+    }
+}
+
+/// Recompute the key reference's rows after `keys.toml` reloads underneath
+/// it, clamping the cursor rather than resetting it.
+///
+/// Not [`refresh_help`]: a mode switch or a filter edit is the *person
+/// looking at this screen* asking for a different list, where jumping to
+/// the top is the right answer for a set of rows that is now about
+/// something else entirely. A `keys.toml` reload is not that — it can land
+/// at any moment mid-browse, was not asked for by whoever is looking at
+/// this overlay, and typically changes at most one row. Resetting to the
+/// top on every one of those would make browsing the key reference while
+/// rebinding things from a second terminal (this very overlay's own `c`
+/// row action, run from *this* terminal, reloads the same way) actively
+/// hostile. The cursor's *index* survives, not necessarily the row at
+/// it — a reload that removes a binding above it shifts a different action
+/// underneath, the same trade every other list here makes — and if the
+/// list shrank past the old index, it clamps to the new last row.
+fn reload_help(model: &mut Model) {
+    let Some(Overlay::Help(pane)) = model.overlay.as_ref() else {
+        return;
+    };
+    let rows = help::rows(pane.mode, &pane.filter, &model.keymap);
+    if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+        pane.rows = rows;
+        let count = help::binding_count(pane);
+        pane.cursor = pane.cursor.min(count.saturating_sub(1));
+    }
+}
+
+/// `<tab>`/`<c-i>` (forward) and `<c-o>` (back) on the key reference: cycle
+/// which mode's chain it shows, wrapping through every configurable mode.
+///
+/// The same two direction bindings the manual's jump list uses in this
+/// layer, made context-sensitive here rather than given bindings of their
+/// own — the collision `keymap::mod`'s defaults document, and the same
+/// answer `open_search` already gives the sibling collision on `/`.
+fn cycle_help_mode(model: &mut Model, jump: Jump) -> Vec<Cmd> {
+    let Some(Overlay::Help(pane)) = model.overlay.as_mut() else {
+        return Vec::new();
+    };
+    let modes = Mode::CONFIGURABLE;
+    let Some(idx) = modes.iter().position(|candidate| *candidate == pane.mode) else {
+        return Vec::new();
+    };
+    pane.mode = match jump {
+        Jump::Forward => modes[(idx + 1) % modes.len()],
+        Jump::Back => modes[(idx + modes.len() - 1) % modes.len()],
+    };
+    refresh_help(model);
+    Vec::new()
+}
+
+/// `c` on the key reference: open a rebind for the highlighted row, the
+/// command line pre-filled with `keys set <chord> <action>`.
+///
+/// The mode flag is only spelled out when it would change anything: `keys
+/// set`'s own default is `normal`, so a row from that mode's own chain does
+/// not need `--mode normal` to say what is already true.
+fn open_help_rebind(model: &mut Model) -> Vec<Cmd> {
+    let Some(Overlay::Help(pane)) = model.overlay.as_ref() else {
+        return Vec::new();
+    };
+    let Some(action) = help::selected(pane) else {
+        model.fail("nothing highlighted to rebind");
+        return Vec::new();
+    };
+    let mode = pane.mode;
+    let Some(chord) = model.keymap.chords_for(mode, action).into_iter().next() else {
+        return Vec::new();
+    };
+    // `chords_for` walks `mode`'s whole chain, so the chord it found can
+    // live in a farther layer than the one being browsed — most rows do,
+    // since a mode's own key reference mostly shows what it *inherits*.
+    // Rebinding has to target the layer that actually owns the binding, not
+    // the layer being looked at: prefilling the browsed mode would not
+    // replace anything, only add a shadow next to a binding still live
+    // everywhere that layer is inherited.
+    let Some(owner) = owning_mode(&model.keymap, mode, action, &chord) else {
+        return Vec::new();
+    };
+    if !Mode::CONFIGURABLE.contains(&owner) {
+        // Global's two bindings are the way out from every mode and are
+        // deliberately not rebindable (`DEFAULTS`'s own comment). Failing
+        // here says why, instead of opening a command line that
+        // `keys_file::edit`'s reserved-chord check would refuse anyway.
+        model.fail(format!(
+            "{} is bound in every mode and cannot be rebound",
+            action.id()
+        ));
+        return Vec::new();
+    }
+    let mode_flag = if owner == Mode::Normal {
+        String::new()
+    } else {
+        // `=`-joined: `command::tokenize` only recognizes `--name=value` as
+        // a value-carrying flag — `--mode help` (space separated) tokenizes
+        // as an empty `--mode` flag followed by a stray `help` word, which
+        // `check_flags` refuses as `MissingFlagValue`. Caught by
+        // `every_colon_line_an_authored_page_shows_parses_and_uses_an_honoured_range`
+        // against the manual's own `:keys set --mode viewer …` example
+        // before it ever reached this line's own behavior.
+        format!(" --mode={}", owner.id())
+    };
+    let input = format!("keys set {chord} {}{mode_flag}", action.id());
+    model.overlay = Some(Overlay::Command(Box::new(CommandPane {
+        input,
+        ..CommandPane::default()
+    })));
+    refresh_command(model);
+    model.info("rebind — edit and press Enter, or Esc to cancel");
+    Vec::new()
+}
+
+/// Which mode in `browsing`'s chain actually binds `chord` to `action` in
+/// its own layer, as opposed to inheriting it from farther out.
+///
+/// [`Keymap::chords_for`] walks the same chain but only answers "does a
+/// chord reach `browsing`", not "which layer declared it" — the second
+/// question is what [`open_help_rebind`] needs, since editing the layer
+/// that is merely on screen would shadow an inherited binding rather than
+/// replace it.
+fn owning_mode(keymap: &Keymap, browsing: Mode, action: Action, chord: &Chord) -> Option<Mode> {
+    browsing
+        .chain()
+        .iter()
+        .copied()
+        .find(|&layer| keymap.layer(layer).any(|(c, a)| c == chord && a == action))
+}
+
+// ---------------------------------------------------------------------------
 // the manual (task 103)
 // ---------------------------------------------------------------------------
 
-/// `K` — the manual, at its front page.
+/// `K` — the manual, at its front page, or — from the key reference (task
+/// 102) — at the page documenting the highlighted row.
 fn open_manual(model: &mut Model) -> Vec<Cmd> {
+    if let Some(Overlay::Help(pane)) = model.overlay.as_ref() {
+        if let Some(action) = help::selected(pane) {
+            return open_manual_at(model, action.id());
+        }
+    }
     open_manual_at(model, manual::START)
 }
 
@@ -3417,6 +3959,13 @@ fn announce_manual(model: &mut Model) {
 
 /// `<c-o>` / `<c-i>`.
 fn manual_jump(model: &mut Model, jump: Jump) -> Vec<Cmd> {
+    // The key reference's own mode-cycling, task 102: `<tab>`/`<c-i>` and
+    // `<c-o>` are this layer's manual-jump bindings, made context-sensitive
+    // here rather than given a binding of their own — the same collision
+    // `open_search` already resolves for the sibling `/`.
+    if matches!(model.overlay, Some(Overlay::Help(_))) {
+        return cycle_help_mode(model, jump);
+    }
     let Some(manual) = model.manual.as_mut() else {
         return Vec::new();
     };
@@ -3664,6 +4213,15 @@ fn open_search(model: &mut Model) -> Vec<Cmd> {
     // there would cover the text it was pressed to search.
     if model.screen == Screen::Manual && model.overlay.is_none() {
         return prompt_manual(model, Scope::Page);
+    }
+    // The key reference's own rows, task 102: `/` starts a live filter over
+    // them rather than opening a second overlay on top. Silent on the status
+    // line like every other key this overlay's own cursor and mode-cycling
+    // already answer — a hint on every press of `/`, `<tab>` or `j` would be
+    // noise none of Help's other in-place moves write either.
+    if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+        pane.editing = true;
+        return Vec::new();
     }
     if let Some(Overlay::Search(pane)) = model.overlay.as_mut() {
         pane.focus = SearchFocus::Query;
@@ -4071,6 +4629,58 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         };
         return set_option(model, option, value);
     }
+    if verb == "keys set" {
+        // Same rule as `set` just above: left open on a bad chord/action/mode
+        // (`complain` writes into the command pane's own error line) and
+        // only closed once the write has actually landed. A hand-written
+        // case rather than the generic too-many-arguments check just below,
+        // for the same reason `set` is: both positionals are declared
+        // optional so this custom "needs two arguments" message can fire,
+        // and neither `run_action` nor `open_report` know how to edit a
+        // file.
+        let [chord, action] = invocation.positionals.as_slice() else {
+            return complain(
+                model,
+                "keys set needs two arguments: a chord and an action".to_owned(),
+            );
+        };
+        let mode = invocation
+            .flags
+            .iter()
+            .find(|flag| flag.name == "mode")
+            .and_then(|flag| flag.value.as_deref())
+            .unwrap_or("normal");
+        return set_keybinding(model, &keys_path_from_env(), mode, chord, action);
+    }
+    if verb == "reply" {
+        // Hand-written for the reason `set`/`keys set` are: `--ai` branches
+        // between two things an `Action` cannot carry — delegating to the
+        // plain reply flow `r` already runs, or opening a new streaming
+        // pane — so this has to decide before the generic daemon-verb
+        // routing below ever sees it, the same way `keys set`'s `--mode`
+        // is read before the generic flag check would refuse it as
+        // "not wired up yet".
+        let ai = invocation.flags.iter().any(|flag| flag.name == "ai");
+        let reply_all = invocation.flags.iter().any(|flag| flag.name == "reply-all");
+        // Joined rather than `positionals.first()`, for the reason
+        // `helpgrep`'s `pattern` is: an unquoted multi-word intent is what
+        // somebody types.
+        let intent = invocation.positionals.join(" ");
+        if !ai {
+            if reply_all {
+                return complain(model, "--reply-all needs --ai".to_owned());
+            }
+            if !intent.is_empty() {
+                return complain(
+                    model,
+                    "an intent needs --ai — try `:reply --ai ...`".to_owned(),
+                );
+            }
+            close_command(model);
+            return reply(model);
+        }
+        return start_ai_reply(model, intent, reply_all);
+    }
     // More arguments than the verb declares. Derived from the registry rather
     // than "action-backed verbs take none", which is what this was before task
     // 94 declared verbs that take one: `command::parse` collects trailing words
@@ -4102,20 +4712,23 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
             },
         );
     }
-    if let Some(flag) = invocation.flags.first() {
-        // Defence, not a path anything reaches today: `command::parse`
-        // rejects a flag no verb declares, and no verb declares one. Worded
-        // for the case that *would* arrive first — a declared flag this
-        // dispatch has not learned — rather than claiming the verb has no
-        // such flag, which by then would be false.
-        return complain(model, format!("{verb} --{}: not wired up yet", flag.name));
-    }
     // The daemon verbs, after the argument guards rather than before them: these
     // reach a capability with no `Action` behind them, so there is nothing to
-    // delegate to — and a flag none of them declares has to be refused rather
-    // than silently dropped on the way past.
+    // delegate to. Before the generic flag check just below: task 100's daemon
+    // verbs are the first to declare flags of their own (`draft edit --body`,
+    // `outbox reschedule --at`, `waiting --overdue`...), and `commands::answer`
+    // is what reads them — the same way `keys set`'s hand-written `--mode` is
+    // read above, before that check would otherwise refuse it as unwired.
     if invocation.action.is_none() && invocation.capability.is_some() {
         return run_daemon_command(model, invocation);
+    }
+    if let Some(flag) = invocation.flags.first() {
+        // Reachable now only by an action-backed verb given a flag it did not
+        // declare — `command::parse` already rejects a flag no verb declares
+        // at all, so this is a verb that takes none refusing the one case
+        // that gets this far: a flag *declared* on a verb with no daemon
+        // command and no hand-written case above to read it.
+        return complain(model, format!("{verb} --{}: not wired up yet", flag.name));
     }
     let Some(action) = invocation.action else {
         return complain(model, format!("{verb} is not something this TUI runs"));
@@ -4191,6 +4804,96 @@ fn set_option(model: &mut Model, option: &str, value: &str) -> Vec<Cmd> {
     close_command(model);
     model.info(format!("{option} set to {pct}"));
     Vec::new()
+}
+
+/// `:keys set <chord> <action> [--mode <mode>]` (task 102) — `keys.toml`'s
+/// TUI-side counterpart to `mail keys set`, and the verb the key
+/// reference's `c` row action pre-fills.
+///
+/// Edits the file directly rather than going through the daemon: a key
+/// binding is a property of the terminal in front of whoever is pressing
+/// keys, not of the mailbox, the same reason `mail keys set` is a local file
+/// edit and not an RPC (`keys_cli`'s own module docs). `model.keymap` itself
+/// is not touched here — a running `mail tui` re-reads `keys.toml` within a
+/// second and swaps its bindings live, the same reload path a
+/// `mail keys set` run from a second terminal already relies on.
+///
+/// Only validates and dispatches [`Cmd::WriteKeybinding`]; [`write_keybinding`]
+/// does the actual read/edit/write, off this function and off [`update`],
+/// for the reason that command's own doc gives.
+///
+/// Takes `path` as a parameter rather than resolving `$RMAIL_KEYS` itself,
+/// the same split `keys_cli::set` keeps between "which file" and "edit this
+/// file" — `$RMAIL_KEYS` is process-global and `tests` runs alongside
+/// everything else in this test binary, so the boundary that reads it stays
+/// at the caller.
+fn set_keybinding(
+    model: &mut Model,
+    path: &std::path::Path,
+    mode: &str,
+    chord: &str,
+    action: &str,
+) -> Vec<Cmd> {
+    let Some(mode) = Mode::from_id(mode) else {
+        return complain(model, format!("unknown mode: {mode}"));
+    };
+    let chord = match Chord::parse(chord) {
+        Ok(chord) => chord,
+        Err(error) => return complain(model, error.to_string()),
+    };
+    let Some(action) = Action::from_id(action) else {
+        return complain(model, format!("unknown action: {action}"));
+    };
+
+    let label = format!(
+        "bound {chord} to {} in {} mode ({})",
+        action.id(),
+        mode.id(),
+        path.display()
+    );
+    close_command(model);
+    model.inflight += 1;
+    vec![Cmd::WriteKeybinding {
+        path: path.to_path_buf(),
+        mode,
+        chord,
+        action,
+        label,
+    }]
+}
+
+/// The blocking half of [`Cmd::WriteKeybinding`]: read `keys.toml` (or
+/// treat it as empty if absent — the normal first-run state, the same
+/// reading `keys_cli::set` gives it), edit in the one binding, and write it
+/// back. `crate::keymap::file` is the one place the edit itself is
+/// implemented; this calls it rather than growing a second copy.
+///
+/// `keys_file::read_bounded` rather than `std::fs::read_to_string`: this
+/// runs on a blocking-pool thread behind [`Model::inflight`], which nothing
+/// but [`Msg::KeysWritten`] arriving ever releases — a path that never
+/// reaches EOF (a device file, a fifo someone pointed `$RMAIL_KEYS` at)
+/// would hang the read forever and strand the counter with it. See
+/// `read_bounded`'s own doc for why `keys_cli::set`, a short-lived CLI
+/// process, does not need the same guard.
+///
+/// # Errors
+///
+/// A human-readable reason the read, the edit or the write failed.
+pub fn write_keybinding(
+    path: &std::path::Path,
+    mode: Mode,
+    chord: &Chord,
+    action: Action,
+) -> Result<(), String> {
+    let existing = match keys_file::read_bounded(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let updated =
+        keys_file::edit(&existing, mode, chord, Some(action)).map_err(|error| error.to_string())?;
+    keys_file::write_atomic(path, &updated)
+        .map_err(|error| format!("writing {}: {error}", path.display()))
 }
 
 /// `pct`, and its counterpart `other` (the other of `folder-width`/
@@ -4737,9 +5440,12 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Row(Box<command::Invocation>),
         /// The row under the cursor is a manual link.
         ManualLink,
+        /// The highlighted key reference row (task 102).
+        Run(Action),
         /// There is no row cursor here, so "use the highlighted row" is
-        /// "close this" — which is what `<enter>` has meant on the `?`
-        /// overlay since task 83.
+        /// "close this" — what `<enter>` meant on the whole `?` overlay
+        /// through task 102, and still means when nothing is highlighted
+        /// (an empty filter's match set, or the manual sharing this layer).
         Close,
         Nothing,
     }
@@ -4758,10 +5464,7 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
             .map_or(Chosen::Nothing, |invocation| {
                 Chosen::Row(Box::new(invocation))
             }),
-        // Task 102 gives the key reference a row cursor of its own; until it
-        // does, `<enter>` there closes it, exactly as before this action was
-        // bound to that key.
-        Some(Overlay::Help) => Chosen::Close,
+        Some(Overlay::Help(pane)) => help::selected(pane).map_or(Chosen::Close, Chosen::Run),
         None if model.screen == Screen::Manual => Chosen::ManualLink,
         _ => Chosen::Nothing,
     };
@@ -4771,6 +5474,16 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Chosen::Quick(action) => run_quick(model, action),
         Chosen::Row(invocation) => run_report_row(model, *invocation),
         Chosen::ManualLink => follow_manual_link(model),
+        // Not `run_named` for this one action: `open_help_rebind` reads the
+        // key reference's own `pane` (the highlighted action, and which
+        // mode it is bound in) to build the line it pre-fills, and
+        // `run_named`'s whole point is to close the triggering overlay
+        // *before* the action runs — which for every other action is
+        // exactly right (it should see the screen it is about to reveal,
+        // not the overlay asking it to run), but here would mean this
+        // action finds the overlay it needs already gone.
+        Chosen::Run(Action::HelpRebind) => open_help_rebind(model),
+        Chosen::Run(action) => run_named(model, action),
         Chosen::Close => leave(model, Leave::ThenNothing),
         Chosen::Nothing => Vec::new(),
     }
@@ -4818,6 +5531,9 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         Finder,
         Command,
         AskQuestion,
+        /// The key reference's filter (task 102) — `<enter>` stops editing
+        /// it and returns to browsing the (already live-filtered) rows.
+        HelpFilterDone,
         Nothing,
     }
     // The manual's search line first, and unconditionally: it is the only
@@ -4835,6 +5551,7 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         Some(Overlay::Finder(_)) => Which::Finder,
         Some(Overlay::Command(_)) => Which::Command,
         Some(Overlay::Ask(pane)) if pane.typing() => Which::AskQuestion,
+        Some(Overlay::Help(pane)) if pane.editing => Which::HelpFilterDone,
         _ => Which::Nothing,
     };
     match which {
@@ -4843,6 +5560,12 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         Which::Finder => activate_finder(model),
         Which::Command => submit_command(model),
         Which::AskQuestion => ask_now(model),
+        Which::HelpFilterDone => {
+            if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+                pane.editing = false;
+            }
+            Vec::new()
+        }
     }
 }
 

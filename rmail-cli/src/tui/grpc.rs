@@ -57,18 +57,23 @@ use rmail_proto::v1::send_scheduler_service_client::SendSchedulerServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::tag_service_client::TagServiceClient;
 use rmail_proto::v1::{
-    analyze_event, ask_chunk, bulk_tag_request, target, AddTagRequest, AnalyzeMessageRequest,
-    AskRequest, AuthStatusRequest, BacktestRuleRequest, BulkTagRequest, CancelRequest,
-    ClearPasswordRequest, CopyRequest, CreateRuleRequest, CreateTagRequest, DeleteRequest,
+    analyze_event, ask_chunk, bulk_tag_request, draft_reply_event, target, AddTagRequest,
+    AnalyzeMessageRequest, AskRequest, AuthStatusRequest, BacktestRuleRequest, BulkTagRequest,
+    CancelRequest, ClearPasswordRequest, CopyRequest, CreateFollowupRequest, CreateRuleRequest,
+    CreateTagRequest, DeleteDraftRequest, DeleteRequest, DraftNudgeRequest, DraftReplyRequest,
     EvaluateRulesRequest, EventKind, ExplainRequest, FindRequest, FinderRebuildRequest,
-    FinderStatusRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest, GetUsageRequest,
-    IndexGcRequest, IndexProgress, IndexStatusRequest, ListAccountsRequest, ListEntitiesRequest,
-    ListMessagesRequest, ListOutboxRequest, ListRulesRequest, ListTagRulesRequest, ListTagsRequest,
-    MoveRequest, PauseRequest, RebuildRequest, RecordCorrectionRequest, ReindexMode,
-    ReindexRequest, RemoveTagRequest, ResolveSuggestionRequest, ResumeRequest, RetryFailedRequest,
-    SearchRequest, SetFlagsRequest, SetIndexPausedRequest, SetPausedRequest, SetTagRuleRequest,
-    SuggestReplyRequest, SuggestTagsRequest, SyncFolderRequest, SyncMode, SyncStatusRequest,
-    SynthesizeRuleRequest, TagRuleMode, TagSuggestion, TagSyncMode, Target, VerifyIndexRequest,
+    FinderStatusRequest, GetDraftRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest,
+    GetUsageRequest, IdRequest, IndexGcRequest, IndexProgress, IndexStatusRequest,
+    ListAccountsRequest, ListDraftRevisionsRequest, ListDraftsRequest, ListEntitiesRequest,
+    ListFollowupsRequest, ListMessagesRequest, ListOutboxRequest, ListRulesRequest,
+    ListTagRulesRequest, ListTagsRequest, ListWaitingOnRequest, MoveRequest, PauseRequest,
+    PreflightCheckRequest, RebuildRequest, RecordCorrectionRequest, ReindexMode, ReindexRequest,
+    RemoveTagRequest, RenderDraftRequest, RescheduleRequest, ResolveSuggestionRequest,
+    ResumeRequest, RetryFailedRequest, RewriteDraftRequest, ScheduleSendRequest, SearchRequest,
+    SelectDraftRevisionRequest, SetFlagsRequest, SetIndexPausedRequest, SetPausedRequest,
+    SetTagRuleRequest, SuggestReplyRequest, SuggestSendTimeRequest, SuggestTagsRequest,
+    SyncFolderRequest, SyncMode, SyncStatusRequest, SynthesizeRuleRequest, TagRuleMode,
+    TagSuggestion, TagSyncMode, Target, UpdateBodyRequest, UpdateDraftRequest, VerifyIndexRequest,
     WatchEventsRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -89,7 +94,8 @@ use super::history;
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
 use super::model::{
-    wire, AskEvent, Cmd, Effect, FinderEvent, Msg, ReportEvent, SearchEvent, Stream,
+    wire, write_keybinding, AskEvent, Cmd, Effect, FinderEvent, Msg, ReplyEvent, ReportEvent,
+    SearchEvent, Stream,
 };
 use super::report::{ReportFill, ReportRow, ReportTone};
 use super::status::{Health, Subsystem};
@@ -175,6 +181,11 @@ pub struct GrpcExec {
     searching: Mutex<Option<AbortHandle>>,
     finding: Mutex<Option<AbortHandle>>,
     asking: Mutex<Option<AbortHandle>>,
+    /// `ComposeService.DraftReply`. A slot for the same reason `asking` is
+    /// one: `Esc` needs one thing to abort, and a second `:reply --ai`
+    /// before the first finishes is a supersession, not two replies racing
+    /// to draft the same message.
+    replying: Mutex<Option<AbortHandle>>,
     /// The why-panel's `Explain`. A slot even though the RPC is unary:
     /// holding `j` down the results issues one per row, each re-running the
     /// whole retrieval pipeline server-side, and only the last one can ever
@@ -256,6 +267,7 @@ impl GrpcExec {
             searching: Mutex::new(None),
             finding: Mutex::new(None),
             asking: Mutex::new(None),
+            replying: Mutex::new(None),
             explaining: Mutex::new(None),
             reporting: Mutex::new(None),
             beating: Mutex::new(None),
@@ -1168,11 +1180,381 @@ impl CmdExec for GrpcExec {
                     }
                 });
             }
+
+            // -- reply and drafts (task 100) ---------------------------------
+            Cmd::DraftReply {
+                generation,
+                message_id,
+                intent,
+                reply_all,
+            } => {
+                let mut client = self.compose.clone();
+                self.spawn_superseding(&self.replying, async move {
+                    stream_draft_reply(
+                        &mut client,
+                        message_id,
+                        intent,
+                        reply_all,
+                        generation,
+                        &out,
+                    )
+                    .await;
+                });
+            }
+            Cmd::DraftList {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.compose.clone();
+                self.report(generation, out, async move {
+                    call(client.list_drafts(ListDraftsRequest {
+                        account_id,
+                        page_size: 0,
+                        page_token: String::new(),
+                    }))
+                    .await
+                    .map(|r| wire::draft_list_rows(&r.into_inner()))
+                });
+            }
+            Cmd::DraftShow {
+                generation,
+                draft_id,
+            } => {
+                let mut client = self.compose.clone();
+                self.report(generation, out, async move {
+                    call(client.get_draft(GetDraftRequest { draft_id }))
+                        .await
+                        .map(|r| wire::draft_fields(&r.into_inner()))
+                });
+            }
+            Cmd::DraftEdit {
+                generation,
+                draft_id,
+                body,
+            } => {
+                let mut client = self.compose.clone();
+                self.report(generation, out, async move {
+                    call(client.update_draft(UpdateDraftRequest {
+                        draft_id,
+                        from: None,
+                        to: None,
+                        cc: None,
+                        bcc: None,
+                        subject: None,
+                        body_text: Some(body),
+                        body_html: None,
+                        attachments: None,
+                    }))
+                    .await
+                    .map(|r| wire::draft_fields(&r.into_inner()))
+                });
+            }
+            Cmd::DraftDelete { draft_id } => {
+                let mut client = self.compose.clone();
+                self.spawn(out, async move {
+                    Msg::Done {
+                        label: format!("draft {draft_id} deleted"),
+                        result: call(client.delete_draft(DeleteDraftRequest { draft_id }))
+                            .await
+                            .map(|_| Effect::None),
+                    }
+                });
+            }
+            Cmd::DraftRender {
+                generation,
+                draft_id,
+            } => {
+                let mut client = self.compose.clone();
+                self.report(generation, out, async move {
+                    call(client.render_draft(RenderDraftRequest { draft_id }))
+                        .await
+                        .map(|r| wire::rendered_draft_fields(&r.into_inner()))
+                });
+            }
+            Cmd::DraftRewrite {
+                generation,
+                draft_id,
+                tone,
+                shorter,
+                longer,
+                instruction,
+            } => {
+                let mut client = self.compose.clone();
+                self.report(generation, out, async move {
+                    call(client.rewrite_draft(RewriteDraftRequest {
+                        draft_id,
+                        tone: wire::rewrite_tone(tone.as_deref()) as i32,
+                        length: wire::rewrite_length(shorter, longer) as i32,
+                        instruction,
+                    }))
+                    .await
+                    .map(|r| wire::draft_revision_fields(&r.into_inner()))
+                });
+            }
+            Cmd::DraftRevisions {
+                generation,
+                draft_id,
+            } => {
+                let mut client = self.compose.clone();
+                self.report(generation, out, async move {
+                    call(client.list_draft_revisions(ListDraftRevisionsRequest { draft_id }))
+                        .await
+                        .map(|r| wire::draft_revision_rows(&r.into_inner()))
+                });
+            }
+            Cmd::DraftRevert {
+                generation,
+                draft_id,
+                seq,
+            } => {
+                let mut client = self.compose.clone();
+                self.report(generation, out, async move {
+                    call(client.select_draft_revision(SelectDraftRevisionRequest { draft_id, seq }))
+                        .await
+                        .map(|r| wire::draft_fields(&r.into_inner()))
+                });
+            }
+
+            // -- send and the outbox (task 100) ------------------------------
+            Cmd::ScheduleSend {
+                account_id,
+                draft_id,
+                at,
+                undo,
+            } => {
+                let mut client = self.scheduler.clone();
+                self.spawn(out, async move {
+                    let result = async {
+                        let entry = call(client.schedule_send(ScheduleSendRequest {
+                            account_id,
+                            draft_id: Some(draft_id),
+                            send_at_nl: (!at.is_empty()).then_some(at),
+                            undo_window_secs: undo,
+                            // No fence, matching `mail send`'s own choice
+                            // (`outbox_cli.rs`) rather than diverging from
+                            // it: neither client auto-retries this call, so
+                            // a duplicate send needs a person to type `:send`
+                            // twice, which is the same deliberate repetition
+                            // an unfenced `r` (`Cmd::Draft`) already accepts.
+                            ..ScheduleSendRequest::default()
+                        }))
+                        .await?
+                        .into_inner();
+                        list_outbox(&mut client, entry.account_id).await
+                    }
+                    .await;
+                    Msg::Outbox {
+                        now: now_unix(),
+                        result,
+                    }
+                });
+            }
+            Cmd::RetryFailed { outbox_id } => {
+                let mut client = self.scheduler.clone();
+                self.spawn(out, async move {
+                    let result = async {
+                        let entry = call(client.retry_failed(IdRequest { id: outbox_id }))
+                            .await?
+                            .into_inner();
+                        list_outbox(&mut client, entry.account_id).await
+                    }
+                    .await;
+                    Msg::Outbox {
+                        now: now_unix(),
+                        result,
+                    }
+                });
+            }
+            Cmd::RescheduleSend { outbox_id, at } => {
+                let mut client = self.scheduler.clone();
+                self.spawn(out, async move {
+                    let result = async {
+                        let entry = call(client.reschedule_send(RescheduleRequest {
+                            id: outbox_id,
+                            send_at: None,
+                            send_at_nl: Some(at),
+                            tz: String::new(),
+                        }))
+                        .await?
+                        .into_inner();
+                        list_outbox(&mut client, entry.account_id).await
+                    }
+                    .await;
+                    Msg::Outbox {
+                        now: now_unix(),
+                        result,
+                    }
+                });
+            }
+            Cmd::UpdateScheduledBody { outbox_id, body } => {
+                let mut client = self.scheduler.clone();
+                self.spawn(out, async move {
+                    let result = async {
+                        let entry = call(client.update_scheduled_body(UpdateBodyRequest {
+                            id: outbox_id,
+                            body,
+                        }))
+                        .await?
+                        .into_inner();
+                        list_outbox(&mut client, entry.account_id).await
+                    }
+                    .await;
+                    Msg::Outbox {
+                        now: now_unix(),
+                        result,
+                    }
+                });
+            }
+            Cmd::SendNow { outbox_id } => {
+                let mut client = self.scheduler.clone();
+                self.spawn(out, async move {
+                    let result = async {
+                        let entry = call(client.send_now(IdRequest { id: outbox_id }))
+                            .await?
+                            .into_inner();
+                        list_outbox(&mut client, entry.account_id).await
+                    }
+                    .await;
+                    Msg::Outbox {
+                        now: now_unix(),
+                        result,
+                    }
+                });
+            }
+            Cmd::SuggestSendTime {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.scheduler.clone();
+                self.report(generation, out, async move {
+                    call(client.suggest_send_time(SuggestSendTimeRequest {
+                        account_id,
+                        tz: String::new(),
+                        not_before: None,
+                    }))
+                    .await
+                    .map(|r| wire::suggest_send_time_fields(&r.into_inner()))
+                });
+            }
+
+            // -- follow-ups and the pre-send guardian (task 100) -------------
+            Cmd::FollowupList {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.scheduler.clone();
+                self.report(generation, out, async move {
+                    call(client.list_followups(ListFollowupsRequest {
+                        account_id: Some(account_id),
+                        ..ListFollowupsRequest::default()
+                    }))
+                    .await
+                    .map(|r| wire::followup_rows(&r.into_inner().followups))
+                });
+            }
+            Cmd::FollowupNew {
+                message_id,
+                remind_in,
+                note,
+            } => {
+                let mut mail = self.mail.clone();
+                let mut scheduler = self.scheduler.clone();
+                self.spawn(out, async move {
+                    let result = async {
+                        let original = call(mail.get(GetMessageRequest { id: message_id }))
+                            .await?
+                            .into_inner();
+                        let message = original.message.unwrap_or_default();
+                        let Some(header) = message.message_id.filter(|id| !id.is_empty()) else {
+                            return Err("that message has no Message-ID to follow up on".to_owned());
+                        };
+                        call(scheduler.create_followup(CreateFollowupRequest {
+                            account_id: message.account_id,
+                            message_id: header,
+                            thread_id: message.thread_id,
+                            remind_at: None,
+                            remind_in: (!remind_in.is_empty()).then_some(remind_in),
+                            tz: String::new(),
+                            note: (!note.is_empty()).then_some(note),
+                            cancel_on_reply: None,
+                        }))
+                        .await
+                        .map(|r| r.into_inner())
+                    }
+                    .await;
+                    let label = match &result {
+                        Ok(followup) => {
+                            format!(
+                                "follow-up created — reminds {}",
+                                wire::when(followup.remind_at)
+                            )
+                        }
+                        Err(_) => "follow-up".to_owned(),
+                    };
+                    Msg::Done {
+                        label,
+                        result: result.map(|_| Effect::None),
+                    }
+                });
+            }
+            Cmd::FollowupDismiss { id } => {
+                let mut client = self.scheduler.clone();
+                self.spawn(out, async move {
+                    Msg::Done {
+                        label: format!("follow-up {id} dismissed"),
+                        result: call(client.dismiss_followup(IdRequest { id }))
+                            .await
+                            .map(|_| Effect::None),
+                    }
+                });
+            }
+            Cmd::Waiting {
+                generation,
+                account_id,
+                overdue,
+            } => {
+                let mut client = self.scheduler.clone();
+                self.report(generation, out, async move {
+                    call(client.list_waiting_on(ListWaitingOnRequest {
+                        account_id: Some(account_id),
+                        overdue_only: overdue,
+                        page_size: 0,
+                        page_token: String::new(),
+                    }))
+                    .await
+                    .map(|r| wire::followup_rows(&r.into_inner().followups))
+                });
+            }
+            Cmd::DraftNudge { generation, id } => {
+                let mut client = self.scheduler.clone();
+                self.report(generation, out, async move {
+                    call(client.draft_nudge(DraftNudgeRequest { id }))
+                        .await
+                        .map(|r| wire::draft_nudge_fields(&r.into_inner()))
+                });
+            }
+            Cmd::PreflightCheck {
+                generation,
+                account_id,
+                draft_id,
+            } => {
+                let mut client = self.scheduler.clone();
+                self.report(generation, out, async move {
+                    call(client.preflight_check(PreflightCheckRequest {
+                        account_id,
+                        draft_id: Some(draft_id),
+                        ..PreflightCheckRequest::default()
+                    }))
+                    .await
+                    .map(|r| wire::preflight_rows(&r.into_inner()))
+                });
+            }
             Cmd::CancelStream { which } => {
                 let slot = match which {
                     Stream::Search => &self.searching,
                     Stream::Find => &self.finding,
                     Stream::Ask => &self.asking,
+                    Stream::Reply => &self.replying,
                     Stream::Explain => &self.explaining,
                     Stream::Report => &self.reporting,
                 };
@@ -1200,6 +1582,31 @@ impl CmdExec for GrpcExec {
                             "could not write the command history",
                         );
                     }
+                });
+            }
+            Cmd::WriteKeybinding {
+                path,
+                mode,
+                chord,
+                action,
+                label,
+            } => {
+                // Plain `spawn`, not `spawn_superseding`: two `:keys set`
+                // invocations are independent edits, not the same growing
+                // list `SaveHistory` re-sends whole — cancelling the first
+                // because a second one landed would strand its `inflight`
+                // increment with no `Msg::KeysWritten` ever arriving to
+                // release it.
+                self.spawn(out, async move {
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        write_keybinding(&path, mode, &chord, action)
+                    })
+                    .await;
+                    let result = match outcome {
+                        Ok(result) => result,
+                        Err(join_error) => Err(join_error.to_string()),
+                    };
+                    Msg::KeysWritten { label, result }
                 });
             }
             Cmd::Countdown { until } => {
@@ -1425,6 +1832,85 @@ async fn stream_ask(
     let _ = out.send(Msg::Ask {
         generation,
         event: AskEvent::Failed("the daemon ended the answer early".to_owned()),
+    });
+}
+
+/// Drive one `ComposeService.DraftReply` stream into the model. The same
+/// shape [`stream_ask`] is: a deadline on *opening* only, frames mapped in
+/// the proto's own order (context, then tokens, then the draft, then done),
+/// and a stream that ends with no `done` frame reported as failed rather than
+/// left to read as a complete reply.
+async fn stream_draft_reply(
+    client: &mut ComposeServiceClient<Conn>,
+    message_id: i64,
+    intent: String,
+    reply_all: bool,
+    generation: u64,
+    out: &UnboundedSender<Msg>,
+) {
+    tracing::debug!(generation, message_id, "draft-reply stream opening");
+    let request = DraftReplyRequest {
+        message_id,
+        intent,
+        reply_all,
+    };
+    let opened = tokio::time::timeout(RPC_TIMEOUT, client.draft_reply(request)).await;
+    let mut stream = match opened {
+        Ok(Ok(response)) => response.into_inner(),
+        Ok(Err(status)) => {
+            let _ = out.send(Msg::Reply {
+                generation,
+                event: ReplyEvent::Failed(status.message().to_owned()),
+            });
+            return;
+        }
+        Err(_) => {
+            let _ = out.send(Msg::Reply {
+                generation,
+                event: ReplyEvent::Failed(format!(
+                    "the daemon did not start drafting within {}s",
+                    RPC_TIMEOUT.as_secs()
+                )),
+            });
+            return;
+        }
+    };
+    let mut finished = false;
+    while let Some(next) = stream.next().await {
+        let event = match next {
+            Ok(chunk) => match chunk.event {
+                Some(draft_reply_event::Event::Context(context)) => {
+                    ReplyEvent::Context(wire::draft_reply_context(&context))
+                }
+                Some(draft_reply_event::Event::Token(token)) => ReplyEvent::Token(token),
+                Some(draft_reply_event::Event::Draft(draft)) => ReplyEvent::Drafted {
+                    draft_id: draft.id,
+                    to: wire::addr_list(&draft.to),
+                },
+                Some(draft_reply_event::Event::Done(_)) => {
+                    finished = true;
+                    ReplyEvent::Done
+                }
+                // Live token accounting; the durable, billed copy is the
+                // audit ledger's, not this echo's — the same reason
+                // `stream_ask` skips `ask_chunk::Body::Usage`.
+                Some(draft_reply_event::Event::Usage(_)) | None => continue,
+            },
+            Err(status) => {
+                finished = true;
+                ReplyEvent::Failed(status.message().to_owned())
+            }
+        };
+        if out.send(Msg::Reply { generation, event }).is_err() {
+            return;
+        }
+        if finished {
+            return;
+        }
+    }
+    let _ = out.send(Msg::Reply {
+        generation,
+        event: ReplyEvent::Failed("the daemon ended the reply early".to_owned()),
     });
 }
 

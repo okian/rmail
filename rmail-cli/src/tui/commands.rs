@@ -36,6 +36,7 @@
 //! rides on the spec rather than in a second table, so a verb cannot be added
 //! without the author looking at the field.
 
+pub mod compose;
 pub mod daemon;
 pub mod rule;
 pub mod tag;
@@ -200,13 +201,13 @@ pub(super) fn joined(invocation: &Invocation) -> String {
     invocation.positionals.join(" ")
 }
 
-/// A value-taking flag's value, if it was given.
-pub(super) fn flag(invocation: &Invocation, name: &str) -> Option<String> {
+/// A value-taking flag's value, if the line carried one.
+pub(super) fn flag<'a>(invocation: &'a Invocation, name: &str) -> Option<&'a str> {
     invocation
         .flags
         .iter()
         .find(|flag| flag.name == name)
-        .and_then(|flag| flag.value.clone())
+        .and_then(|flag| flag.value.as_deref())
 }
 
 /// Whether a switch flag was given.
@@ -229,6 +230,46 @@ pub(super) fn days(invocation: &Invocation) -> Result<Option<u32>, String> {
     }
 }
 
+/// The one positional every id-taking verb declares (task 100). `None` covers
+/// both "nothing was typed" and "what was typed is not a number" — the caller's
+/// own refusal names the listing that has the real ids, which is the answer
+/// either way.
+pub(super) fn id_positional(invocation: &Invocation) -> Option<i64> {
+    invocation.positionals.first()?.parse().ok()
+}
+
+/// What a verb needing an id says when [`id_positional`] found none.
+pub(super) fn no_id(noun: &str, listing: &str) -> Answer {
+    Answer::Refused(format!("name a {noun} — see `:{listing}`"))
+}
+
+/// The columns a report showing one item's fields draws — `:draft show` and
+/// everything shaped like it (task 100): one row per field, rather than the
+/// one-row-per-item table a listing draws. Shared for the same reason
+/// `daemon::progress_columns` is: several verbs answer with a single item of
+/// different underlying types, and a field/value pair is the one layout that fits
+/// all of them without a column list per verb to keep in sync.
+pub(super) fn field_value_columns() -> Vec<ReportColumn> {
+    vec![
+        ReportColumn::new("field", 10),
+        ReportColumn::new("value", 60),
+    ]
+}
+
+/// The columns `:followup list` and `:waiting` both draw. One shape for both
+/// because `ListFollowupsResponse` and `ListWaitingOnResponse` answer with the
+/// same `Followup` rows — `:waiting` is a filtered view of the same list, not a
+/// different report.
+pub(super) fn followup_columns() -> Vec<ReportColumn> {
+    vec![
+        ReportColumn::new("id", 6),
+        ReportColumn::new("message", 24),
+        ReportColumn::new("remind at", 17),
+        ReportColumn::new("state", 10),
+        ReportColumn::new("note", 20),
+    ]
+}
+
 /// What a verb answers with, asked of each domain in turn.
 ///
 /// `None` for a verb no domain answers for — which is a real state, not an
@@ -245,4 +286,5 @@ pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Opti
     daemon::answer(invocation, target, generation)
         .or_else(|| tag::answer(invocation, target, generation))
         .or_else(|| rule::answer(invocation, target, generation))
+        .or_else(|| compose::answer(invocation, target, generation))
 }

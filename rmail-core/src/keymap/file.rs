@@ -117,7 +117,17 @@ pub fn load(path: &Path) -> Result<Keymap, KeymapError> {
 /// `Read::take` rather than a `metadata().len()` check: the point is to be
 /// safe on a path that is not a regular file, and those are exactly the ones
 /// that report a length of zero and then never end.
-fn read_bounded(path: &Path) -> std::io::Result<String> {
+///
+/// `pub` rather than crate-private for `rmail_cli::tui::model::write_keybinding`
+/// (task 102's `:keys set`), which reads `keys.toml` on a blocking-pool
+/// thread behind a `Model::inflight` count nothing else ever releases — a
+/// path that never reaches EOF would hang that thread and strand the
+/// counter forever, exactly the failure mode this bound exists to rule out.
+/// `keys_cli::set` reads the same file with a plain, unbounded
+/// `std::fs::read_to_string` and is not changed to match: that is a
+/// short-lived CLI process that exits either way, so the same hang there
+/// costs nothing this one does.
+pub fn read_bounded(path: &Path) -> std::io::Result<String> {
     let mut text = String::new();
     let read = std::fs::File::open(path)?
         .take(MAX_KEYS_BYTES as u64 + 1)

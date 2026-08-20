@@ -132,7 +132,7 @@ pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Opti
             };
             let sync = match flag(invocation, "sync") {
                 None => None,
-                Some(text) => match Sync::parse(&text) {
+                Some(text) => match Sync::parse(text) {
                     Some(sync) => Some(sync),
                     None => {
                         return Some(Answer::Refused(format!(
@@ -145,7 +145,7 @@ pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Opti
                 Cmd::TagCreate {
                     account_id,
                     name: name.clone(),
-                    color: flag(invocation, "color"),
+                    color: flag(invocation, "color").map(str::to_owned),
                     sync,
                 },
                 &format!("creating the tag {name}…"),
@@ -250,7 +250,7 @@ pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Opti
             // rather than an oversight.
             let mode = match flag(invocation, "mode") {
                 None => RuleMode::Suggest,
-                Some(text) => match RuleMode::parse(&text) {
+                Some(text) => match RuleMode::parse(text) {
                     Some(mode) => mode,
                     None => {
                         return Some(Answer::Refused(format!(

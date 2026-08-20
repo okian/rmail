@@ -133,7 +133,7 @@ pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Opti
                     // One rule by name, or every enabled one. Named rather than
                     // positional because the common case is "all of them" and a
                     // positional would make the common case the odd one.
-                    rule: flag(invocation, "rule"),
+                    rule: flag(invocation, "rule").map(str::to_owned),
                 },
                 "rule run — a dry run over the selection",
                 outcome_columns(),
