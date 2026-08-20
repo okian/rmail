@@ -24,6 +24,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+use super::form::FormPane;
 use super::help::{self, HelpPane};
 use super::manual;
 use super::model::{Focus, Model, Overlay, Scope, Screen, FLAGGED, SEEN};
@@ -98,6 +99,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
         Some(Overlay::Outbox(pane)) => render_outbox(&model.theme, pane, frame, area),
         Some(Overlay::Quick(pane)) => render_quick(&model.theme, pane, frame, area),
         Some(Overlay::Report(pane)) => render_report(&model.theme, pane, frame, area),
+        Some(Overlay::Form(pane)) => render_form(&model.theme, pane, frame, area),
         None => {}
     }
 }
@@ -1382,6 +1384,109 @@ fn render_report(theme: &Theme, pane: &ReportPane, frame: &mut Frame, area: Rect
         rows[1],
         &mut state,
     );
+}
+
+/// The form overlay: a label/value row per field, then the row that applies it
+/// (task 96).
+///
+/// The apply row is drawn as a row rather than as a button because it *is* one —
+/// see [`FormPane::rows`]. It is styled by whether the form can be applied at
+/// all, so "nothing to replace yet" is visible before `<enter>` says it.
+fn render_form(theme: &Theme, pane: &FormPane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 72, 62);
+    frame.render_widget(Clear, area);
+    let title = form_title(pane);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner(theme, frame, area, &title));
+
+    let mut items: Vec<ListItem> = pane
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let editing = pane.editing.as_ref().is_some_and(|edit| edit.at == idx);
+            // A caret only on the field being typed into, and only there: a
+            // form showing eight of them would say every field was open.
+            let value = if editing {
+                format!("{}▏", field.value)
+            } else if field.value.is_empty() {
+                // Not blank: an empty cell reads as a rendering fault, and for
+                // this RPC an empty cap is a real value — "no cap" — that
+                // applying will store.
+                "(none)".to_owned()
+            } else {
+                field.value.clone()
+            };
+            let style = if field.value.is_empty() && !editing {
+                theme.muted
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", fitted(field.label, FORM_LABEL)),
+                    theme.muted,
+                ),
+                Span::styled(overlays::safe_line(&value), style),
+            ]))
+        })
+        .collect();
+    let (apply, apply_style) = match pane.blocked() {
+        Some(why) => (why, theme.muted),
+        None => (
+            "apply — replaces every value above".to_owned(),
+            theme.accent,
+        ),
+    };
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(format!(" {} ", fitted("⏎", FORM_LABEL)), theme.muted),
+        Span::styled(overlays::safe_line(&apply), apply_style),
+    ])));
+
+    let mut state = ListState::default();
+    state.select(Some(pane.cursor.min(pane.rows().saturating_sub(1))));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selected_style(theme, true)),
+        rows[0],
+        &mut state,
+    );
+
+    // The highlighted field's own hint, on its own line: eight hints drawn at
+    // once is a wall of text, and the one that matters is the one under the
+    // cursor.
+    let hint = pane.error.as_ref().map_or_else(
+        || pane.field().map_or("", |field| field.hint).to_owned(),
+        |error| overlays::safe_line(error),
+    );
+    let style = if pane.error.is_some() {
+        theme.err
+    } else {
+        theme.muted
+    };
+    frame.render_widget(Paragraph::new(Line::styled(hint, style)), rows[1]);
+}
+
+/// How wide a form's label column is.
+///
+/// Fixed, so the values line up under each other: `monthly soft tokens` is the
+/// longest label task 96 has, and a column sized to whatever the longest label
+/// happened to be would move every value the moment a field was added.
+const FORM_LABEL: usize = 20;
+
+/// A form's border.
+fn form_title(pane: &FormPane) -> String {
+    let state = if pane.editing.is_some() {
+        "typing · <enter> keeps it · Esc puts it back"
+    } else if pane.ready {
+        "j/k moves · <enter> edits · Esc closes"
+    } else if pane.error.is_some() {
+        "failed · Esc closes"
+    } else {
+        "reading…"
+    };
+    format!("{} · {state}", overlays::safe_line(&pane.title))
 }
 
 /// One row's cells, each padded or truncated to its column's declared width.

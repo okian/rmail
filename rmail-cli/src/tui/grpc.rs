@@ -45,7 +45,9 @@ use std::time::Duration;
 
 use rmail_proto::v1::account_service_client::AccountServiceClient;
 use rmail_proto::v1::ai_policy_service_client::AiPolicyServiceClient;
+use rmail_proto::v1::ai_safety_service_client::AiSafetyServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
+use rmail_proto::v1::audit_service_client::AuditServiceClient;
 use rmail_proto::v1::client_auth_service_client::ClientAuthServiceClient;
 use rmail_proto::v1::compose_service_client::ComposeServiceClient;
 use rmail_proto::v1::finder_service_client::FinderServiceClient;
@@ -58,23 +60,26 @@ use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::tag_service_client::TagServiceClient;
 use rmail_proto::v1::{
     analyze_event, ask_chunk, bulk_tag_request, draft_reply_event, target, AddTagRequest,
-    AnalyzeMessageRequest, AskRequest, AuthStatusRequest, BacktestRuleRequest, BulkTagRequest,
-    CancelRequest, ClearPasswordRequest, CopyRequest, CreateFollowupRequest, CreateRuleRequest,
-    CreateTagRequest, DeleteDraftRequest, DeleteRequest, DraftNudgeRequest, DraftReplyRequest,
-    EvaluateRulesRequest, EventKind, ExplainRequest, FindRequest, FinderRebuildRequest,
-    FinderStatusRequest, GetDraftRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest,
+    AiProviderKind, AnalyzeMessageRequest, AskRequest, AuditEntry, AuditFilter, AuthStatusRequest,
+    BacktestRuleRequest, BudgetCaps, BudgetClass, BudgetWindowCaps, BulkTagRequest, CallStatus,
+    CancelRequest, ClearPasswordRequest, ConfirmInjectionRequest, CopyRequest,
+    CreateFollowupRequest, CreateRuleRequest, CreateTagRequest, DeleteDraftRequest, DeleteRequest,
+    DraftNudgeRequest, DraftReplyRequest, EvaluateRulesRequest, EventKind, ExplainRequest,
+    ExportLedgerRequest, FindRequest, FinderRebuildRequest, FinderStatusRequest,
+    GetAiProviderRequest, GetDraftRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest,
     GetUsageRequest, IdRequest, IndexGcRequest, IndexProgress, IndexStatusRequest,
     ListAccountsRequest, ListDraftRevisionsRequest, ListDraftsRequest, ListEntitiesRequest,
     ListFollowupsRequest, ListMessagesRequest, ListOutboxRequest, ListRulesRequest,
     ListTagRulesRequest, ListTagsRequest, ListWaitingOnRequest, MoveRequest, PauseRequest,
-    PreflightCheckRequest, RebuildRequest, RecordCorrectionRequest, ReindexMode, ReindexRequest,
-    RemoveTagRequest, RenderDraftRequest, RescheduleRequest, ResolveSuggestionRequest,
-    ResumeRequest, RetryFailedRequest, RewriteDraftRequest, ScheduleSendRequest, SearchRequest,
-    SelectDraftRevisionRequest, SetFlagsRequest, SetIndexPausedRequest, SetPausedRequest,
-    SetTagRuleRequest, SuggestReplyRequest, SuggestSendTimeRequest, SuggestTagsRequest,
-    SyncFolderRequest, SyncMode, SyncStatusRequest, SynthesizeRuleRequest, TagRuleMode,
-    TagSuggestion, TagSyncMode, Target, UpdateBodyRequest, UpdateDraftRequest, VerifyIndexRequest,
-    WatchEventsRequest,
+    PreflightCheckRequest, QueryAiCallsRequest, RebuildRequest, RecordCorrectionRequest,
+    ReindexMode, ReindexRequest, RemoveTagRequest, RenderDraftRequest, RescheduleRequest,
+    ResolveSuggestionRequest, ResumeRequest, RetryFailedRequest, RewriteDraftRequest,
+    ScanInjectionRequest, ScheduleSendRequest, SearchRequest, SelectDraftRevisionRequest,
+    SetAiProviderRequest, SetBudgetRequest, SetFlagsRequest, SetIndexPausedRequest,
+    SetPausedRequest, SetTagRuleRequest, SuggestReplyRequest, SuggestSendTimeRequest,
+    SuggestTagsRequest, SyncFolderRequest, SyncMode, SyncStatusRequest, SynthesizeRuleRequest,
+    TagRuleMode, TagSuggestion, TagSyncMode, Target, UpdateBodyRequest, UpdateDraftRequest,
+    VerifyIndexRequest, WatchEventsRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
@@ -94,8 +99,8 @@ use super::history;
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
 use super::model::{
-    wire, write_keybinding, AskEvent, Cmd, Effect, FinderEvent, Msg, ReplyEvent, ReportEvent,
-    SearchEvent, Stream,
+    wire, write_keybinding, AskEvent, Cmd, Effect, FinderEvent, FormEvent, Msg, ReplyEvent,
+    ReportEvent, SearchEvent, Stream,
 };
 use super::report::{ReportFill, ReportRow, ReportTone};
 use super::status::{Health, Subsystem};
@@ -167,6 +172,8 @@ pub struct GrpcExec {
     auth: ClientAuthServiceClient<Conn>,
     index: IndexServiceClient<Conn>,
     policy: AiPolicyServiceClient<Conn>,
+    safety: AiSafetyServiceClient<Conn>,
+    audit: AuditServiceClient<Conn>,
     tags: TagServiceClient<Conn>,
     rules: RuleServiceClient<Conn>,
     /// The task feeding the search overlay, so the next keystroke can abort
@@ -262,6 +269,8 @@ impl GrpcExec {
             auth: ClientAuthServiceClient::new(channel.clone()),
             index: IndexServiceClient::new(channel.clone()),
             policy: AiPolicyServiceClient::new(channel.clone()),
+            safety: AiSafetyServiceClient::new(channel.clone()),
+            audit: AuditServiceClient::new(channel.clone()),
             tags: TagServiceClient::new(channel.clone()),
             rules: RuleServiceClient::new(channel),
             searching: Mutex::new(None),
@@ -1179,6 +1188,202 @@ impl CmdExec for GrpcExec {
                         },
                     }
                 });
+            }
+
+            // -- AI policy, safety and audit (task 96) ------------------------
+            Cmd::BudgetStatus {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.policy.clone();
+                self.report(generation, out, async move {
+                    call(client.get_spend(GetSpendRequest { account_id }))
+                        .await
+                        .map(|r| wire::budget_rows(&r.into_inner()))
+                });
+            }
+            Cmd::BudgetForm {
+                generation,
+                account_id,
+                class,
+            } => {
+                let mut client = self.policy.clone();
+                // Through the reporting slot, like every other read that fills a
+                // pane: only one of the two panes is on screen at a time, so a
+                // second request always supersedes the first and `Esc` has one
+                // thing to abort.
+                self.spawn_superseding(&self.reporting, async move {
+                    let event = match call(client.get_spend(GetSpendRequest { account_id })).await {
+                        Ok(response) => FormEvent::Fields(wire::budget_fields(
+                            &response.into_inner(),
+                            class == commands::ai_policy::Class::Bulk,
+                        )),
+                        Err(error) => FormEvent::Failed(error),
+                    };
+                    let _ = out.send(Msg::Form { generation, event });
+                });
+            }
+            Cmd::BudgetSet {
+                account_id,
+                class,
+                caps,
+            } => {
+                let mut client = self.policy.clone();
+                self.spawn(out, async move {
+                    let request = SetBudgetRequest {
+                        account_id,
+                        class: match class {
+                            commands::ai_policy::Class::All => BudgetClass::All,
+                            commands::ai_policy::Class::Bulk => BudgetClass::Bulk,
+                        } as i32,
+                        caps: Some(budget_caps(&caps)),
+                    };
+                    match call(client.set_budget(request)).await {
+                        // What was *stored*, echoed from the response rather
+                        // than repeated from the request: this RPC replaces a
+                        // whole budget, and the one thing a caller needs
+                        // confirmed is which caps are now in force.
+                        Ok(response) => Msg::Done {
+                            label: wire::budget_stored(&response.into_inner()),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "ai budget set".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::ProviderStatus {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.policy.clone();
+                self.report(generation, out, async move {
+                    call(client.get_ai_provider(GetAiProviderRequest { account_id }))
+                        .await
+                        .map(|r| wire::provider_rows(&r.into_inner()))
+                });
+            }
+            Cmd::ProviderSet {
+                account_id,
+                provider,
+            } => {
+                let mut client = self.policy.clone();
+                self.spawn(out, async move {
+                    let request = SetAiProviderRequest {
+                        account_id,
+                        provider: match provider {
+                            commands::ai_policy::Provider::Claude => AiProviderKind::Claude,
+                            commands::ai_policy::Provider::Local => AiProviderKind::Local,
+                            // UNSPECIFIED *clears* the override on a set, which
+                            // is what `clear`/`inherit` asked for — see that
+                            // enum's own docs on why absence is spelled rather
+                            // than implied.
+                            commands::ai_policy::Provider::Inherit => AiProviderKind::Unspecified,
+                        } as i32,
+                    };
+                    match call(client.set_ai_provider(request)).await {
+                        Ok(response) => Msg::Done {
+                            label: wire::provider_set(&response.into_inner()),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "ai provider set".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::ScanInjection {
+                generation,
+                message_id,
+            } => {
+                let mut client = self.safety.clone();
+                self.report(generation, out, async move {
+                    call(client.scan_injection(ScanInjectionRequest { message_id }))
+                        .await
+                        .map(|r| wire::injection_rows(&r.into_inner()))
+                });
+            }
+            Cmd::ConfirmInjection {
+                generation,
+                message_id,
+                confirm,
+            } => {
+                let mut client = self.safety.clone();
+                self.report(generation, out, async move {
+                    // Scanned first, even to confirm, exactly as
+                    // `mail ai scan-injection --confirm` does: a confirmation is
+                    // consent to a *specific* set of findings — the daemon clears
+                    // it when a re-scan turns up different ones — so confirming
+                    // without having just seen them would be consent to whatever
+                    // a stale row happened to hold.
+                    let scan = call(client.scan_injection(ScanInjectionRequest { message_id }))
+                        .await?
+                        .into_inner();
+                    if !scan.flagged {
+                        // Not an error: the message is already in the state that
+                        // was asked for. Reporting the scan says so, and says it
+                        // in the same shape a scan does.
+                        return Ok(wire::injection_rows(&scan));
+                    }
+                    let response = call(client.confirm_injection(ConfirmInjectionRequest {
+                        message_id,
+                        confirmed: confirm.confirmed(),
+                    }))
+                    .await?
+                    .into_inner();
+                    Ok(response
+                        .flag
+                        .as_ref()
+                        .map_or_else(Vec::new, wire::injection_rows))
+                });
+            }
+            Cmd::AuditQuery {
+                generation,
+                account_id,
+                model,
+                failed_only,
+                whole_ledger,
+            } => {
+                let filter = AuditFilter {
+                    // Zero is "every account" for this filter, so it is sent as
+                    // an absent field rather than as a literal 0 — which the
+                    // ledger would read as "the account whose id is 0" and match
+                    // nothing.
+                    account_id: (account_id != 0).then_some(account_id),
+                    model,
+                    status: failed_only.then_some(CallStatus::Error as i32),
+                    ..AuditFilter::default()
+                };
+                if whole_ledger {
+                    let mut client = self.audit.clone();
+                    self.stream_report(generation, out, move |sink| async move {
+                        export_ledger(
+                            client.export_ledger(ExportLedgerRequest {
+                                filter: Some(filter),
+                            }),
+                            sink,
+                        )
+                        .await;
+                    });
+                } else {
+                    let mut client = self.audit.clone();
+                    self.report(generation, out, async move {
+                        call(client.query_ai_calls(QueryAiCallsRequest {
+                            filter: Some(filter),
+                            // The server clamps this, and the pane caps what it
+                            // keeps at `overlays::MAX_ROWS` anyway; asking for
+                            // exactly that many is what makes "one page" and
+                            // "one screenful" the same thing here.
+                            limit: i32::try_from(super::overlays::MAX_ROWS).unwrap_or(i32::MAX),
+                            before_id: None,
+                        }))
+                        .await
+                        .map(|r| wire::audit_rows(&r.into_inner().entries))
+                    });
+                }
             }
 
             // -- reply and drafts (task 100) ---------------------------------
@@ -2161,6 +2366,65 @@ async fn apply_tags(
             Err(error) => wire::tag_failed_row(*message_id, name, &error),
         });
         sink.rows(rows.clone(), index + 1 == message_ids.len());
+    }
+}
+
+/// Drain an `ExportLedger` stream into a Report.
+///
+/// Appends, like `SuggestTags`: the ledger sends each entry once, newest first.
+/// The stream ending cleanly *is* the end of the export — the proto is explicit
+/// that a truncated one terminates with `CANCELLED` rather than `OK`, so a `None`
+/// here can be trusted to mean "that was all of it".
+async fn export_ledger<S>(request: S, sink: ReportSink)
+where
+    S: Future<Output = Result<tonic::Response<tonic::Streaming<AuditEntry>>, tonic::Status>>,
+{
+    let mut stream = match request.await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    loop {
+        match stream.next().await {
+            Some(Ok(entry)) => sink.append(vec![wire::audit_row(&entry)], false),
+            Some(Err(status)) => return sink.failed(status.message().to_owned()),
+            None => return sink.append(Vec::new(), true),
+        }
+    }
+}
+
+/// The eight `(flag, value)` caps a `:ai budget set` line carried, as the RPC's
+/// nested request.
+///
+/// A value that does not parse is *dropped*, which is uncapping that dimension.
+/// Reachable only from a bang'd line, because the form refuses a non-number
+/// where it was typed (`commands::ai_policy::caps`) and the parse there is the
+/// same one — so this is the belt to that braces, and dropping is the safe
+/// direction: an unparseable cap must never become a `0`, which on this RPC
+/// forbids all spending rather than allowing it.
+fn budget_caps(caps: &[(String, String)]) -> BudgetCaps {
+    let usd = |flag: &str| {
+        caps.iter()
+            .find(|(name, _)| name == flag)
+            .and_then(|(_, value)| value.parse::<f64>().ok())
+    };
+    let tokens = |flag: &str| {
+        caps.iter()
+            .find(|(name, _)| name == flag)
+            .and_then(|(_, value)| value.parse::<i64>().ok())
+    };
+    BudgetCaps {
+        daily: Some(BudgetWindowCaps {
+            soft_usd: usd("daily-soft-usd"),
+            hard_usd: usd("daily-hard-usd"),
+            soft_tokens: tokens("daily-soft-tokens"),
+            hard_tokens: tokens("daily-hard-tokens"),
+        }),
+        monthly: Some(BudgetWindowCaps {
+            soft_usd: usd("monthly-soft-usd"),
+            hard_usd: usd("monthly-hard-usd"),
+            soft_tokens: tokens("monthly-soft-tokens"),
+            hard_tokens: tokens("monthly-hard-tokens"),
+        }),
     }
 }
 

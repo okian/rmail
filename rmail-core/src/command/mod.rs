@@ -315,6 +315,87 @@ fn explicit() -> Vec<Verb> {
         name: "no",
         takes_value: false,
     }];
+    /// `:ai budget set`'s eight caps, spelled as `mail ai budget set` spells
+    /// them. Every one optional and value-taking, because an omitted cap is a
+    /// cap *cleared* — `SetBudget` replaces the whole scope — which is the reason
+    /// the bare verb opens a pre-filled form rather than sending what was typed.
+    const BUDGET_FLAGS: &[Flag] = &[
+        Flag {
+            name: "account",
+            takes_value: true,
+        },
+        Flag {
+            name: "bulk",
+            takes_value: false,
+        },
+        Flag {
+            name: "daily-soft-usd",
+            takes_value: true,
+        },
+        Flag {
+            name: "daily-hard-usd",
+            takes_value: true,
+        },
+        Flag {
+            name: "daily-soft-tokens",
+            takes_value: true,
+        },
+        Flag {
+            name: "daily-hard-tokens",
+            takes_value: true,
+        },
+        Flag {
+            name: "monthly-soft-usd",
+            takes_value: true,
+        },
+        Flag {
+            name: "monthly-hard-usd",
+            takes_value: true,
+        },
+        Flag {
+            name: "monthly-soft-tokens",
+            takes_value: true,
+        },
+        Flag {
+            name: "monthly-hard-tokens",
+            takes_value: true,
+        },
+    ];
+    /// `:ai budget status` and `:ai provider status`, which read one scope.
+    const SCOPE_FLAGS: &[Flag] = &[Flag {
+        name: "account",
+        takes_value: true,
+    }];
+    /// `:ai audit`'s filters, plus the switch that walks the whole ledger rather
+    /// than the most recent page.
+    const AUDIT_FLAGS: &[Flag] = &[
+        Flag {
+            name: "account",
+            takes_value: true,
+        },
+        Flag {
+            name: "model",
+            takes_value: true,
+        },
+        Flag {
+            name: "failed",
+            takes_value: false,
+        },
+        Flag {
+            name: "all",
+            takes_value: false,
+        },
+    ];
+    /// `:ai provider set`'s backend, and the scope it applies to.
+    const PROVIDER_FLAGS: &[Flag] = &[Flag {
+        name: "account",
+        takes_value: true,
+    }];
+    /// `:ai confirm`'s direction: present re-withholds rather than releasing.
+    const REVOKE_FLAGS: &[Flag] = &[Flag {
+        name: "revoke",
+        takes_value: false,
+    }];
     /// One tag name. Optional so the verb stays typeable (see `KIND`); the
     /// caller refuses a missing one.
     const TAG: &[Positional] = &[Positional {
@@ -354,6 +435,12 @@ fn explicit() -> Vec<Verb> {
             rest: false,
         },
     ];
+    /// A backend name — `claude`, `local`, or `clear` to inherit again.
+    const PROVIDER: &[Positional] = &[Positional {
+        name: "provider",
+        required: false,
+        rest: false,
+    }];
     /// A name, for a verb that addresses one thing it already has.
     const NAME: &[Positional] = &[Positional {
         name: "name",
@@ -837,6 +924,69 @@ fn explicit() -> Vec<Verb> {
             action: None,
             positionals: NAME,
             flags: DAYS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["ai", "budget", "status"],
+            capability: Some(Capability::AiPolicyGetSpend),
+            action: None,
+            positionals: &[],
+            flags: SCOPE_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["ai", "budget", "set"],
+            capability: Some(Capability::AiPolicySetBudget),
+            action: None,
+            positionals: &[],
+            flags: BUDGET_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["ai", "provider", "status"],
+            capability: Some(Capability::AiPolicyGetAiProvider),
+            action: None,
+            positionals: &[],
+            flags: SCOPE_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["ai", "provider", "set"],
+            capability: Some(Capability::AiPolicySetAiProvider),
+            action: None,
+            positionals: PROVIDER,
+            flags: PROVIDER_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["ai", "scan"],
+            capability: Some(Capability::AiSafetyScanInjection),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: Some("ai scan-injection"),
+            description: None,
+        },
+        Verb {
+            path: vec!["ai", "confirm"],
+            capability: Some(Capability::AiSafetyConfirmInjection),
+            action: None,
+            positionals: &[],
+            flags: REVOKE_FLAGS,
+            cli_alias: Some("ai scan-injection"),
+            description: None,
+        },
+        Verb {
+            path: vec!["ai", "audit"],
+            capability: Some(Capability::AuditQueryAiCalls),
+            action: None,
+            positionals: &[],
+            flags: AUDIT_FLAGS,
             cli_alias: None,
             description: None,
         },

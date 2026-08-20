@@ -169,11 +169,18 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
     let expected: BTreeSet<String> = [
         "auth clear",
         "auth status",
+        "ai audit",
+        "ai budget set",
+        "ai budget status",
+        "ai confirm",
         "ai cost",
         "ai pause",
         "ai process",
+        "ai provider set",
+        "ai provider status",
         "ai resume",
         "ai retry",
+        "ai scan",
         "ai status",
         "draft delete",
         "draft edit",
@@ -606,19 +613,22 @@ fn a_verb_this_build_has_no_answer_for_is_not_a_refusal() {
     // verb", and reporting a missing account as that would send somebody looking
     // for a feature that is present and has nothing to act on yet.
     //
-    // Built by hand because the registry has no such verb yet — which is the
-    // point: this is the exact shape task 96's `:ai budget status` will arrive
-    // in, and the table has to answer `None` for it rather than guessing.
-    let later_task = Invocation {
+    // Built by hand, and deliberately *not* a declared verb. The claim is about
+    // this table's own fallthrough — a verb reaching a capability it has no arm
+    // for — and pinning it to whichever RPC happened to be unimplemented broke
+    // the moment that RPC arrived: this was `:ai budget status` until task 96
+    // answered it. A path the registry does not declare cannot be overtaken by
+    // a later task, and tests the same thing.
+    let unanswered = Invocation {
         range: None,
-        verb: vec!["ai".to_owned(), "budget".to_owned(), "status".to_owned()],
+        verb: vec!["ai".to_owned(), "budget".to_owned(), "forecast".to_owned()],
         capability: Some(Capability::AiPolicyGetSpend),
         action: None,
         positionals: Vec::new(),
         flags: Vec::new(),
         bang: false,
     };
-    assert!(answer(&later_task, &screen(), 1).is_none());
+    assert!(answer(&unanswered, &screen(), 1).is_none());
     assert!(matches!(asked("sync status", &empty()), Answer::Refused(_)));
 }
 

@@ -36,6 +36,7 @@
 //! rides on the spec rather than in a second table, so a verb cannot be added
 //! without the author looking at the field.
 
+pub mod ai_policy;
 pub mod compose;
 pub mod daemon;
 pub mod rule;
@@ -46,6 +47,7 @@ mod tests;
 
 use rmail_core::command::Invocation;
 
+use super::form::Field;
 use super::model::Cmd;
 use super::report::ReportColumn;
 
@@ -113,6 +115,13 @@ pub enum Answer {
     Rows(Box<Request>),
     /// A single fact, on the status line.
     Fact(Box<Request>),
+    /// A set of fields to fill in, read from the daemon first (task 96).
+    ///
+    /// The third shape rather than a flag on [`Request`], because what arrives
+    /// is not rows: a form's answer names *fields* and a report's names cells,
+    /// and one type carrying either would leave every reader of it asking which
+    /// it was holding.
+    Form(Box<FormRequest>),
     /// The verb needs something the screen does not have — no account loaded,
     /// no message under the cursor. Carries what to say about it.
     ///
@@ -139,6 +148,21 @@ pub struct Request {
     pub confirm: Option<String>,
 }
 
+/// One verb's form: what to read, and the fields the answer fills in.
+///
+/// The fields carry their flag, label and hint but no values — those come from
+/// the daemon, which is the whole reason a form exists rather than a `:` line
+/// with eight flags on it. See `tui::form`'s module docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormRequest {
+    /// The read that pre-fills it.
+    pub cmd: Cmd,
+    /// The border's title.
+    pub title: String,
+    /// The fields, in the order they are drawn.
+    pub fields: Vec<Field>,
+}
+
 impl Request {
     /// A verb that answers with rows.
     pub(super) fn rows(cmd: Cmd, title: &str, columns: Vec<ReportColumn>) -> Answer {
@@ -147,6 +171,15 @@ impl Request {
             title: title.to_owned(),
             columns,
             confirm: None,
+        }))
+    }
+
+    /// A verb that opens a form over what a read reports.
+    pub(super) fn form(cmd: Cmd, title: &str, fields: Vec<Field>) -> Answer {
+        Answer::Form(Box::new(FormRequest {
+            cmd,
+            title: title.to_owned(),
+            fields,
         }))
     }
 
@@ -287,4 +320,5 @@ pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Opti
         .or_else(|| tag::answer(invocation, target, generation))
         .or_else(|| rule::answer(invocation, target, generation))
         .or_else(|| compose::answer(invocation, target, generation))
+        .or_else(|| ai_policy::answer(invocation, target, generation))
 }

@@ -31,16 +31,18 @@
 mod tests;
 
 use rmail_proto::v1::{
-    Account as ProtoAccount, Attachment, AuthStatusResponse, BulkTagResponse,
-    Citation as ProtoCitation, CreateDraftRequest, DayUsage, Draft, DraftAddress,
-    DraftNudgeResponse, DraftReplyContext, DraftRevision, EvaluationStats, FindResult,
-    FinderStatusResponse, FolderStatus, Followup, FollowupState, FullMessage, GetSpendResponse,
-    IndexDrift, IndexGcReport, IndexKind, IndexProgress, IndexStatusResponse, ItemKind,
-    ListDraftRevisionsResponse, ListDraftsResponse, ListEntitiesResponse, ListRulesResponse,
-    ListTagRulesResponse, ListTagsResponse, Message as ProtoMessage, MessageOutcome, OutboxEntry,
-    OutboxState, PreflightCheckResponse, PreflightDegradation, PreflightFindingKind,
-    PreflightSeverity, RankExplanation, RenderedDraft, RetrievalTrace, RewriteLength, RewriteTone,
-    SearchHit, SuggestSendTimeResponse, Summary, SyncFolderResponse, SyncStatusResponse,
+    Account as ProtoAccount, AiProviderKind, Attachment, AuditEntry, AuthStatusResponse,
+    BudgetClass, BulkTagResponse, CallStatus, Citation as ProtoCitation, CreateDraftRequest,
+    DayUsage, Draft, DraftAddress, DraftNudgeResponse, DraftReplyContext, DraftRevision,
+    EvaluationStats, FindResult, FinderStatusResponse, FolderStatus, Followup, FollowupState,
+    FullMessage, GetAiProviderResponse, GetSpendResponse, IndexDrift, IndexGcReport, IndexKind,
+    IndexProgress, IndexStatusResponse, InjectionSeverity, ItemKind, ListDraftRevisionsResponse,
+    ListDraftsResponse, ListEntitiesResponse, ListRulesResponse, ListTagRulesResponse,
+    ListTagsResponse, Message as ProtoMessage, MessageOutcome, OutboxEntry, OutboxState,
+    PreflightCheckResponse, PreflightDegradation, PreflightFindingKind, PreflightSeverity,
+    RankExplanation, RenderedDraft, RetrievalTrace, RewriteLength, RewriteTone,
+    ScanInjectionResponse, SearchHit, SetAiProviderResponse, SetBudgetResponse,
+    SuggestSendTimeResponse, Summary, SyncFolderResponse, SyncStatusResponse,
     SynthesizeRuleResponse, TagRuleMode, TagSource, TagSuggestion, TagSyncMode, UsageStats,
 };
 
@@ -1791,4 +1793,444 @@ pub fn draft_reply_context(proto: &DraftReplyContext) -> String {
         line.push_str(&format!(" · {}", proto.model));
     }
     line
+}
+
+// ---------------------------------------------------------------------------
+// AI policy, safety and audit (task 96)
+// ---------------------------------------------------------------------------
+
+/// A dollar figure at the precision the budget surface uses.
+///
+/// Four places rather than [`usd`]'s two, and deliberately not the same
+/// function: a single triage call costs a fraction of a cent, and a budget
+/// report that rounded it to `$0.00` would say nothing was spent by an account
+/// that has been spending all day. The status bar's zone has no room for four
+/// places and does not need them — it answers "am I near the cap", not "what
+/// exactly has this cost".
+fn budget_usd(amount: f64) -> String {
+    format!("${amount:.4}")
+}
+
+/// A cap, or `-` when that dimension is uncapped.
+///
+/// Uncapped is not zero — zero forbids all spending — so an absent cap can
+/// never be printed as a number. `mail ai budget status` draws it the same way.
+fn cap_usd(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_owned(), budget_usd)
+}
+
+/// A token cap, or `-` when uncapped. See [`cap_usd`].
+fn cap_tokens(value: Option<i64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
+/// Where one figure sits against its caps.
+///
+/// The ladder `spend_health` climbs, returning a report's vocabulary instead of
+/// the status bar's: hard first, because a scope past both caps is *blocked*
+/// rather than downgrading, and reporting the softer verdict for it would
+/// understate what is happening. A dimension with no cap at all is muted and
+/// says so — unlimited is a configuration, not a warning.
+fn cap_state(spent: f64, soft: Option<f64>, hard: Option<f64>) -> (&'static str, ReportTone) {
+    if hard.is_some_and(|hard| spent >= hard) {
+        return ("blocked", ReportTone::Bad);
+    }
+    if soft.is_some_and(|soft| spent >= soft) {
+        return ("downgrading", ReportTone::Warn);
+    }
+    if soft.is_some() || hard.is_some() {
+        return ("under", ReportTone::Ok);
+    }
+    ("no cap", ReportTone::Muted)
+}
+
+/// `AiPolicyService.GetSpend` as the `:ai budget status` table.
+///
+/// Eight rows: each class's daily and monthly spend, in dollars and in tokens,
+/// each against the caps that dimension is actually measured by. The tone and
+/// the glyph come from [`cap_state`], which is the same ladder the status bar's
+/// budget indicator climbs — so the report and the bar cannot disagree about
+/// whether a scope is throttled.
+#[must_use]
+pub fn budget_rows(response: &GetSpendResponse) -> Vec<ReportRow> {
+    let mut rows = Vec::new();
+    for class in [response.all.as_ref(), response.bulk.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        // Where the caps came from, on the row rather than in a note of its
+        // own: "unset" and "set to exactly the configured default" behave
+        // identically until the configuration changes, and a reader deciding
+        // whether to edit them needs to know which one they are looking at.
+        let label = format!(
+            "{} ({})",
+            class_label(class.class()),
+            if class.stored { "set" } else { "ai.limits" }
+        );
+        let caps = class.caps.unwrap_or_default();
+        for (window, spend, window_caps) in [
+            (
+                format!("today {}", response.day),
+                class.daily.unwrap_or_default(),
+                caps.daily.unwrap_or_default(),
+            ),
+            (
+                format!("month {}", response.month),
+                class.monthly.unwrap_or_default(),
+                caps.monthly.unwrap_or_default(),
+            ),
+        ] {
+            let (state, tone) = cap_state(spend.usd, window_caps.soft_usd, window_caps.hard_usd);
+            rows.push(
+                ReportRow::new([
+                    label.clone(),
+                    window.clone(),
+                    "dollars".to_owned(),
+                    budget_usd(spend.usd),
+                    cap_usd(window_caps.soft_usd),
+                    cap_usd(window_caps.hard_usd),
+                    state.to_owned(),
+                ])
+                .toned(tone),
+            );
+            // Tokens through the same ladder, as floats only to reuse it: a
+            // token count that exceeds `f64`'s exact integer range would need
+            // more tokens than any provider has ever served, and the comparison
+            // is `>=` against a cap in the same units either way.
+            #[allow(clippy::cast_precision_loss)]
+            let (state, tone) = cap_state(
+                spend.tokens as f64,
+                window_caps.soft_tokens.map(|cap| cap as f64),
+                window_caps.hard_tokens.map(|cap| cap as f64),
+            );
+            rows.push(
+                ReportRow::new([
+                    label.clone(),
+                    window,
+                    "tokens".to_owned(),
+                    spend.tokens.to_string(),
+                    cap_tokens(window_caps.soft_tokens),
+                    cap_tokens(window_caps.hard_tokens),
+                    state.to_owned(),
+                ])
+                .toned(tone),
+            );
+        }
+    }
+    rows
+}
+
+/// The caps in force for one class, as the form's `(flag, value)` pre-fill.
+///
+/// Absent caps are *omitted* rather than sent as an empty string, so a field
+/// this build has no answer for keeps whatever the typed line put in it. An
+/// uncapped dimension therefore shows as the empty field it is, which is what
+/// applying will store — see `commands::ai_policy::fields`.
+///
+/// Formatted with `Display` rather than a fixed precision so the value in the
+/// field is the shortest text that parses back to the same number: a cap of `5`
+/// reads as `5`, not `5.0000`, and a form is read by a person before it is
+/// parsed by anything.
+#[must_use]
+pub fn budget_fields(response: &GetSpendResponse, bulk: bool) -> Vec<(String, String)> {
+    let class = if bulk {
+        response.bulk.as_ref()
+    } else {
+        response.all.as_ref()
+    };
+    let caps = class.and_then(|class| class.caps).unwrap_or_default();
+    let daily = caps.daily.unwrap_or_default();
+    let monthly = caps.monthly.unwrap_or_default();
+    let mut fields = Vec::new();
+    let mut usd = |flag: &str, value: Option<f64>| {
+        if let Some(value) = value {
+            fields.push((flag.to_owned(), value.to_string()));
+        }
+    };
+    usd("daily-soft-usd", daily.soft_usd);
+    usd("daily-hard-usd", daily.hard_usd);
+    usd("monthly-soft-usd", monthly.soft_usd);
+    usd("monthly-hard-usd", monthly.hard_usd);
+    let mut tokens = |flag: &str, value: Option<i64>| {
+        if let Some(value) = value {
+            fields.push((flag.to_owned(), value.to_string()));
+        }
+    };
+    tokens("daily-soft-tokens", daily.soft_tokens);
+    tokens("daily-hard-tokens", daily.hard_tokens);
+    tokens("monthly-soft-tokens", monthly.soft_tokens);
+    tokens("monthly-hard-tokens", monthly.hard_tokens);
+    fields
+}
+
+/// What `SetBudget` stored, as the one line the status line says.
+#[must_use]
+pub fn budget_stored(response: &SetBudgetResponse) -> String {
+    let caps = response.caps.unwrap_or_default();
+    let daily = caps.daily.unwrap_or_default();
+    let monthly = caps.monthly.unwrap_or_default();
+    // Every dimension, including the uncapped ones, because *clearing* a cap is
+    // the outcome somebody needs to see confirmed: this RPC replaces rather than
+    // merges, and a line reporting only what was set would look identical
+    // whether or not the rest had just been wiped.
+    format!(
+        "{} {} budget stored — daily soft {}/{} hard {}/{}, monthly soft {}/{} hard {}/{}",
+        class_label(response.class()),
+        if response.account_id == 0 {
+            "global".to_owned()
+        } else {
+            format!("account {}", response.account_id)
+        },
+        cap_usd(daily.soft_usd),
+        cap_tokens(daily.soft_tokens),
+        cap_usd(daily.hard_usd),
+        cap_tokens(daily.hard_tokens),
+        cap_usd(monthly.soft_usd),
+        cap_tokens(monthly.soft_tokens),
+        cap_usd(monthly.hard_usd),
+        cap_tokens(monthly.hard_tokens),
+    )
+}
+
+/// A budget class's wire name, spelled as `mail ai budget status` spells it.
+fn class_label(class: BudgetClass) -> &'static str {
+    match class {
+        BudgetClass::All => "all",
+        BudgetClass::Bulk => "bulk",
+        BudgetClass::Unspecified => "unspecified",
+    }
+}
+
+/// An AI backend, spelled as `mail ai provider status` spells it.
+fn backend_label(kind: AiProviderKind) -> &'static str {
+    match kind {
+        AiProviderKind::Local => "local (on-device, zero egress)",
+        AiProviderKind::Claude => "claude (hosted)",
+        AiProviderKind::Unspecified => "none (inherits the daemon-wide setting)",
+    }
+}
+
+/// `AiPolicyService.GetAiProvider` as the `:ai provider status` table.
+#[must_use]
+pub fn provider_rows(response: &GetAiProviderResponse) -> Vec<ReportRow> {
+    let effective = response.effective();
+    let mut rows = vec![
+        ReportRow::new([
+            "scope".to_owned(),
+            if response.account_id == 0 {
+                "daemon-wide (every account with no override of its own)".to_owned()
+            } else {
+                format!("account {}", response.account_id)
+            },
+        ]),
+        ReportRow::new([
+            "configured".to_owned(),
+            backend_label(response.configured()).to_owned(),
+        ]),
+        ReportRow::new([
+            "override".to_owned(),
+            backend_label(response.account_override()).to_owned(),
+        ])
+        .toned(
+            if response.account_override() == AiProviderKind::Unspecified {
+                ReportTone::Muted
+            } else {
+                ReportTone::Plain
+            },
+        ),
+        ReportRow::new(["effective".to_owned(), backend_label(effective).to_owned()])
+            .toned(ReportTone::Ok),
+        ReportRow::new(["ai.policy mode".to_owned(), response.policy_mode.clone()]),
+        ReportRow::new([
+            "network provider".to_owned(),
+            if response.network_provider_built {
+                "built".to_owned()
+            } else {
+                "not built — nothing in this daemon can dial out for AI".to_owned()
+            },
+        ])
+        // Muted rather than warned about: an absent network provider is the
+        // structural half of the local-only guarantee holding, not a fault.
+        .toned(if response.network_provider_built {
+            ReportTone::Plain
+        } else {
+            ReportTone::Muted
+        }),
+        ReportRow::new(["local model".to_owned(), response.local_model.clone()]),
+    ];
+    // Bad rather than Warn only when the local path is the one that will serve
+    // the next call: a local backend nobody is routed to being unready is a
+    // fact about this host, and drawing it red would cry wolf on every
+    // hosted-backend install.
+    let tone = match (response.local_ready, effective) {
+        (true, _) => ReportTone::Ok,
+        (false, AiProviderKind::Local) => ReportTone::Bad,
+        (false, _) => ReportTone::Muted,
+    };
+    rows.push(
+        ReportRow::new([
+            "local ready".to_owned(),
+            if response.local_ready { "yes" } else { "no" }.to_owned(),
+        ])
+        .toned(tone),
+    );
+    // Drawn whether or not the path is ready: when it is, this says where the
+    // weights were found; when it is not, it is the fix.
+    rows.push(ReportRow::new([
+        "local detail".to_owned(),
+        response.local_detail.clone(),
+    ]));
+    rows
+}
+
+/// What `SetAiProvider` stored, as the one line the status line says.
+#[must_use]
+pub fn provider_set(response: &SetAiProviderResponse) -> String {
+    format!(
+        "override {} → calls for {} now use {}",
+        backend_label(response.provider()),
+        if response.account_id == 0 {
+            "every account with no override of its own".to_owned()
+        } else {
+            format!("account {}", response.account_id)
+        },
+        backend_label(response.effective()),
+    )
+}
+
+/// How seriously a scan's findings are taken, spelled as the CLI spells it.
+fn severity_label(severity: InjectionSeverity) -> &'static str {
+    match severity {
+        InjectionSeverity::Hostile => "hostile",
+        InjectionSeverity::Suspicious => "suspicious",
+        InjectionSeverity::Unspecified => "unknown",
+    }
+}
+
+/// `AiSafetyService.ScanInjection` as the `:ai scan` table.
+///
+/// The `actions` row carries the invocation that changes the state it reports:
+/// `<enter>` on a withheld message releases it, and on a confirmed one withdraws
+/// the confirmation. Not bang'd, unlike the tag suggestions — releasing a
+/// safety hold is consent to AI-decided mail mutations, and task 90's gate
+/// asking `[y/N]` for exactly that is the gate earning its keep. The row is also
+/// the reason `:ai confirm` is a verb: a row's action *is* an `Invocation`.
+#[must_use]
+pub fn injection_rows(scan: &ScanInjectionResponse) -> Vec<ReportRow> {
+    if !scan.flagged {
+        return vec![ReportRow::new([
+            "clean".to_owned(),
+            format!("message {}: no prompt-injection signals", scan.message_id),
+        ])
+        .toned(ReportTone::Ok)];
+    }
+    let severity = scan.severity();
+    let mut rows = vec![
+        ReportRow::new(["severity".to_owned(), severity_label(severity).to_owned()]).toned(
+            match severity {
+                InjectionSeverity::Hostile => ReportTone::Bad,
+                InjectionSeverity::Suspicious => ReportTone::Warn,
+                InjectionSeverity::Unspecified => ReportTone::Plain,
+            },
+        ),
+        ReportRow::new(["kinds".to_owned(), scan.kinds.join(", ")]),
+    ];
+    let actions = ReportRow::new([
+        "actions".to_owned(),
+        if scan.actions_withheld {
+            "withheld — a rule matching on claude_is will not act here".to_owned()
+        } else if scan.confirmed_at > 0 {
+            "allowed (confirmed)".to_owned()
+        } else {
+            "allowed (below the configured block threshold)".to_owned()
+        },
+    ])
+    .toned(if scan.actions_withheld {
+        ReportTone::Bad
+    } else {
+        ReportTone::Ok
+    });
+    rows.push(match confirm_invocation(scan.confirmed_at > 0) {
+        Some(invocation) => actions.running(invocation),
+        // Unreachable: `ai confirm` is declared, and
+        // `command::tests::every_real_verb_is_reachable_by_typing_its_own_path`
+        // is what keeps it so. A row that does nothing beats a panic in a
+        // client holding a terminal in raw mode.
+        None => actions,
+    });
+    rows.push(ReportRow::new([
+        "scanned".to_owned(),
+        when(scan.scanned_at),
+    ]));
+    rows.push(ReportRow::new([
+        "confirmed".to_owned(),
+        when(scan.confirmed_at),
+    ]));
+    for detection in &scan.detections {
+        rows.push(
+            ReportRow::new([
+                detection.kind.clone(),
+                // Already stripped of invisible and bidi-override characters by
+                // the daemon, and put through `safe_line` anyway: this client
+                // never renders remote text it has not bounded itself.
+                detection.excerpt.clone(),
+                format!("byte {}", detection.offset),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    rows
+}
+
+/// The `:ai confirm` invocation the `actions` row runs.
+///
+/// Parsed rather than built field by field, so the row runs exactly what typing
+/// that line runs — including the capability task 90's gate reads.
+fn confirm_invocation(confirmed: bool) -> Option<command::Invocation> {
+    let line = if confirmed {
+        "ai confirm --revoke"
+    } else {
+        "ai confirm"
+    };
+    match command::parse(line) {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
+    }
+}
+
+/// `AuditService.QueryAiCalls` (and `ExportLedger`) as the `:ai audit` table.
+///
+/// Newest first, which is the order both RPCs send in — not re-sorted here: a
+/// client that reordered a ledger would be a client whose page boundaries no
+/// longer matched the cursor the daemon paginates by.
+#[must_use]
+pub fn audit_rows(entries: &[AuditEntry]) -> Vec<ReportRow> {
+    entries.iter().map(audit_row).collect()
+}
+
+/// One ledger row.
+#[must_use]
+pub fn audit_row(entry: &AuditEntry) -> ReportRow {
+    let tokens = entry.input_tokens
+        + entry.output_tokens
+        + entry.cache_creation_input_tokens
+        + entry.cache_read_input_tokens;
+    let failed = entry.status() == CallStatus::Error;
+    ReportRow::new([
+        when(entry.created_at),
+        entry.model.clone(),
+        entry.pass.clone().unwrap_or_else(|| "-".to_owned()),
+        tokens.to_string(),
+        budget_usd(entry.cost_usd),
+        match (&entry.error, failed) {
+            (Some(error), _) => error.clone(),
+            (None, true) => "error".to_owned(),
+            (None, false) => format!("ok · {} ms · {}", entry.latency_ms, entry.redaction_level),
+        },
+    ])
+    .toned(if failed {
+        ReportTone::Bad
+    } else {
+        ReportTone::Plain
+    })
 }

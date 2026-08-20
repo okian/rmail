@@ -351,6 +351,20 @@ pub const PAGES: &[Page] = &[
         ],
     },
     Page {
+        anchor: "ai-policy",
+        title: "AI spend, safety and the ledger",
+        body: Body::Authored(include_str!("manual/pages/ai-policy.md")),
+        documents: &[
+            "ai budget status",
+            "ai budget set",
+            "ai provider status",
+            "ai provider set",
+            "ai scan",
+            "ai confirm",
+            "ai audit",
+        ],
+    },
+    Page {
         anchor: "compose-and-send",
         title: "Reply, drafts, sending and follow-ups",
         body: Body::Authored(include_str!("manual/pages/compose-and-send.md")),

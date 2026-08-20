@@ -58,6 +58,7 @@ use rmail_core::command;
 use rmail_core::parity::Command as Capability;
 
 use super::commands::{self, Answer, Target};
+use super::form::FormPane;
 use super::help::{self, HelpPane};
 use super::history::History;
 use super::manual;
@@ -539,6 +540,8 @@ pub enum Overlay {
     Quick(QuickPane),
     /// The answer to a `:` verb that reports rows (task 90).
     Report(Box<ReportPane>),
+    /// A set of fields a verb is being given, applied as a `:` line (task 96).
+    Form(Box<FormPane>),
 }
 
 /// What answering `y` to an [`Overlay::Confirm`] does.
@@ -598,6 +601,7 @@ impl Overlay {
             Self::Outbox(pane) => (pane.cursor, pane.rows.len()),
             Self::Quick(pane) => (pane.cursor, QuickAction::ALL.len()),
             Self::Report(pane) => (pane.cursor, pane.rows.len()),
+            Self::Form(pane) => (pane.cursor, pane.rows()),
             // Counts only `help::Row::Binding` entries — the group headers
             // interspersed among them are not something a cursor can land
             // on, so they must not be something its length counts either.
@@ -626,6 +630,7 @@ impl Overlay {
             Self::Outbox(pane) => pane.cursor = at,
             Self::Quick(pane) => pane.cursor = at,
             Self::Report(pane) => pane.cursor = at,
+            Self::Form(pane) => pane.cursor = at,
             Self::Help(pane) => pane.cursor = at,
             Self::Pick { .. }
             | Self::Confirm { .. }
@@ -803,6 +808,17 @@ pub enum Msg {
         /// What arrived.
         event: ReportEvent,
     },
+    /// What a form's pre-fill read reported (task 96).
+    ///
+    /// Its own message rather than a [`Msg::Report`] frame: what arrives names
+    /// *fields*, not cells, and a form fed a report's rows would have to guess
+    /// which column was which flag.
+    Form {
+        /// Which form it belongs to. An answer to a superseded one is dropped.
+        generation: u64,
+        /// What arrived.
+        event: FormEvent,
+    },
     /// `keys.toml` was read (see [`crate::keymap::file::Source`]).
     Keymap {
         /// The bindings to switch to, or why the file was refused — in which
@@ -865,6 +881,20 @@ pub enum ReportEvent {
     },
     /// The report failed. Rows already shown are kept — see
     /// [`ReportPane::fail`].
+    Failed(String),
+}
+
+/// What a form's pre-fill read delivered.
+///
+/// No streaming case and no `complete` flag: a form is filled by one unary read
+/// and applied once. A verb whose fields arrived in pieces would be a form that
+/// could be applied halfway through being told what it was replacing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormEvent {
+    /// The values in force, as `(flag, value)` pairs. A flag this build has no
+    /// field for is ignored — see [`FormPane::fill`].
+    Fields(Vec<(String, String)>),
+    /// The read failed. The form stays un-appliable; see [`FormPane::ready`].
     Failed(String),
 }
 
@@ -1330,6 +1360,81 @@ pub enum Cmd {
         name: String,
         /// How far back, or the daemon's default.
         days: Option<u32>,
+    },
+    /// `AiPolicyService.GetSpend` — the `:ai budget status` report.
+    BudgetStatus {
+        /// Which report this is.
+        generation: u64,
+        /// Which scope: 0 is the global budget.
+        account_id: i64,
+    },
+    /// `AiPolicyService.GetSpend`, read to pre-fill the budget form.
+    ///
+    /// The same RPC as [`Cmd::BudgetStatus`] and deliberately its own command:
+    /// the answer goes somewhere different (a form, not a report), and one command
+    /// whose destination depended on a flag would be two behaviours behind one
+    /// name.
+    BudgetForm {
+        /// Which form this is.
+        generation: u64,
+        /// Which scope.
+        account_id: i64,
+        /// Which sub-budget the form will write.
+        class: commands::ai_policy::Class,
+    },
+    /// `AiPolicyService.SetBudget` — replaces the scope's whole budget.
+    BudgetSet {
+        /// Which scope.
+        account_id: i64,
+        /// Which sub-budget.
+        class: commands::ai_policy::Class,
+        /// The caps to store, as `(flag, value)` text pairs. A cap absent from
+        /// this list is a cap *cleared* — the RPC replaces rather than merges.
+        caps: Vec<(String, String)>,
+    },
+    /// `AiPolicyService.GetAiProvider`.
+    ProviderStatus {
+        /// Which report this is.
+        generation: u64,
+        /// Which scope.
+        account_id: i64,
+    },
+    /// `AiPolicyService.SetAiProvider`.
+    ProviderSet {
+        /// Which scope.
+        account_id: i64,
+        /// Which backend, or inherit.
+        provider: commands::ai_policy::Provider,
+    },
+    /// `AiSafetyService.ScanInjection`.
+    ScanInjection {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+    },
+    /// `AiSafetyService.ConfirmInjection`.
+    ConfirmInjection {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+        /// Release the withheld actions, or withhold them again.
+        confirm: commands::ai_policy::Confirm,
+    },
+    /// `AuditService.QueryAiCalls`, or `ExportLedger` when the whole ledger was
+    /// asked for.
+    AuditQuery {
+        /// Which report this is.
+        generation: u64,
+        /// Narrow to one account, or 0 for every one.
+        account_id: i64,
+        /// Narrow to one model.
+        model: Option<String>,
+        /// Only the calls that failed.
+        failed_only: bool,
+        /// Walk the whole ledger rather than the most recent page.
+        whole_ledger: bool,
     },
     /// `RuleService.RecordCorrection`.
     RuleCorrect {
@@ -1833,13 +1938,19 @@ impl Model {
             Some(Overlay::Help(pane)) if pane.editing => Mode::Prompt,
             Some(Overlay::Help(_)) => Mode::Help,
             Some(Overlay::Finder(_) | Overlay::Command(_)) => Mode::Prompt,
+            // A form is two modes for the same reason the search pane is: the
+            // keyboard is text while a field is open and commands while it is
+            // not, and deriving that from the pane rather than storing it is what
+            // stops the two from disagreeing.
+            Some(Overlay::Form(pane)) if pane.editing.is_some() => Mode::Insert,
             Some(
                 Overlay::Search(_)
                 | Overlay::Ask(_)
                 | Overlay::Reply(_)
                 | Overlay::Outbox(_)
                 | Overlay::Quick(_)
-                | Overlay::Report(_),
+                | Overlay::Report(_)
+                | Overlay::Form(_),
             ) => Mode::Menu,
             None => match self.screen {
                 // Checked before the visual selection, not after: the manual
@@ -2370,6 +2481,29 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             apply_note(model, note);
             Vec::new()
         }
+        Msg::Form { generation, event } => {
+            let mut note = None;
+            if let Some(Overlay::Form(pane)) = model.overlay.as_mut() {
+                match event {
+                    FormEvent::Fields(values) => {
+                        if pane.fill(generation, &values) {
+                            note = Some(Ok(format!(
+                                "{} — <enter> edits a field · apply to store · Esc closes",
+                                pane.invocation.verb.join(" ")
+                            )));
+                        }
+                    }
+                    FormEvent::Failed(error) => {
+                        if pane.fail(generation, error.clone()) {
+                            note =
+                                Some(Err(format!("{}: {error}", pane.invocation.verb.join(" "))));
+                        }
+                    }
+                }
+            }
+            apply_note(model, note);
+            Vec::new()
+        }
         Msg::Explained { message_id, result } => {
             let mut note = None;
             if let Some(Overlay::Search(pane)) = model.overlay.as_mut() {
@@ -2809,6 +2943,17 @@ fn edit_prompt(model: &mut Model, edit: TextEdit) -> Vec<Cmd> {
         Some(Overlay::Help(pane)) if pane.editing => {
             once(apply_edit(&mut pane.filter, edit), Typed::HelpFilter)
         }
+        // The pane's own methods rather than `apply_edit`: a field is bounded by
+        // `form::MAX_VALUE` rather than `MAX_INPUT`, and an edit to one clears
+        // the complaint the last apply left — which is state `apply_edit` cannot
+        // see from behind a `&mut String`.
+        Some(Overlay::Form(pane)) if pane.editing.is_some() => {
+            match edit {
+                TextEdit::Push(c) => pane.push(c),
+                TextEdit::Backspace => pane.backspace(),
+            }
+            Typed::Nothing
+        }
         _ => Typed::Nothing,
     };
     match typed {
@@ -3141,6 +3286,16 @@ enum Leave {
 /// (`keymap::Chord::is_reserved`), and always makes progress towards the
 /// message list.
 fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
+    // A form's open field is inside the form, the way the manual's search line
+    // is inside the manual: `<esc>` puts the value back and leaves the form up.
+    // Ahead of the take below, because taking the overlay first would close the
+    // whole form to cancel one field.
+    if let Some(Overlay::Form(pane)) = model.overlay.as_mut() {
+        if pane.cancel_edit() {
+            model.info("cancelled");
+            return Vec::new();
+        }
+    }
     if let Some(overlay) = model.overlay.take() {
         // The help screen was not collecting anything, so "cancelled" would
         // be a lie; the others were. Half true since task 102: browsing it
@@ -3226,6 +3381,10 @@ fn streams_of(overlay: &Overlay) -> &'static [Stream] {
         Overlay::Ask(_) => &[Stream::Ask],
         Overlay::Reply(_) => &[Stream::Reply],
         Overlay::Report(_) => &[Stream::Report],
+        // A form's own pre-fill read shares the report slot: only one of the two
+        // is on screen at a time, and `Esc` needs one thing to cancel whichever
+        // it is.
+        Overlay::Form(_) => &[Stream::Report],
         Overlay::Help(_)
         | Overlay::Pick { .. }
         | Overlay::Confirm { .. }
@@ -3407,6 +3566,15 @@ fn accept_confirm(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn submit(model: &mut Model) -> Vec<Cmd> {
+    // `<enter>` closes the field it opened and leaves the form up. Not an
+    // apply: the form is several fields and committing on the first `<enter>`
+    // would make filling in the second one impossible.
+    if let Some(Overlay::Form(pane)) = model.overlay.as_mut() {
+        if pane.editing.is_some() {
+            pane.commit();
+            return Vec::new();
+        }
+    }
     let (buffer, what, message_id) = match model.overlay.take() {
         Some(Overlay::Input {
             buffer,
@@ -5054,6 +5222,19 @@ fn run_daemon_command(model: &mut Model, invocation: command::Invocation) -> Vec
     };
     let request = match answer {
         Answer::Refused(why) => return complain(model, format!("{verb}: {why}")),
+        // A form's read is issued and its pane opened here rather than below,
+        // because a form has no columns and no confirmation: the pane *is* the
+        // confirmation — it shows what is about to be replaced, which is more
+        // than a `[y/N]` could say.
+        Answer::Form(request) => {
+            model.generation = generation;
+            close_command(model);
+            let mut pane = FormPane::new(invocation, request.title, request.fields, generation);
+            pane.prefill(&pane.invocation.flags.clone());
+            model.overlay = Some(Overlay::Form(Box::new(pane)));
+            model.info(format!("{verb} — reading what is in force…"));
+            return vec![request.cmd];
+        }
         Answer::Rows(request) | Answer::Fact(request) => request,
     };
     // The question comes before anything else is touched, and it carries the
@@ -5138,6 +5319,14 @@ fn rerun_report(model: &mut Model) -> Vec<Cmd> {
     let generation = model.generation + 1;
     let request = match commands::answer(&invocation, &target_of(model), generation) {
         Some(Answer::Rows(request) | Answer::Fact(request)) => request,
+        // A verb that answers with a form rather than rows. Unreachable today —
+        // no form opens a report — and reported rather than ignored, because
+        // "`r` did nothing" is the one outcome that would send somebody looking
+        // for a broken key.
+        Some(Answer::Form(_)) => {
+            model.fail(format!("{verb} answers with a form — Esc, then type it"));
+            return Vec::new();
+        }
         // A report open for a verb whose answer has become unavailable: the
         // account went away under a `:sync status`, say. Reported rather than
         // silently doing nothing, and the rows already on screen are left
@@ -5438,6 +5627,8 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Quick(QuickAction),
         /// A report row carrying something to run.
         Row(Box<command::Invocation>),
+        /// A form's highlighted field, or its apply row.
+        Field,
         /// The row under the cursor is a manual link.
         ManualLink,
         /// The highlighted key reference row (task 102).
@@ -5464,6 +5655,7 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
             .map_or(Chosen::Nothing, |invocation| {
                 Chosen::Row(Box::new(invocation))
             }),
+        Some(Overlay::Form(_)) => Chosen::Field,
         Some(Overlay::Help(pane)) => help::selected(pane).map_or(Chosen::Close, Chosen::Run),
         None if model.screen == Screen::Manual => Chosen::ManualLink,
         _ => Chosen::Nothing,
@@ -5473,6 +5665,7 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Chosen::Outbox => describe_outbox_row(model),
         Chosen::Quick(action) => run_quick(model, action),
         Chosen::Row(invocation) => run_report_row(model, *invocation),
+        Chosen::Field => edit_or_apply_form(model),
         Chosen::ManualLink => follow_manual_link(model),
         // Not `run_named` for this one action: `open_help_rebind` reads the
         // key reference's own `pane` (the highlighted action, and which
@@ -5487,6 +5680,65 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Chosen::Close => leave(model, Leave::ThenNothing),
         Chosen::Nothing => Vec::new(),
     }
+}
+
+/// `<enter>` on a form: open the highlighted field, or apply the whole thing.
+///
+/// One key for both because [`FormPane::rows`] makes the apply *a row*: `Menu`
+/// has one gesture for "use what is highlighted", and a form whose fields and
+/// whose commit answered to different keys would be a second vocabulary to
+/// learn for one overlay.
+fn edit_or_apply_form(model: &mut Model) -> Vec<Cmd> {
+    let Some(Overlay::Form(pane)) = model.overlay.as_mut() else {
+        return Vec::new();
+    };
+    if !pane.on_apply() {
+        pane.edit();
+        return Vec::new();
+    }
+    // The one rule that matters about this pane, and it lives on the pane: an
+    // unfilled form must not replace what it could not read. See
+    // `FormPane::blocked`.
+    if let Some(why) = pane.blocked() {
+        let verb = pane.invocation.verb.join(" ");
+        model.fail(format!("{verb}: {why}"));
+        return Vec::new();
+    }
+    let line = pane.line();
+    let applied = match pane.apply() {
+        Ok(invocation) => invocation,
+        // The parser's own complaint about a field's value.
+        Err(error) => return refuse_form(model, error.to_string()),
+    };
+    // The verb's own refusal, asked here as well as by the dispatcher so a value
+    // it will not accept is refused *on the form*. `commands::answer` is pure —
+    // no overlay, no request, no `Model` — so asking it twice costs nothing and
+    // cannot drift from the answer that will actually run.
+    let generation = model.generation + 1;
+    if let Some(Answer::Refused(why)) = commands::answer(&applied, &target_of(model), generation) {
+        return refuse_form(model, why);
+    }
+    // Down before the invocation runs, for the reason `run_row` takes the
+    // report down: every action reads `Model::mode`, and one dispatched with the
+    // form still up would be answered by the form's own `Menu` layer.
+    model.overlay = None;
+    record_command(model, &line);
+    run_invocation(model, applied)
+}
+
+/// Keep the form up, with `why` on it.
+///
+/// The field that caused the refusal is still on screen and still editable,
+/// which is the whole point of refusing at the form rather than a round trip
+/// later — and of not closing it first.
+fn refuse_form(model: &mut Model, why: String) -> Vec<Cmd> {
+    let Some(Overlay::Form(pane)) = model.overlay.as_mut() else {
+        return Vec::new();
+    };
+    let verb = pane.invocation.verb.join(" ");
+    pane.error = Some(why.clone());
+    model.fail(format!("{verb}: {why}"));
+    Vec::new()
 }
 
 /// The outbox has nothing to open — a scheduled send is not a message in a

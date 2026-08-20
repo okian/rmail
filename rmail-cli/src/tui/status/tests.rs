@@ -735,9 +735,16 @@ fn an_indicator_names_its_command_only_when_this_build_has_it() {
 
 #[test]
 fn the_hint_is_the_verbs_own_canonical_spelling() {
-    // Task 94 declared three of the four, so those hints now name one — which
-    // is the derivation working rather than the hints being written down:
-    // nothing in `tui::status` changed when those verbs arrived.
+    // All four now name one, and no edit in `tui::status` made that happen:
+    // task 94 declared three of these verbs and task 96 the fourth, and the
+    // hints turned on as each arrived. That is the derivation working rather
+    // than the hints being written down.
+    //
+    // The `Option` is still load-bearing — a build without a verb draws no hint,
+    // which `an_indicator_names_its_command_only_when_this_build_has_it` checks
+    // against the registry rather than against a list — but nothing in this
+    // build exercises the `None` any more, which is what having every subsystem
+    // reachable by typing means.
     let model = loaded();
     let named: Vec<Option<String>> = bar(&model)
         .daemon
@@ -750,9 +757,7 @@ fn the_hint_is_the_verbs_own_canonical_spelling() {
             Some(":sync status".to_owned()),
             Some(":index status".to_owned()),
             Some(":ai status".to_owned()),
-            // Task 96's, and still undeclared — which is what keeps the
-            // `Option` load-bearing rather than decorative.
-            None,
+            Some(":ai budget status".to_owned()),
         ],
         "each hint is the verb's own canonical spelling, in indicator order"
     );
