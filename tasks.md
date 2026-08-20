@@ -1059,7 +1059,7 @@ Known backend gaps this phase deliberately does **not** paper over (Settings sho
 - **verify:** `cargo nextest run -p rmail-cli tui::commands::content` (export streams to each format, digest row citation navigation, saved-search/smart-folder CRUD, attachment ask/search)
 
 ## 100. Compose, send and follow-up commands
-- [ ] status
+- [x] status
 - **depends-on:** 94
 - **parallel-safe:** yes
 - **acceptance:**
