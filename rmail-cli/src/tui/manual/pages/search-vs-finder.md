@@ -42,6 +42,32 @@ and the reranker's own one-line reason when a model reranked.
 data an agent is handed as grounding, which is why [[grounded]] can make the
 claim it does.
 
+## Reading the plan, and the index behind it
+
+Three verbs sit next to search rather than inside it, because each answers a
+question *about* a search rather than running one.
+
+{{cmd:search compile}} compiles a sentence into a query and shows you the plan
+before anything runs — the operators it turned into, the semantic arm if there is
+one, and whether the answer came from the cache or a fresh model call. A plan you
+can read is a plan you can correct.
+
+{{cmd:search entities}} searches the extracted entities rather than the messages:
+the addresses, amounts, phone numbers and organisations the index pulled out.
+`--kinds` narrows to some of them.
+
+{{cmd:search eval}} scores a golden set — a file of queries with judged answers —
+and reports NDCG@10, MRR, Recall@50 and P@3 per query and overall. It is the one
+verb in this client that reads a file, and it has to: the RPC takes its judgments
+by value so the daemon needs no access to whatever directory you are in, and a
+golden set exists nowhere but on disk. A query whose judgments name messages the
+index does not have is drawn as a warning, because every metric for it is then a
+lower bound rather than a measurement.
+
+```
+mail search eval --golden eval/golden.toml
+```
+
 ## The finder's scopes
 
 A leading sigil narrows what is searched, and is stripped before matching:

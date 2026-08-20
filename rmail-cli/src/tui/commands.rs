@@ -40,6 +40,7 @@ pub mod account;
 pub mod ai_policy;
 pub mod automation;
 pub mod compose;
+pub mod content;
 pub mod daemon;
 pub mod rule;
 pub mod tag;
@@ -346,4 +347,5 @@ pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Opti
         .or_else(|| account::answer(invocation, target, generation))
         .or_else(|| token::answer(invocation, target, generation))
         .or_else(|| automation::answer(invocation, target, generation))
+        .or_else(|| content::answer(invocation, target, generation))
 }

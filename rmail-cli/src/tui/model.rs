@@ -1368,6 +1368,374 @@ pub enum Cmd {
         /// How far back, or the daemon's default.
         days: Option<u32>,
     },
+    /// `ExportService.Export`, written to disk by
+    /// `rmail_core::export::write::DestinationWriter` at the wire seam.
+    Export {
+        /// Which report this is.
+        generation: u64,
+        /// The query selecting what to export. Empty when `thread_id` is set —
+        /// the proto's selection is a oneof.
+        query: String,
+        /// One thread instead of a query.
+        thread_id: Option<i64>,
+        /// How the archive is framed on disk.
+        format: commands::content::analytics::Format,
+        /// The directory to write into.
+        to: String,
+        /// Include what the AI passes produced.
+        with_ai: bool,
+        /// At most this many messages.
+        limit: Option<i64>,
+    },
+    /// `AnalyticsService.GetResponseTimes`.
+    ResponseTimes {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// One row per contact, or per mailbox.
+        group_by: commands::content::analytics::GroupBy,
+        /// How far back to look, in seconds. Subtracted from `now` at the wire
+        /// seam — see `commands::content`'s module docs on why the model does not
+        /// read a clock.
+        since_secs: Option<i64>,
+        /// Where the window ends, as unix seconds, or `None` for now.
+        until: Option<i64>,
+        /// At most this many groups.
+        limit: Option<i64>,
+        /// Ignore a group with fewer samples than this.
+        min_samples: Option<i64>,
+    },
+    /// `AnalyticsService.AskAnalytics`.
+    AskAnalytics {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// The question, in words.
+        question: String,
+        /// Also have the rows summarized in prose.
+        narrate: bool,
+    },
+    /// `AnalyticsService.GenerateDigest`.
+    Digest {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// How far back, in seconds.
+        since_secs: Option<i64>,
+        /// Where the window ends.
+        until: Option<i64>,
+        /// Regenerate rather than answering from the cache.
+        force: bool,
+    },
+    /// `AnalyticsService.GetContactInsight`.
+    ContactInsight {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// Whose.
+        address: String,
+        /// How far back, in seconds.
+        since_secs: Option<i64>,
+        /// Where the window ends.
+        until: Option<i64>,
+        /// Skip the model briefing.
+        metrics_only: bool,
+    },
+    /// `AnalyticsService.ListSubscriptions`.
+    Subscriptions {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// How far back, in seconds.
+        since_secs: Option<i64>,
+        /// Where the window ends.
+        until: Option<i64>,
+        /// At most this many senders.
+        limit: Option<i64>,
+        /// Only the senders worth unsubscribing from.
+        candidates_only: bool,
+        /// Have a model classify the ones the heuristics could not.
+        classify_unknown: bool,
+    },
+    /// `AttachmentService.ExtractTables`.
+    AttachTables {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+        /// One part, or every one the extractor recognises.
+        part: Option<String>,
+        /// Let a model read what the parsers cannot.
+        allow_model: bool,
+    },
+    /// `AttachmentService.ExtractInvoice`.
+    AttachInvoice {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+        /// One part, or the best candidate.
+        part: Option<String>,
+        /// Let a model read what the parsers cannot.
+        use_model: bool,
+    },
+    /// `AttachmentService.ExportInvoices`.
+    AttachInvoices {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// Narrow to one vendor.
+        vendor: Option<String>,
+        /// How far back, in seconds.
+        since_secs: Option<i64>,
+        /// Where the window ends.
+        until: Option<i64>,
+        /// At most this many invoices.
+        limit: Option<i64>,
+        /// Rows, or a CSV document.
+        format: commands::content::analytics::InvoiceFormat,
+    },
+    /// `AttachmentService.AskAttachment` — streamed.
+    AttachAsk {
+        /// Which report this is.
+        generation: u64,
+        /// The question.
+        question: String,
+        /// One message, or 0 for the whole account.
+        message_id: i64,
+        /// The account, when the question is account-wide.
+        account_id: i64,
+        /// One part, or every one.
+        part: Option<String>,
+        /// How many passages to retrieve.
+        top_k: Option<i64>,
+    },
+    /// `SearchService.SearchAttachments`.
+    AttachSearch {
+        /// Which report this is.
+        generation: u64,
+        /// The query.
+        query: String,
+        /// Which account.
+        account_id: i64,
+        /// One message, or 0 for the whole account.
+        message_id: i64,
+        /// At most this many hits.
+        limit: Option<i64>,
+    },
+    /// `ExtractService.ExtractEvents` or `ExtractTasks`.
+    ///
+    /// One command for two RPCs because they are the same act over two item
+    /// kinds: the request fields, the sink, the idempotency claim and the report
+    /// shape are identical, and two commands would be two copies of one wire seam.
+    Extract {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+        /// Tasks rather than events.
+        tasks: bool,
+        /// Let a model read free text, rather than only a real `.ics` part.
+        use_model: bool,
+        /// Where the items are delivered.
+        sink: commands::content::extract::Sink,
+    },
+    /// `ExtractService.ExtractStructured`.
+    ExtractData {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+        /// Which configured schema.
+        schema: String,
+        /// Re-extract rather than answering from the cache.
+        refresh: bool,
+    },
+    /// `LinkService.ExtractLinks`.
+    Links {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+        /// Let a model classify what the rules could not.
+        use_model: bool,
+    },
+    /// `SearchService.CompileQuery`.
+    CompileQuery {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// The sentence to compile.
+        query: String,
+        /// Recompile rather than answering from the cache.
+        refresh: bool,
+    },
+    /// `SearchService.SearchEntities`.
+    SearchEntities {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// The query.
+        query: String,
+        /// Narrow to these kinds.
+        kinds: Vec<String>,
+        /// How far back, in seconds.
+        since_secs: Option<i64>,
+        /// At most this many hits.
+        limit: Option<i64>,
+    },
+    /// `SearchService.Evaluate`, over a golden set read from `path`.
+    SearchEval {
+        /// Which report this is.
+        generation: u64,
+        /// The golden-set file. Parsed at the wire seam, on a blocking task —
+        /// the one file this client reads, and `commands::content::extract`'s
+        /// module docs say why it has to.
+        path: String,
+        /// Which retrieval arm to score, or the daemon's default.
+        mode: Option<commands::content::extract::Mode>,
+        /// How many results to score per query.
+        limit: Option<i64>,
+    },
+    /// `NoteService.AddNote`.
+    NoteAdd {
+        /// The message the note is about.
+        message_id: i64,
+        /// Whether it is about that message's thread rather than the message.
+        thread: bool,
+        /// The note, as markdown.
+        body: String,
+    },
+    /// `NoteService.ListNotes`.
+    NoteList {
+        /// Which report this is.
+        generation: u64,
+        /// The message.
+        message_id: i64,
+        /// Whether it is the thread.
+        thread: bool,
+    },
+    /// `NoteService.WatchNotes` — the live listing.
+    NoteWatch {
+        /// Which report this is.
+        generation: u64,
+        /// The message.
+        message_id: i64,
+        /// Whether it is the thread.
+        thread: bool,
+    },
+    /// `NoteService.EditNote`.
+    NoteEdit {
+        /// Which note.
+        note_id: i64,
+        /// What it should say now.
+        body: String,
+    },
+    /// `NoteService.DeleteNote`.
+    NoteDelete {
+        /// Which note.
+        note_id: i64,
+    },
+    /// `SavedSearchService.ListSavedSearches`.
+    SavedList {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+    },
+    /// `SavedSearchService.CreateSavedSearch` or `UpdateSavedSearch`.
+    SavedSet {
+        /// Which account.
+        account_id: i64,
+        /// The name it is stored under.
+        name: String,
+        /// The query it stands for.
+        query: String,
+        /// Update an existing one rather than creating a new one.
+        update: bool,
+    },
+    /// `SavedSearchService.RunSavedSearch` — streamed.
+    SavedRun {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// Which saved search.
+        name: String,
+        /// At most this many hits.
+        limit: Option<i64>,
+        /// Ask for each hit's ranking explanation.
+        explain: bool,
+    },
+    /// `SavedSearchService.DeleteSavedSearch`.
+    SavedDelete {
+        /// Which account.
+        account_id: i64,
+        /// Which saved search.
+        name: String,
+    },
+    /// `SavedSearchService.ListSmartFolders`.
+    FolderList {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+    },
+    /// `SavedSearchService.CreateSmartFolder` or `CompileSmartFolder`.
+    FolderCreate {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// The folder's name.
+        name: String,
+        /// Its predicate, or — when `compile` is set — the sentence to compile
+        /// into one.
+        text: String,
+        /// Have a model compile a sentence rather than taking a predicate.
+        compile: bool,
+        /// A tag to apply to whatever enters it.
+        auto_tag: Option<String>,
+        /// Notify on what enters it.
+        notify: bool,
+        /// Recompile rather than answering from the cache.
+        refresh: bool,
+    },
+    /// `SavedSearchService.ListSmartFolderMembers` — streamed.
+    FolderMembers {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// Which folder.
+        name: String,
+        /// At most this many members.
+        limit: Option<i64>,
+    },
+    /// `SavedSearchService.EvaluateSmartFolder`.
+    FolderEval {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// Which folder.
+        name: String,
+    },
+    /// `SavedSearchService.DeleteSmartFolder`.
+    FolderDelete {
+        /// Which account.
+        account_id: i64,
+        /// Which folder.
+        name: String,
+    },
     /// `WebhookService.List` — the `:webhook list` report.
     WebhookList {
         /// Which report this is.
@@ -5131,6 +5499,63 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
             );
         };
         return use_account(model, id);
+    }
+    if verb == "message open" {
+        // Hand-written next to `:attach list` and for the same reason: it reaches
+        // no capability of its own. What it does is navigate, which no `Answer`
+        // shape describes — a report row that opened a message would otherwise
+        // have to be a special case in the dispatcher rather than a `:` line.
+        let Some(message_id) = invocation
+            .positionals
+            .first()
+            .and_then(|id| id.parse::<i64>().ok())
+        else {
+            return complain(
+                model,
+                "message open needs an id — a citing report row carries one".to_owned(),
+            );
+        };
+        close_command(model);
+        return open_message_by_id(model, message_id);
+    }
+    if verb == "attach list" {
+        // Hand-written next to `:toml` and for the same reason: it reaches no
+        // capability. The open message's parts came back with the message, so a
+        // round trip to re-fetch what the preview pane is already drawing would
+        // be a second source of truth for one listing.
+        let Some(open) = model.open.as_ref() else {
+            return complain(
+                model,
+                "no message open — <enter> on a row opens one".to_owned(),
+            );
+        };
+        let rows: Vec<ReportRow> = open
+            .attachments
+            .iter()
+            .map(|line| ReportRow::new([line.clone()]))
+            .collect();
+        let message_id = open.id;
+        let generation = model.generation + 1;
+        model.generation = generation;
+        close_command(model);
+        let mut pane = ReportPane::new(
+            invocation,
+            format!("attach list {message_id}"),
+            vec![ReportColumn::new("attachment", 72)],
+            generation,
+        );
+        // Complete on arrival, for the reason a block's report is: nothing is
+        // outstanding, so a border reading "asking…" would describe a request
+        // that was never made.
+        pane.apply(generation, ReportFill::Replace, rows, true);
+        let count = pane.rows.len();
+        model.overlay = Some(Overlay::Report(Box::new(pane)));
+        model.info(match count {
+            0 => "nothing attached to this message".to_owned(),
+            1 => "1 attachment · :attach tables, :attach invoice, :attach ask".to_owned(),
+            n => format!("{n} attachments · :attach tables, :attach invoice, :attach ask"),
+        });
+        return Vec::new();
     }
     if verb == "toml" {
         // Hand-written next to `:account use` and for the same reason: it

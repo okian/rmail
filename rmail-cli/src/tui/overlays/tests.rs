@@ -595,6 +595,38 @@ fn a_finder_kind_this_build_does_not_know_is_never_acted_on() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_needle_that_begins_a_word_outranks_one_buried_inside_one() {
+    // Stated over the ranker rather than through two named verbs, so it keeps
+    // holding as the registry grows: whichever verbs happen to collide, the one
+    // where the needle starts a segment comes first.
+    let keymap = Keymap::defaults();
+    for needle in ["arch", "list", "new", "run", "add"] {
+        let matches = command_matches(needle, &keymap);
+        let Some(first) = matches.first() else {
+            continue;
+        };
+        let word_start = matches.iter().any(|entry| {
+            entry
+                .verb
+                .split(' ')
+                .any(|segment| segment.starts_with(needle))
+        });
+        if !word_start {
+            continue;
+        }
+        assert!(
+            first.verb.starts_with(needle)
+                || first
+                    .verb
+                    .split(' ')
+                    .any(|segment| segment.starts_with(needle)),
+            "{needle:?} ranked {:?} first while a word-start match existed",
+            first.verb
+        );
+    }
+}
+
+#[test]
 fn the_command_line_resolves_typed_text_to_verbs() {
     let mut model = loaded();
     press(&mut model, Key::ctrl('k'));
@@ -607,6 +639,10 @@ fn the_command_line_resolves_typed_text_to_verbs() {
 
     keys(&mut model, "arch");
     let matches = &command_pane(&model).matches;
+    // `arch` begins a word in `message archive` and is buried inside `search` in
+    // `attach search`. Both are substrings of their path, so without the
+    // word-start tier the tie breaks alphabetically and the wrong one wins — see
+    // `command_matches`.
     assert_eq!(
         matches.first().map(|entry| entry.verb.as_str()),
         Some("message archive")

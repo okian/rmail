@@ -542,11 +542,18 @@ impl CommandPane {
 /// everything, which is what makes this a discovery surface rather than only
 /// a shortcut.
 ///
-/// Four tiers, so an exact-ish path beats a coincidental word in a help
-/// string: a prefix of the path, then a substring of it, then a subsequence
-/// of it, then a substring of the description. Ties break on the path so the
-/// order is stable across frames — a list that reshuffles between keystrokes
-/// is unusable.
+/// Five tiers, so an exact-ish path beats a coincidental word in a help
+/// string: a prefix of the path, then the needle at the *start of a word* in
+/// it, then a substring anywhere, then a subsequence, then a substring of the
+/// description. Ties break on the path so the order is stable across frames —
+/// a list that reshuffles between keystrokes is unusable.
+///
+/// The word-start tier is not a nicety. `arch` occurs in `message archive` and
+/// in `attach search` — the second time buried inside `search` — and while both
+/// were "a substring of the path" the tie broke alphabetically, so typing `arch`
+/// ranked `attach search` first. Which verbs collide that way depends on what the
+/// registry happens to contain, so the fix belongs in the ranking rather than in
+/// whichever example a test picked.
 #[must_use]
 pub fn command_matches(input: &str, keymap: &Keymap) -> Vec<CommandEntry> {
     let needle = verb_words(input);
@@ -555,15 +562,17 @@ pub fn command_matches(input: &str, keymap: &Keymap) -> Vec<CommandEntry> {
         let path = verb.canonical();
         let describe = verb.describe().to_lowercase();
         let tier = if needle.is_empty() {
-            3
+            4
         } else if path.starts_with(&needle) {
             0
-        } else if path.contains(&needle) {
+        } else if starts_a_word(&path, &needle) {
             1
-        } else if is_subsequence(&needle, &path) {
+        } else if path.contains(&needle) {
             2
-        } else if describe.contains(&needle) {
+        } else if is_subsequence(&needle, &path) {
             3
+        } else if describe.contains(&needle) {
+            4
         } else {
             continue;
         };
@@ -615,6 +624,16 @@ pub fn verb_words(input: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// Whether `needle` occurs in `haystack` at the beginning of a word.
+///
+/// A verb path is space separated, so "the beginning of a word" is offset zero or
+/// the character after a space. See [`command_matches`] on why this tier exists.
+fn starts_a_word(haystack: &str, needle: &str) -> bool {
+    haystack
+        .match_indices(needle)
+        .any(|(at, _)| at == 0 || haystack.as_bytes().get(at.wrapping_sub(1)) == Some(&b' '))
 }
 
 /// Whether every character of `needle` appears in `haystack`, in order.

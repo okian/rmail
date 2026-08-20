@@ -40,56 +40,78 @@ mod tests;
 
 use std::future::Future;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use rmail_core::export::write::DestinationWriter;
+use rmail_core::export::{Chunk as ExportPart, Format as ArchiveFormat};
 use rmail_proto::v1::account_service_client::AccountServiceClient;
 use rmail_proto::v1::admin_service_client::AdminServiceClient;
 use rmail_proto::v1::ai_policy_service_client::AiPolicyServiceClient;
 use rmail_proto::v1::ai_safety_service_client::AiSafetyServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
+use rmail_proto::v1::analytics_service_client::AnalyticsServiceClient;
+use rmail_proto::v1::attachment_service_client::AttachmentServiceClient;
 use rmail_proto::v1::audit_service_client::AuditServiceClient;
 use rmail_proto::v1::client_auth_service_client::ClientAuthServiceClient;
 use rmail_proto::v1::compose_service_client::ComposeServiceClient;
+use rmail_proto::v1::export_service_client::ExportServiceClient;
+use rmail_proto::v1::extract_service_client::ExtractServiceClient;
 use rmail_proto::v1::finder_service_client::FinderServiceClient;
 use rmail_proto::v1::hook_service_client::HookServiceClient;
 use rmail_proto::v1::index_service_client::IndexServiceClient;
+use rmail_proto::v1::link_service_client::LinkServiceClient;
 use rmail_proto::v1::mail_service_client::MailServiceClient;
+use rmail_proto::v1::note_service_client::NoteServiceClient;
 use rmail_proto::v1::notification_service_client::NotificationServiceClient;
 use rmail_proto::v1::rule_service_client::RuleServiceClient;
+use rmail_proto::v1::saved_search_service_client::SavedSearchServiceClient;
 use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::send_scheduler_service_client::SendSchedulerServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::tag_service_client::TagServiceClient;
 use rmail_proto::v1::webhook_service_client::WebhookServiceClient;
 use rmail_proto::v1::{
-    analyze_event, ask_chunk, bulk_tag_request, draft_reply_event, target, AddTagRequest,
-    AiProviderKind, Alert, AnalyzeMessageRequest, AskRequest, AuditEntry, AuditFilter,
-    AuthStatusRequest, AutoconfigureRequest, BacktestRuleRequest, BeginOAuthRequest, BudgetCaps,
-    BudgetClass, BudgetWindowCaps, BulkTagRequest, CallStatus, CancelRequest, ClearPasswordRequest,
-    CompleteOAuthRequest, ConfirmInjectionRequest, CopyRequest, CreateAccountRequest,
-    CreateFollowupRequest, CreateRuleRequest, CreateTagRequest, CredentialRef,
-    DeleteAccountRequest, DeleteDraftRequest, DeleteRequest, DraftNudgeRequest, DraftReplyRequest,
-    EvaluateRulesRequest, EventKind, ExplainRequest, ExportLedgerRequest, FindRequest,
-    FinderRebuildRequest, FinderStatusRequest, ForwardMessageRequest, GetAccountRequest,
-    GetAiProviderRequest, GetDraftRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest,
-    GetUsageRequest, IdRequest, IndexGcRequest, IndexProgress, IndexStatusRequest,
+    analyze_event, ask_chunk, bulk_tag_request, draft_reply_event, export_request, target,
+    AddNoteRequest, AddTagRequest, AiProviderKind, Alert, AnalyzeMessageRequest,
+    AskAnalyticsRequest, AskAttachmentChunk, AskAttachmentRequest, AskRequest, AuditEntry,
+    AuditFilter, AuthStatusRequest, AutoconfigureRequest, BacktestRuleRequest, BeginOAuthRequest,
+    BudgetCaps, BudgetClass, BudgetWindowCaps, BulkTagRequest, CallStatus, CancelRequest,
+    ClearPasswordRequest, CompileQueryRequest, CompileSmartFolderRequest, CompleteOAuthRequest,
+    ConfirmInjectionRequest, CopyRequest, CreateAccountRequest, CreateFollowupRequest,
+    CreateRuleRequest, CreateSavedSearchRequest, CreateSmartFolderRequest, CreateTagRequest,
+    CredentialRef, DeleteAccountRequest, DeleteDraftRequest, DeleteNoteRequest, DeleteRequest,
+    DeleteSavedSearchRequest, DeleteSmartFolderRequest, DraftNudgeRequest, DraftReplyRequest,
+    EditNoteRequest, EvaluateRequest, EvaluateRulesRequest, EvaluateSmartFolderRequest, EventKind,
+    ExplainRequest, ExportChunk, ExportFormat, ExportInvoicesRequest, ExportLedgerRequest,
+    ExportRequest, ExtractEventsRequest, ExtractInvoiceRequest, ExtractLinksRequest,
+    ExtractStructuredRequest, ExtractTablesRequest, ExtractTasksRequest, ExtractionSink,
+    FindRequest, FinderRebuildRequest, FinderStatusRequest, ForwardMessageRequest,
+    GenerateDigestRequest, GetAccountRequest, GetAiProviderRequest, GetContactInsightRequest,
+    GetDraftRequest, GetMessageRequest, GetResponseTimesRequest, GetSpendRequest,
+    GetSummaryRequest, GetUsageRequest, GoldenQuery as WireGoldenQuery, IdRequest, IndexGcRequest,
+    IndexProgress, IndexStatusRequest, InvoiceExportFormat, Judgment as WireJudgment,
     ListAccountsRequest, ListDeliveriesRequest, ListDraftRevisionsRequest, ListDraftsRequest,
     ListEntitiesRequest, ListFollowupsRequest, ListHooksRequest, ListMessagesRequest,
-    ListOutboxRequest, ListRulesRequest, ListTagRulesRequest, ListTagsRequest, ListTokensRequest,
-    ListWaitingOnRequest, ListWebhooksRequest, MintTokenRequest, MoveRequest, PauseRequest,
-    PreflightCheckRequest, QueryAiCallsRequest, RebuildRequest, RecordCorrectionRequest,
-    RefreshTokenRequest, RegisterWebhookRequest, ReindexMode, ReindexRequest, RemoveTagRequest,
-    RemoveWebhookRequest, RenderDraftRequest, ReplayDeliveryRequest, RescheduleRequest,
-    ResolveSuggestionRequest, ResumeRequest, RetryFailedRequest, RevokeTokenRequest,
-    RewriteDraftRequest, ScanInjectionRequest, ScheduleSendRequest, ScoreMessageRequest,
-    SearchRequest, SelectDraftRevisionRequest, SetAiProviderRequest, SetBudgetRequest,
-    SetFlagsRequest, SetIndexPausedRequest, SetPausedRequest, SetTagRuleRequest,
-    SetWebhookEnabledRequest, StreamAlertsRequest, SuggestReplyRequest, SuggestSendTimeRequest,
-    SuggestTagsRequest, SyncFolderRequest, SyncMode, SyncStatusRequest, SynthesizeRuleRequest,
-    TagRuleMode, TagSuggestion, TagSyncMode, Target, TestConnectionRequest, TestHookRequest,
-    UpdateBodyRequest, UpdateDraftRequest, VerifyIndexRequest, WatchEventsRequest,
-    WebhookSecretSource, WebhookTemplate,
+    ListNotesRequest, ListOutboxRequest, ListRulesRequest, ListSavedSearchesRequest,
+    ListSmartFolderMembersRequest, ListSmartFoldersRequest, ListSubscriptionsRequest,
+    ListTagRulesRequest, ListTagsRequest, ListTokensRequest, ListWaitingOnRequest,
+    ListWebhooksRequest, Message as ProtoMessage, MintTokenRequest, Mode as EvalMode, MoveRequest,
+    NoteAuthor, NoteEvent as WireNoteEvent, NoteTarget, PauseRequest, PreflightCheckRequest,
+    QueryAiCallsRequest, RebuildRequest, RecordCorrectionRequest, RefreshTokenRequest,
+    RegisterWebhookRequest, ReindexMode, ReindexRequest, RemoveTagRequest, RemoveWebhookRequest,
+    RenderDraftRequest, ReplayDeliveryRequest, RescheduleRequest, ResolveSuggestionRequest,
+    ResponseTimeGroupBy, ResumeRequest, RetryFailedRequest, RevokeTokenRequest,
+    RewriteDraftRequest, RunSavedSearchRequest, ScanInjectionRequest, ScheduleSendRequest,
+    ScoreMessageRequest, SearchAttachmentsRequest, SearchEntitiesRequest, SearchHit, SearchRequest,
+    SelectDraftRevisionRequest, SetAiProviderRequest, SetBudgetRequest, SetFlagsRequest,
+    SetIndexPausedRequest, SetPausedRequest, SetTagRuleRequest, SetWebhookEnabledRequest,
+    StreamAlertsRequest, SuggestReplyRequest, SuggestSendTimeRequest, SuggestTagsRequest,
+    SyncFolderRequest, SyncMode, SyncStatusRequest, SynthesizeRuleRequest, TagRuleMode,
+    TagSuggestion, TagSyncMode, Target, TestConnectionRequest, TestHookRequest, UpdateBodyRequest,
+    UpdateDraftRequest, UpdateSavedSearchRequest, VerifyIndexRequest, WatchEventsRequest,
+    WatchNotesRequest, WebhookSecretSource, WebhookTemplate,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
@@ -115,6 +137,13 @@ use super::model::{
 };
 use super::report::{ReportFill, ReportRow, ReportTone};
 use super::status::{Health, Subsystem};
+
+/// How many export frames may sit between the gRPC stream and the writer task.
+///
+/// Small on purpose, for the reason `export_cli`'s own constant is: the point is
+/// to keep the disk and the socket coupled, so a slow disk throttles the daemon's
+/// scan instead of letting this process buffer an archive it has not written.
+const EXPORT_QUEUE: usize = 4;
 
 /// Deadline for a unary RPC. Generous: these are local reads over a Unix
 /// socket, and the ones that reach IMAP (move/copy/delete) are several
@@ -187,6 +216,13 @@ pub struct GrpcExec {
     audit: AuditServiceClient<Conn>,
     admin: AdminServiceClient<Conn>,
     webhooks: WebhookServiceClient<Conn>,
+    export: ExportServiceClient<Conn>,
+    analytics: AnalyticsServiceClient<Conn>,
+    attachments: AttachmentServiceClient<Conn>,
+    extract: ExtractServiceClient<Conn>,
+    links: LinkServiceClient<Conn>,
+    notes: NoteServiceClient<Conn>,
+    saved: SavedSearchServiceClient<Conn>,
     hooks: HookServiceClient<Conn>,
     notify: NotificationServiceClient<Conn>,
     tags: TagServiceClient<Conn>,
@@ -293,6 +329,13 @@ impl GrpcExec {
             audit: AuditServiceClient::new(channel.clone()),
             admin: AdminServiceClient::new(channel.clone()),
             webhooks: WebhookServiceClient::new(channel.clone()),
+            export: ExportServiceClient::new(channel.clone()),
+            analytics: AnalyticsServiceClient::new(channel.clone()),
+            attachments: AttachmentServiceClient::new(channel.clone()),
+            extract: ExtractServiceClient::new(channel.clone()),
+            links: LinkServiceClient::new(channel.clone()),
+            notes: NoteServiceClient::new(channel.clone()),
+            saved: SavedSearchServiceClient::new(channel.clone()),
             hooks: HookServiceClient::new(channel.clone()),
             notify: NotificationServiceClient::new(channel.clone()),
             tags: TagServiceClient::new(channel.clone()),
@@ -1209,6 +1252,710 @@ impl CmdExec for GrpcExec {
                         },
                         Err(error) => Msg::Done {
                             label: "rule correct".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+
+            // -- content, export and analytics (task 99) ----------------------
+            Cmd::Export {
+                generation,
+                query,
+                thread_id,
+                format,
+                to,
+                with_ai,
+                limit,
+            } => {
+                let mut client = self.export.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    run_export(
+                        &mut client,
+                        ExportRequest {
+                            selection: Some(match thread_id {
+                                Some(thread_id) => export_request::Selection::ThreadId(thread_id),
+                                None => export_request::Selection::Query(query),
+                            }),
+                            format: export_format(format) as i32,
+                            with_ai,
+                            limit: i32::try_from(limit.unwrap_or(0)).unwrap_or(i32::MAX),
+                        },
+                        format,
+                        PathBuf::from(&to),
+                        sink,
+                    )
+                    .await;
+                });
+            }
+            Cmd::ResponseTimes {
+                generation,
+                account_id,
+                group_by,
+                since_secs,
+                until,
+                limit,
+                min_samples,
+            } => {
+                let mut client = self.analytics.clone();
+                self.report(generation, out, async move {
+                    let (since, until) = window(since_secs, until);
+                    call(client.get_response_times(GetResponseTimesRequest {
+                        account_id,
+                        group_by: match group_by {
+                            commands::content::analytics::GroupBy::Contact => {
+                                ResponseTimeGroupBy::Contact
+                            }
+                            commands::content::analytics::GroupBy::Mailbox => {
+                                ResponseTimeGroupBy::Mailbox
+                            }
+                        } as i32,
+                        since,
+                        until,
+                        bucket_seconds: 0,
+                        window_seconds: 0,
+                        limit: u32::try_from(limit.unwrap_or(0)).unwrap_or(u32::MAX),
+                        min_samples: u32::try_from(min_samples.unwrap_or(0)).unwrap_or(u32::MAX),
+                        bottleneck_ratio: 0.0,
+                    }))
+                    .await
+                    .map(|r| wire::response_time_rows(&r.into_inner()))
+                });
+            }
+            Cmd::AskAnalytics {
+                generation,
+                account_id,
+                question,
+                narrate,
+            } => {
+                let mut client = self.analytics.clone();
+                self.report(generation, out, async move {
+                    call(client.ask_analytics(AskAnalyticsRequest {
+                        account_id,
+                        question,
+                        narrate,
+                    }))
+                    .await
+                    .map(|r| wire::ask_analytics_rows(&r.into_inner()))
+                });
+            }
+            Cmd::Digest {
+                generation,
+                account_id,
+                since_secs,
+                until,
+                force,
+            } => {
+                let mut client = self.analytics.clone();
+                self.report(generation, out, async move {
+                    let (since, until) = window(since_secs, until);
+                    call(client.generate_digest(GenerateDigestRequest {
+                        account_id,
+                        since,
+                        until,
+                        force,
+                    }))
+                    .await
+                    .map(|r| wire::digest_rows(&r.into_inner()))
+                });
+            }
+            Cmd::ContactInsight {
+                generation,
+                account_id,
+                address,
+                since_secs,
+                until,
+                metrics_only,
+            } => {
+                let mut client = self.analytics.clone();
+                self.report(generation, out, async move {
+                    let (since, until) = window(since_secs, until);
+                    call(client.get_contact_insight(GetContactInsightRequest {
+                        account_id,
+                        address,
+                        since,
+                        until,
+                        topic_limit: 0,
+                        metrics_only,
+                    }))
+                    .await
+                    .map(|r| wire::contact_rows(&r.into_inner()))
+                });
+            }
+            Cmd::Subscriptions {
+                generation,
+                account_id,
+                since_secs,
+                until,
+                limit,
+                candidates_only,
+                classify_unknown,
+            } => {
+                let mut client = self.analytics.clone();
+                self.report(generation, out, async move {
+                    let (since, until) = window(since_secs, until);
+                    call(client.list_subscriptions(ListSubscriptionsRequest {
+                        account_id,
+                        since,
+                        until,
+                        limit: u32::try_from(limit.unwrap_or(0)).unwrap_or(u32::MAX),
+                        candidates_only,
+                        classify_unknown,
+                    }))
+                    .await
+                    .map(|r| wire::subscription_rows(&r.into_inner()))
+                });
+            }
+            Cmd::AttachTables {
+                generation,
+                message_id,
+                part,
+                allow_model,
+            } => {
+                let mut client = self.attachments.clone();
+                self.report(generation, out, async move {
+                    call(client.extract_tables(ExtractTablesRequest {
+                        message_id,
+                        part_id: part.unwrap_or_default(),
+                        allow_model,
+                    }))
+                    .await
+                    .map(|r| wire::table_rows(&r.into_inner()))
+                });
+            }
+            Cmd::AttachInvoice {
+                generation,
+                message_id,
+                part,
+                use_model,
+            } => {
+                let mut client = self.attachments.clone();
+                self.report(generation, out, async move {
+                    call(client.extract_invoice(ExtractInvoiceRequest {
+                        message_id,
+                        part_id: part.unwrap_or_default(),
+                        use_model,
+                    }))
+                    .await
+                    .map(|r| wire::invoice_rows(&r.into_inner()))
+                });
+            }
+            Cmd::AttachInvoices {
+                generation,
+                account_id,
+                vendor,
+                since_secs,
+                until,
+                limit,
+                format,
+            } => {
+                let mut client = self.attachments.clone();
+                self.report(generation, out, async move {
+                    let (since, until) = window(since_secs, until);
+                    call(client.export_invoices(ExportInvoicesRequest {
+                        account_id,
+                        message_id: 0,
+                        vendor: vendor.unwrap_or_default(),
+                        since,
+                        until,
+                        limit: limit.unwrap_or(0),
+                        format: match format {
+                            commands::content::analytics::InvoiceFormat::Rows => {
+                                InvoiceExportFormat::Rows
+                            }
+                            commands::content::analytics::InvoiceFormat::Csv => {
+                                InvoiceExportFormat::Csv
+                            }
+                        } as i32,
+                    }))
+                    .await
+                    .map(|r| wire::invoices_rows(&r.into_inner()))
+                });
+            }
+            Cmd::AttachAsk {
+                generation,
+                question,
+                message_id,
+                account_id,
+                part,
+                top_k,
+            } => {
+                let mut client = self.attachments.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    ask_attachment(
+                        client.ask_attachment(AskAttachmentRequest {
+                            question,
+                            message_id,
+                            part_id: part.unwrap_or_default(),
+                            account_id,
+                            top_k: u32::try_from(top_k.unwrap_or(0)).unwrap_or(u32::MAX),
+                        }),
+                        sink,
+                    )
+                    .await;
+                });
+            }
+            Cmd::AttachSearch {
+                generation,
+                query,
+                account_id,
+                message_id,
+                limit,
+            } => {
+                let mut client = self.search.clone();
+                self.report(generation, out, async move {
+                    call(client.search_attachments(SearchAttachmentsRequest {
+                        query,
+                        account_id,
+                        message_id,
+                        limit: u32::try_from(limit.unwrap_or(0)).unwrap_or(u32::MAX),
+                    }))
+                    .await
+                    .map(|r| wire::attachment_hit_rows(&r.into_inner()))
+                });
+            }
+            Cmd::Extract {
+                generation,
+                message_id,
+                tasks,
+                use_model,
+                sink,
+            } => {
+                let mut client = self.extract.clone();
+                let sink = match sink {
+                    commands::content::extract::Sink::Ics => ExtractionSink::Ics,
+                    commands::content::extract::Sink::Command => ExtractionSink::Command,
+                    commands::content::extract::Sink::Webhook => ExtractionSink::Webhook,
+                } as i32;
+                self.report(generation, out, async move {
+                    if tasks {
+                        return call(client.extract_tasks(ExtractTasksRequest {
+                            message_id,
+                            use_model,
+                            sink,
+                        }))
+                        .await
+                        .map(|r| wire::task_rows(&r.into_inner()));
+                    }
+                    call(client.extract_events(ExtractEventsRequest {
+                        message_id,
+                        use_model,
+                        sink,
+                    }))
+                    .await
+                    .map(|r| wire::event_rows(&r.into_inner()))
+                });
+            }
+            Cmd::ExtractData {
+                generation,
+                message_id,
+                schema,
+                refresh,
+            } => {
+                let mut client = self.extract.clone();
+                self.report(generation, out, async move {
+                    call(client.extract_structured(ExtractStructuredRequest {
+                        message_id,
+                        schema,
+                        // The schema is named, never supplied inline: a client
+                        // handing the daemon a JSON schema of its own would be a
+                        // second place extraction schemas live.
+                        schema_json: String::new(),
+                        refresh,
+                    }))
+                    .await
+                    .map(|r| wire::structured_rows(&r.into_inner()))
+                });
+            }
+            Cmd::Links {
+                generation,
+                message_id,
+                use_model,
+            } => {
+                let mut client = self.links.clone();
+                self.report(generation, out, async move {
+                    call(client.extract_links(ExtractLinksRequest {
+                        message_id,
+                        use_model,
+                    }))
+                    .await
+                    .map(|r| wire::link_rows(&r.into_inner()))
+                });
+            }
+            Cmd::CompileQuery {
+                generation,
+                account_id,
+                query,
+                refresh,
+            } => {
+                let mut client = self.search.clone();
+                self.report(generation, out, async move {
+                    call(client.compile_query(CompileQueryRequest {
+                        query,
+                        account_id,
+                        refresh,
+                    }))
+                    .await
+                    .map(|r| wire::query_plan_rows(&r.into_inner()))
+                });
+            }
+            Cmd::SearchEntities {
+                generation,
+                account_id,
+                query,
+                kinds,
+                since_secs,
+                limit,
+            } => {
+                let mut client = self.search.clone();
+                self.report(generation, out, async move {
+                    let (since, _) = window(since_secs, None);
+                    call(client.search_entities(SearchEntitiesRequest {
+                        query,
+                        kinds,
+                        account_id,
+                        since,
+                        limit: limit.unwrap_or(0),
+                    }))
+                    .await
+                    .map(|r| wire::entity_rows(&r.into_inner()))
+                });
+            }
+            Cmd::SearchEval {
+                generation,
+                path,
+                mode,
+                limit,
+            } => {
+                let mut client = self.search.clone();
+                self.report(generation, out, async move {
+                    // Read on a blocking task, and parsed by the same shared type
+                    // `mail search eval` parses with — so a malformed set is
+                    // refused with a message about a path the user can see rather
+                    // than an INVALID_ARGUMENT about a request they did not write.
+                    let set = tokio::task::spawn_blocking(move || {
+                        rmail_core::eval::GoldenSet::load(Path::new(&path))
+                    })
+                    .await
+                    .map_err(|error| format!("reading the golden set: {error}"))?
+                    .map_err(|error| error.to_string())?;
+                    call(
+                        client.evaluate(EvaluateRequest {
+                            corpus: set.corpus.clone(),
+                            queries: set
+                                .queries
+                                .iter()
+                                .map(|query| WireGoldenQuery {
+                                    name: query.name.clone(),
+                                    query: query.query.clone(),
+                                    account_id: query.account_id,
+                                    judgments: query
+                                        .judgments
+                                        .iter()
+                                        .map(|judged| WireJudgment {
+                                            message_id: judged.message_id.clone(),
+                                            gain: judged.gain,
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                            mode: match mode {
+                                None => EvalMode::Unspecified,
+                                Some(commands::content::extract::Mode::Lexical) => {
+                                    EvalMode::Lexical
+                                }
+                                Some(commands::content::extract::Mode::Semantic) => {
+                                    EvalMode::Semantic
+                                }
+                                Some(commands::content::extract::Mode::Hybrid) => EvalMode::Hybrid,
+                            } as i32,
+                            limit: u32::try_from(limit.unwrap_or(0)).unwrap_or(u32::MAX),
+                        }),
+                    )
+                    .await
+                    .map(|r| wire::eval_rows(&r.into_inner()))
+                });
+            }
+            Cmd::NoteAdd {
+                message_id,
+                thread,
+                body,
+            } => {
+                let mut client = self.notes.clone();
+                self.spawn(out, async move {
+                    let result = call(client.add_note(AddNoteRequest {
+                        target: Some(note_target(message_id, thread)),
+                        body_md: body,
+                        author: NoteAuthor::User as i32,
+                        // Empty: a keystroke in the TUI is issued once, so there
+                        // is nothing to deduplicate — the same reasoning every
+                        // other idempotency key here follows.
+                        idempotency_key: String::new(),
+                    }))
+                    .await;
+                    match result {
+                        Ok(response) => Msg::Done {
+                            label: format!("note {} added", response.into_inner().id),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "note add".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::NoteList {
+                generation,
+                message_id,
+                thread,
+            } => {
+                let mut client = self.notes.clone();
+                self.report(generation, out, async move {
+                    call(client.list_notes(ListNotesRequest {
+                        target: Some(note_target(message_id, thread)),
+                    }))
+                    .await
+                    .map(|r| wire::note_rows(&r.into_inner()))
+                });
+            }
+            Cmd::NoteWatch {
+                generation,
+                message_id,
+                thread,
+            } => {
+                let mut client = self.notes.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    watch_notes(
+                        client.watch_notes(WatchNotesRequest {
+                            target: Some(note_target(message_id, thread)),
+                        }),
+                        sink,
+                    )
+                    .await;
+                });
+            }
+            Cmd::NoteEdit { note_id, body } => {
+                let mut client = self.notes.clone();
+                self.spawn(out, async move {
+                    match call(client.edit_note(EditNoteRequest {
+                        note_id,
+                        body_md: body,
+                    }))
+                    .await
+                    {
+                        Ok(_) => Msg::Done {
+                            label: format!("note {note_id} rewritten"),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "note edit".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::NoteDelete { note_id } => {
+                let mut client = self.notes.clone();
+                self.spawn(out, async move {
+                    match call(client.delete_note(DeleteNoteRequest { note_id })).await {
+                        Ok(_) => Msg::Done {
+                            label: format!("note {note_id} deleted"),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "note rm".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::SavedList {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.saved.clone();
+                self.report(generation, out, async move {
+                    call(client.list_saved_searches(ListSavedSearchesRequest { account_id }))
+                        .await
+                        .map(|r| wire::saved_rows(&r.into_inner()))
+                });
+            }
+            Cmd::SavedSet {
+                account_id,
+                name,
+                query,
+                update,
+            } => {
+                let mut client = self.saved.clone();
+                self.spawn(out, async move {
+                    let result = if update {
+                        call(client.update_saved_search(UpdateSavedSearchRequest {
+                            account_id,
+                            name,
+                            query,
+                        }))
+                        .await
+                    } else {
+                        call(client.create_saved_search(CreateSavedSearchRequest {
+                            account_id,
+                            name,
+                            query,
+                        }))
+                        .await
+                    };
+                    match result {
+                        Ok(response) => Msg::Done {
+                            label: wire::saved_stored(&response.into_inner()),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: if update { "saved edit" } else { "saved save" }.to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::SavedRun {
+                generation,
+                account_id,
+                name,
+                limit,
+                explain,
+            } => {
+                let mut client = self.saved.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    stream_saved_hits(
+                        client.run_saved_search(RunSavedSearchRequest {
+                            account_id,
+                            name,
+                            limit: u32::try_from(limit.unwrap_or(0)).unwrap_or(u32::MAX),
+                            explain,
+                        }),
+                        sink,
+                    )
+                    .await;
+                });
+            }
+            Cmd::SavedDelete { account_id, name } => {
+                let mut client = self.saved.clone();
+                let label = name.clone();
+                self.spawn(out, async move {
+                    match call(
+                        client.delete_saved_search(DeleteSavedSearchRequest { account_id, name }),
+                    )
+                    .await
+                    {
+                        Ok(_) => Msg::Done {
+                            label: format!("{label} forgotten"),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "saved rm".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::FolderList {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.saved.clone();
+                self.report(generation, out, async move {
+                    call(client.list_smart_folders(ListSmartFoldersRequest { account_id }))
+                        .await
+                        .map(|r| wire::smart_folder_rows(&r.into_inner()))
+                });
+            }
+            Cmd::FolderCreate {
+                generation,
+                account_id,
+                name,
+                text,
+                compile,
+                auto_tag,
+                notify,
+                refresh,
+            } => {
+                let mut client = self.saved.clone();
+                self.report(generation, out, async move {
+                    if compile {
+                        let compiled =
+                            call(client.compile_smart_folder(CompileSmartFolderRequest {
+                                account_id,
+                                name,
+                                description: text,
+                                auto_tag: auto_tag.unwrap_or_default(),
+                                notify,
+                                refresh,
+                            }))
+                            .await?
+                            .into_inner();
+                        return Ok(compiled.folder.as_ref().map_or_else(Vec::new, |folder| {
+                            wire::smart_folder_fields(folder, compiled.plan.as_ref())
+                        }));
+                    }
+                    call(client.create_smart_folder(CreateSmartFolderRequest {
+                        account_id,
+                        name,
+                        predicate: text,
+                        auto_tag: auto_tag.unwrap_or_default(),
+                        notify,
+                    }))
+                    .await
+                    .map(|r| wire::smart_folder_fields(&r.into_inner(), None))
+                });
+            }
+            Cmd::FolderMembers {
+                generation,
+                account_id,
+                name,
+                limit,
+            } => {
+                let mut client = self.saved.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    stream_members(
+                        client.list_smart_folder_members(ListSmartFolderMembersRequest {
+                            account_id,
+                            name,
+                            limit: u32::try_from(limit.unwrap_or(0)).unwrap_or(u32::MAX),
+                        }),
+                        sink,
+                    )
+                    .await;
+                });
+            }
+            Cmd::FolderEval {
+                generation,
+                account_id,
+                name,
+            } => {
+                let mut client = self.saved.clone();
+                self.report(generation, out, async move {
+                    call(
+                        client
+                            .evaluate_smart_folder(EvaluateSmartFolderRequest { account_id, name }),
+                    )
+                    .await
+                    .map(|r| wire::evaluation_rows(&r.into_inner()))
+                });
+            }
+            Cmd::FolderDelete { account_id, name } => {
+                let mut client = self.saved.clone();
+                let label = name.clone();
+                self.spawn(out, async move {
+                    match call(
+                        client.delete_smart_folder(DeleteSmartFolderRequest { account_id, name }),
+                    )
+                    .await
+                    {
+                        Ok(_) => Msg::Done {
+                            label: format!("{label} forgotten"),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "folder rm".to_owned(),
                             result: Err(error),
                         },
                     }
@@ -2905,6 +3652,317 @@ fn new_account(name: String, settings: &[(String, String)]) -> CreateAccountRequ
         smtp_server: text("smtp-server"),
         smtp_port: port("smtp-port"),
         credential: credential.as_ref().map(credential_ref),
+    }
+}
+
+/// A window's absolute bounds from a duration and an optional end.
+///
+/// The one place a clock is read for these reports. `update` is pure, so the
+/// `Cmd` carries "this many seconds back" and the conversion happens here — see
+/// `commands::content`'s module docs. Zero means "the daemon's own default", which
+/// is what every one of these RPCs reads an absent bound as.
+fn window(since_secs: Option<i64>, until: Option<i64>) -> (i64, i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        });
+    let end = until.unwrap_or(now);
+    let start = since_secs.map_or(0, |secs| end.saturating_sub(secs));
+    (start, if until.is_some() { end } else { 0 })
+}
+
+/// A note's target on the wire — a message, or the thread it belongs to.
+fn note_target(message_id: i64, thread: bool) -> NoteTarget {
+    use rmail_proto::v1::note_target::Of;
+    NoteTarget {
+        of: Some(if thread {
+            Of::ThreadId(message_id)
+        } else {
+            Of::MessageId(message_id)
+        }),
+    }
+}
+
+/// An export's framing on the wire.
+fn export_format(format: commands::content::analytics::Format) -> ExportFormat {
+    match format {
+        commands::content::analytics::Format::Mbox => ExportFormat::Mbox,
+        commands::content::analytics::Format::Maildir => ExportFormat::Maildir,
+        commands::content::analytics::Format::Eml => ExportFormat::Eml,
+        commands::content::analytics::Format::Json => ExportFormat::Json,
+    }
+}
+
+/// The same framing as `rmail_core::export::Format`, which owns the writer.
+fn archive_format(format: commands::content::analytics::Format) -> ArchiveFormat {
+    match format {
+        commands::content::analytics::Format::Mbox => ArchiveFormat::Mbox,
+        commands::content::analytics::Format::Maildir => ArchiveFormat::Maildir,
+        commands::content::analytics::Format::Eml => ArchiveFormat::Eml,
+        commands::content::analytics::Format::Json => ArchiveFormat::Json,
+    }
+}
+
+/// Run an export, writing the archive and reporting what landed.
+///
+/// The writer is `rmail_core::export::write::DestinationWriter` — the same shared
+/// code `mail export` uses, which owns the check keeping a server-supplied entry
+/// name inside the directory the caller named. A second writer here would be a
+/// second place that check could be got wrong.
+///
+/// One blocking task fed by a bounded channel rather than one `spawn_blocking`
+/// per frame, for the reason `export_cli` gives: the channel's bound is what gives
+/// the gRPC stream backpressure when the disk is slower than the socket.
+///
+/// A partial archive is left on disk in every failure path. Deleting a
+/// half-written export would destroy the only copy of whatever did arrive; saying
+/// it is partial is what stops it being mistaken for a whole one.
+async fn run_export(
+    client: &mut ExportServiceClient<Conn>,
+    request: ExportRequest,
+    format: commands::content::analytics::Format,
+    to: PathBuf,
+    sink: ReportSink,
+) {
+    let format = archive_format(format);
+    let mut stream = match client.export(request).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ExportPart>(EXPORT_QUEUE);
+    let destination = to.clone();
+    let writer = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut writer = DestinationWriter::create(format, &destination)
+            .map_err(|error| format!("creating {}: {error}", destination.display()))?;
+        while let Some(part) = rx.blocking_recv() {
+            writer.apply(&part).map_err(|error| error.to_string())?;
+        }
+        writer.finish().map_err(|error| error.to_string())
+    });
+
+    let mut messages = 0_u64;
+    let mut done = None;
+    let mut failed = None;
+    while let Some(item) = stream.next().await {
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            Err(status) => {
+                failed = Some(status.message().to_owned());
+                break;
+            }
+        };
+        if let Some(summary) = chunk.done {
+            done = Some(summary);
+            break;
+        }
+        if chunk.start_of_message {
+            messages += 1;
+            // Progress, replacing each time: an export of forty thousand
+            // messages is the case this pane exists for, and a row per message
+            // would fill it long before the archive was written.
+            sink.rows(
+                vec![ReportRow::new([
+                    "writing".to_owned(),
+                    format!("{messages} message(s) so far → {}", to.display()),
+                ])],
+                false,
+            );
+        }
+        if tx.send(part_from_proto(chunk)).await.is_err() {
+            // The writer died; its error is the real one, so stop feeding it and
+            // let the join report why.
+            break;
+        }
+    }
+    // Closing the channel is what ends the writer's loop, and it has to happen
+    // before the join or this deadlocks.
+    drop(tx);
+    match writer.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return sink.failed(error),
+        Err(error) => return sink.failed(format!("the export writer stopped: {error}")),
+    }
+    if let Some(error) = failed {
+        return sink.failed(format!(
+            "after {messages} message(s) — {} is incomplete: {error}",
+            to.display()
+        ));
+    }
+    // A gRPC stream that stops yielding ends OK, so without this a daemon that
+    // shut down mid-export would leave a truncated archive reported as a whole
+    // one.
+    let Some(done) = done else {
+        return sink.failed(format!(
+            "the stream ended with no completion marker after {messages} message(s) — {} is \
+             incomplete",
+            to.display()
+        ));
+    };
+    sink.rows(wire::export_rows(&to.display().to_string(), &done), true);
+}
+
+/// One export frame as the shared writer's own chunk type.
+fn part_from_proto(chunk: ExportChunk) -> ExportPart {
+    ExportPart {
+        path: (!chunk.path.is_empty()).then_some(chunk.path),
+        start_of_message: chunk.start_of_message,
+        message_id: (chunk.message_id != 0).then_some(chunk.message_id),
+        data: chunk.data,
+    }
+}
+
+/// Drain an `AskAttachment` stream into a Report.
+///
+/// The prose is accumulated into rows as it arrives and the citations follow it,
+/// which is the order the proto fixes: an inline `[n]` is only resolvable once the
+/// whole answer has been seen. A refusal is reported as a failure, because an
+/// ungrounded answer this daemon declined to give is not an answer.
+async fn ask_attachment<S>(request: S, sink: ReportSink)
+where
+    S: Future<
+        Output = Result<tonic::Response<tonic::Streaming<AskAttachmentChunk>>, tonic::Status>,
+    >,
+{
+    use rmail_proto::v1::ask_attachment_chunk::Body;
+    let mut stream = match request.await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    let mut rows: Vec<ReportRow> = Vec::new();
+    let mut prose = String::new();
+    loop {
+        let Some(item) = stream.next().await else {
+            return sink.failed("the daemon ended the answer early".to_owned());
+        };
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            Err(status) => return sink.failed(status.message().to_owned()),
+        };
+        match chunk.body {
+            Some(Body::Trace(trace)) => {
+                rows.push(
+                    ReportRow::new([
+                        "read".to_owned(),
+                        format!(
+                            "{} passage(s) from {} attachment(s){}",
+                            trace.passages,
+                            trace.attachments,
+                            if trace.withheld_by_policy > 0 {
+                                format!(", {} withheld by policy", trace.withheld_by_policy)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                    ])
+                    .toned(if trace.withheld_by_policy > 0 {
+                        ReportTone::Warn
+                    } else {
+                        ReportTone::Muted
+                    }),
+                );
+                sink.rows(rows.clone(), false);
+            }
+            Some(Body::Token(token)) => {
+                prose.push_str(&token);
+                let mut frame = rows.clone();
+                for line in prose.lines() {
+                    frame.push(ReportRow::new([String::new(), line.to_owned()]));
+                }
+                sink.rows(frame, false);
+            }
+            Some(Body::Citation(citation)) => {
+                rows.push(ReportRow::new([
+                    format!("[{}]", citation.label),
+                    format!("{} — {}", citation.filename, citation.quote),
+                ]));
+            }
+            Some(Body::Usage(_)) => {}
+            Some(Body::Done(done)) => {
+                if !done.refusal.is_empty() {
+                    return sink.failed(done.refusal);
+                }
+                let mut frame = rows.clone();
+                for line in prose.lines() {
+                    frame.push(ReportRow::new([String::new(), line.to_owned()]));
+                }
+                if !done.grounded {
+                    frame.push(
+                        ReportRow::new([
+                            "ungrounded".to_owned(),
+                            "this answer cites nothing — treat it as a guess".to_owned(),
+                        ])
+                        .toned(ReportTone::Warn),
+                    );
+                }
+                return sink.rows(frame, true);
+            }
+            None => {}
+        }
+    }
+}
+
+/// Drain a `WatchNotes` stream into a Report.
+///
+/// Appends and never completes, like the alert feed: it is a live view, and a
+/// border saying "done" would describe a stream that is still listening.
+async fn watch_notes<S>(request: S, sink: ReportSink)
+where
+    S: Future<Output = Result<tonic::Response<tonic::Streaming<WireNoteEvent>>, tonic::Status>>,
+{
+    let mut stream = match request.await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    loop {
+        match stream.next().await {
+            Some(Ok(event)) => {
+                if let Some(row) = wire::note_event_row(&event) {
+                    sink.append(vec![row], false);
+                }
+            }
+            Some(Err(status)) => return sink.failed(status.message().to_owned()),
+            None => return sink.failed("the daemon closed the note stream".to_owned()),
+        }
+    }
+}
+
+/// Drain a `RunSavedSearch` stream into a Report.
+///
+/// Appends: hits arrive once, in rank order — `SearchService.Search`'s discipline,
+/// which this RPC shares because it *is* that search under a stored name.
+async fn stream_saved_hits<S>(request: S, sink: ReportSink)
+where
+    S: Future<Output = Result<tonic::Response<tonic::Streaming<SearchHit>>, tonic::Status>>,
+{
+    let mut stream = match request.await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    loop {
+        match stream.next().await {
+            Some(Ok(hit)) => sink.append(vec![wire::saved_hit_row(&hit)], false),
+            Some(Err(status)) => return sink.failed(status.message().to_owned()),
+            None => return sink.append(Vec::new(), true),
+        }
+    }
+}
+
+/// Drain a `ListSmartFolderMembers` stream into a Report.
+async fn stream_members<S>(request: S, sink: ReportSink)
+where
+    S: Future<Output = Result<tonic::Response<tonic::Streaming<ProtoMessage>>, tonic::Status>>,
+{
+    let mut stream = match request.await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    loop {
+        match stream.next().await {
+            Some(Ok(message)) => sink.append(vec![wire::member_row(&message)], false),
+            Some(Err(status)) => return sink.failed(status.message().to_owned()),
+            None => return sink.append(Vec::new(), true),
+        }
     }
 }
 

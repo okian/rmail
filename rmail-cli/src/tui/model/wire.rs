@@ -31,22 +31,30 @@
 mod tests;
 
 use rmail_proto::v1::{
-    Account as ProtoAccount, AiProviderKind, Alert, Attachment, AuditEntry, AuthStatusResponse,
-    AutoconfigureResponse, BeginOAuthResponse, BudgetClass, BulkTagResponse, CallStatus,
-    Citation as ProtoCitation, CompleteOAuthResponse, CreateDraftRequest, DayUsage, Draft,
-    DraftAddress, DraftNudgeResponse, DraftReplyContext, DraftRevision, EvaluationStats,
-    FindResult, FinderStatusResponse, FolderStatus, Followup, FollowupState,
-    ForwardMessageResponse, FullMessage, GetAiProviderResponse, GetSpendResponse, HookEvent,
-    IndexDrift, IndexGcReport, IndexKind, IndexProgress, IndexStatusResponse, InjectionSeverity,
-    ItemKind, ListAccountsResponse, ListDraftRevisionsResponse, ListDraftsResponse,
-    ListEntitiesResponse, ListHooksResponse, ListRulesResponse, ListTagRulesResponse,
-    ListTagsResponse, ListTokensResponse, Message as ProtoMessage, MessageOutcome,
-    MintTokenResponse, NotificationState, NotificationTier, OutboxEntry, OutboxState,
+    Account as ProtoAccount, AiProviderKind, Alert, AnalyticsCell, AskAnalyticsResponse,
+    Attachment, AuditEntry, AuthStatusResponse, AutoconfigureResponse, BeginOAuthResponse,
+    BudgetClass, BulkTagResponse, CallStatus, CellType, Citation as ProtoCitation,
+    CompleteOAuthResponse, CreateDraftRequest, DayUsage, Draft, DraftAddress, DraftNudgeResponse,
+    DraftReplyContext, DraftRevision, EvalMetrics, EvalReport, EvaluationStats, ExportDone,
+    ExportInvoicesResponse, ExtractEventsResponse, ExtractInvoiceResponse, ExtractLinksResponse,
+    ExtractStructuredResponse, ExtractTablesResponse, ExtractTasksResponse, ExtractionSource,
+    FieldOrigin, FieldProvenance, FindResult, FinderStatusResponse, FolderStatus, Followup,
+    FollowupState, ForwardMessageResponse, FullMessage, GenerateDigestResponse,
+    GetAiProviderResponse, GetContactInsightResponse, GetResponseTimesResponse, GetSpendResponse,
+    HookEvent, IndexDrift, IndexGcReport, IndexKind, IndexProgress, IndexStatusResponse,
+    InjectionSeverity, InvoiceMoney, InvoicePaymentStatus, InvoiceText, ItemKind, LinkKind,
+    ListAccountsResponse, ListDraftRevisionsResponse, ListDraftsResponse, ListEntitiesResponse,
+    ListHooksResponse, ListNotesResponse, ListRulesResponse, ListSavedSearchesResponse,
+    ListSmartFoldersResponse, ListSubscriptionsResponse, ListTagRulesResponse, ListTagsResponse,
+    ListTokensResponse, Message as ProtoMessage, MessageOutcome, MintTokenResponse, Note,
+    NoteAuthor, NoteEvent, NotificationState, NotificationTier, OutboxEntry, OutboxState,
     PreflightCheckResponse, PreflightDegradation, PreflightFindingKind, PreflightSeverity,
-    RankExplanation, RefreshTokenResponse, RenderedDraft, RetrievalTrace, RewriteLength,
-    RewriteTone, ScanInjectionResponse, ScoreMessageResponse, SearchHit, SetAiProviderResponse,
-    SetBudgetResponse, SuggestSendTimeResponse, Summary, SyncFolderResponse, SyncStatusResponse,
-    SynthesizeRuleResponse, TagRuleMode, TagSource, TagSuggestion, TagSyncMode,
+    QueryPlan, RankExplanation, RefreshTokenResponse, RenderedDraft, ResponseStats, RetrievalTrace,
+    RewriteLength, RewriteTone, SavedSearch, ScanInjectionResponse, ScoreMessageResponse,
+    SearchAttachmentsResponse, SearchEntitiesResponse, SearchHit, SetAiProviderResponse,
+    SetBudgetResponse, SmartFolder, SmartFolderEvaluation, SubscriptionClass,
+    SuggestSendTimeResponse, Summary, SyncFolderResponse, SyncStatusResponse,
+    SynthesizeRuleResponse, TableCell, TagRuleMode, TagSource, TagSuggestion, TagSyncMode,
     TestConnectionResponse, TestHookResponse, UsageStats, WebhookDelivery, WebhookDeliveryState,
     WebhookDestination, WebhookEvent, WebhookSecretSource,
 };
@@ -3085,4 +3093,1259 @@ pub fn score_rows(response: &ScoreMessageResponse) -> Vec<ReportRow> {
         }),
     );
     rows
+}
+
+// ---------------------------------------------------------------------------
+// content, export and analytics (task 99)
+// ---------------------------------------------------------------------------
+
+/// A duration in seconds, as a report draws one.
+///
+/// Rounded to a unit somebody reads rather than printed exactly: a p50 of
+/// `19_847` seconds is `5h 30m`, and the number nobody can hold in their head is
+/// the one that makes the column useless.
+#[must_use]
+pub fn duration(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "-".to_owned();
+    }
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    let (hours, rest) = (rest / 3_600, rest % 3_600);
+    let minutes = rest / 60;
+    if days > 0 {
+        return format!("{days}d {hours}h");
+    }
+    if hours > 0 {
+        return format!("{hours}h {minutes}m");
+    }
+    if minutes > 0 {
+        return format!("{minutes}m");
+    }
+    format!("{seconds}s")
+}
+
+/// `ExportService.Export`'s terminal frame as a table.
+///
+/// The bytes went to disk; what a reader wants is what landed and what did not.
+/// `skipped_without_raw` is a row rather than a footnote: a message whose raw
+/// bytes this daemon never stored cannot be exported, and an archive quietly
+/// short by forty messages is worse than one that says so.
+#[must_use]
+pub fn export_rows(to: &str, done: &ExportDone) -> Vec<ReportRow> {
+    let mut rows = vec![
+        ReportRow::new(["written to".to_owned(), to.to_owned()]),
+        ReportRow::new(["messages".to_owned(), done.messages.to_string()]).toned(ReportTone::Ok),
+        ReportRow::new(["bytes".to_owned(), done.bytes.to_string()]),
+    ];
+    if done.skipped_without_raw > 0 {
+        rows.push(
+            ReportRow::new([
+                "skipped".to_owned(),
+                format!(
+                    "{} had no stored raw message and could not be exported",
+                    done.skipped_without_raw
+                ),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    rows
+}
+
+/// One `ResponseStats` figure, or `-` when there are no samples.
+///
+/// Zero samples is not a p50 of zero: a contact who has never been replied to has
+/// no median reply time, and printing `0s` would read as the fastest possible
+/// answer instead of no answer at all.
+fn stat(stats: Option<&ResponseStats>, pick: fn(&ResponseStats) -> i64) -> String {
+    match stats {
+        Some(stats) if stats.samples > 0 => duration(pick(stats)),
+        _ => "-".to_owned(),
+    }
+}
+
+/// `AnalyticsService.GetResponseTimes` as a table.
+///
+/// A row per group, and the note column is the point of the report: `bottleneck`
+/// means the reader is the slow side, `stalled` means the thread has gone quiet
+/// on their turn. Both are the daemon's own verdicts rather than a comparison
+/// this client re-derives — the thresholds live in the request.
+#[must_use]
+pub fn response_time_rows(response: &GetResponseTimesResponse) -> Vec<ReportRow> {
+    let mut rows = Vec::new();
+    // The overall figures first, labelled, so a reader has something to compare
+    // a group against without doing arithmetic.
+    rows.push(
+        ReportRow::new([
+            "— everyone —".to_owned(),
+            stat(response.ours.as_ref(), |s| s.p50_seconds),
+            stat(response.ours.as_ref(), |s| s.p90_seconds),
+            stat(response.theirs.as_ref(), |s| s.p50_seconds),
+            String::new(),
+            format!("{} pair(s)", response.pairs),
+        ])
+        .toned(ReportTone::Muted),
+    );
+    for group in &response.groups {
+        let mut note = Vec::new();
+        if group.bottleneck {
+            note.push("you are the delay");
+        }
+        if group.slower_than_counterpart {
+            note.push("slower than them");
+        }
+        if group.stalled {
+            note.push("stalled");
+        }
+        rows.push(
+            ReportRow::new([
+                if group.label.is_empty() {
+                    group.key.clone()
+                } else {
+                    group.label.clone()
+                },
+                stat(group.ours.as_ref(), |s| s.p50_seconds),
+                stat(group.ours.as_ref(), |s| s.p90_seconds),
+                stat(group.theirs.as_ref(), |s| s.p50_seconds),
+                if group.overdue > 0 {
+                    format!("{} ({} late)", group.awaiting_reply, group.overdue)
+                } else {
+                    group.awaiting_reply.to_string()
+                },
+                note.join(", "),
+            ])
+            .toned(if group.overdue > 0 || group.bottleneck {
+                ReportTone::Warn
+            } else if group.stalled {
+                ReportTone::Muted
+            } else {
+                ReportTone::Plain
+            }),
+        );
+    }
+    rows
+}
+
+/// `AnalyticsService.GenerateDigest` as a table whose rows open their source.
+///
+/// A digest line cites the messages it is about, and `<enter>` on the row opens
+/// the first of them. That is the acceptance's own requirement and it is why the
+/// rows carry an invocation at all: a summary a reader cannot get behind is a
+/// summary they have to take on trust.
+#[must_use]
+pub fn digest_rows(response: &GenerateDigestResponse) -> Vec<ReportRow> {
+    if response.empty {
+        return vec![ReportRow::new([
+            "nothing".to_owned(),
+            format!(
+                "no mail worth summarizing in this window ({} considered)",
+                response.considered
+            ),
+        ])
+        .toned(ReportTone::Muted)];
+    }
+    let mut rows = Vec::new();
+    for section in &response.sections {
+        for (index, line) in section.lines.iter().enumerate() {
+            let row = ReportRow::new([
+                // The heading once per section rather than on every line: a
+                // column repeating the same word down the screen is a column
+                // carrying no information.
+                if index == 0 {
+                    section.heading.clone()
+                } else {
+                    String::new()
+                },
+                line.text.clone(),
+            ]);
+            rows.push(
+                match line.message_ids.first().and_then(|id| open_invocation(*id)) {
+                    Some(invocation) => row.running(invocation),
+                    None => row,
+                },
+            );
+        }
+    }
+    if response.withheld_by_policy > 0 {
+        rows.push(
+            ReportRow::new([
+                "withheld".to_owned(),
+                format!(
+                    "{} message(s) were kept out of this digest by policy",
+                    response.withheld_by_policy
+                ),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    rows
+}
+
+/// The `:message open <id>` invocation a citing row runs.
+///
+/// Bang'd: opening a message is what `<enter>` does everywhere else in this
+/// client, and there is nothing to confirm about reading mail.
+fn open_invocation(message_id: i64) -> Option<command::Invocation> {
+    match command::parse(&format!("message open {message_id}!")) {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
+    }
+}
+
+/// `AnalyticsService.GetContactInsight` as a table.
+#[must_use]
+pub fn contact_rows(response: &GetContactInsightResponse) -> Vec<ReportRow> {
+    let volume = response.volume.unwrap_or_default();
+    let cadence = response.cadence.unwrap_or_default();
+    let decay = response.decay.unwrap_or_default();
+    let mut rows = vec![
+        ReportRow::new([
+            "who".to_owned(),
+            if response.name.is_empty() {
+                response.address.clone()
+            } else {
+                format!("{} <{}>", response.name, response.address)
+            },
+        ]),
+        ReportRow::new([
+            "volume".to_owned(),
+            format!(
+                "{} in, {} out, {} thread(s)",
+                volume.inbound, volume.outbound, volume.threads
+            ),
+        ]),
+        ReportRow::new([
+            "your p50".to_owned(),
+            stat(response.ours.as_ref(), |s| s.p50_seconds),
+        ]),
+        ReportRow::new([
+            "their p50".to_owned(),
+            stat(response.theirs.as_ref(), |s| s.p50_seconds),
+        ]),
+        ReportRow::new([
+            "cadence".to_owned(),
+            format!(
+                "{} typical gap · {:.1}/week",
+                duration(cadence.median_gap_seconds),
+                cadence.messages_per_week
+            ),
+        ]),
+    ];
+    rows.push(
+        ReportRow::new([
+            "awaiting".to_owned(),
+            format!(
+                "{} reply(s), {} late",
+                response.awaiting_reply, response.overdue
+            ),
+        ])
+        .toned(if response.overdue > 0 {
+            ReportTone::Warn
+        } else {
+            ReportTone::Plain
+        }),
+    );
+    // Dormant and declining are the two facts a relationship report exists to
+    // surface, and they are the daemon's verdicts rather than a threshold this
+    // client re-derives.
+    if decay.dormant || decay.declining {
+        rows.push(
+            ReportRow::new([
+                "trend".to_owned(),
+                format!(
+                    "{} — silent for {}",
+                    if decay.dormant {
+                        "dormant"
+                    } else {
+                        "declining"
+                    },
+                    duration(decay.silence_seconds)
+                ),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    for topic in &response.topics {
+        rows.push(ReportRow::new([
+            "topic".to_owned(),
+            format!("{} ({})", topic.term, topic.messages),
+        ]));
+    }
+    if !response.briefing.is_empty() {
+        for line in response.briefing.lines() {
+            rows.push(ReportRow::new(["briefing".to_owned(), line.to_owned()]));
+        }
+    }
+    for action in &response.next_actions {
+        rows.push(ReportRow::new(["next".to_owned(), action.clone()]).toned(ReportTone::Ok));
+    }
+    rows
+}
+
+/// A subscription's class, as the report names it.
+fn subscription_class(class: i32) -> &'static str {
+    match SubscriptionClass::try_from(class) {
+        Ok(SubscriptionClass::Newsletter) => "newsletter",
+        Ok(SubscriptionClass::Transactional) => "transactional",
+        Ok(SubscriptionClass::Automated) => "automated",
+        Ok(SubscriptionClass::Personal) => "personal",
+        Ok(SubscriptionClass::Unknown) => "unknown",
+        Ok(SubscriptionClass::Unspecified) | Err(_) => "unclassified",
+    }
+}
+
+/// `AnalyticsService.ListSubscriptions` as a table.
+#[must_use]
+pub fn subscription_rows(response: &ListSubscriptionsResponse) -> Vec<ReportRow> {
+    response
+        .senders
+        .iter()
+        .map(|sender| {
+            let unsubscribe = match sender.unsubscribe.as_ref() {
+                // One-click is the difference between "there is a way out" and
+                // "there is a way out that works", so it is said rather than
+                // implied.
+                Some(link) if link.one_click => "one click".to_owned(),
+                Some(link) if !link.http_url.is_empty() => "link".to_owned(),
+                Some(link) if !link.mailto.is_empty() => "by mail".to_owned(),
+                _ => "none offered".to_owned(),
+            };
+            ReportRow::new([
+                if sender.name.is_empty() {
+                    sender.address.clone()
+                } else {
+                    format!("{} <{}>", sender.name, sender.address)
+                },
+                subscription_class(sender.sender_class).to_owned(),
+                sender.messages.to_string(),
+                format!("{:.0}%", sender.read_rate * 100.0),
+                unsubscribe,
+            ])
+            .toned(if sender.candidate {
+                // The whole point of the report: mail arriving that nobody reads.
+                ReportTone::Warn
+            } else {
+                ReportTone::Plain
+            })
+        })
+        .collect()
+}
+
+/// One `AnalyticsCell` as text.
+fn analytics_cell(cell: &AnalyticsCell) -> String {
+    use rmail_proto::v1::analytics_cell::Value;
+    match cell.value.as_ref() {
+        Some(Value::NullValue(_)) | None => String::new(),
+        Some(Value::IntegerValue(value)) => value.to_string(),
+        Some(Value::RealValue(value)) => format!("{value:.2}"),
+        Some(Value::TextValue(value)) => value.clone(),
+        // A column type this projection cannot carry. Named rather than blank:
+        // an empty cell reads as a null, and "the daemon could not put this on
+        // the wire" is a different fact.
+        Some(Value::Unsupported(_)) => "(unsupported)".to_owned(),
+    }
+}
+
+/// `AnalyticsService.AskAnalytics` as a table.
+///
+/// The generated SQL comes first, because a number nobody can see the query
+/// behind is a number nobody can check — which is the whole reason this RPC
+/// returns it.
+#[must_use]
+pub fn ask_analytics_rows(response: &AskAnalyticsResponse) -> Vec<ReportRow> {
+    let mut rows = Vec::new();
+    for line in response.sql.lines() {
+        rows.push(ReportRow::new(["sql".to_owned(), line.to_owned()]).toned(ReportTone::Muted));
+    }
+    if !response.notes.is_empty() {
+        rows.push(ReportRow::new([
+            "reading".to_owned(),
+            response.notes.clone(),
+        ]));
+    }
+    if !response.columns.is_empty() {
+        let mut header = vec![String::new()];
+        header.extend(response.columns.iter().cloned());
+        rows.push(ReportRow::new(header).toned(ReportTone::Muted));
+    }
+    for row in &response.rows {
+        let mut cells = vec![String::new()];
+        cells.extend(row.cells.iter().map(analytics_cell));
+        rows.push(ReportRow::new(cells));
+    }
+    if response.truncated {
+        rows.push(
+            ReportRow::new([
+                "truncated".to_owned(),
+                "there are more rows than this answer carries".to_owned(),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    for line in response.narrative.lines() {
+        rows.push(ReportRow::new(["said".to_owned(), line.to_owned()]));
+    }
+    rows
+}
+
+/// A table cell's text, whatever type the extractor decided it was.
+fn table_cell(cell: &TableCell) -> String {
+    match CellType::try_from(cell.r#type) {
+        Ok(CellType::Number) => format!("{}", cell.number),
+        Ok(CellType::Bool) => if cell.boolean { "true" } else { "false" }.to_owned(),
+        Ok(CellType::Date) => when(cell.date),
+        // Text, empty, or a type this build does not know: the extractor also
+        // supplies the raw text, and that is the honest rendering for all three.
+        _ => cell.text.clone(),
+    }
+}
+
+/// `AttachmentService.ExtractTables` as a table of tables.
+///
+/// One report row per table row, with the table's name in the first column on its
+/// first row only — the same shape the digest uses, and for the same reason: a
+/// column repeating one word down the screen carries no information.
+///
+/// A table wider than the report is truncated at draw time rather than reshaped
+/// here. `Table::truncated` and `dropped_tables` are said outright instead,
+/// because a spreadsheet silently short of three columns is a spreadsheet nobody
+/// can trust.
+#[must_use]
+pub fn table_rows(response: &ExtractTablesResponse) -> Vec<ReportRow> {
+    let mut rows = Vec::new();
+    for table in &response.tables {
+        let name = if table.name.is_empty() {
+            "(unnamed)".to_owned()
+        } else {
+            table.name.clone()
+        };
+        let mut header = vec![name.clone()];
+        header.extend(table.columns.iter().map(|column| column.header.clone()));
+        rows.push(ReportRow::new(header).toned(ReportTone::Muted));
+        for row in &table.rows {
+            let mut cells = vec![String::new()];
+            cells.extend(row.cells.iter().map(table_cell));
+            rows.push(ReportRow::new(cells));
+        }
+        if table.truncated {
+            rows.push(
+                ReportRow::new([
+                    String::new(),
+                    format!("{name} was truncated — it has more rows than this carries"),
+                ])
+                .toned(ReportTone::Warn),
+            );
+        }
+        if table.inferred {
+            rows.push(
+                ReportRow::new([
+                    String::new(),
+                    format!("{name} was inferred by a model, not parsed"),
+                ])
+                .toned(ReportTone::Warn),
+            );
+        }
+    }
+    if response.dropped_tables > 0 || response.cell_budget_exhausted {
+        rows.push(
+            ReportRow::new([
+                "dropped".to_owned(),
+                format!(
+                    "{} table(s) did not fit the extraction budget",
+                    response.dropped_tables
+                ),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    rows
+}
+
+/// Money as the invoice report draws it, from minor units.
+fn money(money: Option<&InvoiceMoney>) -> String {
+    match money {
+        None => "-".to_owned(),
+        Some(money) => {
+            // Minor units throughout, and divided only here: an invoice total is
+            // compared and summed as an integer everywhere upstream for the reason
+            // `rmail_core::ai::budget` gives about floats, and this is the one
+            // place it becomes something to read.
+            #[allow(clippy::cast_precision_loss)]
+            let major = money.minor_units as f64 / 100.0;
+            format!("{} {major:.2}", money.currency)
+        }
+    }
+}
+
+/// Where a field came from, so a reader can tell a parse from a guess.
+fn origin(provenance: Option<&FieldProvenance>) -> String {
+    match provenance.map(|p| FieldOrigin::try_from(p.origin)) {
+        Some(Ok(FieldOrigin::Model)) => "model".to_owned(),
+        Some(Ok(FieldOrigin::Parsed)) => "parsed".to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// An invoice's payment status, as the report names it.
+fn invoice_status(status: i32) -> (&'static str, ReportTone) {
+    match InvoicePaymentStatus::try_from(status) {
+        Ok(InvoicePaymentStatus::Paid) => ("paid", ReportTone::Ok),
+        Ok(InvoicePaymentStatus::Unpaid) => ("unpaid", ReportTone::Plain),
+        Ok(InvoicePaymentStatus::Overdue) => ("overdue", ReportTone::Bad),
+        Ok(InvoicePaymentStatus::Refunded) => ("refunded", ReportTone::Muted),
+        Ok(InvoicePaymentStatus::Void) => ("void", ReportTone::Muted),
+        Ok(InvoicePaymentStatus::Unspecified) | Err(_) => ("unknown", ReportTone::Muted),
+    }
+}
+
+/// `AttachmentService.ExtractInvoice` as a field table.
+///
+/// Every field carries where it came from, which is the column that matters: a
+/// total a parser read out of a PDF's text layer and a total a model inferred from
+/// a scan are not the same claim, and an invoice report that flattened them would
+/// be inviting somebody to pay the second one.
+#[must_use]
+pub fn invoice_rows(response: &ExtractInvoiceResponse) -> Vec<ReportRow> {
+    let Some(invoice) = response.invoice.as_ref() else {
+        let mut rows = vec![ReportRow::new([
+            "nothing".to_owned(),
+            "no invoice or receipt was found in this message".to_owned(),
+        ])
+        .toned(ReportTone::Muted)];
+        for candidate in &response.candidates {
+            rows.push(ReportRow::new([
+                "candidate".to_owned(),
+                candidate.filename.clone(),
+                candidate.part_id.clone(),
+            ]));
+        }
+        return rows;
+    };
+    let text = |field: Option<&InvoiceText>| {
+        field.map_or_else(
+            || ("-".to_owned(), String::new()),
+            |field| (field.value.clone(), origin(field.provenance.as_ref())),
+        )
+    };
+    let (vendor, vendor_from) = text(invoice.vendor.as_ref());
+    let (number, number_from) = text(invoice.number.as_ref());
+    let (status, tone) = invoice_status(invoice.status);
+    let mut rows = vec![
+        ReportRow::new(["vendor".to_owned(), vendor, vendor_from]),
+        ReportRow::new(["number".to_owned(), number, number_from]),
+        ReportRow::new([
+            "total".to_owned(),
+            money(invoice.total.as_ref()),
+            origin(
+                invoice
+                    .total
+                    .as_ref()
+                    .and_then(|total| total.provenance.as_ref()),
+            ),
+        ]),
+        ReportRow::new(["tax".to_owned(), money(invoice.tax.as_ref()), String::new()]),
+        ReportRow::new([
+            "issued".to_owned(),
+            invoice
+                .issued_at
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |date| when(date.at)),
+            String::new(),
+        ]),
+        ReportRow::new([
+            "due".to_owned(),
+            invoice
+                .due_at
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |date| when(date.at)),
+            String::new(),
+        ]),
+        ReportRow::new([
+            "status".to_owned(),
+            status.to_owned(),
+            origin(invoice.status_provenance.as_ref()),
+        ])
+        .toned(tone),
+    ];
+    for item in &invoice.line_items {
+        rows.push(ReportRow::new([
+            "item".to_owned(),
+            item.description.clone(),
+            money(item.total.as_ref()),
+        ]));
+    }
+    if invoice.inferred {
+        rows.push(
+            ReportRow::new([
+                "inferred".to_owned(),
+                "a model read this, and a model can be wrong about a number".to_owned(),
+                String::new(),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    for warning in &invoice.warnings {
+        rows.push(
+            ReportRow::new(["warning".to_owned(), warning.clone(), String::new()])
+                .toned(ReportTone::Warn),
+        );
+    }
+    rows
+}
+
+/// `AttachmentService.ExportInvoices` as a table.
+#[must_use]
+pub fn invoices_rows(response: &ExportInvoicesResponse) -> Vec<ReportRow> {
+    if !response.csv.is_empty() {
+        // The CSV framing asked for a document, so the document is what is drawn
+        // — one row per line, so it can be read and copied rather than elided
+        // into one cell.
+        return response
+            .csv
+            .lines()
+            .map(|line| ReportRow::new([line.to_owned()]))
+            .collect();
+    }
+    response
+        .invoices
+        .iter()
+        .map(|invoice| {
+            let (status, tone) = invoice_status(invoice.status);
+            ReportRow::new([
+                invoice
+                    .vendor
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), |field| field.value.clone()),
+                invoice
+                    .number
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), |field| field.value.clone()),
+                money(invoice.total.as_ref()),
+                invoice
+                    .issued_at
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), |date| when(date.at)),
+                invoice
+                    .due_at
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), |date| when(date.at)),
+                status.to_owned(),
+            ])
+            .toned(tone)
+        })
+        .collect()
+}
+
+/// `SearchService.SearchAttachments` as a table whose rows open the message.
+#[must_use]
+pub fn attachment_hit_rows(response: &SearchAttachmentsResponse) -> Vec<ReportRow> {
+    response
+        .hits
+        .iter()
+        .map(|hit| {
+            let row = ReportRow::new([
+                hit.filename.clone(),
+                hit.from_addr.clone(),
+                if hit.subject.is_empty() {
+                    NO_SUBJECT.to_owned()
+                } else {
+                    hit.subject.clone()
+                },
+                hit.page
+                    .map_or_else(|| hit.part_id.clone(), |page| format!("page {page}")),
+                hit.excerpt.clone(),
+            ]);
+            match open_invocation(hit.message_id) {
+                Some(invocation) => row.running(invocation),
+                None => row,
+            }
+        })
+        .collect()
+}
+
+/// `SearchService.SearchEntities` as a table.
+#[must_use]
+pub fn entity_rows(response: &SearchEntitiesResponse) -> Vec<ReportRow> {
+    response
+        .hits
+        .iter()
+        .map(|hit| {
+            ReportRow::new([
+                hit.kind.clone(),
+                hit.value.clone(),
+                hit.mentions.to_string(),
+                hit.messages.to_string(),
+                when(hit.last_seen),
+            ])
+        })
+        .collect()
+}
+
+/// `SearchService.CompileQuery` as a table.
+///
+/// The compiled query and its filters are the answer: this verb exists so a plan
+/// can be read *before* it runs, and a plan whose filters were folded into one
+/// cell would be a plan nobody could check.
+#[must_use]
+pub fn query_plan_rows(plan: &QueryPlan) -> Vec<ReportRow> {
+    let mut rows = vec![
+        ReportRow::new(["asked".to_owned(), plan.raw.clone()]),
+        ReportRow::new(["compiled".to_owned(), plan.compiled.clone()]).toned(ReportTone::Ok),
+    ];
+    for filter in &plan.filters {
+        rows.push(ReportRow::new(["filter".to_owned(), filter.clone()]));
+    }
+    if !plan.semantic_query.is_empty() {
+        rows.push(ReportRow::new([
+            "semantic".to_owned(),
+            plan.semantic_query.clone(),
+        ]));
+    }
+    if !plan.notes.is_empty() {
+        rows.push(ReportRow::new(["reading".to_owned(), plan.notes.clone()]));
+    }
+    rows.push(
+        ReportRow::new([
+            "from".to_owned(),
+            if plan.cached {
+                format!("a cached compilation ({})", plan.model)
+            } else {
+                format!("a fresh model call ({})", plan.model)
+            },
+        ])
+        .toned(if plan.cached {
+            ReportTone::Muted
+        } else {
+            ReportTone::Plain
+        }),
+    );
+    rows
+}
+
+/// `SearchService.Evaluate` as a table.
+#[must_use]
+pub fn eval_rows(report: &EvalReport) -> Vec<ReportRow> {
+    let metrics = |metrics: Option<&EvalMetrics>| {
+        metrics.map_or_else(
+            || {
+                [
+                    "-".to_owned(),
+                    "-".to_owned(),
+                    "-".to_owned(),
+                    "-".to_owned(),
+                ]
+            },
+            |m| {
+                [
+                    format!("{:.3}", m.ndcg_at_10),
+                    format!("{:.3}", m.mrr),
+                    format!("{:.3}", m.recall_at_50),
+                    format!("{:.3}", m.p_at_3),
+                ]
+            },
+        )
+    };
+    let aggregate = metrics(report.aggregate.as_ref());
+    let mut rows = vec![ReportRow::new([
+        "— all queries —".to_owned(),
+        aggregate[0].clone(),
+        aggregate[1].clone(),
+        aggregate[2].clone(),
+        aggregate[3].clone(),
+        format!("corpus {}", report.corpus),
+    ])
+    .toned(ReportTone::Ok)];
+    for query in &report.per_query {
+        let m = metrics(query.metrics.as_ref());
+        rows.push(
+            ReportRow::new([
+                query.name.clone(),
+                m[0].clone(),
+                m[1].clone(),
+                m[2].clone(),
+                m[3].clone(),
+                if query.unresolved.is_empty() {
+                    format!("{}/{} relevant", query.relevant, query.returned)
+                } else {
+                    // A judgment naming a message that is not in the index makes
+                    // every metric for that query a lower bound rather than a
+                    // measurement, so it is not a footnote.
+                    format!("{} unresolved judgment(s)", query.unresolved.len())
+                },
+            ])
+            .toned(if query.unresolved.is_empty() {
+                ReportTone::Plain
+            } else {
+                ReportTone::Warn
+            }),
+        );
+    }
+    rows
+}
+
+/// Where an extracted item came from.
+fn extraction_source(source: i32) -> &'static str {
+    match ExtractionSource::try_from(source) {
+        Ok(ExtractionSource::Ics) => "ics",
+        Ok(ExtractionSource::Model) => "model",
+        Ok(ExtractionSource::Unspecified) | Err(_) => "?",
+    }
+}
+
+/// `ExtractService.ExtractEvents` as a table.
+#[must_use]
+pub fn event_rows(response: &ExtractEventsResponse) -> Vec<ReportRow> {
+    let mut rows: Vec<ReportRow> = response
+        .events
+        .iter()
+        .map(|event| {
+            ReportRow::new([
+                event.summary.clone(),
+                if event.all_day {
+                    format!("{} (all day)", when(event.starts_at))
+                } else {
+                    when(event.starts_at)
+                },
+                event.location.clone(),
+                extraction_source(event.source).to_owned(),
+            ])
+            // A cancellation is the one row somebody must not skim past: it means
+            // a meeting they may still have on a calendar is off.
+            .toned(if event.cancelled {
+                ReportTone::Bad
+            } else if ExtractionSource::try_from(event.source) == Ok(ExtractionSource::Model) {
+                // Inferred from prose rather than read out of an `.ics` part, so
+                // the time may be wrong in a way a real invitation's cannot be.
+                ReportTone::Warn
+            } else {
+                ReportTone::Plain
+            })
+        })
+        .collect();
+    rows.extend(delivery_note(
+        response.skipped,
+        response.delivered,
+        response.already_delivered,
+        &response.sink_output,
+    ));
+    rows
+}
+
+/// `ExtractService.ExtractTasks` as a table.
+#[must_use]
+pub fn task_rows(response: &ExtractTasksResponse) -> Vec<ReportRow> {
+    let mut rows: Vec<ReportRow> = response
+        .tasks
+        .iter()
+        .map(|task| {
+            ReportRow::new([
+                task.summary.clone(),
+                when(task.due_at),
+                task.priority.to_string(),
+                extraction_source(task.source).to_owned(),
+            ])
+            .toned(if task.completed {
+                ReportTone::Muted
+            } else if ExtractionSource::try_from(task.source) == Ok(ExtractionSource::Model) {
+                ReportTone::Warn
+            } else {
+                ReportTone::Plain
+            })
+        })
+        .collect();
+    rows.extend(delivery_note(
+        response.skipped,
+        response.delivered,
+        response.already_delivered,
+        &response.sink_output,
+    ));
+    rows
+}
+
+/// What an extraction's sink did, when there is anything to say.
+///
+/// `already_delivered` is the idempotency claim working — a second call over the
+/// same message delivers nothing — and saying so is what stops it reading as a
+/// failure. Drawn only when non-zero, so an ordinary extraction has no noise
+/// under it.
+fn delivery_note(
+    skipped: u32,
+    delivered: u32,
+    already_delivered: u32,
+    sink_output: &str,
+) -> Vec<ReportRow> {
+    let mut rows = Vec::new();
+    if skipped > 0 {
+        rows.push(
+            ReportRow::new([
+                "skipped".to_owned(),
+                format!("{skipped} item(s) the extractor would not vouch for"),
+            ])
+            .toned(ReportTone::Muted),
+        );
+    }
+    if delivered > 0 || already_delivered > 0 {
+        rows.push(
+            ReportRow::new([
+                "delivered".to_owned(),
+                format!("{delivered} sent, {already_delivered} already claimed"),
+            ])
+            .toned(ReportTone::Ok),
+        );
+    }
+    for line in sink_output.lines() {
+        rows.push(ReportRow::new(["sink".to_owned(), line.to_owned()]));
+    }
+    rows
+}
+
+/// `ExtractService.ExtractStructured` as a table.
+///
+/// The document is drawn a line at a time rather than as one cell: it is JSON
+/// somebody is reading against a schema, and folded into a cell it would be
+/// elided at the column width.
+#[must_use]
+pub fn structured_rows(response: &ExtractStructuredResponse) -> Vec<ReportRow> {
+    let mut rows = vec![
+        ReportRow::new(["schema".to_owned(), response.schema.clone()]),
+        ReportRow::new([
+            "from".to_owned(),
+            if response.cached {
+                format!("a cached extraction ({})", response.model)
+            } else {
+                format!("a fresh model call ({})", response.model)
+            },
+        ])
+        .toned(if response.cached {
+            ReportTone::Muted
+        } else {
+            ReportTone::Plain
+        }),
+    ];
+    for line in response.data.lines() {
+        rows.push(ReportRow::new(["data".to_owned(), line.to_owned()]));
+    }
+    rows
+}
+
+/// What kind of link the classifier decided this is.
+fn link_kind(kind: i32) -> &'static str {
+    match LinkKind::try_from(kind) {
+        Ok(LinkKind::Unsubscribe) => "unsubscribe",
+        Ok(LinkKind::Tracking) => "tracking",
+        Ok(LinkKind::Meeting) => "meeting",
+        Ok(LinkKind::Document) => "document",
+        Ok(LinkKind::Cta) => "call to action",
+        Ok(LinkKind::Other) => "other",
+        Ok(LinkKind::Unspecified) | Err(_) => "?",
+    }
+}
+
+/// `LinkService.ExtractLinks` as a table.
+///
+/// A deceptive link — one whose visible text names a different host from the one
+/// it goes to — is the reason this verb exists, so it is drawn `Bad` and its
+/// reason is on the row. Tracking pixels are counted rather than listed: there
+/// are frequently dozens and none of them is individually interesting.
+#[must_use]
+pub fn link_rows(response: &ExtractLinksResponse) -> Vec<ReportRow> {
+    let mut rows: Vec<ReportRow> = response
+        .links
+        .iter()
+        .map(|link| {
+            ReportRow::new([
+                link_kind(link.kind).to_owned(),
+                link.host.clone(),
+                if link.display_text.is_empty() {
+                    link.display_host.clone()
+                } else {
+                    link.display_text.clone()
+                },
+                link.reason.clone(),
+            ])
+            .toned(if link.deceptive {
+                ReportTone::Bad
+            } else if LinkKind::try_from(link.kind) == Ok(LinkKind::Tracking) {
+                ReportTone::Muted
+            } else {
+                ReportTone::Plain
+            })
+        })
+        .collect();
+    if response.tracking_pixels > 0 {
+        rows.push(
+            ReportRow::new([
+                "pixels".to_owned(),
+                format!(
+                    "{} tracking pixel(s) — images that report when you opened this",
+                    response.tracking_pixels
+                ),
+                String::new(),
+                String::new(),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    if response.truncated > 0 {
+        rows.push(
+            ReportRow::new([
+                "truncated".to_owned(),
+                format!("{} more link(s) than this carries", response.truncated),
+                String::new(),
+                String::new(),
+            ])
+            .toned(ReportTone::Muted),
+        );
+    }
+    rows
+}
+
+/// A note's author, as the listing names it.
+fn note_author(author: i32) -> &'static str {
+    match NoteAuthor::try_from(author) {
+        Ok(NoteAuthor::User) => "you",
+        Ok(NoteAuthor::Ai) => "ai",
+        Ok(NoteAuthor::Unspecified) | Err(_) => "?",
+    }
+}
+
+/// One note as a row.
+///
+/// Carries `:note edit <id>` — pressing `<enter>` on a note is how it is
+/// rewritten, and the row is where the id already is. Not bang'd: `note edit`
+/// needs text after the id, so the row's line would be refused; what the row
+/// carries is a *prefilled* invocation nothing can run silently.
+#[must_use]
+pub fn note_row(note: &Note) -> ReportRow {
+    // Multi-line notes are folded to one line for the row, which is the same
+    // rule every other remote string here follows. The body is markdown and the
+    // whole of it is on the wire; a reader who needs it all opens the note.
+    ReportRow::new([
+        note.id.to_string(),
+        note_author(note.author).to_owned(),
+        when(note.created_at),
+        note.body_md.clone(),
+    ])
+    .toned(if NoteAuthor::try_from(note.author) == Ok(NoteAuthor::Ai) {
+        // An AI-written note is a different claim from one the user wrote, and a
+        // listing that drew them identically would be inviting somebody to treat
+        // a summary as a decision they made.
+        ReportTone::Muted
+    } else {
+        ReportTone::Plain
+    })
+}
+
+/// `NoteService.ListNotes` as a table.
+#[must_use]
+pub fn note_rows(response: &ListNotesResponse) -> Vec<ReportRow> {
+    response.notes.iter().map(note_row).collect()
+}
+
+/// One `NoteEvent` as a row of the live listing.
+///
+/// A deletion is a row rather than a removal: the pane appends, and rewriting
+/// history under a reader who is looking at it is worse than saying what changed.
+#[must_use]
+pub fn note_event_row(event: &NoteEvent) -> Option<ReportRow> {
+    use rmail_proto::v1::note_event::Event;
+    match event.event.as_ref()? {
+        Event::Added(note) => Some(note_row(note)),
+        Event::Edited(note) => Some(note_row(note).toned(ReportTone::Ok)),
+        Event::Deleted(deleted) => Some(
+            ReportRow::new([
+                deleted.id.to_string(),
+                String::new(),
+                String::new(),
+                "deleted".to_owned(),
+            ])
+            .toned(ReportTone::Bad),
+        ),
+    }
+}
+
+/// `SavedSearchService.ListSavedSearches` as a table.
+///
+/// Every row carries `:saved run <name>`, which is what makes the listing the way
+/// one is run. Bang'd: running a saved search is a read, and there is nothing to
+/// confirm about searching.
+#[must_use]
+pub fn saved_rows(response: &ListSavedSearchesResponse) -> Vec<ReportRow> {
+    response
+        .searches
+        .iter()
+        .map(|saved| {
+            let row = ReportRow::new([
+                saved.name.clone(),
+                saved.query.clone(),
+                when(saved.last_run_at),
+            ]);
+            match run_saved_invocation(&saved.name) {
+                Some(invocation) => row.running(invocation),
+                None => row,
+            }
+        })
+        .collect()
+}
+
+/// The `:saved run <name>` invocation a listing row runs.
+fn run_saved_invocation(name: &str) -> Option<command::Invocation> {
+    match command::parse(&format!("saved run {}!", command::quoted(name))) {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
+    }
+}
+
+/// One saved search, echoed back after being stored.
+#[must_use]
+pub fn saved_stored(saved: &SavedSearch) -> String {
+    format!(
+        "{} saved — :saved run {} searches it",
+        saved.name, saved.name
+    )
+}
+
+/// `SavedSearchService.ListSmartFolders` as a table.
+///
+/// Every row carries `:folder members <name>`, because "what is in it" is the
+/// question a folder listing raises.
+#[must_use]
+pub fn smart_folder_rows(response: &ListSmartFoldersResponse) -> Vec<ReportRow> {
+    response
+        .folders
+        .iter()
+        .map(|folder| {
+            let row = ReportRow::new([
+                folder.name.clone(),
+                folder.predicate.clone(),
+                if folder.auto_tag.is_empty() {
+                    "-".to_owned()
+                } else {
+                    folder.auto_tag.clone()
+                },
+                when(folder.last_evaluated_at),
+            ])
+            .toned(if folder.auto_tag.is_empty() {
+                ReportTone::Plain
+            } else {
+                // A folder that tags what enters it changes mail on its own, which
+                // is the one thing about a folder listing worth spotting.
+                ReportTone::Warn
+            });
+            match members_invocation(&folder.name) {
+                Some(invocation) => row.running(invocation),
+                None => row,
+            }
+        })
+        .collect()
+}
+
+/// The `:folder members <name>` invocation a listing row runs.
+fn members_invocation(name: &str) -> Option<command::Invocation> {
+    match command::parse(&format!("folder members {}!", command::quoted(name))) {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
+    }
+}
+
+/// One smart folder as a field table — what `:folder new` and `:folder compile`
+/// answer with.
+#[must_use]
+pub fn smart_folder_fields(folder: &SmartFolder, plan: Option<&QueryPlan>) -> Vec<ReportRow> {
+    let mut rows = vec![
+        ReportRow::new(["name".to_owned(), folder.name.clone()]),
+        ReportRow::new(["predicate".to_owned(), folder.predicate.clone()]).toned(ReportTone::Ok),
+    ];
+    if !folder.nl_source.is_empty() {
+        rows.push(ReportRow::new([
+            "compiled from".to_owned(),
+            folder.nl_source.clone(),
+        ]));
+    }
+    if !folder.auto_tag.is_empty() {
+        rows.push(
+            ReportRow::new(["auto-tag".to_owned(), folder.auto_tag.clone()])
+                .toned(ReportTone::Warn),
+        );
+    }
+    rows.push(ReportRow::new([
+        "notify".to_owned(),
+        if folder.notify { "yes" } else { "no" }.to_owned(),
+    ]));
+    if let Some(plan) = plan {
+        for filter in &plan.filters {
+            rows.push(ReportRow::new(["filter".to_owned(), filter.clone()]));
+        }
+        if !plan.semantic_query.is_empty() {
+            rows.push(ReportRow::new([
+                "semantic".to_owned(),
+                plan.semantic_query.clone(),
+            ]));
+        }
+    }
+    rows
+}
+
+/// `SavedSearchService.EvaluateSmartFolder` as a table.
+#[must_use]
+pub fn evaluation_rows(evaluation: &SmartFolderEvaluation) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new(["members".to_owned(), evaluation.members.to_string()])
+            .toned(ReportTone::Ok),
+        ReportRow::new(["entered".to_owned(), evaluation.entered_count.to_string()]),
+        ReportRow::new(["departed".to_owned(), evaluation.departed_count.to_string()]),
+        ReportRow::new(["tagged".to_owned(), evaluation.tagged.to_string()]).toned(
+            if evaluation.tagged > 0 {
+                // This is the row that says mail was changed.
+                ReportTone::Warn
+            } else {
+                ReportTone::Plain
+            },
+        ),
+        ReportRow::new(["notified".to_owned(), evaluation.notified.to_string()]),
+    ]
+}
+
+/// A `SearchHit` as a row of a saved search's results.
+#[must_use]
+pub fn saved_hit_row(hit: &SearchHit) -> ReportRow {
+    let message = hit.message.clone().unwrap_or_default();
+    let row = ReportRow::new([
+        format!("{:.3}", hit.score),
+        message
+            .from_name
+            .clone()
+            .unwrap_or_else(|| message.from_addr.clone().unwrap_or_else(|| "-".to_owned())),
+        message
+            .subject
+            .clone()
+            .unwrap_or_else(|| NO_SUBJECT.to_owned()),
+        when(message.date.unwrap_or(0)),
+    ]);
+    match open_invocation(message.id) {
+        Some(invocation) => row.running(invocation),
+        None => row,
+    }
+}
+
+/// A `Message` as a row of a smart folder's membership.
+#[must_use]
+pub fn member_row(message: &ProtoMessage) -> ReportRow {
+    let row = ReportRow::new([
+        message.id.to_string(),
+        message
+            .from_name
+            .clone()
+            .or_else(|| message.from_addr.clone())
+            .unwrap_or_else(|| "-".to_owned()),
+        message
+            .subject
+            .clone()
+            .unwrap_or_else(|| NO_SUBJECT.to_owned()),
+        when(message.date.unwrap_or(0)),
+    ]);
+    match open_invocation(message.id) {
+        Some(invocation) => row.running(invocation),
+        None => row,
+    }
 }

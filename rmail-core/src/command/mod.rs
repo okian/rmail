@@ -683,6 +683,329 @@ fn explicit() -> Vec<Verb> {
             takes_value: false,
         },
     ];
+    /// A free-text query, joined from every positional — a query is a sentence
+    /// and reading only its first word is the silent truncation `PATTERN`'s own
+    /// docs call out.
+    const QUERY_TEXT: &[Positional] = &[Positional {
+        name: "query",
+        required: false,
+        rest: true,
+    }];
+    /// One email address, for a verb that reports on a correspondent.
+    const ADDRESS: &[Positional] = &[Positional {
+        name: "address",
+        required: false,
+        rest: false,
+    }];
+    /// A note's row id, as `:note list` shows it.
+    const NOTE_ID: &[Positional] = &[Positional {
+        name: "note_id",
+        required: false,
+        rest: false,
+    }];
+    /// A note's id and its new text.
+    const NOTE_EDIT: &[Positional] = &[
+        Positional {
+            name: "note_id",
+            required: false,
+            rest: false,
+        },
+        Positional {
+            name: "text",
+            required: false,
+            rest: true,
+        },
+    ];
+    /// A name and the query, predicate or description it stands for.
+    const NAME_AND_QUERY: &[Positional] = &[
+        Positional {
+            name: "name",
+            required: false,
+            rest: false,
+        },
+        Positional {
+            name: "query",
+            required: false,
+            rest: true,
+        },
+    ];
+    /// A filesystem path — the one verb here that reads one, and its docs in
+    /// `tui::commands::content` say why it has to.
+    const PATH: &[Positional] = &[Positional {
+        name: "path",
+        required: false,
+        rest: false,
+    }];
+    /// `:export`'s destination, framing and selection.
+    const EXPORT_FLAGS: &[Flag] = &[
+        Flag {
+            name: "to",
+            takes_value: true,
+        },
+        Flag {
+            name: "format",
+            takes_value: true,
+        },
+        Flag {
+            name: "thread",
+            takes_value: true,
+        },
+        Flag {
+            name: "with-ai",
+            takes_value: false,
+        },
+        Flag {
+            name: "limit",
+            takes_value: true,
+        },
+    ];
+    /// `:stats response-time`'s grouping and window.
+    const RESPONSE_TIME_FLAGS: &[Flag] = &[
+        Flag {
+            name: "since",
+            takes_value: true,
+        },
+        Flag {
+            name: "until",
+            takes_value: true,
+        },
+        Flag {
+            name: "group-by",
+            takes_value: true,
+        },
+        Flag {
+            name: "limit",
+            takes_value: true,
+        },
+        Flag {
+            name: "min-samples",
+            takes_value: true,
+        },
+    ];
+    /// `:stats ask`'s one switch.
+    const NARRATE: &[Flag] = &[Flag {
+        name: "narrate",
+        takes_value: false,
+    }];
+    /// `:digest`'s window, plus the switch that ignores a cached one.
+    const DIGEST_FLAGS: &[Flag] = &[
+        Flag {
+            name: "since",
+            takes_value: true,
+        },
+        Flag {
+            name: "until",
+            takes_value: true,
+        },
+        Flag {
+            name: "force",
+            takes_value: false,
+        },
+    ];
+    /// `:contact`'s window, plus the switch that skips the model briefing.
+    const CONTACT_FLAGS: &[Flag] = &[
+        Flag {
+            name: "since",
+            takes_value: true,
+        },
+        Flag {
+            name: "until",
+            takes_value: true,
+        },
+        Flag {
+            name: "metrics-only",
+            takes_value: false,
+        },
+    ];
+    /// `:subs`' window and the two switches that narrow or widen it.
+    const SUBS_FLAGS: &[Flag] = &[
+        Flag {
+            name: "since",
+            takes_value: true,
+        },
+        Flag {
+            name: "until",
+            takes_value: true,
+        },
+        Flag {
+            name: "limit",
+            takes_value: true,
+        },
+        Flag {
+            name: "candidates-only",
+            takes_value: false,
+        },
+        Flag {
+            name: "classify",
+            takes_value: false,
+        },
+    ];
+    /// Which attachment part a verb acts on, and whether a model may help.
+    const PART_FLAGS: &[Flag] = &[
+        Flag {
+            name: "part",
+            takes_value: true,
+        },
+        Flag {
+            name: "model",
+            takes_value: false,
+        },
+    ];
+    /// `:attach invoices`' filters and framing.
+    const INVOICES_FLAGS: &[Flag] = &[
+        Flag {
+            name: "vendor",
+            takes_value: true,
+        },
+        Flag {
+            name: "since",
+            takes_value: true,
+        },
+        Flag {
+            name: "until",
+            takes_value: true,
+        },
+        Flag {
+            name: "limit",
+            takes_value: true,
+        },
+        Flag {
+            name: "format",
+            takes_value: true,
+        },
+    ];
+    /// `:attach ask`'s scope and retrieval depth.
+    const ASK_ATTACHMENT_FLAGS: &[Flag] = &[
+        Flag {
+            name: "part",
+            takes_value: true,
+        },
+        Flag {
+            name: "top-k",
+            takes_value: true,
+        },
+        Flag {
+            name: "all",
+            takes_value: false,
+        },
+    ];
+    /// `:attach search`'s scope and bound.
+    const ATTACHMENT_SEARCH_FLAGS: &[Flag] = &[
+        Flag {
+            name: "limit",
+            takes_value: true,
+        },
+        Flag {
+            name: "all",
+            takes_value: false,
+        },
+    ];
+    /// `:search compile`'s one switch.
+    const REFRESH: &[Flag] = &[Flag {
+        name: "refresh",
+        takes_value: false,
+    }];
+    /// `:search entities`' narrowing.
+    const ENTITY_FLAGS: &[Flag] = &[
+        Flag {
+            name: "kinds",
+            takes_value: true,
+        },
+        Flag {
+            name: "since",
+            takes_value: true,
+        },
+        Flag {
+            name: "limit",
+            takes_value: true,
+        },
+    ];
+    /// `:search eval`'s retrieval mode and per-query bound.
+    const EVAL_FLAGS: &[Flag] = &[
+        Flag {
+            name: "mode",
+            takes_value: true,
+        },
+        Flag {
+            name: "limit",
+            takes_value: true,
+        },
+    ];
+    /// `:extract events`/`:extract tasks`' model switch and delivery sink.
+    const EXTRACT_FLAGS: &[Flag] = &[
+        Flag {
+            name: "model",
+            takes_value: false,
+        },
+        Flag {
+            name: "sink",
+            takes_value: true,
+        },
+    ];
+    /// `:extract data`'s schema and cache switch.
+    const STRUCTURED_FLAGS: &[Flag] = &[
+        Flag {
+            name: "schema",
+            takes_value: true,
+        },
+        Flag {
+            name: "refresh",
+            takes_value: false,
+        },
+    ];
+    /// `:links`' one switch.
+    const MODEL: &[Flag] = &[Flag {
+        name: "model",
+        takes_value: false,
+    }];
+    /// A note verb's target: the thread rather than the one message.
+    const THREAD: &[Flag] = &[Flag {
+        name: "thread",
+        takes_value: false,
+    }];
+    /// `:saved run`'s bound and its explanation switch.
+    const SAVED_RUN_FLAGS: &[Flag] = &[
+        Flag {
+            name: "limit",
+            takes_value: true,
+        },
+        Flag {
+            name: "explain",
+            takes_value: false,
+        },
+    ];
+    /// A smart folder's side effects.
+    const SMART_FOLDER_FLAGS: &[Flag] = &[
+        Flag {
+            name: "auto-tag",
+            takes_value: true,
+        },
+        Flag {
+            name: "notify",
+            takes_value: false,
+        },
+    ];
+    /// `:folder compile`'s side effects plus the switch that ignores a cached
+    /// compilation.
+    const COMPILE_FOLDER_FLAGS: &[Flag] = &[
+        Flag {
+            name: "auto-tag",
+            takes_value: true,
+        },
+        Flag {
+            name: "notify",
+            takes_value: false,
+        },
+        Flag {
+            name: "refresh",
+            takes_value: false,
+        },
+    ];
+    /// A bound on how many rows a listing returns.
+    const LIMIT: &[Flag] = &[Flag {
+        name: "limit",
+        takes_value: true,
+    }];
     /// The address `:account add` discovers settings for.
     const EMAIL: &[Positional] = &[Positional {
         name: "email",
@@ -1714,6 +2037,356 @@ fn explicit() -> Vec<Verb> {
             flags: &[],
             cli_alias: None,
             description: Some("Switch which account this session is looking at."),
+        },
+        // -- content, export and analytics (task 99) ---------------------------
+        Verb {
+            path: vec!["message", "open"],
+            // Neither, for the reason `:account use` has neither. It does reach
+            // `MailService.Get` on the way, but `capability` in this registry
+            // means "this verb is that capability's human surface", which the
+            // parity drift tests reconcile against the CLI and MCP — and this is
+            // navigation, not a surface for a read. `Action::Open` is the *key*
+            // that opens what the cursor is on; this is the same act addressed by
+            // id, which an `Action` cannot carry.
+            //
+            // It exists because a report row's action is an `Invocation`, and
+            // several of task 99's reports cite a message — a digest line, an
+            // attachment hit, a saved search's result, a smart folder's member.
+            // Without a verb none of them could be followed.
+            capability: None,
+            action: None,
+            positionals: MESSAGE_ID,
+            flags: &[],
+            cli_alias: None,
+            description: Some("Open a message by id — what a citing report row does."),
+        },
+        Verb {
+            path: vec!["export"],
+            capability: Some(Capability::ExportExport),
+            action: None,
+            positionals: QUERY_TEXT,
+            flags: EXPORT_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["stats", "response-time"],
+            capability: Some(Capability::AnalyticsGetResponseTimes),
+            action: None,
+            positionals: &[],
+            flags: RESPONSE_TIME_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["stats", "ask"],
+            capability: Some(Capability::AnalyticsAskAnalytics),
+            action: None,
+            positionals: TEXT,
+            flags: NARRATE,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["digest"],
+            capability: Some(Capability::AnalyticsGenerateDigest),
+            action: None,
+            positionals: &[],
+            flags: DIGEST_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["contact"],
+            capability: Some(Capability::AnalyticsGetContactInsight),
+            action: None,
+            positionals: ADDRESS,
+            flags: CONTACT_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["subs"],
+            capability: Some(Capability::AnalyticsListSubscriptions),
+            action: None,
+            positionals: &[],
+            flags: SUBS_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["attach", "list"],
+            // Neither, for the reason `:account use` has neither: the open
+            // message's parts are already in the model — `MailService.Get`
+            // returned them — and a round trip to re-fetch what is on screen
+            // would be a second source of truth for one listing.
+            capability: None,
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: Some("List what is attached to the open message."),
+        },
+        Verb {
+            path: vec!["attach", "tables"],
+            capability: Some(Capability::AttachmentExtractTables),
+            action: None,
+            positionals: MESSAGE_ID,
+            flags: PART_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["attach", "invoice"],
+            capability: Some(Capability::AttachmentExtractInvoice),
+            action: None,
+            positionals: MESSAGE_ID,
+            flags: PART_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["attach", "invoices"],
+            capability: Some(Capability::AttachmentExportInvoices),
+            action: None,
+            positionals: &[],
+            flags: INVOICES_FLAGS,
+            cli_alias: Some("invoices"),
+            description: None,
+        },
+        Verb {
+            path: vec!["attach", "ask"],
+            capability: Some(Capability::AttachmentAskAttachment),
+            action: None,
+            positionals: TEXT,
+            flags: ASK_ATTACHMENT_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["attach", "search"],
+            capability: Some(Capability::SearchSearchAttachments),
+            action: None,
+            positionals: QUERY_TEXT,
+            flags: ATTACHMENT_SEARCH_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["search", "attachments"],
+            capability: Some(Capability::SearchSearchAttachments),
+            action: None,
+            positionals: QUERY_TEXT,
+            flags: ATTACHMENT_SEARCH_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["search", "compile"],
+            capability: Some(Capability::SearchCompileQuery),
+            action: None,
+            positionals: QUERY_TEXT,
+            flags: REFRESH,
+            cli_alias: Some("search"),
+            description: None,
+        },
+        Verb {
+            path: vec!["search", "entities"],
+            capability: Some(Capability::SearchSearchEntities),
+            action: None,
+            positionals: QUERY_TEXT,
+            flags: ENTITY_FLAGS,
+            cli_alias: Some("entities"),
+            description: None,
+        },
+        Verb {
+            path: vec!["search", "eval"],
+            capability: Some(Capability::SearchEvaluate),
+            action: None,
+            positionals: PATH,
+            flags: EVAL_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["extract", "events"],
+            capability: Some(Capability::ExtractExtractEvents),
+            action: None,
+            positionals: MESSAGE_ID,
+            flags: EXTRACT_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["extract", "tasks"],
+            capability: Some(Capability::ExtractExtractTasks),
+            action: None,
+            positionals: MESSAGE_ID,
+            flags: EXTRACT_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["extract", "data"],
+            capability: Some(Capability::ExtractExtractStructured),
+            action: None,
+            positionals: MESSAGE_ID,
+            flags: STRUCTURED_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["links"],
+            capability: Some(Capability::LinkExtractLinks),
+            action: None,
+            positionals: MESSAGE_ID,
+            flags: MODEL,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["note", "add"],
+            capability: Some(Capability::NoteAddNote),
+            action: None,
+            positionals: TEXT,
+            flags: THREAD,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["note", "list"],
+            capability: Some(Capability::NoteListNotes),
+            action: None,
+            positionals: &[],
+            flags: THREAD,
+            cli_alias: Some("notes"),
+            description: None,
+        },
+        Verb {
+            path: vec!["note", "edit"],
+            capability: Some(Capability::NoteEditNote),
+            action: None,
+            positionals: NOTE_EDIT,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["note", "rm"],
+            capability: Some(Capability::NoteDeleteNote),
+            action: None,
+            positionals: NOTE_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["note", "watch"],
+            capability: Some(Capability::NoteWatchNotes),
+            action: None,
+            positionals: &[],
+            flags: THREAD,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["saved", "list"],
+            capability: Some(Capability::SavedSearchListSavedSearches),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["saved", "save"],
+            capability: Some(Capability::SavedSearchCreateSavedSearch),
+            action: None,
+            positionals: NAME_AND_QUERY,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["saved", "edit"],
+            capability: Some(Capability::SavedSearchUpdateSavedSearch),
+            action: None,
+            positionals: NAME_AND_QUERY,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["saved", "run"],
+            capability: Some(Capability::SavedSearchRunSavedSearch),
+            action: None,
+            positionals: NAME,
+            flags: SAVED_RUN_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["saved", "rm"],
+            capability: Some(Capability::SavedSearchDeleteSavedSearch),
+            action: None,
+            positionals: NAME,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["folder", "new"],
+            capability: Some(Capability::SavedSearchCreateSmartFolder),
+            action: None,
+            positionals: NAME_AND_QUERY,
+            flags: SMART_FOLDER_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["folder", "compile"],
+            capability: Some(Capability::SavedSearchCompileSmartFolder),
+            action: None,
+            positionals: NAME_AND_QUERY,
+            flags: COMPILE_FOLDER_FLAGS,
+            cli_alias: Some("folder new"),
+            description: None,
+        },
+        Verb {
+            path: vec!["folder", "list"],
+            capability: Some(Capability::SavedSearchListSmartFolders),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["folder", "members"],
+            capability: Some(Capability::SavedSearchListSmartFolderMembers),
+            action: None,
+            positionals: NAME,
+            flags: LIMIT,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["folder", "eval"],
+            capability: Some(Capability::SavedSearchEvaluateSmartFolder),
+            action: None,
+            positionals: NAME,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["folder", "rm"],
+            capability: Some(Capability::SavedSearchDeleteSmartFolder),
+            action: None,
+            positionals: NAME,
+            flags: &[],
+            cli_alias: None,
+            description: None,
         },
         // -- automation and notifications (task 98) ---------------------------
         Verb {
