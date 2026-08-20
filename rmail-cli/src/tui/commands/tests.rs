@@ -171,8 +171,19 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
         "ai resume",
         "ai retry",
         "ai status",
+        "draft delete",
+        "draft edit",
+        "draft list",
+        "draft render",
+        "draft revert",
+        "draft revisions",
+        "draft rewrite",
+        "draft show",
         "finder rebuild",
         "finder status",
+        "followup dismiss",
+        "followup list",
+        "followup new",
         "index entities",
         "index gc",
         "index rebuild",
@@ -182,10 +193,19 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
         "index status",
         "index stop",
         "index verify",
+        "nudge",
+        "outbox edit",
+        "outbox reschedule",
+        "outbox retry",
+        "outbox send-now",
+        "outbox suggest",
+        "preflight",
+        "send",
         "sync now",
         "sync pause",
         "sync resume",
         "sync status",
+        "waiting",
     ]
     .iter()
     .map(|verb| (*verb).to_owned())
@@ -226,6 +246,94 @@ fn every_capability_task_94_names_is_reachable_by_a_verb() {
         assert!(
             reached,
             "{} is named by task 94's acceptance and no verb answers for it",
+            capability.name()
+        );
+    }
+}
+
+/// Task 100's own version of the test above — every `ComposeService` and
+/// `SendSchedulerService` capability task 100 owns is reachable through
+/// `commands::answer`, with the handful that are not named and explained
+/// rather than silently passing because nothing checked them.
+///
+/// `ComposeCreateDraft`, `SendSchedulerCancelScheduled` and
+/// `SendSchedulerListOutbox` predate this task and are reached through an
+/// `Action` (`r`/`f`/`O`/`u`), not through this table, so `answer` was never
+/// going to find them — task 94's own coverage test has the identical
+/// exemption for capabilities `run_action` reaches. `SendSchedulerWatchOutbox`
+/// and `SendSchedulerTrackFollowup` are the two `command::explicit`'s own
+/// comments name as deliberately unwired.
+#[test]
+fn every_capability_task_100_owns_is_reachable_by_a_verb_or_named_as_an_exception() {
+    let wanted = [
+        Capability::ComposeDraftReply,
+        Capability::ComposeGetDraft,
+        Capability::ComposeListDrafts,
+        Capability::ComposeUpdateDraft,
+        Capability::ComposeDeleteDraft,
+        Capability::ComposeRenderDraft,
+        Capability::ComposeRewriteDraft,
+        Capability::ComposeListDraftRevisions,
+        Capability::ComposeSelectDraftRevision,
+        Capability::SendSchedulerScheduleSend,
+        Capability::SendSchedulerRetryFailed,
+        Capability::SendSchedulerRescheduleSend,
+        Capability::SendSchedulerUpdateScheduledBody,
+        Capability::SendSchedulerSendNow,
+        Capability::SendSchedulerSuggestSendTime,
+        Capability::SendSchedulerCreateFollowup,
+        Capability::SendSchedulerListFollowups,
+        Capability::SendSchedulerDismissFollowup,
+        Capability::SendSchedulerListWaitingOn,
+        Capability::SendSchedulerDraftNudge,
+        Capability::SendSchedulerPreflightCheck,
+    ];
+    for capability in wanted {
+        // `reply`'s own capability is included above even though `reply` is
+        // hand-written in `run_invocation` and never reaches `answer` at
+        // all — so it is checked by declaration (some real verb names it),
+        // not by `answer` returning `Some`, which is the one capability here
+        // that would otherwise look silently unreached.
+        let declared = command::children_of(&[])
+            .into_iter()
+            .any(|verb| verb.capability == Some(capability));
+        assert!(
+            declared,
+            "{} is a capability task 100 owns and no verb declares it",
+            capability.name()
+        );
+        if capability == Capability::ComposeDraftReply {
+            continue;
+        }
+        let answered = command::children_of(&[]).into_iter().any(|verb| {
+            verb.capability == Some(capability)
+                && answer(&invocation(&with_arguments(verb)), &screen(), 1).is_some()
+        });
+        assert!(
+            answered,
+            "{} is declared but no verb answers for it through commands::answer",
+            capability.name()
+        );
+    }
+}
+
+/// The two exclusions the test above takes on faith, checked directly: they
+/// really are absent from the registry, not merely unreached by a verb that
+/// still exists.
+#[test]
+fn watch_outbox_and_track_followup_are_not_reachable_by_any_verb() {
+    for capability in [
+        Capability::SendSchedulerWatchOutbox,
+        Capability::SendSchedulerTrackFollowup,
+    ] {
+        let declared = command::children_of(&[])
+            .into_iter()
+            .any(|verb| verb.capability == Some(capability));
+        assert!(
+            !declared,
+            "{} was declared unreachable by design; a verb now reaches it, so \
+             the comment in command::explicit and every_capability_task_100_owns_… \
+             above are both stale",
             capability.name()
         );
     }
@@ -589,6 +697,27 @@ fn a_verb_that_declares_an_argument_is_dispatched_with_it() {
     );
 }
 
+/// `run_invocation`'s daemon-verb routing has to happen *before* its generic
+/// "no verb here has ever declared a flag" refusal, or every flag task 100's
+/// daemon-routed verbs declare would be swallowed on the way past — this
+/// build's own flag-carrying verbs are the only ones that can catch a
+/// regression of that ordering, since none of task 94's declare one.
+#[test]
+fn a_flag_on_a_daemon_verb_reaches_it_through_the_real_dispatch_not_just_answer() {
+    let mut model = loaded();
+    let cmds = issued(&run(&mut model, "waiting --overdue"));
+    assert_eq!(
+        cmds,
+        vec![Cmd::Waiting {
+            generation: 1,
+            account_id: 7,
+            overdue: true,
+        }],
+        "the flag reached the daemon verb rather than being refused as \
+         unwired on the way past: {cmds:?}"
+    );
+}
+
 #[test]
 fn a_verb_given_more_arguments_than_it_declares_is_refused() {
     let mut model = loaded();
@@ -736,4 +865,366 @@ fn a_streamed_report_fills_in_and_a_stale_frame_is_dropped() {
     );
     assert!(open_pane(&model).rows.is_empty(), "{:?}", open_pane(&model));
     assert!(!open_pane(&model).complete);
+}
+
+// ---------------------------------------------------------------------------
+// drafts, send, the outbox and follow-ups (task 100)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_draft_verbs_issue_the_rpc_they_name() {
+    assert_eq!(
+        request("draft show 5").cmd,
+        Cmd::DraftShow {
+            generation: 5,
+            draft_id: 5,
+        }
+    );
+    assert_eq!(
+        request("draft delete 5!").cmd,
+        Cmd::DraftDelete { draft_id: 5 }
+    );
+    assert_eq!(
+        request("draft render 5").cmd,
+        Cmd::DraftRender {
+            generation: 5,
+            draft_id: 5,
+        }
+    );
+    assert_eq!(
+        request("draft revisions 5").cmd,
+        Cmd::DraftRevisions {
+            generation: 5,
+            draft_id: 5,
+        }
+    );
+}
+
+#[test]
+fn draft_list_carries_the_account_on_screen() {
+    assert_eq!(
+        request("draft list").cmd,
+        Cmd::DraftList {
+            generation: 5,
+            account_id: 7,
+        }
+    );
+    match asked("draft list", &empty()) {
+        Answer::Refused(why) => assert!(why.contains("account"), "{why}"),
+        other => panic!("expected a refusal with no account, found {other:?}"),
+    }
+}
+
+#[test]
+fn draft_edit_needs_a_body() {
+    assert_eq!(
+        request(r#"draft edit 5 --body="new text""#).cmd,
+        Cmd::DraftEdit {
+            generation: 5,
+            draft_id: 5,
+            body: "new text".to_owned(),
+        }
+    );
+    match asked("draft edit 5", &screen()) {
+        Answer::Refused(why) => assert!(why.contains("body"), "{why}"),
+        other => panic!("expected a refusal with no body, found {other:?}"),
+    }
+}
+
+#[test]
+fn draft_revert_defaults_its_revision_to_the_original() {
+    assert_eq!(
+        request("draft revert 5").cmd,
+        Cmd::DraftRevert {
+            generation: 5,
+            draft_id: 5,
+            seq: 0,
+        }
+    );
+    assert_eq!(
+        request("draft revert 5 2").cmd,
+        Cmd::DraftRevert {
+            generation: 5,
+            draft_id: 5,
+            seq: 2,
+        }
+    );
+}
+
+#[test]
+fn draft_revert_refuses_a_malformed_revision_rather_than_defaulting_to_the_original() {
+    // Distinct from no second argument at all, which is what the test above
+    // covers: a typo here must not silently mean the same thing an absent
+    // one does.
+    match asked("draft revert 5 tow", &screen()) {
+        Answer::Refused(why) => assert!(why.contains("tow"), "{why}"),
+        other => panic!("expected a refusal, found {other:?}"),
+    }
+}
+
+#[test]
+fn draft_rewrite_reads_its_own_flags() {
+    assert_eq!(
+        request("draft rewrite 5 --tone=formal --shorter --instruction=\"drop the joke\"").cmd,
+        Cmd::DraftRewrite {
+            generation: 5,
+            draft_id: 5,
+            tone: Some("formal".to_owned()),
+            shorter: true,
+            longer: false,
+            instruction: "drop the joke".to_owned(),
+        }
+    );
+    // Bare, it is refused rather than sent — see
+    // `draft_rewrite_bare_is_refused_the_same_as_mail_draft_rewrite` below.
+}
+
+#[test]
+fn draft_rewrite_refuses_a_tone_it_does_not_know() {
+    match asked("draft rewrite 5 --tone=sarcastic", &screen()) {
+        Answer::Refused(why) => assert!(why.contains("sarcastic"), "{why}"),
+        other => panic!("expected a refusal, found {other:?}"),
+    }
+}
+
+#[test]
+fn draft_rewrite_refuses_shorter_and_longer_together() {
+    match asked("draft rewrite 5 --shorter --longer", &screen()) {
+        Answer::Refused(why) => assert!(why.contains("shorter") && why.contains("longer"), "{why}"),
+        other => panic!("expected a refusal, found {other:?}"),
+    }
+}
+
+#[test]
+fn draft_rewrite_bare_is_refused_the_same_as_mail_draft_rewrite() {
+    // `mail draft rewrite` refuses this client-side too, and for the stated
+    // reason a round trip to be told the command asked for nothing is one
+    // that did not need making — this mirrors that guard rather than leaving
+    // it to a server round trip the CLI already avoids.
+    match asked("draft rewrite 5", &screen()) {
+        Answer::Refused(why) => assert!(why.contains("nothing to do"), "{why}"),
+        other => panic!("expected a refusal, found {other:?}"),
+    }
+}
+
+#[test]
+fn an_id_taking_draft_verb_refuses_with_no_id() {
+    // One representative rather than all seven: `id_positional` is the same
+    // function under each of them, so this is a claim about that function,
+    // not about `draft show` specifically.
+    match asked("draft show", &screen()) {
+        Answer::Refused(why) => assert!(why.contains("draft"), "{why}"),
+        other => panic!("expected a refusal, found {other:?}"),
+    }
+    match asked("draft show notanumber", &screen()) {
+        Answer::Refused(_) => {}
+        other => panic!("a non-numeric id is refused the same as a missing one: {other:?}"),
+    }
+}
+
+#[test]
+fn send_carries_its_flags_and_needs_a_draft_and_an_account() {
+    assert_eq!(
+        request("send --draft=5 --at=\"tomorrow 9am\" --undo=60").cmd,
+        Cmd::ScheduleSend {
+            account_id: 7,
+            draft_id: 5,
+            at: "tomorrow 9am".to_owned(),
+            undo: Some(60),
+        }
+    );
+    match asked("send", &screen()) {
+        Answer::Refused(why) => assert!(why.contains("draft"), "{why}"),
+        other => panic!("expected a refusal with no draft named, found {other:?}"),
+    }
+    match asked("send --draft=5", &empty()) {
+        Answer::Refused(why) => assert!(why.contains("account"), "{why}"),
+        other => panic!("expected a refusal with no account, found {other:?}"),
+    }
+}
+
+#[test]
+fn send_refuses_an_undo_window_that_would_not_lengthen_anything() {
+    // The proto: undo "can only lengthen". Zero, negative or unparseable all
+    // have to be refused rather than silently falling back to the account
+    // default the way a bare `--undo` with no value never even reaches this
+    // arm (that is a parse-time `MissingFlagValue`) — this is the one case
+    // the parser lets through that still has to be caught here.
+    for line in [
+        "send --draft=5 --undo=0",
+        "send --draft=5 --undo=-30",
+        "send --draft=5 --undo=abc",
+    ] {
+        match asked(line, &screen()) {
+            Answer::Refused(why) => assert!(why.contains("positive"), "{line}: {why}"),
+            other => panic!("{line}: expected a refusal, found {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_outbox_mutation_verbs_issue_the_rpc_they_name() {
+    assert_eq!(
+        request("outbox retry 9").cmd,
+        Cmd::RetryFailed { outbox_id: 9 }
+    );
+    assert_eq!(
+        request("outbox reschedule 9 --at=\"in 1h\"").cmd,
+        Cmd::RescheduleSend {
+            outbox_id: 9,
+            at: "in 1h".to_owned(),
+        }
+    );
+    assert_eq!(
+        request(r#"outbox edit 9 --body="revised""#).cmd,
+        Cmd::UpdateScheduledBody {
+            outbox_id: 9,
+            body: "revised".to_owned(),
+        }
+    );
+    assert_eq!(
+        request("outbox send-now 9!").cmd,
+        Cmd::SendNow { outbox_id: 9 }
+    );
+    assert_eq!(
+        request("outbox suggest").cmd,
+        Cmd::SuggestSendTime {
+            generation: 5,
+            account_id: 7,
+        }
+    );
+}
+
+#[test]
+fn outbox_reschedule_and_edit_need_their_value_flag() {
+    match asked("outbox reschedule 9", &screen()) {
+        Answer::Refused(why) => assert!(why.contains("time")),
+        other => panic!("expected a refusal with no --at, found {other:?}"),
+    }
+    match asked("outbox edit 9", &screen()) {
+        Answer::Refused(why) => assert!(why.contains("body")),
+        other => panic!("expected a refusal with no --body, found {other:?}"),
+    }
+}
+
+#[test]
+fn draft_delete_and_outbox_send_now_ask_before_running() {
+    // The other two verbs here that ask when typed in full, and — like
+    // `index rebuild` — not because they mutate (every verb in this section
+    // mutates): both discard something a report cannot show back
+    // afterwards, a body typed once (`send-now`, skipping the rest of a
+    // wait a person chose) or a stored draft outright.
+    for line in ["draft delete 5", "outbox send-now 9"] {
+        match asked(line, &screen()) {
+            Answer::Fact(request) => {
+                assert!(request.confirm.is_some(), "{line} should ask");
+            }
+            other => panic!("{line}: expected a fact, found {other:?}"),
+        }
+        let banged = format!("{line}!");
+        match asked(&banged, &screen()) {
+            Answer::Fact(request) => {
+                assert!(request.confirm.is_none(), "{banged} should not ask");
+            }
+            other => panic!("{banged}: expected a fact, found {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_banged_draft_delete_deletes_without_asking() {
+    let mut model = loaded();
+    let cmds = issued(&run(&mut model, "draft delete 5!"));
+    assert_eq!(cmds, vec![Cmd::DraftDelete { draft_id: 5 }]);
+    assert!(model.overlay.is_none());
+}
+
+#[test]
+fn the_followup_verbs_issue_the_rpc_they_name() {
+    assert_eq!(
+        request("followup list").cmd,
+        Cmd::FollowupList {
+            generation: 5,
+            account_id: 7,
+        }
+    );
+    assert_eq!(
+        request("followup dismiss 3").cmd,
+        Cmd::FollowupDismiss { id: 3 }
+    );
+    assert_eq!(
+        request("nudge 3").cmd,
+        Cmd::DraftNudge {
+            generation: 5,
+            id: 3
+        }
+    );
+    assert_eq!(
+        request("preflight 5").cmd,
+        Cmd::PreflightCheck {
+            generation: 5,
+            account_id: 7,
+            draft_id: 5,
+        }
+    );
+}
+
+#[test]
+fn followup_new_reads_its_flags_and_needs_a_message() {
+    assert_eq!(
+        request("followup new --in=3d --note=\"circle back\"").cmd,
+        Cmd::FollowupNew {
+            message_id: 10,
+            remind_in: "3d".to_owned(),
+            note: "circle back".to_owned(),
+        }
+    );
+    match asked("followup new", &empty()) {
+        Answer::Refused(why) => assert!(why.contains("message")),
+        other => panic!("expected a refusal with no message, found {other:?}"),
+    }
+}
+
+#[test]
+fn waiting_reads_its_overdue_flag_and_shares_followups_row_shape() {
+    assert_eq!(
+        request("waiting").cmd,
+        Cmd::Waiting {
+            generation: 5,
+            account_id: 7,
+            overdue: false,
+        }
+    );
+    assert_eq!(
+        request("waiting --overdue").cmd,
+        Cmd::Waiting {
+            generation: 5,
+            account_id: 7,
+            overdue: true,
+        }
+    );
+    assert_eq!(
+        request("waiting").columns,
+        request("followup list").columns,
+        "one RPC's rows, `Followup`, and one row shape for both — see \
+         commands::followup_columns"
+    );
+}
+
+#[test]
+fn followup_list_and_waiting_need_an_account_too() {
+    for line in ["followup list", "waiting"] {
+        match asked(line, &empty()) {
+            Answer::Refused(why) => assert!(why.contains("account"), "{line}: {why}"),
+            other => panic!("{line}: expected a refusal with no account, found {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn preflight_needs_an_account_before_a_draft_id() {
+    match asked("preflight 5", &empty()) {
+        Answer::Refused(why) => assert!(why.contains("account"), "{why}"),
+        other => panic!("expected a refusal with no account, found {other:?}"),
+    }
 }

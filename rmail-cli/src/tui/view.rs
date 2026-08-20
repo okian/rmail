@@ -29,7 +29,7 @@ use super::manual;
 use super::model::{Focus, Model, Overlay, Scope, Screen, FLAGGED, SEEN};
 use super::overlays::{
     self, AskPane, AskPhase, CommandPane, FinderPane, OutboxPane, QuickAction, QuickPane,
-    SearchFocus, SearchPane, Toast,
+    ReplyPane, SearchFocus, SearchPane, Toast,
 };
 use super::report::{ReportColumn, ReportPane, ReportTone};
 use super::status;
@@ -94,6 +94,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
         Some(Overlay::Finder(pane)) => render_finder(&model.theme, pane, frame, area),
         Some(Overlay::Command(pane)) => render_command(&model.theme, pane, frame, area),
         Some(Overlay::Ask(pane)) => render_ask(&model.theme, pane, frame, area),
+        Some(Overlay::Reply(pane)) => render_reply(&model.theme, pane, frame, area),
         Some(Overlay::Outbox(pane)) => render_outbox(&model.theme, pane, frame, area),
         Some(Overlay::Quick(pane)) => render_quick(&model.theme, pane, frame, area),
         Some(Overlay::Report(pane)) => render_report(&model.theme, pane, frame, area),
@@ -1191,6 +1192,63 @@ fn ask_title(pane: &AskPane) -> &'static str {
         (AskPhase::Streaming, _) => "ask — answering…",
         (AskPhase::Done, true) => "ask — grounded in your mail (daemon-verified)",
         (AskPhase::Done, false) => "ask — NOT grounded (daemon's verdict)",
+    }
+}
+
+/// `:reply --ai` — simpler than [`render_ask`]: no typing phase, no
+/// citations, so two rows (a context line, then the streaming prose) are all
+/// this pane draws.
+fn render_reply(theme: &Theme, pane: &ReplyPane, frame: &mut Frame, area: Rect) {
+    let area = centered_pct(area, 88, 84);
+    frame.render_widget(Clear, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner(theme, frame, area, reply_title(pane)));
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            overlays::safe_line(pane.context.as_deref().unwrap_or("reading the thread…")),
+            theme.muted,
+        )),
+        rows[0],
+    );
+
+    // Model-authored prose: neutralized, but with its paragraph breaks kept —
+    // the same reason `render_ask`'s own body is.
+    let mut body: Vec<Line> = overlays::safe_prose(&pane.body)
+        .lines()
+        .map(|line| Line::raw(line.to_owned()))
+        .collect();
+    if let Some(error) = pane.error.as_ref() {
+        body.push(Line::styled(
+            format!("({})", overlays::safe_line(error)),
+            theme.err,
+        ));
+    }
+    if let Some((id, to)) = &pane.drafted {
+        body.push(Line::styled(
+            format!(
+                "draft {id} created for {} — `mail draft rewrite {id}` to adjust, :send --draft={id} to schedule",
+                overlays::safe_line(to)
+            ),
+            theme.muted,
+        ));
+    }
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[1]);
+}
+
+/// The reply pane's title says what its one visible state is: still
+/// streaming, finished, or failed. The draft id and next steps live in the
+/// body instead of here, for the reason [`ask_title`] keeps citations out of
+/// its own title — a border title is not the place for text a stream wrote.
+fn reply_title(pane: &ReplyPane) -> &'static str {
+    if pane.error.is_some() {
+        "reply — failed"
+    } else if pane.done {
+        "reply — Esc closes"
+    } else {
+        "reply — drafting…"
     }
 }
 

@@ -17,6 +17,7 @@ use super::*;
 use crate::keymap::{Key, Mode};
 use crate::tui::model::{
     update, Account, Confirmed, Folder, InputFor, Level, MessageRow, Msg, OpenMessage, PickFor,
+    ReplyEvent,
 };
 use crate::tui::overlays::UndoToast;
 use crate::tui::theme::ThemeName;
@@ -435,7 +436,8 @@ fn generation(cmds: &[Cmd]) -> u64 {
         match cmd {
             Cmd::Search { generation, .. }
             | Cmd::Find { generation, .. }
-            | Cmd::Ask { generation, .. } => return *generation,
+            | Cmd::Ask { generation, .. }
+            | Cmd::DraftReply { generation, .. } => return *generation,
             _ => {}
         }
     }
@@ -578,6 +580,35 @@ fn the_ask_pane_renders_its_citations_and_says_whose_verdict_grounded_is() {
     assert!(
         screen.contains("NOT grounded") && screen.contains("daemon"),
         "an ungrounded answer is labelled as the daemon's verdict: {screen}"
+    );
+}
+
+#[test]
+fn the_reply_pane_renders_its_context_prose_and_the_drafted_id() {
+    let mut model = loaded();
+    press(&mut model, Key::Char(':'));
+    let generation = generation(&{
+        type_in(&mut model, "reply --ai push to tuesday");
+        update(&mut model, Msg::Key(Key::Enter))
+    });
+    for event in [
+        ReplyEvent::Context("2 thread message(s)".to_owned()),
+        ReplyEvent::Token("Sounds good, see you then.".to_owned()),
+        ReplyEvent::Drafted {
+            draft_id: 42,
+            to: "alice@example.com".to_owned(),
+        },
+        ReplyEvent::Done,
+    ] {
+        update(&mut model, Msg::Reply { generation, event });
+    }
+
+    let screen = screen(&model);
+    assert!(screen.contains("2 thread message(s)"), "{screen}");
+    assert!(screen.contains("Sounds good, see you then."), "{screen}");
+    assert!(
+        screen.contains("draft 42") && screen.contains("alice@example.com"),
+        "the drafted id and recipient are the pane's own next-step hint: {screen}"
     );
 }
 

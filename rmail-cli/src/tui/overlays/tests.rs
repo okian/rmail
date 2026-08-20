@@ -14,7 +14,7 @@
 use super::*;
 use crate::tui::model::{
     update, Account, AskEvent, Cmd, FinderEvent, Folder, Key, MessageRow, Model, Msg, Overlay,
-    SearchEvent, Stream,
+    ReplyEvent, SearchEvent, Stream,
 };
 
 // ---------------------------------------------------------------------------
@@ -834,6 +834,201 @@ fn a_token_from_a_superseded_ask_is_dropped() {
         },
     );
     assert_eq!(ask_pane(&model).answer, "Acme owes you [1].");
+}
+
+// ---------------------------------------------------------------------------
+// reply pane (task 100)
+// ---------------------------------------------------------------------------
+
+/// Type a `:` line and run it, the same way `commands::tests::run` does —
+/// duplicated rather than shared, since that helper is private to a sibling
+/// module and this file already has its own `press`/`keys`.
+fn typed(model: &mut Model, line: &str) -> Vec<Cmd> {
+    press(model, Key::Char(':'));
+    keys(model, line);
+    press(model, Key::Enter)
+}
+
+/// A typed `:` line's own commands, ignoring the history write that rides
+/// along with every line that parses — refused or not, `commands::tests`'
+/// own `issued` is the precedent for stripping it before comparing.
+fn issued(cmds: &[Cmd]) -> Vec<Cmd> {
+    cmds.iter()
+        .filter(|cmd| !matches!(cmd, Cmd::SaveHistory { .. }))
+        .cloned()
+        .collect()
+}
+
+fn reply_pane(model: &Model) -> &ReplyPane {
+    match model.overlay.as_ref() {
+        Some(Overlay::Reply(pane)) => pane,
+        other => panic!("expected the reply overlay, found {other:?}"),
+    }
+}
+
+/// `:reply --ai` on message 10, streamed to completion.
+fn replied(intent: &str) -> Model {
+    let mut model = loaded();
+    let cmds = typed(&mut model, &format!("reply --ai {intent}"));
+    let generation = stream_generation_reply(&cmds);
+    for event in [
+        ReplyEvent::Context("2 thread message(s)".to_owned()),
+        ReplyEvent::Token("Sounds good, ".to_owned()),
+        ReplyEvent::Token("see you then.".to_owned()),
+    ] {
+        update(&mut model, Msg::Reply { generation, event });
+    }
+    update(
+        &mut model,
+        Msg::Reply {
+            generation,
+            event: ReplyEvent::Drafted {
+                draft_id: 42,
+                to: "alice@example.com".to_owned(),
+            },
+        },
+    );
+    update(
+        &mut model,
+        Msg::Reply {
+            generation,
+            event: ReplyEvent::Done,
+        },
+    );
+    model
+}
+
+fn stream_generation_reply(cmds: &[Cmd]) -> u64 {
+    for cmd in cmds {
+        if let Cmd::DraftReply { generation, .. } = cmd {
+            return *generation;
+        }
+    }
+    panic!("no Cmd::DraftReply in {cmds:?}");
+}
+
+#[test]
+fn the_reply_pane_streams_context_then_prose_then_the_drafted_id() {
+    let model = replied("push to tuesday");
+    let pane = reply_pane(&model);
+    assert!(pane.done);
+    assert_eq!(pane.context.as_deref(), Some("2 thread message(s)"));
+    assert_eq!(pane.body, "Sounds good, see you then.");
+    assert_eq!(pane.drafted, Some((42, "alice@example.com".to_owned())));
+    assert!(
+        model.status.contains("42"),
+        "the status line names the draft it created: {}",
+        model.status
+    );
+}
+
+#[test]
+fn a_reply_that_fails_leaves_the_pane_usable() {
+    let mut model = loaded();
+    let cmds = typed(&mut model, "reply --ai anything");
+    let generation = stream_generation_reply(&cmds);
+    update(
+        &mut model,
+        Msg::Reply {
+            generation,
+            event: ReplyEvent::Failed("the provider is down".to_owned()),
+        },
+    );
+    assert!(reply_pane(&model).done);
+    assert!(model.status.contains("the provider is down"));
+    press(&mut model, Key::Esc);
+    assert!(model.overlay.is_none());
+}
+
+#[test]
+fn a_token_from_a_superseded_reply_is_dropped() {
+    let mut model = replied("push to tuesday");
+    update(
+        &mut model,
+        Msg::Reply {
+            generation: 999,
+            event: ReplyEvent::Token(" and one more thing".to_owned()),
+        },
+    );
+    assert_eq!(reply_pane(&model).body, "Sounds good, see you then.");
+}
+
+#[test]
+fn leaving_the_reply_pane_cancels_the_model_call() {
+    // The same reason leaving the ask pane does: `DraftReply` is a retrieval
+    // pass plus a model completion, and letting it run after Esc bills for a
+    // reply nothing will draw.
+    let mut model = loaded();
+    typed(&mut model, "reply --ai anything");
+    assert_eq!(
+        press(&mut model, Key::Esc),
+        vec![Cmd::CancelStream {
+            which: Stream::Reply
+        }]
+    );
+}
+
+#[test]
+fn bare_reply_drafts_the_same_way_r_does() {
+    let mut typed_model = loaded();
+    let typed_cmds = issued(&typed(&mut typed_model, "reply"));
+
+    let mut keyed_model = loaded();
+    let keyed_cmds = press(&mut keyed_model, Key::Char('r'));
+
+    assert_eq!(
+        typed_cmds, keyed_cmds,
+        "`:reply` and `r` are the same request to the daemon"
+    );
+    assert!(
+        !matches!(typed_model.overlay, Some(Overlay::Reply(_))),
+        "no --ai, no streaming pane"
+    );
+}
+
+#[test]
+fn reply_all_without_ai_is_refused() {
+    let mut model = loaded();
+    let cmds = issued(&typed(&mut model, "reply --reply-all"));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("--ai"), "{why}");
+}
+
+#[test]
+fn an_intent_without_ai_is_refused() {
+    let mut model = loaded();
+    let cmds = issued(&typed(&mut model, "reply see you then"));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    let why = command_pane(&model).error.clone().unwrap_or_default();
+    assert!(why.contains("--ai"), "{why}");
+}
+
+#[test]
+fn reply_ai_with_no_message_selected_is_refused() {
+    // Through `single_target`, the same as bare `:reply` — see
+    // `reply_ai_and_bare_reply_agree_on_a_visual_selection` below — so the
+    // command line is closed and the refusal lands on the status line,
+    // exactly where `r` would put it, rather than as a command-line error.
+    let mut model = loaded();
+    model.messages.clear();
+    let cmds = issued(&typed(&mut model, "reply --ai anything"));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(model.overlay.is_none());
+    assert!(model.status.contains("message"), "{}", model.status);
+}
+
+#[test]
+fn reply_ai_and_bare_reply_agree_on_a_visual_selection() {
+    // Before the fix this pins, `--ai` read `target_message` directly and
+    // drafted from the cursor row while a selection was up; bare `:reply`
+    // (via `reply` -> `single_target`) already refused it. One verb, one
+    // rule for what "the target" means, regardless of the flag.
+    let mut model = loaded();
+    press(&mut model, Key::Char('v'));
+    let cmds = issued(&typed(&mut model, "reply --ai anything"));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(model.status.contains("one message"), "{}", model.status);
 }
 
 // ---------------------------------------------------------------------------

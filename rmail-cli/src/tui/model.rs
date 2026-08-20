@@ -65,7 +65,7 @@ use super::overlays;
 use super::overlays::{
     command_matches, complete_operator, AiSummary, AskPane, AskPhase, Browse, Citation,
     CommandPane, Explanation, FinderItem, FinderKind, FinderPane, Hit, OutboxPane, OutboxRow,
-    QuickAction, QuickPane, SearchFocus, SearchPane, Toast, UndoToast,
+    QuickAction, QuickPane, ReplyPane, SearchFocus, SearchPane, Toast, UndoToast,
 };
 use super::report::{self, ReportFill, ReportPane, ReportRow};
 use super::status::{Daemon, Health, Subsystem};
@@ -531,6 +531,8 @@ pub enum Overlay {
     Command(Box<CommandPane>),
     /// `A` — the ask pane.
     Ask(Box<AskPane>),
+    /// `:reply --ai` — the streamed-reply pane.
+    Reply(Box<ReplyPane>),
     /// `O` — the outbox pseudo-folder.
     Outbox(Box<OutboxPane>),
     /// `.` — the AI quick-action menu.
@@ -604,9 +606,13 @@ impl Overlay {
             // walk the history rather than a list, which is what `:` means
             // everywhere else it exists. Its ranked matches are a preview
             // with no cursor — `<tab>` is what puts one into the line.
-            Self::Pick { .. } | Self::Confirm { .. } | Self::Input { .. } | Self::Command(_) => {
-                return None
-            }
+            // The reply pane is absent for the same reason the command line
+            // is: nothing in it is a list a cursor walks.
+            Self::Pick { .. }
+            | Self::Confirm { .. }
+            | Self::Input { .. }
+            | Self::Command(_)
+            | Self::Reply(_) => return None,
         })
     }
 
@@ -621,7 +627,11 @@ impl Overlay {
             Self::Quick(pane) => pane.cursor = at,
             Self::Report(pane) => pane.cursor = at,
             Self::Help(pane) => pane.cursor = at,
-            Self::Pick { .. } | Self::Confirm { .. } | Self::Input { .. } | Self::Command(_) => {}
+            Self::Pick { .. }
+            | Self::Confirm { .. }
+            | Self::Input { .. }
+            | Self::Command(_)
+            | Self::Reply(_) => {}
         }
     }
 }
@@ -731,6 +741,13 @@ pub enum Msg {
         generation: u64,
         /// What arrived.
         event: AskEvent,
+    },
+    /// One frame of a `ComposeService.DraftReply` stream.
+    Reply {
+        /// Which reply it belongs to.
+        generation: u64,
+        /// What arrived.
+        event: ReplyEvent,
     },
     /// `SearchService.Explain` finished.
     Explained {
@@ -865,6 +882,31 @@ pub enum AskEvent {
         /// Why not, when it is not.
         refusal: String,
     },
+    /// The stream failed.
+    Failed(String),
+}
+
+/// What a `ComposeService.DraftReply` stream delivered.
+///
+/// The order is fixed by the proto: one context frame, then tokens, then the
+/// draft the daemon created from the finished prose, then done. See
+/// [`AskEvent`] for why a stream that ends with no done frame is reported as
+/// failed rather than treated as a complete answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyEvent {
+    /// What the drafter read before it wrote anything, pre-formatted.
+    Context(String),
+    /// A chunk of prose.
+    Token(String),
+    /// The draft the daemon created from the finished prose.
+    Drafted {
+        /// Its id.
+        draft_id: i64,
+        /// Its recipient(s), joined.
+        to: String,
+    },
+    /// The terminal frame.
+    Done,
     /// The stream failed.
     Failed(String),
 }
@@ -1158,6 +1200,193 @@ pub enum Cmd {
     },
     /// `FinderService.RebuildIndex`.
     FinderRebuild,
+
+    // -- reply and drafts (task 100) -----------------------------------
+    /// `ComposeService.DraftReply` — a streamed reply, written from an
+    /// intent rather than typed by hand.
+    DraftReply {
+        /// Which reply this is.
+        generation: u64,
+        /// The message being replied to.
+        message_id: i64,
+        /// What the reply should say. May be empty.
+        intent: String,
+        /// Address everyone the parent addressed, not only its author.
+        reply_all: bool,
+    },
+    /// `ComposeService.ListDrafts` — the `:draft list` report.
+    DraftList {
+        /// Which report this is.
+        generation: u64,
+        /// Whose drafts.
+        account_id: i64,
+    },
+    /// `ComposeService.GetDraft` — the `:draft show` report.
+    DraftShow {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+    },
+    /// `ComposeService.UpdateDraft` — replace a draft's body.
+    DraftEdit {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+        /// Its new body.
+        body: String,
+    },
+    /// `ComposeService.DeleteDraft`.
+    DraftDelete {
+        /// Which draft.
+        draft_id: i64,
+    },
+    /// `ComposeService.RenderDraft` — what a draft renders to, unsent.
+    DraftRender {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+    },
+    /// `ComposeService.RewriteDraft`.
+    DraftRewrite {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+        /// The register to aim for, as typed. Validated by the daemon, not
+        /// here.
+        tone: Option<String>,
+        /// Aim shorter.
+        shorter: bool,
+        /// Aim longer.
+        longer: bool,
+        /// What to change, in the caller's own words.
+        instruction: String,
+    },
+    /// `ComposeService.ListDraftRevisions`.
+    DraftRevisions {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+    },
+    /// `ComposeService.SelectDraftRevision` — restore an earlier revision.
+    DraftRevert {
+        /// Which report this is.
+        generation: u64,
+        /// Which draft.
+        draft_id: i64,
+        /// Which revision, 0 for the original text.
+        seq: i64,
+    },
+
+    // -- send and the outbox (task 100) ---------------------------------
+    /// `SendSchedulerService.ScheduleSend`. The same "mutate, then re-list,
+    /// then one [`Msg::Outbox`]" template [`Cmd::CancelSend`] uses, so
+    /// scheduling a send (re-)arms the undo toast exactly as cancelling one
+    /// does — the moment right after this succeeds is the moment "undo"
+    /// matters most.
+    ScheduleSend {
+        /// Whose draft.
+        account_id: i64,
+        /// The draft to send.
+        draft_id: i64,
+        /// A time expression, resolved daemon-side. Empty sends now (subject
+        /// to the account's undo window).
+        at: String,
+        /// An undo-window override, seconds. `None` uses the account default.
+        undo: Option<i64>,
+    },
+    /// `SendSchedulerService.RetryFailed`. Same template as
+    /// [`Cmd::ScheduleSend`].
+    RetryFailed {
+        /// Which entry.
+        outbox_id: i64,
+    },
+    /// `SendSchedulerService.RescheduleSend`. Same template as
+    /// [`Cmd::ScheduleSend`].
+    RescheduleSend {
+        /// Which entry.
+        outbox_id: i64,
+        /// A time expression, resolved daemon-side.
+        at: String,
+    },
+    /// `SendSchedulerService.UpdateScheduledBody`. Same template as
+    /// [`Cmd::ScheduleSend`].
+    UpdateScheduledBody {
+        /// Which entry.
+        outbox_id: i64,
+        /// Its new body.
+        body: String,
+    },
+    /// `SendSchedulerService.SendNow`. Same template as [`Cmd::ScheduleSend`].
+    SendNow {
+        /// Which entry.
+        outbox_id: i64,
+    },
+    /// `SendSchedulerService.SuggestSendTime` — the `:outbox suggest` report.
+    SuggestSendTime {
+        /// Which report this is.
+        generation: u64,
+        /// Whose outbox.
+        account_id: i64,
+    },
+
+    // -- follow-ups and the pre-send guardian (task 100) -----------------
+    /// `SendSchedulerService.ListFollowups` — the `:followup list` report.
+    FollowupList {
+        /// Which report this is.
+        generation: u64,
+        /// Whose follow-ups.
+        account_id: i64,
+    },
+    /// `SendSchedulerService.CreateFollowup`. Resolves `message_id`'s RFC
+    /// 5322 Message-ID via `MailService.Get` first — the request wants the
+    /// header the server knows the message by, and a row id is all a `:`
+    /// line can name.
+    FollowupNew {
+        /// The local message to follow up.
+        message_id: i64,
+        /// A time expression, or empty for `send.followup.default_delay`.
+        remind_in: String,
+        /// A note to carry on the reminder.
+        note: String,
+    },
+    /// `SendSchedulerService.DismissFollowup`.
+    FollowupDismiss {
+        /// Which follow-up.
+        id: i64,
+    },
+    /// `SendSchedulerService.ListWaitingOn` — the `:waiting` report.
+    Waiting {
+        /// Which report this is.
+        generation: u64,
+        /// Whose follow-ups.
+        account_id: i64,
+        /// Only entries already past their `remind_at`.
+        overdue: bool,
+    },
+    /// `SendSchedulerService.DraftNudge` — a drafted chase message. Sends
+    /// nothing; the daemon only writes the words.
+    DraftNudge {
+        /// Which report this is.
+        generation: u64,
+        /// The waiting-on entry to chase.
+        id: i64,
+    },
+    /// `SendSchedulerService.PreflightCheck` — the `:preflight` report.
+    PreflightCheck {
+        /// Which report this is.
+        generation: u64,
+        /// Whose draft — `PreflightCheckRequest.account_id` is required even
+        /// when `draft_id` is set.
+        account_id: i64,
+        /// The draft to check.
+        draft_id: i64,
+    },
+
     /// Stop a stream nobody is reading any more.
     ///
     /// Leaving an overlay is the one case the generation stamp does not
@@ -1184,6 +1413,8 @@ pub enum Stream {
     /// `SearchService.Explain` — superseded per cursor row, so it is a stream
     /// slot even though the RPC itself is unary.
     Explain,
+    /// `ComposeService.DraftReply`.
+    Reply,
     /// Whatever is feeding the Report overlay (task 90).
     ///
     /// One slot for every reporting verb rather than one per verb: only one
@@ -1455,6 +1686,7 @@ impl Model {
             Some(
                 Overlay::Search(_)
                 | Overlay::Ask(_)
+                | Overlay::Reply(_)
                 | Overlay::Outbox(_)
                 | Overlay::Quick(_)
                 | Overlay::Report(_),
@@ -1902,6 +2134,36 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                             pane.phase = AskPhase::Done;
                             pane.error = Some(error.clone());
                             note = Some(Err(format!("ask: {error}")));
+                        }
+                    }
+                }
+            }
+            apply_note(model, note);
+            Vec::new()
+        }
+        Msg::Reply { generation, event } => {
+            let mut note = None;
+            if let Some(Overlay::Reply(pane)) = model.overlay.as_mut() {
+                if generation == pane.generation {
+                    match event {
+                        ReplyEvent::Context(context) => pane.context = Some(context),
+                        ReplyEvent::Token(token) => pane.push_token(generation, &token),
+                        ReplyEvent::Drafted { draft_id, to } => {
+                            pane.drafted = Some((draft_id, to));
+                        }
+                        ReplyEvent::Done => {
+                            pane.done = true;
+                            note = Some(Ok(match &pane.drafted {
+                                Some((id, to)) => format!(
+                                    "draft {id} created for {to} — `mail draft rewrite {id}` to adjust, :send --draft={id} to schedule"
+                                ),
+                                None => "drafted, but the daemon named no draft — check `:draft list`".to_owned(),
+                            }));
+                        }
+                        ReplyEvent::Failed(error) => {
+                            pane.done = true;
+                            pane.error = Some(error.clone());
+                            note = Some(Err(format!("reply: {error}")));
                         }
                     }
                 }
@@ -2804,6 +3066,7 @@ fn streams_of(overlay: &Overlay) -> &'static [Stream] {
         Overlay::Search(_) => &[Stream::Search, Stream::Explain],
         Overlay::Finder(_) => &[Stream::Find],
         Overlay::Ask(_) => &[Stream::Ask],
+        Overlay::Reply(_) => &[Stream::Reply],
         Overlay::Report(_) => &[Stream::Report],
         Overlay::Help(_)
         | Overlay::Pick { .. }
@@ -3170,6 +3433,39 @@ fn pick(model: &mut Model, what: PickFor) -> Vec<Cmd> {
         idx: 0,
     });
     Vec::new()
+}
+
+/// `:reply --ai [intent]`: open the streaming reply pane and start it.
+///
+/// Not counted into [`Model::inflight`], for the reason [`ask_now`] is not:
+/// the pane's own "drafting…" state is what says this is running, the same
+/// way a superseded search's own state is.
+fn start_ai_reply(model: &mut Model, intent: String, reply_all: bool) -> Vec<Cmd> {
+    // `single_target`, not `target_message`, and closed first regardless of
+    // which way this goes: `reply(model)` is what bare `:reply` calls, and it
+    // is `single_target` that refuses a visual selection ("that acts on one
+    // message") rather than silently drafting from the row under the cursor.
+    // Two rules for what "the target" means on the same verb, one gated on a
+    // flag, would be a `--ai` that quietly acts on different mail than the
+    // line without it names.
+    close_command(model);
+    let Some(message_id) = single_target(model) else {
+        return Vec::new();
+    };
+    model.generation += 1;
+    let generation = model.generation;
+    model.overlay = Some(Overlay::Reply(Box::new(ReplyPane {
+        message_id,
+        generation,
+        ..ReplyPane::default()
+    })));
+    model.info("reply — drafting…");
+    vec![Cmd::DraftReply {
+        generation,
+        message_id,
+        intent,
+        reply_all,
+    }]
 }
 
 fn reply(model: &mut Model) -> Vec<Cmd> {
@@ -4198,6 +4494,35 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
             .unwrap_or("normal");
         return set_keybinding(model, &keys_path_from_env(), mode, chord, action);
     }
+    if verb == "reply" {
+        // Hand-written for the reason `set`/`keys set` are: `--ai` branches
+        // between two things an `Action` cannot carry — delegating to the
+        // plain reply flow `r` already runs, or opening a new streaming
+        // pane — so this has to decide before the generic daemon-verb
+        // routing below ever sees it, the same way `keys set`'s `--mode`
+        // is read before the generic flag check would refuse it as
+        // "not wired up yet".
+        let ai = invocation.flags.iter().any(|flag| flag.name == "ai");
+        let reply_all = invocation.flags.iter().any(|flag| flag.name == "reply-all");
+        // Joined rather than `positionals.first()`, for the reason
+        // `helpgrep`'s `pattern` is: an unquoted multi-word intent is what
+        // somebody types.
+        let intent = invocation.positionals.join(" ");
+        if !ai {
+            if reply_all {
+                return complain(model, "--reply-all needs --ai".to_owned());
+            }
+            if !intent.is_empty() {
+                return complain(
+                    model,
+                    "an intent needs --ai — try `:reply --ai ...`".to_owned(),
+                );
+            }
+            close_command(model);
+            return reply(model);
+        }
+        return start_ai_reply(model, intent, reply_all);
+    }
     // More arguments than the verb declares. Derived from the registry rather
     // than "action-backed verbs take none", which is what this was before task
     // 94 declared verbs that take one: `command::parse` collects trailing words
@@ -4220,21 +4545,23 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
             },
         );
     }
-    if let Some(flag) = invocation.flags.first() {
-        // Defence, not a path anything else reaches today: `command::parse`
-        // rejects a flag no verb declares, and `keys set`'s own `--mode` is
-        // handled above, before positionals or flags are checked generically
-        // at all. Worded for the case that *would* arrive first — a declared
-        // flag this dispatch has not learned — rather than claiming the verb
-        // has no such flag, which by then would be false.
-        return complain(model, format!("{verb} --{}: not wired up yet", flag.name));
-    }
     // The daemon verbs, after the argument guards rather than before them: these
     // reach a capability with no `Action` behind them, so there is nothing to
-    // delegate to — and a flag none of them declares has to be refused rather
-    // than silently dropped on the way past.
+    // delegate to. Before the generic flag check just below: task 100's daemon
+    // verbs are the first to declare flags of their own (`draft edit --body`,
+    // `outbox reschedule --at`, `waiting --overdue`...), and `commands::answer`
+    // is what reads them — the same way `keys set`'s hand-written `--mode` is
+    // read above, before that check would otherwise refuse it as unwired.
     if invocation.action.is_none() && invocation.capability.is_some() {
         return run_daemon_command(model, invocation);
+    }
+    if let Some(flag) = invocation.flags.first() {
+        // Reachable now only by an action-backed verb given a flag it did not
+        // declare — `command::parse` already rejects a flag no verb declares
+        // at all, so this is a verb that takes none refusing the one case
+        // that gets this far: a flag *declared* on a verb with no daemon
+        // command and no hand-written case above to read it.
+        return complain(model, format!("{verb} --{}: not wired up yet", flag.name));
     }
     let Some(action) = invocation.action else {
         return complain(model, format!("{verb} is not something this TUI runs"));

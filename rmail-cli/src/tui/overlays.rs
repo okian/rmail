@@ -797,6 +797,48 @@ impl AskPane {
     }
 }
 
+/// `:reply --ai` — a reply streamed from an intent rather than typed by hand.
+///
+/// No typing phase, unlike [`AskPane`]: the intent is whatever the `:` line
+/// already carried, so this pane opens straight into `Streaming` and has
+/// nothing [`AskPhase::Asking`] would mean here. No citations either — a
+/// drafted reply is prose to read and either keep or discard, not a claim to
+/// verify against sources.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplyPane {
+    /// The message being replied to.
+    pub message_id: i64,
+    /// The generation the outstanding `DraftReply` was issued under.
+    pub generation: u64,
+    /// What the drafter read before it wrote anything, pre-formatted.
+    pub context: Option<String>,
+    /// The prose so far.
+    pub body: String,
+    /// The draft's id and recipient, once the stream created one.
+    pub drafted: Option<(i64, String)>,
+    /// Whether the stream has ended, successfully or not.
+    pub done: bool,
+    /// Why the stream failed, if it did.
+    pub error: Option<String>,
+}
+
+impl ReplyPane {
+    /// Append a token, bounded the same way [`AskPane::push_token`] is.
+    pub fn push_token(&mut self, generation: u64, token: &str) {
+        if generation != self.generation {
+            return;
+        }
+        let room = MAX_ANSWER_CHARS.saturating_sub(self.body.chars().count());
+        if room == 0 {
+            return;
+        }
+        self.body.extend(token.chars().take(room));
+        if self.body.chars().count() >= MAX_ANSWER_CHARS {
+            self.body.push_str("\n[reply truncated]");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // outbox
 // ---------------------------------------------------------------------------

@@ -32,11 +32,14 @@ mod tests;
 
 use rmail_proto::v1::{
     Account as ProtoAccount, Attachment, AuthStatusResponse, Citation as ProtoCitation,
-    CreateDraftRequest, DayUsage, DraftAddress, FindResult, FinderStatusResponse, FolderStatus,
+    CreateDraftRequest, DayUsage, Draft, DraftAddress, DraftNudgeResponse, DraftReplyContext,
+    DraftRevision, FindResult, FinderStatusResponse, FolderStatus, Followup, FollowupState,
     FullMessage, GetSpendResponse, IndexDrift, IndexGcReport, IndexKind, IndexProgress,
-    IndexStatusResponse, ItemKind, ListEntitiesResponse, Message as ProtoMessage, OutboxEntry,
-    OutboxState, RankExplanation, RetrievalTrace, SearchHit, Summary, SyncFolderResponse,
-    SyncStatusResponse, UsageStats,
+    IndexStatusResponse, ItemKind, ListDraftRevisionsResponse, ListDraftsResponse,
+    ListEntitiesResponse, Message as ProtoMessage, OutboxEntry, OutboxState,
+    PreflightCheckResponse, PreflightDegradation, PreflightFindingKind, PreflightSeverity,
+    RankExplanation, RenderedDraft, RetrievalTrace, RewriteLength, RewriteTone, SearchHit,
+    SuggestSendTimeResponse, Summary, SyncFolderResponse, SyncStatusResponse, UsageStats,
 };
 
 use rmail_core::command;
@@ -693,7 +696,8 @@ fn usd(amount: f64) -> String {
 /// Local because these are read where the reader is, which is `view::short_date`'s
 /// own reasoning for message dates; the format differs because a report column
 /// has room for the year and a message list does not.
-fn when(unix_seconds: i64) -> String {
+#[must_use]
+pub fn when(unix_seconds: i64) -> String {
     if unix_seconds == 0 {
         return "never".to_owned();
     }
@@ -1090,4 +1094,380 @@ pub fn finder_status_rows(response: &FinderStatusResponse) -> Vec<ReportRow> {
         ),
         ReportRow::new(["refreshed".to_owned(), when(response.refreshed_at)]),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// reply, drafts, send and follow-ups (task 100)
+// ---------------------------------------------------------------------------
+
+/// Addresses, joined the way a report cell shows a recipient list. Display
+/// names are dropped: a report column is not the place to disambiguate two
+/// people sharing a name, and the address alone is what every other id-taking
+/// verb here expects typed back at it.
+#[must_use]
+pub fn addr_list(addrs: &[DraftAddress]) -> String {
+    if addrs.is_empty() {
+        return "(none)".to_owned();
+    }
+    addrs
+        .iter()
+        .map(|addr| addr.address.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `ComposeService.ListDrafts` as a table: one row per draft.
+#[must_use]
+pub fn draft_list_rows(response: &ListDraftsResponse) -> Vec<ReportRow> {
+    response
+        .drafts
+        .iter()
+        .map(|draft| {
+            ReportRow::new([
+                draft.id.to_string(),
+                addr_list(&draft.to),
+                if draft.subject.trim().is_empty() {
+                    NO_SUBJECT.to_owned()
+                } else {
+                    draft.subject.clone()
+                },
+                when(draft.updated_at),
+            ])
+        })
+        .collect()
+}
+
+/// One draft's own fields, field per row — what `:draft show`, `:draft edit`
+/// and `:draft revert` all answer with, since all three end with "here is the
+/// draft as it now stands".
+#[must_use]
+pub fn draft_fields(draft: &Draft) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new(["id".to_owned(), draft.id.to_string()]),
+        ReportRow::new([
+            "from".to_owned(),
+            draft
+                .from
+                .as_ref()
+                .map_or_else(|| "(none)".to_owned(), |a| a.address.clone()),
+        ]),
+        ReportRow::new(["to".to_owned(), addr_list(&draft.to)]),
+        ReportRow::new(["cc".to_owned(), addr_list(&draft.cc)]),
+        ReportRow::new([
+            "subject".to_owned(),
+            if draft.subject.trim().is_empty() {
+                NO_SUBJECT.to_owned()
+            } else {
+                draft.subject.clone()
+            },
+        ]),
+        ReportRow::new(["updated".to_owned(), when(draft.updated_at)]),
+        ReportRow::new(["body".to_owned(), preview(&draft.body_text)]),
+    ]
+}
+
+/// One drafted revision's fields — `:draft rewrite`'s answer.
+#[must_use]
+pub fn draft_revision_fields(rev: &DraftRevision) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new(["draft".to_owned(), rev.draft_id.to_string()]),
+        ReportRow::new(["seq".to_owned(), rev.seq.to_string()]),
+        ReportRow::new(["label".to_owned(), rev.label.clone()]),
+        ReportRow::new([
+            "subject".to_owned(),
+            if rev.subject.trim().is_empty() {
+                NO_SUBJECT.to_owned()
+            } else {
+                rev.subject.clone()
+            },
+        ]),
+        ReportRow::new(["body".to_owned(), preview(&rev.body_text)]),
+        ReportRow::new([
+            "model".to_owned(),
+            rev.model.clone().unwrap_or_else(|| "(original)".to_owned()),
+        ]),
+    ]
+}
+
+/// `ComposeService.ListDraftRevisions` as a table: one row per revision, seq
+/// ascending as the RPC already orders them.
+#[must_use]
+pub fn draft_revision_rows(response: &ListDraftRevisionsResponse) -> Vec<ReportRow> {
+    response
+        .revisions
+        .iter()
+        .map(|rev| {
+            ReportRow::new([
+                rev.seq.to_string(),
+                rev.label.clone(),
+                if rev.subject.trim().is_empty() {
+                    NO_SUBJECT.to_owned()
+                } else {
+                    rev.subject.clone()
+                },
+                rev.model.clone().unwrap_or_else(|| "(original)".to_owned()),
+            ])
+        })
+        .collect()
+}
+
+/// `ComposeService.RenderDraft`'s answer. The MIME bytes themselves stay off
+/// screen — `:draft render`'s job is to confirm who this would actually reach
+/// and that it produced a message at all, which `:draft show` already covers
+/// the prose half of.
+#[must_use]
+pub fn rendered_draft_fields(rendered: &RenderedDraft) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new(["message-id".to_owned(), rendered.message_id.clone()]),
+        ReportRow::new([
+            "recipients".to_owned(),
+            if rendered.envelope_recipients.is_empty() {
+                "(none)".to_owned()
+            } else {
+                rendered.envelope_recipients.join(", ")
+            },
+        ]),
+        ReportRow::new(["size".to_owned(), format!("{} bytes", rendered.mime.len())]),
+    ]
+}
+
+/// `SendSchedulerService.SuggestSendTime`'s answer.
+#[must_use]
+pub fn suggest_send_time_fields(response: &SuggestSendTimeResponse) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new(["when".to_owned(), response.display.clone()]),
+        ReportRow::new(["zone".to_owned(), response.tz.clone()]),
+        ReportRow::new(["why".to_owned(), response.rationale.clone()]),
+    ]
+}
+
+/// A follow-up's state, the way `:followup list` and `:waiting` print it.
+fn followup_state(state: FollowupState) -> &'static str {
+    match state {
+        FollowupState::Armed => "armed",
+        FollowupState::Fired => "fired",
+        FollowupState::Dismissed => "dismissed",
+        FollowupState::Unspecified => "unknown",
+    }
+}
+
+/// `SendSchedulerService.ListFollowups` and `ListWaitingOn` both answer with
+/// this same row shape — see `commands::followup_columns`.
+#[must_use]
+pub fn followup_rows(followups: &[Followup]) -> Vec<ReportRow> {
+    followups
+        .iter()
+        .map(|f| {
+            let row = ReportRow::new([
+                f.id.to_string(),
+                f.message_id.clone(),
+                when(f.remind_at),
+                followup_state(f.state()).to_owned(),
+                f.note.clone().unwrap_or_default(),
+            ]);
+            match f.state() {
+                FollowupState::Fired => row.toned(ReportTone::Warn),
+                FollowupState::Dismissed => row.toned(ReportTone::Muted),
+                FollowupState::Armed | FollowupState::Unspecified => row,
+            }
+        })
+        .collect()
+}
+
+/// `SendSchedulerService.DraftNudge`'s answer: a subject, a model, and the
+/// chase message itself — split on its own line breaks so a report row never
+/// has to wrap prose it was never designed to.
+#[must_use]
+pub fn draft_nudge_fields(response: &DraftNudgeResponse) -> Vec<ReportRow> {
+    let mut rows = vec![
+        ReportRow::new(["subject".to_owned(), response.subject.clone()]),
+        ReportRow::new(["model".to_owned(), response.model.clone()]),
+    ];
+    rows.extend(
+        response
+            .body
+            .lines()
+            .take(MAX_NUDGE_LINES)
+            .map(|line| ReportRow::new(["".to_owned(), line.to_owned()])),
+    );
+    rows
+}
+
+/// How many lines of a drafted nudge's body the report shows before it stops
+/// rather than growing a report past what a screen can hold.
+const MAX_NUDGE_LINES: usize = 20;
+
+/// A preflight finding's severity, as `:preflight` prints it.
+fn preflight_severity(severity: PreflightSeverity) -> &'static str {
+    match severity {
+        PreflightSeverity::Notice => "notice",
+        PreflightSeverity::Warn => "warn",
+        PreflightSeverity::Block => "block",
+        PreflightSeverity::Unspecified => "—",
+    }
+}
+
+/// A preflight finding's kind, as `:preflight` prints it.
+fn preflight_kind(kind: PreflightFindingKind) -> &'static str {
+    match kind {
+        PreflightFindingKind::MissingAttachment => "missing attachment",
+        PreflightFindingKind::UnfilledPlaceholder => "unfilled placeholder",
+        PreflightFindingKind::ApparentSecret => "apparent secret",
+        PreflightFindingKind::RecipientNotOnThread => "recipient not on thread",
+        PreflightFindingKind::DuplicateRecipient => "duplicate recipient",
+        PreflightFindingKind::LargeRecipientList => "large recipient list",
+        PreflightFindingKind::ToneClash => "tone clash",
+        PreflightFindingKind::Unspecified => "unknown",
+    }
+}
+
+/// Why the model half of a preflight check did not contribute, when
+/// [`PreflightCheckResponse::degradation_detail`] itself is empty.
+fn preflight_degradation(degradation: PreflightDegradation) -> &'static str {
+    match degradation {
+        PreflightDegradation::Disabled => "disabled by policy",
+        PreflightDegradation::Refused => "refused by policy or budget",
+        PreflightDegradation::Unavailable => "the model was unavailable",
+        PreflightDegradation::TimedOut => "timed out",
+        PreflightDegradation::Cancelled => "cancelled",
+        PreflightDegradation::Unreadable => "the model's answer could not be read",
+        PreflightDegradation::NothingToReview => "the redaction firewall left nothing to review",
+        PreflightDegradation::Unspecified => "the full check ran",
+    }
+}
+
+/// `SendSchedulerService.PreflightCheck`'s answer: one row per finding, then
+/// a summary row naming whether `ScheduleSend` would refuse this draft and,
+/// when the model half did not run, why not — silence there would read as
+/// "nothing to say" rather than "half of this check did not happen".
+#[must_use]
+pub fn preflight_rows(response: &PreflightCheckResponse) -> Vec<ReportRow> {
+    let mut rows: Vec<ReportRow> = response
+        .findings
+        .iter()
+        .map(|finding| {
+            let row = ReportRow::new([
+                preflight_severity(finding.severity()).to_owned(),
+                preflight_kind(finding.kind()).to_owned(),
+                finding.detail.clone(),
+                if finding.from_model { "model" } else { "check" }.to_owned(),
+            ]);
+            match finding.severity() {
+                PreflightSeverity::Block => row.toned(ReportTone::Bad),
+                PreflightSeverity::Warn => row.toned(ReportTone::Warn),
+                PreflightSeverity::Notice | PreflightSeverity::Unspecified => row,
+            }
+        })
+        .collect();
+    if rows.is_empty() {
+        rows.push(
+            ReportRow::new([
+                "—".to_owned(),
+                "nothing found".to_owned(),
+                String::new(),
+                String::new(),
+            ])
+            .toned(ReportTone::Ok),
+        );
+    }
+    if response.blocks {
+        rows.push(
+            ReportRow::new([
+                "verdict".to_owned(),
+                "would block the send".to_owned(),
+                String::new(),
+                String::new(),
+            ])
+            .toned(ReportTone::Bad),
+        );
+    }
+    if response.degradation() != PreflightDegradation::Unspecified {
+        let why = response
+            .degradation_detail
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .map_or_else(
+                || preflight_degradation(response.degradation()).to_owned(),
+                str::to_owned,
+            );
+        rows.push(ReportRow::new([
+            "model check".to_owned(),
+            why,
+            String::new(),
+            String::new(),
+        ]));
+    }
+    rows
+}
+
+/// The first line of a body, or as much of it as fits — what a report field
+/// meant for a whole message's prose actually has room for.
+fn preview(body: &str) -> String {
+    let first_line = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let truncated: String = first_line.chars().take(BODY_PREVIEW_CHARS).collect();
+    if first_line.chars().count() > BODY_PREVIEW_CHARS || body.lines().count() > 1 {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// How much of a body [`preview`] shows.
+const BODY_PREVIEW_CHARS: usize = 90;
+
+/// The register `:draft rewrite --tone` names, as the proto enum.
+///
+/// Parsed through `rmail_core::compose::reply::Tone` rather than matched
+/// against a second copy of its six spellings: `commands::answer` already
+/// refuses anything `Tone::parse` does not recognise before a
+/// [`Cmd::DraftRewrite`] can carry it this far, so `None` (an unset flag, or
+/// — defensively — an unparseable one that should not reach here) falling
+/// back to [`RewriteTone::AsIs`] is the same "no change" `Tone::AsIs` already
+/// means, not a silent misread of real input. One parser, shared with
+/// `commands::answer`, is what keeps a seventh tone from being reachable on
+/// one side and not the other.
+#[must_use]
+pub fn rewrite_tone(name: Option<&str>) -> RewriteTone {
+    match name.and_then(rmail_core::compose::reply::Tone::parse) {
+        Some(rmail_core::compose::reply::Tone::AsIs) | None => RewriteTone::AsIs,
+        Some(rmail_core::compose::reply::Tone::Formal) => RewriteTone::Formal,
+        Some(rmail_core::compose::reply::Tone::Casual) => RewriteTone::Casual,
+        Some(rmail_core::compose::reply::Tone::Warmer) => RewriteTone::Warmer,
+        Some(rmail_core::compose::reply::Tone::Firmer) => RewriteTone::Firmer,
+        Some(rmail_core::compose::reply::Tone::MirrorRecipient) => RewriteTone::Mirror,
+    }
+}
+
+/// `:draft rewrite --shorter`/`--longer`. `commands::answer` already refuses
+/// both at once, so at most one of these is ever `true`.
+#[must_use]
+pub fn rewrite_length(shorter: bool, longer: bool) -> RewriteLength {
+    match (shorter, longer) {
+        (true, _) => RewriteLength::Shorter,
+        (_, true) => RewriteLength::Longer,
+        (false, false) => RewriteLength::AsIs,
+    }
+}
+
+/// What `ComposeService.DraftReply` read before it wrote anything, the way
+/// [`ask_trace`] formats `AiService.AskMailbox`'s own retrieval trace.
+#[must_use]
+pub fn draft_reply_context(proto: &DraftReplyContext) -> String {
+    let mut line = format!("{} thread message(s)", proto.thread_messages);
+    if proto.withheld_by_policy > 0 {
+        line.push_str(&format!(
+            " · {} withheld by policy",
+            proto.withheld_by_policy
+        ));
+    }
+    if proto.voice_samples > 0 {
+        line.push_str(&format!(" · {} voice sample(s)", proto.voice_samples));
+    }
+    if !proto.model.is_empty() {
+        line.push_str(&format!(" · {}", proto.model));
+    }
+    line
 }
