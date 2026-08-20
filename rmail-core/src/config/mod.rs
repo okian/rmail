@@ -21,6 +21,7 @@
 //! error.
 
 mod duration;
+mod toml_string;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,7 @@ use figment::{Figment, Provider};
 use serde::Deserialize;
 
 pub use duration::{parse_human_duration, HumanDuration};
+pub use toml_string::toml_string;
 
 /// Top-level table names accepted from the environment overlay.
 ///

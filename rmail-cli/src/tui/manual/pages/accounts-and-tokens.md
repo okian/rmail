@@ -74,8 +74,8 @@ imap_server = "imap.example.com"
 imap_port = 993
 ```
 
-{{cmd:account toml}} opens the same block later, after the report has been
-closed.
+{{cmd:toml}} opens the same block later, after the report has been closed — the
+same verb every other block-producing command here reaches for.
 
 `apply` runs {{cmd:account new}}, which stores the account through the API
 instead. The row carries the whole line with the discovered settings on it, so

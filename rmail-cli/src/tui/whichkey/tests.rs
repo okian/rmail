@@ -239,19 +239,40 @@ fn a_command_candidate_with_children_reads_as_a_group() {
     let mut model = loaded();
     press(&mut model, Key::Char(':'));
     let band = shown(&model);
-    // `message` has children (`message.archive`, …); `quit` does not — and,
-    // unlike this test's original example, is a poor candidate for ever
-    // growing one. (`help` was that original example; task 102 gave it a
-    // child of its own — `help.rebind` — which correctly flips it to
-    // `Group` here too, the same way `search`/`search.explain` already
-    // coexist as a bare leaf with a dotted sibling.)
+    // Asserted over whatever the band actually holds, not about two verbs named
+    // here. The entry list is capped at `MAX_ENTRIES` and the `:` vocabulary has
+    // long since outgrown that cap, so a test naming a verb was really asserting
+    // that verb had not yet been trimmed out of the middle — which task 98's
+    // verbs did to `quit`, the previous example. (`help` was the example before
+    // that, until task 102 gave it a child and correctly flipped it to `Group`.)
+    //
+    // This form gets *stronger* as the vocabulary grows rather than more
+    // brittle: every candidate the band did show has to be classified right.
+    let mut groups = 0_usize;
+    let mut runs = 0_usize;
+    for entry in &band.entries {
+        // The pinned ways out are not command candidates.
+        if entry.keys.starts_with('<') {
+            continue;
+        }
+        let has_children = !rmail_core::command::children_of(&[entry.keys.as_str()]).is_empty();
+        if has_children {
+            groups += 1;
+            assert_eq!(
+                entry.kind,
+                Kind::Group,
+                "{} has children: {band:?}",
+                entry.keys
+            );
+        } else {
+            runs += 1;
+            assert_eq!(entry.kind, Kind::Run, "{} has none: {band:?}", entry.keys);
+        }
+    }
+    // Both kinds are present, or the loop above could pass by covering neither.
     assert!(
-        of_kind(&band, Kind::Group).contains(&"message".to_owned()),
-        "{band:?}"
-    );
-    assert!(
-        of_kind(&band, Kind::Run).contains(&"quit".to_owned()),
-        "{band:?}"
+        groups > 0 && runs > 0,
+        "{groups} groups, {runs} runs: {band:?}"
     );
 }
 

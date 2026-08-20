@@ -31,22 +31,24 @@
 mod tests;
 
 use rmail_proto::v1::{
-    Account as ProtoAccount, AiProviderKind, Attachment, AuditEntry, AuthStatusResponse,
+    Account as ProtoAccount, AiProviderKind, Alert, Attachment, AuditEntry, AuthStatusResponse,
     AutoconfigureResponse, BeginOAuthResponse, BudgetClass, BulkTagResponse, CallStatus,
     Citation as ProtoCitation, CompleteOAuthResponse, CreateDraftRequest, DayUsage, Draft,
     DraftAddress, DraftNudgeResponse, DraftReplyContext, DraftRevision, EvaluationStats,
-    FindResult, FinderStatusResponse, FolderStatus, Followup, FollowupState, FullMessage,
-    GetAiProviderResponse, GetSpendResponse, IndexDrift, IndexGcReport, IndexKind, IndexProgress,
-    IndexStatusResponse, InjectionSeverity, ItemKind, ListAccountsResponse,
-    ListDraftRevisionsResponse, ListDraftsResponse, ListEntitiesResponse, ListRulesResponse,
-    ListTagRulesResponse, ListTagsResponse, ListTokensResponse, Message as ProtoMessage,
-    MessageOutcome, MintTokenResponse, OutboxEntry, OutboxState, PreflightCheckResponse,
-    PreflightDegradation, PreflightFindingKind, PreflightSeverity, RankExplanation,
-    RefreshTokenResponse, RenderedDraft, RetrievalTrace, RewriteLength, RewriteTone,
-    ScanInjectionResponse, SearchHit, SetAiProviderResponse, SetBudgetResponse,
-    SuggestSendTimeResponse, Summary, SyncFolderResponse, SyncStatusResponse,
+    FindResult, FinderStatusResponse, FolderStatus, Followup, FollowupState,
+    ForwardMessageResponse, FullMessage, GetAiProviderResponse, GetSpendResponse, HookEvent,
+    IndexDrift, IndexGcReport, IndexKind, IndexProgress, IndexStatusResponse, InjectionSeverity,
+    ItemKind, ListAccountsResponse, ListDraftRevisionsResponse, ListDraftsResponse,
+    ListEntitiesResponse, ListHooksResponse, ListRulesResponse, ListTagRulesResponse,
+    ListTagsResponse, ListTokensResponse, Message as ProtoMessage, MessageOutcome,
+    MintTokenResponse, NotificationState, NotificationTier, OutboxEntry, OutboxState,
+    PreflightCheckResponse, PreflightDegradation, PreflightFindingKind, PreflightSeverity,
+    RankExplanation, RefreshTokenResponse, RenderedDraft, RetrievalTrace, RewriteLength,
+    RewriteTone, ScanInjectionResponse, ScoreMessageResponse, SearchHit, SetAiProviderResponse,
+    SetBudgetResponse, SuggestSendTimeResponse, Summary, SyncFolderResponse, SyncStatusResponse,
     SynthesizeRuleResponse, TagRuleMode, TagSource, TagSuggestion, TagSyncMode,
-    TestConnectionResponse, UsageStats,
+    TestConnectionResponse, TestHookResponse, UsageStats, WebhookDelivery, WebhookDeliveryState,
+    WebhookDestination, WebhookEvent, WebhookSecretSource,
 };
 
 use rmail_core::command;
@@ -2463,8 +2465,8 @@ pub fn autoconfigure_rows(email: &str, response: &AutoconfigureResponse) -> Vec<
         ]);
         rows.push(match toml_invocation() {
             Some(invocation) => row.running(invocation),
-            // Unreachable: `account toml` is declared. A row that does nothing
-            // beats a panic in a client holding a terminal in raw mode.
+            // Unreachable: `toml` is declared. A row that does nothing beats a
+            // panic in a client holding a terminal in raw mode.
             None => row,
         });
     }
@@ -2524,7 +2526,7 @@ fn new_account_invocation(
     }
 }
 
-/// The `:account toml` invocation the `toml` row runs.
+/// The `:toml` invocation a block row runs.
 ///
 /// A verb rather than a row-only gesture, for the reachability rule this client
 /// holds everywhere: a report row's action *is* an `Invocation`, so an
@@ -2534,8 +2536,8 @@ fn new_account_invocation(
 ///
 /// Bang'd: opening a file this process wrote, read-only, in the platform's own
 /// handler is not a thing to ask about.
-fn toml_invocation() -> Option<command::Invocation> {
-    match command::parse("account toml!") {
+pub fn toml_invocation() -> Option<command::Invocation> {
+    match command::parse("toml!") {
         Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
         _ => None,
     }
@@ -2695,4 +2697,392 @@ pub fn minted_rows(response: &MintTokenResponse) -> Vec<ReportRow> {
         ])
         .toned(ReportTone::Bad),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// automation and notifications (task 98)
+// ---------------------------------------------------------------------------
+
+/// A webhook event's wire string, or the enum name for one this build does not
+/// know.
+///
+/// The same vocabulary `HookEvent` uses, deliberately — the protos say so — which
+/// is why one function serves both.
+fn event_label(event: i32) -> String {
+    match WebhookEvent::try_from(event) {
+        Ok(WebhookEvent::OnNewMessage) => "on_new_message".to_owned(),
+        Ok(WebhookEvent::OnLabel) => "on_label".to_owned(),
+        Ok(WebhookEvent::OnMove) => "on_move".to_owned(),
+        Ok(WebhookEvent::OnRuleMatch) => "on_rule_match".to_owned(),
+        Ok(WebhookEvent::OnSyncError) => "on_sync_error".to_owned(),
+        // Rendered as its own number rather than dropped: an event this build
+        // has no name for is a newer daemon's, and losing the row entirely would
+        // hide a subscription that is real.
+        Ok(WebhookEvent::Unspecified) | Err(_) => format!("event {event}"),
+    }
+}
+
+/// The wire enum for one of `commands::automation::EVENTS`' strings.
+///
+/// `None` for anything else, which the caller drops. Only reachable with a name
+/// the answer table already checked against the same list, so this is the belt to
+/// that braces — and dropping is the safe direction: an unrecognised event
+/// silently mapped to `UNSPECIFIED` would register a subscription to something
+/// nobody asked for.
+#[must_use]
+pub fn webhook_event(name: &str) -> Option<WebhookEvent> {
+    match name {
+        "on_new_message" => Some(WebhookEvent::OnNewMessage),
+        "on_label" => Some(WebhookEvent::OnLabel),
+        "on_move" => Some(WebhookEvent::OnMove),
+        "on_rule_match" => Some(WebhookEvent::OnRuleMatch),
+        "on_sync_error" => Some(WebhookEvent::OnSyncError),
+        _ => None,
+    }
+}
+
+/// Where a signing key comes from, as the listing names it — a reference, never
+/// the key.
+fn signing_label(source: i32, reference: &str) -> String {
+    let kind = match WebhookSecretSource::try_from(source) {
+        Ok(WebhookSecretSource::Env) => "env",
+        Ok(WebhookSecretSource::Command) => "command",
+        Ok(WebhookSecretSource::Keychain) => "keychain",
+        // Honest about what a receiver can verify rather than pretending a
+        // constant is a signature — the proto's own words.
+        Ok(WebhookSecretSource::Unspecified) | Err(_) => return "unsigned".to_owned(),
+    };
+    if reference.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind} {reference}")
+    }
+}
+
+/// `WebhookService.List` (and the single-destination echoes) as a table.
+#[must_use]
+pub fn destination_rows(destinations: &[WebhookDestination]) -> Vec<ReportRow> {
+    destinations.iter().map(destination_row).collect()
+}
+
+/// One destination's row.
+#[must_use]
+pub fn destination_row(destination: &WebhookDestination) -> ReportRow {
+    let events = if destination.events.is_empty() {
+        // Not a blank cell: a destination that subscribes to nothing is a real
+        // and useful configuration — it receives an explicit `:forward` and no
+        // firehose — and drawing it empty would read as a rendering fault.
+        "forward only".to_owned()
+    } else {
+        destination
+            .events
+            .iter()
+            .map(|event| event_label(*event))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    ReportRow::new([
+        destination.name.clone(),
+        destination.url.clone(),
+        if destination.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+        .to_owned(),
+        events,
+        if destination.include_body {
+            "body included".to_owned()
+        } else {
+            "notification".to_owned()
+        },
+        signing_label(destination.secret_source, &destination.secret_reference),
+    ])
+    .toned(match (destination.enabled, destination.include_body) {
+        // A destination entitled to message bodies is the one configuration on
+        // this screen worth finding at a glance: it ships the mail itself,
+        // redacted, to a third party on every matching message.
+        (true, true) => ReportTone::Warn,
+        (true, false) => ReportTone::Ok,
+        (false, _) => ReportTone::Muted,
+    })
+}
+
+/// A delivery's state, as the queue names it.
+fn delivery_state(state: i32) -> (&'static str, ReportTone) {
+    match WebhookDeliveryState::try_from(state) {
+        Ok(WebhookDeliveryState::Pending) => ("pending", ReportTone::Plain),
+        Ok(WebhookDeliveryState::Delivered) => ("delivered", ReportTone::Ok),
+        Ok(WebhookDeliveryState::Failed) => ("failed", ReportTone::Bad),
+        Ok(WebhookDeliveryState::Unspecified) | Err(_) => ("unknown", ReportTone::Muted),
+    }
+}
+
+/// `WebhookService.ListDeliveries` as a table.
+#[must_use]
+pub fn delivery_rows(deliveries: &[WebhookDelivery]) -> Vec<ReportRow> {
+    deliveries.iter().map(delivery_row).collect()
+}
+
+/// One delivery's row.
+///
+/// A failed row carries `:webhook replay <id>` — the only way out of the terminal
+/// state, and deliberately something a human does, which is exactly what a row
+/// action is. Not bang'd: replaying POSTs the same mail content to a third party
+/// again, so task 90's gate asking first is the gate doing its job.
+#[must_use]
+pub fn delivery_row(delivery: &WebhookDelivery) -> ReportRow {
+    let (state, tone) = delivery_state(delivery.state);
+    let last = if !delivery.last_error.is_empty() {
+        delivery.last_error.clone()
+    } else if delivery.delivered_at > 0 {
+        when(delivery.delivered_at)
+    } else if delivery.next_attempt_at > 0 {
+        format!("next {}", when(delivery.next_attempt_at))
+    } else if delivery.last_status != 0 {
+        format!("HTTP {}", delivery.last_status)
+    } else {
+        // Distinct from a 500 and not to be read as one: nothing answered at
+        // all.
+        "no answer yet".to_owned()
+    };
+    let row = ReportRow::new([
+        delivery.id.to_string(),
+        delivery.destination_name.clone(),
+        delivery.event.clone(),
+        state.to_owned(),
+        format!("{}/{}", delivery.attempts, delivery.max_attempts),
+        last,
+    ])
+    .toned(tone);
+    if WebhookDeliveryState::try_from(delivery.state) != Ok(WebhookDeliveryState::Failed) {
+        return row;
+    }
+    match replay_invocation(delivery.id) {
+        Some(invocation) => row.running(invocation),
+        None => row,
+    }
+}
+
+/// The `:webhook replay <id>` invocation a failed row runs.
+fn replay_invocation(delivery_id: i64) -> Option<command::Invocation> {
+    match command::parse(&format!("webhook replay {delivery_id}")) {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
+    }
+}
+
+/// What `WebhookService.Forward` queued, as the one line the status line says.
+///
+/// "Queued", never "sent" — and it says so louder when no dispatcher is running:
+/// a client reporting a send on a daemon with `webhooks.enabled = false` would be
+/// the lie the response's own `dispatcher_running` field exists to prevent.
+#[must_use]
+pub fn forwarded(response: &ForwardMessageResponse) -> String {
+    let id = response.delivery.as_ref().map_or(0, |delivery| delivery.id);
+    if response.dispatcher_running {
+        format!("queued as delivery {id} — it goes out on the next dispatch tick")
+    } else {
+        format!(
+            "queued as delivery {id}, but no dispatcher is running \
+             (webhooks.enabled) — it is durably queued, not sent"
+        )
+    }
+}
+
+/// A hook's event, as `HookService` names it.
+fn hook_event_label(event: i32) -> String {
+    match HookEvent::try_from(event) {
+        Ok(HookEvent::OnNewMessage) => "on_new_message".to_owned(),
+        Ok(HookEvent::OnLabel) => "on_label".to_owned(),
+        Ok(HookEvent::OnMove) => "on_move".to_owned(),
+        Ok(HookEvent::OnRuleMatch) => "on_rule_match".to_owned(),
+        Ok(HookEvent::OnSyncError) => "on_sync_error".to_owned(),
+        Ok(HookEvent::Unspecified) | Err(_) => format!("event {event}"),
+    }
+}
+
+/// `HookService.ListHooks` as a table.
+#[must_use]
+pub fn hook_rows(response: &ListHooksResponse) -> Vec<ReportRow> {
+    response
+        .hooks
+        .iter()
+        .map(|hook| {
+            let command = if hook.args.is_empty() {
+                hook.command.clone()
+            } else {
+                format!("{} {}", hook.command, hook.args.join(" "))
+            };
+            ReportRow::new([
+                hook.name.clone(),
+                hook_event_label(hook.event),
+                if hook.enabled { "enabled" } else { "disabled" }.to_owned(),
+                format!("{} ms", hook.timeout_ms),
+                command,
+            ])
+            .toned(if hook.enabled {
+                ReportTone::Ok
+            } else {
+                ReportTone::Muted
+            })
+        })
+        .collect()
+}
+
+/// `HookService.TestHook` as a table.
+///
+/// Four outcomes the proto distinguishes and this does too, because they are
+/// different operational facts: it exited with a code, it was killed for
+/// exceeding its timeout, the daemon shut down under it, or it could not be
+/// spawned at all.
+#[must_use]
+pub fn hook_test_rows(response: &TestHookResponse) -> Vec<ReportRow> {
+    let (outcome, tone) = if response.timed_out {
+        (
+            "killed — it exceeded its timeout".to_owned(),
+            ReportTone::Bad,
+        )
+    } else if response.cancelled {
+        (
+            "cancelled — the daemon shut down mid-run".to_owned(),
+            ReportTone::Warn,
+        )
+    } else {
+        match response.exit_code {
+            Some(0) => ("exit 0".to_owned(), ReportTone::Ok),
+            Some(code) => (format!("exit {code}"), ReportTone::Bad),
+            None => (
+                "never ran — the command could not be spawned".to_owned(),
+                ReportTone::Bad,
+            ),
+        }
+    };
+    let mut rows = vec![
+        ReportRow::new(["outcome".to_owned(), outcome]).toned(tone),
+        ReportRow::new(["took".to_owned(), format!("{} ms", response.duration_ms)]),
+    ];
+    for (label, text) in [("stdout", &response.stdout), ("stderr", &response.stderr)] {
+        if text.trim().is_empty() {
+            continue;
+        }
+        // A line per line, for the reason a config block is drawn that way: this
+        // is output somebody is reading, and folded into one cell it would be
+        // elided at the column width.
+        for line in text.lines() {
+            rows.push(ReportRow::new([label.to_owned(), line.to_owned()]));
+        }
+    }
+    rows
+}
+
+/// A notification tier, as the config file spells it.
+fn tier_label(tier: i32) -> &'static str {
+    match NotificationTier::try_from(tier) {
+        Ok(NotificationTier::Low) => "low",
+        Ok(NotificationTier::Normal) => "normal",
+        Ok(NotificationTier::High) => "high",
+        Ok(NotificationTier::Critical) => "critical",
+        Ok(NotificationTier::Unspecified) | Err(_) => "unscored",
+    }
+}
+
+/// How loud a tier is, for a row's tone.
+fn tier_tone(tier: i32) -> ReportTone {
+    match NotificationTier::try_from(tier) {
+        Ok(NotificationTier::Critical) => ReportTone::Bad,
+        Ok(NotificationTier::High) => ReportTone::Warn,
+        Ok(NotificationTier::Normal) => ReportTone::Plain,
+        Ok(NotificationTier::Low) => ReportTone::Muted,
+        Ok(NotificationTier::Unspecified) | Err(_) => ReportTone::Muted,
+    }
+}
+
+/// One `Alert` as a row of the live `:notify list` report.
+#[must_use]
+pub fn alert_row(alert: &Alert) -> ReportRow {
+    ReportRow::new([
+        when(alert.delivered_at),
+        tier_label(alert.tier).to_owned(),
+        alert.account.clone(),
+        alert.from.clone().unwrap_or_else(|| "-".to_owned()),
+        alert
+            .subject
+            .clone()
+            .unwrap_or_else(|| NO_SUBJECT.to_owned()),
+        alert.reason.clone(),
+    ])
+    .toned(tier_tone(alert.tier))
+}
+
+/// `NotificationService.ScoreMessage` as a table.
+///
+/// The interesting answer is usually not the tier but *why nothing happened*, so
+/// the state, the threshold it was measured against and whether the account has
+/// notifications on at all are all rows rather than something a reader has to
+/// infer from a tier.
+#[must_use]
+pub fn score_rows(response: &ScoreMessageResponse) -> Vec<ReportRow> {
+    let (state, tone) = match NotificationState::try_from(response.state) {
+        Ok(NotificationState::Pending) => ("pending", ReportTone::Plain),
+        Ok(NotificationState::Delivered) => ("delivered", ReportTone::Ok),
+        Ok(NotificationState::Suppressed) => ("suppressed", ReportTone::Muted),
+        // "We chose not to" and "we could not" are different facts, which is why
+        // the proto keeps them apart and why only one of them is drawn as a
+        // failure.
+        Ok(NotificationState::Failed) => ("failed", ReportTone::Bad),
+        Ok(NotificationState::Queued) => ("queued — scoring now", ReportTone::Plain),
+        Ok(NotificationState::Unspecified) | Err(_) => ("unknown", ReportTone::Muted),
+    };
+    let mut rows = vec![ReportRow::new(["state".to_owned(), state.to_owned()]).toned(tone)];
+    rows.push(
+        ReportRow::new([
+            "tier".to_owned(),
+            response.tier.map_or_else(
+                || "not scored yet".to_owned(),
+                |tier| tier_label(tier).to_owned(),
+            ),
+        ])
+        .toned(response.tier.map_or(ReportTone::Muted, tier_tone)),
+    );
+    if let Some(reason) = response.reason.as_ref() {
+        rows.push(ReportRow::new(["why".to_owned(), reason.clone()]));
+    }
+    if !response.suppressed_reason.is_empty() {
+        rows.push(
+            ReportRow::new(["suppressed".to_owned(), response.suppressed_reason.clone()])
+                .toned(ReportTone::Muted),
+        );
+    }
+    rows.push(ReportRow::new([
+        "threshold".to_owned(),
+        response.effective_threshold.clone(),
+    ]));
+    rows.push(
+        ReportRow::new([
+            "account".to_owned(),
+            if response.account_enabled {
+                "notifications on".to_owned()
+            } else {
+                "notifications off for this account".to_owned()
+            },
+        ])
+        .toned(if response.account_enabled {
+            ReportTone::Plain
+        } else {
+            ReportTone::Muted
+        }),
+    );
+    rows.push(
+        ReportRow::new([
+            "would notify".to_owned(),
+            if response.would_notify { "yes" } else { "no" }.to_owned(),
+        ])
+        .toned(if response.would_notify {
+            ReportTone::Ok
+        } else {
+            ReportTone::Muted
+        }),
+    );
+    rows
 }

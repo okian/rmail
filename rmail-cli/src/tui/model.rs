@@ -58,6 +58,7 @@ use rmail_core::command;
 use rmail_core::parity::Command as Capability;
 
 use super::commands::{self, Answer, Target};
+use super::config_block::ConfigBlock;
 use super::form::FormPane;
 use super::help::{self, HelpPane};
 use super::history::History;
@@ -68,7 +69,7 @@ use super::overlays::{
     CommandPane, Explanation, FinderItem, FinderKind, FinderPane, Hit, OutboxPane, OutboxRow,
     QuickAction, QuickPane, ReplyPane, SearchFocus, SearchPane, Toast, UndoToast,
 };
-use super::report::{self, ReportFill, ReportPane, ReportRow};
+use super::report::{self, ReportColumn, ReportFill, ReportPane, ReportRow};
 use super::status::{Daemon, Health, Subsystem};
 use super::theme::Theme;
 use crate::keymap::file::{self as keys_file, keys_path_from_env};
@@ -788,12 +789,12 @@ pub enum Msg {
     /// thinks, and then types `:rule add`. Not a `Msg::Done` either — nothing
     /// finished, and the counter would go negative.
     RuleDrafted(String),
-    /// `:account add` discovered a `[[accounts]]` block (task 97).
+    /// A verb produced a TOML block for the operator to paste (task 97).
     ///
     /// Its own message for the reason [`Msg::RuleDrafted`] is: the block
     /// outlives the report it is shown in, and nothing finished, so a
     /// [`Msg::Done`] would decrement a counter it never incremented.
-    AccountToml(String),
+    Block(Box<ConfigBlock>),
     /// One subsystem's standing, from the heartbeat (task 92).
     ///
     /// Deliberately not a [`Msg::Done`]: nobody asked for it and nothing
@@ -1367,6 +1368,108 @@ pub enum Cmd {
         /// How far back, or the daemon's default.
         days: Option<u32>,
     },
+    /// `WebhookService.List` — the `:webhook list` report.
+    WebhookList {
+        /// Which report this is.
+        generation: u64,
+        /// Show each destination's full URL rather than its authority. A webhook
+        /// URL is frequently the credential itself, so this is off unless asked.
+        reveal_url: bool,
+    },
+    /// `WebhookService.Register`.
+    WebhookAdd {
+        /// Which report this is.
+        generation: u64,
+        /// The handle `:forward --to` and `:webhook rm` address it by.
+        name: String,
+        /// Where deliveries are POSTed.
+        url: String,
+        /// How the payload is rendered.
+        template: commands::automation::Template,
+        /// The events it subscribes to, as canonical wire strings. Empty
+        /// registers a destination that only ever receives an explicit
+        /// `:forward`.
+        events: Vec<String>,
+        /// Whether it is entitled to message bodies.
+        include_body: bool,
+        /// Register it disabled.
+        disabled: bool,
+        /// Where its HMAC signing key is resolved from — a reference, never the
+        /// key.
+        secret: Option<commands::automation::Secret>,
+        /// Attempt cap for its deliveries, or `None` for the daemon's default.
+        max_attempts: Option<i64>,
+    },
+    /// `WebhookService.Remove`.
+    WebhookRemove {
+        /// Which destination.
+        name: String,
+    },
+    /// `WebhookService.SetEnabled`.
+    WebhookEnabled {
+        /// Which report this is.
+        generation: u64,
+        /// Which destination.
+        name: String,
+        /// Whether to send to it.
+        enabled: bool,
+    },
+    /// `WebhookService.ListDeliveries`.
+    WebhookDeliveries {
+        /// Which report this is.
+        generation: u64,
+        /// One destination by name, or every one.
+        destination: Option<String>,
+        /// How many rows, or the daemon's default.
+        limit: Option<i64>,
+        /// Include the frozen request body on each row.
+        show_payload: bool,
+    },
+    /// `WebhookService.ReplayDelivery`.
+    WebhookReplay {
+        /// Which report this is.
+        generation: u64,
+        /// Which delivery.
+        delivery_id: i64,
+    },
+    /// `WebhookService.Forward`.
+    Forward {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+        /// Which destination, by name.
+        destination: String,
+    },
+    /// `HookService.ListHooks`.
+    HookList {
+        /// Which report this is.
+        generation: u64,
+    },
+    /// `HookService.TestHook`.
+    HookTest {
+        /// Which report this is.
+        generation: u64,
+        /// Which hook.
+        name: String,
+        /// Event JSON for its stdin, or `None` for a synthetic sample.
+        event_json: Option<String>,
+    },
+    /// `NotificationService.StreamAlerts` — the live `:notify list` report.
+    NotifyAlerts {
+        /// Which report this is.
+        generation: u64,
+        /// Replay everything after this alert id first, or `None` for only what
+        /// fires from now on.
+        since_id: Option<i64>,
+    },
+    /// `NotificationService.ScoreMessage`.
+    NotifyScore {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+    },
     /// `AccountService.List` — the `:account list` report.
     ///
     /// Its own command rather than a second use of [`Cmd::LoadAccounts`]: that
@@ -1913,14 +2016,17 @@ pub struct Model {
     /// is [`Model::message_idx`], so extending the selection is the ordinary
     /// cursor movement and needs no second set of bindings.
     pub visual: Option<usize>,
-    /// The `[[accounts]]` block `:account add` last discovered, which
-    /// `:account toml` opens.
+    /// The TOML block this session last produced, which `:toml` opens.
     ///
     /// Session state rather than a field on the Report it was shown in, for the
     /// reason [`Model::rule_draft`] is: it outlives the report — somebody reads
     /// the proposal, closes it, thinks, then wants the block — and a generic
     /// overlay growing one field per verb is how it stops being generic.
-    pub account_toml: Option<String>,
+    ///
+    /// One slot for every producer (`:account add`, `:hook add`, `:notify set`)
+    /// rather than one each: they all produce the same thing, and the newest is
+    /// the one anybody means by "the block".
+    pub block: Option<Box<ConfigBlock>>,
     /// The TOML `:rule new` last drafted, which `:rule add` stores.
     ///
     /// Session state rather than a field on the Report it was shown in: a draft
@@ -2018,7 +2124,7 @@ impl Model {
             generation: 0,
             visual: None,
             daemon: Daemon::default(),
-            account_toml: None,
+            block: None,
             rule_draft: None,
             keymap: Keymap::defaults(),
             pending: Pending::default(),
@@ -2581,12 +2687,12 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             apply_note(model, note);
             Vec::new()
         }
-        Msg::AccountToml(toml) => {
-            // Replaces whatever was discovered before, for the reason a second
-            // rule draft does: `:account toml` opens "the block", and two of
-            // them would make which one it meant depend on the order two
-            // reports happened to answer in.
-            model.account_toml = Some(toml);
+        Msg::Block(block) => {
+            // Replaces whatever was produced before, for the reason a second
+            // rule draft does: `:toml` opens "the block", and two of them would
+            // make which one it meant depend on the order two reports happened
+            // to answer in.
+            model.block = Some(block);
             Vec::new()
         }
         Msg::RuleDrafted(toml) => {
@@ -5026,22 +5132,23 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         };
         return use_account(model, id);
     }
-    if verb == "account toml" {
+    if verb == "toml" {
         // Hand-written next to `:account use` and for the same reason: it
         // reaches no capability. Closed only once there is something to open,
         // so the complaint lands on the command line the way `:set`'s does.
-        let Some(toml) = model.account_toml.clone() else {
+        let Some(block) = model.block.clone() else {
             return complain(
                 model,
-                "nothing discovered yet — :account add <address> proposes a block".to_owned(),
+                "no block yet — :account add, :hook add and :notify set each produce one"
+                    .to_owned(),
             );
         };
         close_command(model);
-        model.info("opening the [[accounts]] block…");
+        model.info(format!("opening {}…", block.label));
         return vec![Cmd::OpenText {
-            text: toml,
+            text: block.toml.clone(),
             extension: "toml".to_owned(),
-            label: "the [[accounts]] block".to_owned(),
+            label: block.label.clone(),
         }];
     }
     if verb == "reply" {
@@ -5104,15 +5211,21 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
             },
         );
     }
-    // The daemon verbs, after the argument guards rather than before them: these
-    // reach a capability with no `Action` behind them, so there is nothing to
-    // delegate to. Before the generic flag check just below: task 100's daemon
-    // verbs are the first to declare flags of their own (`draft edit --body`,
-    // `outbox reschedule --at`, `waiting --overdue`...), and `commands::answer`
-    // is what reads them — the same way `keys set`'s hand-written `--mode` is
-    // read above, before that check would otherwise refuse it as unwired.
-    if invocation.action.is_none() && invocation.capability.is_some() {
-        return run_daemon_command(model, invocation);
+    // Every verb with no `Action` behind it, after the argument guards rather
+    // than before them: there is nothing to delegate to, so `tui::commands` is
+    // the table that answers. Usually that means a capability to reach; since
+    // task 98 it can also mean a block to render (`:hook add`, `:notify set`
+    // reach no RPC at all), which is why this no longer tests
+    // `capability.is_some()` — doing so sent those two into the flag check below
+    // and had them refused for carrying flags nothing had read.
+    //
+    // Before that check for the same reason it always was: task 100's verbs were
+    // the first to declare flags of their own (`draft edit --body`,
+    // `outbox reschedule --at`, `waiting --overdue`…), and `commands::answer` is
+    // what reads them — the same way `keys set`'s hand-written `--mode` is read
+    // above.
+    if invocation.action.is_none() {
+        return run_answered_command(model, invocation);
     }
     if let Some(flag) = invocation.flags.first() {
         // Reachable now only by an action-backed verb given a flag it did not
@@ -5428,20 +5541,25 @@ fn browse_history(model: &mut Model, direction: Direction) -> bool {
 // reports
 // ---------------------------------------------------------------------------
 
-/// Dispatch a verb that reaches a capability with no [`Action`] behind it —
-/// task 90's seam, and the one place tasks 94 onward plug into.
+/// Dispatch a verb with no [`Action`] behind it — task 90's seam, and the one
+/// place tasks 94 onward plug into.
 ///
 /// The verb's answer is looked up in `tui::commands`, which is pure data; this
 /// is the only code that turns one into an overlay, a request or a refusal. So
 /// the confirmation gate, the generation stamp and the Report exist once
 /// regardless of how many verbs the table grows to.
-fn run_daemon_command(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd> {
+///
+/// Most of these reach a capability. A few reach nothing — task 98's `:hook add`
+/// and `:notify set` render a TOML block, because the settings they name have no
+/// RPC that writes them — and they come through here too, so the pane, the
+/// status line and the refusal wording are the same code for both.
+fn run_answered_command(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd> {
     let verb = invocation.verb.join(" ");
     let generation = model.generation + 1;
     let Some(answer) = commands::answer(&invocation, &target_of(model), generation) else {
         return complain(
             model,
-            format!("{verb} reaches the daemon, but this build has no answer for it"),
+            format!("{verb} is declared, but this build has no answer for it"),
         );
     };
     let request = match answer {
@@ -5458,6 +5576,33 @@ fn run_daemon_command(model: &mut Model, invocation: command::Invocation) -> Vec
             model.overlay = Some(Overlay::Form(Box::new(pane)));
             model.info(format!("{verb} — reading what is in force…"));
             return vec![request.cmd];
+        }
+        // A block, and no request: the verb names a setting nothing writes over
+        // the wire. Opened as a report over the block's own rows, and remembered
+        // so `:toml` can open it after the report has been closed — which is
+        // where the copy affordance lives, for the reason `tui::config_block`
+        // gives.
+        Answer::Block(block) => {
+            model.generation = generation;
+            close_command(model);
+            let mut pane = ReportPane::new(
+                invocation,
+                format!("{} — paste it into your config", block.label),
+                vec![
+                    ReportColumn::new("what", 14),
+                    ReportColumn::new("value", 62),
+                ],
+                generation,
+            );
+            // Complete on arrival: there is nothing outstanding, so a border
+            // reading "asking…" would be describing a request that was never
+            // made.
+            pane.apply(generation, ReportFill::Replace, block.rows(), true);
+            let label = block.label.clone();
+            model.block = Some(block);
+            model.overlay = Some(Overlay::Report(Box::new(pane)));
+            model.info(format!("{label} — <enter> on a row, or :toml to open it"));
+            return Vec::new();
         }
         Answer::Rows(request) | Answer::Fact(request) => request,
     };
@@ -5634,6 +5779,13 @@ fn rerun_report(model: &mut Model) -> Vec<Cmd> {
         // for a broken key.
         Some(Answer::Form(_)) => {
             model.fail(format!("{verb} answers with a form — Esc, then type it"));
+            return Vec::new();
+        }
+        // A block, which is a pure function of the line that produced it: `r`
+        // would redraw exactly what is already on screen. Reported rather than
+        // silently doing nothing, for the reason the form arm above is.
+        Some(Answer::Block(_)) => {
+            model.fail(format!("{verb} is already showing everything it has"));
             return Vec::new();
         }
         // A report open for a verb whose answer has become unavailable: the

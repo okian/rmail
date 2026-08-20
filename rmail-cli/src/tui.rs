@@ -63,6 +63,7 @@
 //! session.
 
 pub mod commands;
+pub mod config_block;
 pub mod form;
 pub mod grpc;
 pub mod help;

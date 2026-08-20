@@ -52,38 +52,44 @@ use rmail_proto::v1::audit_service_client::AuditServiceClient;
 use rmail_proto::v1::client_auth_service_client::ClientAuthServiceClient;
 use rmail_proto::v1::compose_service_client::ComposeServiceClient;
 use rmail_proto::v1::finder_service_client::FinderServiceClient;
+use rmail_proto::v1::hook_service_client::HookServiceClient;
 use rmail_proto::v1::index_service_client::IndexServiceClient;
 use rmail_proto::v1::mail_service_client::MailServiceClient;
+use rmail_proto::v1::notification_service_client::NotificationServiceClient;
 use rmail_proto::v1::rule_service_client::RuleServiceClient;
 use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::send_scheduler_service_client::SendSchedulerServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
 use rmail_proto::v1::tag_service_client::TagServiceClient;
+use rmail_proto::v1::webhook_service_client::WebhookServiceClient;
 use rmail_proto::v1::{
     analyze_event, ask_chunk, bulk_tag_request, draft_reply_event, target, AddTagRequest,
-    AiProviderKind, AnalyzeMessageRequest, AskRequest, AuditEntry, AuditFilter, AuthStatusRequest,
-    AutoconfigureRequest, BacktestRuleRequest, BeginOAuthRequest, BudgetCaps, BudgetClass,
-    BudgetWindowCaps, BulkTagRequest, CallStatus, CancelRequest, ClearPasswordRequest,
+    AiProviderKind, Alert, AnalyzeMessageRequest, AskRequest, AuditEntry, AuditFilter,
+    AuthStatusRequest, AutoconfigureRequest, BacktestRuleRequest, BeginOAuthRequest, BudgetCaps,
+    BudgetClass, BudgetWindowCaps, BulkTagRequest, CallStatus, CancelRequest, ClearPasswordRequest,
     CompleteOAuthRequest, ConfirmInjectionRequest, CopyRequest, CreateAccountRequest,
     CreateFollowupRequest, CreateRuleRequest, CreateTagRequest, CredentialRef,
     DeleteAccountRequest, DeleteDraftRequest, DeleteRequest, DraftNudgeRequest, DraftReplyRequest,
     EvaluateRulesRequest, EventKind, ExplainRequest, ExportLedgerRequest, FindRequest,
-    FinderRebuildRequest, FinderStatusRequest, GetAccountRequest, GetAiProviderRequest,
-    GetDraftRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest, GetUsageRequest,
-    IdRequest, IndexGcRequest, IndexProgress, IndexStatusRequest, ListAccountsRequest,
-    ListDraftRevisionsRequest, ListDraftsRequest, ListEntitiesRequest, ListFollowupsRequest,
-    ListMessagesRequest, ListOutboxRequest, ListRulesRequest, ListTagRulesRequest, ListTagsRequest,
-    ListTokensRequest, ListWaitingOnRequest, MintTokenRequest, MoveRequest, PauseRequest,
+    FinderRebuildRequest, FinderStatusRequest, ForwardMessageRequest, GetAccountRequest,
+    GetAiProviderRequest, GetDraftRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest,
+    GetUsageRequest, IdRequest, IndexGcRequest, IndexProgress, IndexStatusRequest,
+    ListAccountsRequest, ListDeliveriesRequest, ListDraftRevisionsRequest, ListDraftsRequest,
+    ListEntitiesRequest, ListFollowupsRequest, ListHooksRequest, ListMessagesRequest,
+    ListOutboxRequest, ListRulesRequest, ListTagRulesRequest, ListTagsRequest, ListTokensRequest,
+    ListWaitingOnRequest, ListWebhooksRequest, MintTokenRequest, MoveRequest, PauseRequest,
     PreflightCheckRequest, QueryAiCallsRequest, RebuildRequest, RecordCorrectionRequest,
-    RefreshTokenRequest, ReindexMode, ReindexRequest, RemoveTagRequest, RenderDraftRequest,
-    RescheduleRequest, ResolveSuggestionRequest, ResumeRequest, RetryFailedRequest,
-    RevokeTokenRequest, RewriteDraftRequest, ScanInjectionRequest, ScheduleSendRequest,
+    RefreshTokenRequest, RegisterWebhookRequest, ReindexMode, ReindexRequest, RemoveTagRequest,
+    RemoveWebhookRequest, RenderDraftRequest, ReplayDeliveryRequest, RescheduleRequest,
+    ResolveSuggestionRequest, ResumeRequest, RetryFailedRequest, RevokeTokenRequest,
+    RewriteDraftRequest, ScanInjectionRequest, ScheduleSendRequest, ScoreMessageRequest,
     SearchRequest, SelectDraftRevisionRequest, SetAiProviderRequest, SetBudgetRequest,
     SetFlagsRequest, SetIndexPausedRequest, SetPausedRequest, SetTagRuleRequest,
-    SuggestReplyRequest, SuggestSendTimeRequest, SuggestTagsRequest, SyncFolderRequest, SyncMode,
-    SyncStatusRequest, SynthesizeRuleRequest, TagRuleMode, TagSuggestion, TagSyncMode, Target,
-    TestConnectionRequest, UpdateBodyRequest, UpdateDraftRequest, VerifyIndexRequest,
-    WatchEventsRequest,
+    SetWebhookEnabledRequest, StreamAlertsRequest, SuggestReplyRequest, SuggestSendTimeRequest,
+    SuggestTagsRequest, SyncFolderRequest, SyncMode, SyncStatusRequest, SynthesizeRuleRequest,
+    TagRuleMode, TagSuggestion, TagSyncMode, Target, TestConnectionRequest, TestHookRequest,
+    UpdateBodyRequest, UpdateDraftRequest, VerifyIndexRequest, WatchEventsRequest,
+    WebhookSecretSource, WebhookTemplate,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
@@ -99,6 +105,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 type Conn = crate::client::Client;
 
 use super::commands;
+use super::config_block::{ConfigBlock, ReadOnlyReason};
 use super::history;
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
@@ -179,6 +186,9 @@ pub struct GrpcExec {
     safety: AiSafetyServiceClient<Conn>,
     audit: AuditServiceClient<Conn>,
     admin: AdminServiceClient<Conn>,
+    webhooks: WebhookServiceClient<Conn>,
+    hooks: HookServiceClient<Conn>,
+    notify: NotificationServiceClient<Conn>,
     tags: TagServiceClient<Conn>,
     rules: RuleServiceClient<Conn>,
     /// The task feeding the search overlay, so the next keystroke can abort
@@ -282,6 +292,9 @@ impl GrpcExec {
             safety: AiSafetyServiceClient::new(channel.clone()),
             audit: AuditServiceClient::new(channel.clone()),
             admin: AdminServiceClient::new(channel.clone()),
+            webhooks: WebhookServiceClient::new(channel.clone()),
+            hooks: HookServiceClient::new(channel.clone()),
+            notify: NotificationServiceClient::new(channel.clone()),
             tags: TagServiceClient::new(channel.clone()),
             rules: RuleServiceClient::new(channel),
             searching: Mutex::new(None),
@@ -1202,6 +1215,213 @@ impl CmdExec for GrpcExec {
                 });
             }
 
+            // -- automation and notifications (task 98) -----------------------
+            Cmd::WebhookList {
+                generation,
+                reveal_url,
+            } => {
+                let mut client = self.webhooks.clone();
+                self.report(generation, out, async move {
+                    call(client.list(ListWebhooksRequest { reveal_url }))
+                        .await
+                        .map(|r| wire::destination_rows(&r.into_inner().destinations))
+                });
+            }
+            Cmd::WebhookAdd {
+                generation,
+                name,
+                url,
+                template,
+                events,
+                include_body,
+                disabled,
+                secret,
+                max_attempts,
+            } => {
+                let mut client = self.webhooks.clone();
+                // A report rather than a fact: `Register` echoes the destination
+                // back, and what it echoes is the answer — the URL as stored,
+                // the events actually subscribed to, whether it is entitled to
+                // bodies. A one-line "registered" would hide all of it.
+                self.report(generation, out, async move {
+                    let (secret_source, secret_reference) = webhook_secret(secret.as_ref());
+                    let request = RegisterWebhookRequest {
+                        name,
+                        url,
+                        template: match template {
+                            commands::automation::Template::Generic => WebhookTemplate::Generic,
+                            commands::automation::Template::Slack => WebhookTemplate::Slack,
+                        } as i32,
+                        events: events
+                            .iter()
+                            .filter_map(|name| wire::webhook_event(name))
+                            .map(|event| event as i32)
+                            .collect(),
+                        include_body,
+                        disabled,
+                        secret_source: secret_source as i32,
+                        secret_reference,
+                        max_attempts: max_attempts.unwrap_or(0),
+                    };
+                    call(client.register(request)).await.map(|r| {
+                        r.into_inner()
+                            .destination
+                            .as_ref()
+                            .map_or_else(Vec::new, |destination| {
+                                vec![wire::destination_row(destination)]
+                            })
+                    })
+                });
+            }
+            Cmd::WebhookRemove { name } => {
+                let mut client = self.webhooks.clone();
+                let label = name.clone();
+                self.spawn(out, async move {
+                    match call(client.remove(RemoveWebhookRequest { name })).await {
+                        // Removal is idempotent rather than an error, so the
+                        // answer distinguishes "gone now" from "was not there" —
+                        // a script converging on "gone" wants both to succeed,
+                        // and a person wants to know which happened.
+                        Ok(response) => Msg::Done {
+                            label: if response.into_inner().removed {
+                                format!("{label} removed, with its delivery history")
+                            } else {
+                                format!("no destination named {label}")
+                            },
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "webhook rm".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::WebhookEnabled {
+                generation,
+                name,
+                enabled,
+            } => {
+                let mut client = self.webhooks.clone();
+                self.report(generation, out, async move {
+                    call(client.set_enabled(SetWebhookEnabledRequest { name, enabled }))
+                        .await
+                        .map(|r| {
+                            r.into_inner()
+                                .destination
+                                .as_ref()
+                                .map_or_else(Vec::new, |destination| {
+                                    vec![wire::destination_row(destination)]
+                                })
+                        })
+                });
+            }
+            Cmd::WebhookDeliveries {
+                generation,
+                destination,
+                limit,
+                show_payload,
+            } => {
+                let mut client = self.webhooks.clone();
+                self.report(generation, out, async move {
+                    call(client.list_deliveries(ListDeliveriesRequest {
+                        destination: destination.unwrap_or_default(),
+                        limit: limit.unwrap_or(0),
+                        include_payload: show_payload,
+                    }))
+                    .await
+                    .map(|r| wire::delivery_rows(&r.into_inner().deliveries))
+                });
+            }
+            Cmd::WebhookReplay {
+                generation,
+                delivery_id,
+            } => {
+                let mut client = self.webhooks.clone();
+                self.report(generation, out, async move {
+                    call(client.replay_delivery(ReplayDeliveryRequest { delivery_id }))
+                        .await
+                        .map(|r| {
+                            r.into_inner()
+                                .delivery
+                                .as_ref()
+                                .map_or_else(Vec::new, |delivery| {
+                                    vec![wire::delivery_row(delivery)]
+                                })
+                        })
+                });
+            }
+            Cmd::Forward {
+                generation,
+                message_id,
+                destination,
+            } => {
+                let mut client = self.webhooks.clone();
+                let reporter = out.clone();
+                self.report(generation, out, async move {
+                    let response = call(client.forward(ForwardMessageRequest {
+                        message_id,
+                        destination,
+                    }))
+                    .await?
+                    .into_inner();
+                    // The status line says "queued", never "sent", and says so
+                    // louder when no dispatcher is running — see
+                    // `wire::forwarded`. Sent alongside the report because the
+                    // row shows the queue entry and the line shows what that
+                    // means.
+                    let _ = reporter.send(Msg::Done {
+                        label: wire::forwarded(&response),
+                        result: Ok(Effect::None),
+                    });
+                    Ok(response
+                        .delivery
+                        .as_ref()
+                        .map_or_else(Vec::new, |delivery| vec![wire::delivery_row(delivery)]))
+                });
+            }
+            Cmd::HookList { generation } => {
+                let mut client = self.hooks.clone();
+                self.report(generation, out, async move {
+                    call(client.list_hooks(ListHooksRequest {}))
+                        .await
+                        .map(|r| wire::hook_rows(&r.into_inner()))
+                });
+            }
+            Cmd::HookTest {
+                generation,
+                name,
+                event_json,
+            } => {
+                let mut client = self.hooks.clone();
+                self.report(generation, out, async move {
+                    call(client.test_hook(TestHookRequest { name, event_json }))
+                        .await
+                        .map(|r| wire::hook_test_rows(&r.into_inner()))
+                });
+            }
+            Cmd::NotifyAlerts {
+                generation,
+                since_id,
+            } => {
+                let mut client = self.notify.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    stream_alerts(client.stream_alerts(StreamAlertsRequest { since_id }), sink)
+                        .await;
+                });
+            }
+            Cmd::NotifyScore {
+                generation,
+                message_id,
+            } => {
+                let mut client = self.notify.clone();
+                self.report(generation, out, async move {
+                    call(client.score_message(ScoreMessageRequest { message_id }))
+                        .await
+                        .map(|r| wire::score_rows(&r.into_inner()))
+                });
+            }
+
             // -- accounts and tokens (task 97) --------------------------------
             Cmd::AccountList { generation, open } => {
                 let mut client = self.accounts.clone();
@@ -1244,7 +1464,16 @@ impl CmdExec for GrpcExec {
                     // that only ever existed inside a rendered row could not be
                     // opened at all.
                     if !response.toml.is_empty() {
-                        let _ = reporter.send(Msg::AccountToml(response.toml.clone()));
+                        let _ = reporter.send(Msg::Block(Box::new(ConfigBlock::new(
+                            "the [[accounts]] block",
+                            response.toml.clone(),
+                            rmail_core::config_path_from_env(),
+                            // Accounts are the one block with a wire alternative,
+                            // and the row says so rather than leaving a reader to
+                            // guess that `:account new` exists.
+                            ReadOnlyReason::AlsoOverTheWire("account new"),
+                            "rmaild picks it up on its next restart",
+                        ))));
                     }
                     Ok(wire::autoconfigure_rows(&email, &response))
                 });
@@ -2676,6 +2905,49 @@ fn new_account(name: String, settings: &[(String, String)]) -> CreateAccountRequ
         smtp_server: text("smtp-server"),
         smtp_port: port("smtp-port"),
         credential: credential.as_ref().map(credential_ref),
+    }
+}
+
+/// Drain a `StreamAlerts` stream into a Report.
+///
+/// Appends, like `SuggestTags`: each alert is sent once, and unlike every other
+/// streaming report here this one has no end — it is the live tail. So it never
+/// completes: the border keeps saying it is listening, which is the truth, and
+/// `Esc` is what stops it (through the `reporting` slot, like every other
+/// stream).
+///
+/// A stream that *does* end has been ended by the daemon, and that is reported as
+/// a failure rather than as completion — a live feed that silently stopped would
+/// leave somebody watching a pane that can no longer tell them anything.
+async fn stream_alerts<S>(request: S, sink: ReportSink)
+where
+    S: Future<Output = Result<tonic::Response<tonic::Streaming<Alert>>, tonic::Status>>,
+{
+    let mut stream = match request.await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    loop {
+        match stream.next().await {
+            Some(Ok(alert)) => sink.append(vec![wire::alert_row(&alert)], false),
+            Some(Err(status)) => return sink.failed(status.message().to_owned()),
+            None => return sink.failed("the daemon closed the alert stream".to_owned()),
+        }
+    }
+}
+
+/// A webhook's signing-key source and reference on the wire — a reference, never
+/// the key.
+fn webhook_secret(secret: Option<&commands::automation::Secret>) -> (WebhookSecretSource, String) {
+    match secret {
+        None => (WebhookSecretSource::Unspecified, String::new()),
+        Some(commands::automation::Secret::Env(value)) => (WebhookSecretSource::Env, value.clone()),
+        Some(commands::automation::Secret::Command(value)) => {
+            (WebhookSecretSource::Command, value.clone())
+        }
+        Some(commands::automation::Secret::Keychain(value)) => {
+            (WebhookSecretSource::Keychain, value.clone())
+        }
     }
 }
 

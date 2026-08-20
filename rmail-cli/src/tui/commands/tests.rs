@@ -120,11 +120,22 @@ fn issued(cmds: &[Cmd]) -> Vec<Cmd> {
 /// A verb that requires an argument does not parse without one, and these tests
 /// are about what a verb *answers*, not about the parser — which
 /// `command::tests` already covers.
+///
+/// An id-shaped positional gets a *number*, not its own name. Every id-taking
+/// verb here parses its argument and refuses what is not a number, so a
+/// placeholder of `"delivery_id"` made those verbs answer `Refused` in every
+/// sweep below — which quietly excluded them from what the sweeps claim to
+/// cover. `account rm`'s confirmation went unasserted that way until task 98
+/// noticed.
 fn with_arguments(verb: &rmail_core::command::Verb) -> String {
     let mut line = verb.canonical();
     for positional in verb.positionals {
         line.push(' ');
-        line.push_str(positional.name);
+        if positional.name == "id" || positional.name.ends_with("_id") {
+            line.push('1');
+        } else {
+            line.push_str(positional.name);
+        }
     }
     line
 }
@@ -203,6 +214,9 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
         "followup dismiss",
         "followup list",
         "followup new",
+        "forward",
+        "hook list",
+        "hook test",
         "index entities",
         "index gc",
         "index rebuild",
@@ -218,6 +232,8 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
         "rule list",
         "rule new",
         "rule run",
+        "notify list",
+        "notify score",
         "nudge",
         "outbox edit",
         "outbox reschedule",
@@ -244,6 +260,13 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
         "token list",
         "token revoke",
         "waiting",
+        "webhook add",
+        "webhook deliveries",
+        "webhook disable",
+        "webhook enable",
+        "webhook list",
+        "webhook replay",
+        "webhook rm",
     ]
     .iter()
     .map(|verb| (*verb).to_owned())
@@ -644,11 +667,11 @@ fn a_verb_this_build_has_no_answer_for_is_not_a_refusal() {
 }
 
 // ---------------------------------------------------------------------------
-// the one verb that asks
+// the few verbs that ask
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rebuild_is_the_only_verb_here_that_asks_when_typed() {
+fn only_the_verbs_that_cannot_be_undone_ask_when_typed() {
     let mut asks = Vec::new();
     for verb in command::children_of(&[]) {
         if verb.action.is_some() || verb.capability.is_none() {
@@ -663,12 +686,35 @@ fn rebuild_is_the_only_verb_here_that_asks_when_typed() {
             }
         }
     }
+    asks.sort();
     assert_eq!(
         asks,
-        ["index rebuild"],
-        "task 89 settled that a `:` line typed in full is already the \
-         deliberate act a confirmation asks for, so gating every mutating verb \
-         would make the question meaningless by asking it twenty times"
+        // What unites these five, and nothing else: each destroys something no
+        // later command can put back. `index rebuild` throws away an index that
+        // costs hours to build; `account rm` cascades to every message stored
+        // for the account; `webhook rm` deletes the record of what already left
+        // this machine; `draft delete` takes a draft and its revision history
+        // with it; `outbox send-now` spends the undo window that is the only
+        // thing standing between a scheduled send and an unrecallable one.
+        //
+        // Every other mutating verb here is either reversible or is itself the
+        // undo — and task 89 settled that a `:` line typed in full is already the
+        // deliberate act a confirmation asks for, so gating them all would make
+        // the question meaningless by asking it twenty times.
+        //
+        // Two of these (`draft delete`, `outbox send-now`) were being asserted
+        // by nobody until task 98 fixed `with_arguments`: their placeholder
+        // argument was not a number, so the sweep saw a refusal instead of the
+        // question. See that function.
+        [
+            "account rm",
+            "draft delete",
+            "index rebuild",
+            "outbox send-now",
+            "webhook rm",
+        ],
+        "the confirmation is a per-verb judgement about what cannot be undone, \
+         not a restatement of `effect().is_mutating()`"
     );
 }
 

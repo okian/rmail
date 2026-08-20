@@ -510,6 +510,179 @@ fn explicit() -> Vec<Verb> {
         required: false,
         rest: false,
     }];
+    /// A webhook destination's own name and where it POSTs to.
+    ///
+    /// Name first, unlike `mail webhook add <url> --name <name>`: inside this
+    /// grammar every other webhook verb addresses a destination by name in its
+    /// first positional, and `add` naming it there too is what makes `rm`,
+    /// `enable`, `disable` and `deliveries` read as one family. Optional for the
+    /// reason `DRAFT_ID` is — the `commands` arm refuses a missing one.
+    const NAME_AND_URL: &[Positional] = &[
+        Positional {
+            name: "name",
+            required: false,
+            rest: false,
+        },
+        Positional {
+            name: "url",
+            required: false,
+            rest: false,
+        },
+    ];
+    /// A webhook delivery's row id, as `:webhook deliveries` shows it.
+    const DELIVERY_ID: &[Positional] = &[Positional {
+        name: "delivery_id",
+        required: false,
+        rest: false,
+    }];
+    /// A message's row id, for a verb that will otherwise act on the one on
+    /// screen.
+    const MESSAGE_ID: &[Positional] = &[Positional {
+        name: "message_id",
+        required: false,
+        rest: false,
+    }];
+    /// The mail event a hook subscribes to — `on_new_message`, `on_label`,
+    /// `on_move`, `on_rule_match`, `on_sync_error`. Not enumerated here for the
+    /// reason `KIND` is not: the caller's own refusal names every one it knows,
+    /// and a copy of that list in the grammar goes stale the first time the
+    /// vocabulary grows.
+    const EVENT: &[Positional] = &[Positional {
+        name: "event",
+        required: false,
+        rest: false,
+    }];
+    /// `:webhook add`'s rendering, subscription, body entitlement, signing-key
+    /// *reference* and attempt cap. Named as `mail webhook add` names them.
+    const WEBHOOK_ADD_FLAGS: &[Flag] = &[
+        Flag {
+            name: "template",
+            takes_value: true,
+        },
+        Flag {
+            name: "events",
+            takes_value: true,
+        },
+        Flag {
+            name: "include-body",
+            takes_value: false,
+        },
+        Flag {
+            name: "disabled",
+            takes_value: false,
+        },
+        Flag {
+            name: "secret-env",
+            takes_value: true,
+        },
+        Flag {
+            name: "secret-command",
+            takes_value: true,
+        },
+        Flag {
+            name: "secret-keychain",
+            takes_value: true,
+        },
+        Flag {
+            name: "max-attempts",
+            takes_value: true,
+        },
+    ];
+    /// `:webhook list`'s one switch: show each destination's full URL rather
+    /// than its authority.
+    const REVEAL_FLAGS: &[Flag] = &[Flag {
+        name: "reveal-url",
+        takes_value: false,
+    }];
+    /// `:webhook deliveries`' filters.
+    const DELIVERIES_FLAGS: &[Flag] = &[
+        Flag {
+            name: "destination",
+            takes_value: true,
+        },
+        Flag {
+            name: "limit",
+            takes_value: true,
+        },
+        Flag {
+            name: "show-payload",
+            takes_value: false,
+        },
+    ];
+    /// `:forward`'s destination.
+    const FORWARD_FLAGS: &[Flag] = &[Flag {
+        name: "to",
+        takes_value: true,
+    }];
+    /// `:hook test`'s optional event payload.
+    const HOOK_TEST_FLAGS: &[Flag] = &[Flag {
+        name: "event-json",
+        takes_value: true,
+    }];
+    /// `:hook add`'s fields — the ones a `[[hooks.hooks]]` block carries.
+    const HOOK_ADD_FLAGS: &[Flag] = &[
+        Flag {
+            name: "name",
+            takes_value: true,
+        },
+        Flag {
+            name: "command",
+            takes_value: true,
+        },
+        Flag {
+            name: "arg",
+            takes_value: true,
+        },
+        Flag {
+            name: "timeout",
+            takes_value: true,
+        },
+        Flag {
+            name: "disabled",
+            takes_value: false,
+        },
+    ];
+    /// `:notify list`'s resume cursor.
+    const ALERTS_FLAGS: &[Flag] = &[Flag {
+        name: "since",
+        takes_value: true,
+    }];
+    /// `:notify set`'s fields — the ones a `[notify]` table carries.
+    ///
+    /// Each switch has its off spelling declared as well, because these render a
+    /// TOML block rather than sending a request: a flag that could only be turned
+    /// on could never write `include_subject = false`, and the block has to be
+    /// able to say what the config file will say.
+    const NOTIFY_SET_FLAGS: &[Flag] = &[
+        Flag {
+            name: "threshold",
+            takes_value: true,
+        },
+        Flag {
+            name: "enabled",
+            takes_value: false,
+        },
+        Flag {
+            name: "disabled",
+            takes_value: false,
+        },
+        Flag {
+            name: "subject",
+            takes_value: false,
+        },
+        Flag {
+            name: "no-subject",
+            takes_value: false,
+        },
+        Flag {
+            name: "reason",
+            takes_value: false,
+        },
+        Flag {
+            name: "no-reason",
+            takes_value: false,
+        },
+    ];
     /// The address `:account add` discovers settings for.
     const EMAIL: &[Positional] = &[Positional {
         name: "email",
@@ -1542,20 +1715,160 @@ fn explicit() -> Vec<Verb> {
             cli_alias: None,
             description: Some("Switch which account this session is looking at."),
         },
+        // -- automation and notifications (task 98) ---------------------------
         Verb {
-            path: vec!["account", "toml"],
+            path: vec!["webhook", "list"],
+            capability: Some(Capability::WebhookList),
+            action: None,
+            positionals: &[],
+            flags: REVEAL_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["webhook", "add"],
+            capability: Some(Capability::WebhookRegister),
+            action: None,
+            positionals: NAME_AND_URL,
+            flags: WEBHOOK_ADD_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["webhook", "rm"],
+            capability: Some(Capability::WebhookRemove),
+            action: None,
+            positionals: NAME,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["webhook", "enable"],
+            capability: Some(Capability::WebhookSetEnabled),
+            action: None,
+            positionals: NAME,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["webhook", "disable"],
+            capability: Some(Capability::WebhookSetEnabled),
+            action: None,
+            positionals: NAME,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["webhook", "deliveries"],
+            capability: Some(Capability::WebhookListDeliveries),
+            action: None,
+            positionals: &[],
+            flags: DELIVERIES_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["webhook", "replay"],
+            capability: Some(Capability::WebhookReplayDelivery),
+            action: None,
+            positionals: DELIVERY_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["forward"],
+            capability: Some(Capability::WebhookForward),
+            action: None,
+            positionals: MESSAGE_ID,
+            flags: FORWARD_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["hook", "list"],
+            capability: Some(Capability::HookListHooks),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["hook", "test"],
+            capability: Some(Capability::HookTestHook),
+            action: None,
+            positionals: NAME,
+            flags: HOOK_TEST_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["hook", "add"],
+            // Neither. `HookService` has no Create — hooks are config-driven,
+            // which its own proto docs give the reason for — so this renders the
+            // `[[hooks.hooks]]` block to paste rather than fabricating a write.
+            // `mail hook add` edits the file itself, which is right for a
+            // one-shot command and wrong for a session holding it open; see
+            // `tui::config_block`.
+            capability: None,
+            action: None,
+            positionals: EVENT,
+            flags: HOOK_ADD_FLAGS,
+            cli_alias: None,
+            description: Some("Render the [[hooks.hooks]] block for a new hook, to paste."),
+        },
+        Verb {
+            path: vec!["notify", "list"],
+            capability: Some(Capability::NotificationStreamAlerts),
+            action: None,
+            positionals: &[],
+            flags: ALERTS_FLAGS,
+            cli_alias: Some("notify watch"),
+            description: None,
+        },
+        Verb {
+            path: vec!["notify", "score"],
+            capability: Some(Capability::NotificationScoreMessage),
+            action: None,
+            positionals: MESSAGE_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["notify", "set"],
+            // Neither, for the reason `hook add` has neither: thresholds are
+            // `[notify]` in the master TOML and `NotificationService` has no
+            // SetThreshold, deliberately.
+            capability: None,
+            action: None,
+            positionals: &[],
+            flags: NOTIFY_SET_FLAGS,
+            cli_alias: None,
+            description: Some("Render the [notify] block for the settings given, to paste."),
+        },
+        Verb {
+            path: vec!["toml"],
             // Neither, for the reason `account use` has neither: opening the
-            // `[[accounts]]` block `:account add` last discovered is a client
-            // affordance over session state, not a capability, and it is a verb
-            // rather than a row-only gesture because a row's action *is* an
-            // `Invocation` — an affordance nobody could type would document
-            // nothing either.
+            // TOML block this session last produced is a client affordance over
+            // session state, not a capability, and it is a verb rather than a
+            // row-only gesture because a row's action *is* an `Invocation` — an
+            // affordance nobody could type would document nothing either.
+            //
+            // One verb for every producer of a block (`:account add`,
+            // `:hook add`, `:notify set`) rather than one each: they all produce
+            // the same thing, and three names for one idea is three things to
+            // learn about it.
             capability: None,
             action: None,
             positionals: &[],
             flags: &[],
             cli_alias: None,
-            description: Some("Open the [[accounts]] block the last `:account add` discovered."),
+            description: Some("Open the TOML block this session last produced, to copy it."),
         },
         Verb {
             path: vec!["token", "list"],

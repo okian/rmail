@@ -6,6 +6,8 @@
 //! `tui::model::tests` takes.
 #![allow(clippy::panic)]
 
+use std::path::PathBuf;
+
 use rmail_core::command::{self, Resolution};
 use rmail_core::keymap::Key;
 use rmail_proto::v1::{
@@ -14,6 +16,7 @@ use rmail_proto::v1::{
 };
 
 use super::*;
+use crate::tui::config_block::{ConfigBlock, ReadOnlyReason};
 use crate::tui::html::{self, CommandOpener};
 use crate::tui::model::{
     update, wire, Account, Folder, MessageRow, Model, Msg, Overlay, ReportEvent, Screen,
@@ -417,7 +420,7 @@ fn the_toml_row_carries_the_verb_that_opens_the_block() {
         .find(|row| row.cells.first().is_some_and(|cell| cell == "toml"))
         .expect("a toml row");
     let opened = toml.on_enter.clone().expect("it runs something");
-    assert_eq!(opened.verb, vec!["account", "toml"]);
+    assert_eq!(opened.verb, vec!["toml"]);
     assert!(
         opened.bang,
         "opening a file this process wrote is not a question"
@@ -436,17 +439,26 @@ fn the_block_outlives_the_report_it_was_shown_in() {
     );
     let why = {
         let mut fresh = loaded();
-        // Nothing discovered yet: the verb says how to discover something
-        // rather than doing nothing.
-        run(&mut fresh, "account toml");
+        // Nothing produced yet: the verb says what produces one rather than
+        // doing nothing.
+        run(&mut fresh, "toml");
         complaint(&fresh)
     };
     assert!(why.contains(":account add"), "{why}");
 
-    update(&mut model, Msg::AccountToml("[[accounts]]\n".to_owned()));
+    update(
+        &mut model,
+        Msg::Block(Box::new(ConfigBlock::new(
+            "the [[accounts]] block",
+            "[[accounts]]\n",
+            PathBuf::from("/tmp/config.toml"),
+            ReadOnlyReason::AlsoOverTheWire("account new"),
+            "rmaild picks it up on its next restart",
+        ))),
+    );
     update(&mut model, Msg::Key(Key::Esc));
     assert!(model.overlay.is_none());
-    let cmds = run(&mut model, "account toml");
+    let cmds = run(&mut model, "toml");
     assert_eq!(
         cmds,
         vec![Cmd::OpenText {

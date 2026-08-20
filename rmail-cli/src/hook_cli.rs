@@ -22,9 +22,11 @@
 //! array, so this is always syntactically legal regardless of what the rest
 //! of the file already contains — no existing key, table, comment, or
 //! formatting the operator wrote by hand is parsed, reordered, or rewritten.
-//! [`toml_string`] is this file's own minimal TOML basic-string escaper,
-//! not a dependency on `toml`/`toml_edit`: appending five or six scalar
-//! key/value pairs is the entire serialization surface this command needs.
+//! `rmail_core::config::toml_string` does the escaping, and is not a dependency
+//! on `toml`/`toml_edit`: appending five or six scalar key/value pairs is the
+//! entire serialization surface this command needs. It moved into `rmail-core`
+//! when the TUI needed to render the same block (task 98) — two copies of an
+//! escaper is two chances to disagree about what a quote does.
 //!
 //! The write itself is crash-safe (write to a process-unique sibling temp
 //! path, then rename into place) but **not** safe against two genuinely
@@ -43,6 +45,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
+use rmail_core::config::toml_string;
 use rmail_proto::v1::hook_service_client::HookServiceClient;
 use rmail_proto::v1::{HookEvent as ProtoHookEvent, ListHooksRequest, TestHookRequest};
 
@@ -266,29 +269,6 @@ fn add(
     );
     println!("restart rmaild for the new hook to take effect");
     Ok(())
-}
-
-/// Render `value` as a TOML basic-string literal — quoted, with the minimal
-/// escaping TOML's basic-string grammar requires. See the module docs for
-/// why this exists instead of a `toml`/`toml_edit` dependency.
-fn toml_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04x}", c as u32))
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 // ---------------------------------------------------------------------------

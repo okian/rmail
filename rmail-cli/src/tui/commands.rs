@@ -5,7 +5,7 @@
 //! Everything here is data: given a verb, the [`Cmd`] it issues, and — for a
 //! verb that answers with rows — the title and columns its Report opens with.
 //! Nothing in this module touches `Model`, opens an overlay or issues anything.
-//! `tui::model`'s `run_daemon_command` is the single place that does, so the
+//! `tui::model`'s `run_answered_command` is the single place that does, so the
 //! twenty-odd verbs below share one implementation of the confirmation gate,
 //! the generation stamp, the Report and the status line.
 //!
@@ -38,6 +38,7 @@
 
 pub mod account;
 pub mod ai_policy;
+pub mod automation;
 pub mod compose;
 pub mod daemon;
 pub mod rule;
@@ -49,6 +50,7 @@ mod tests;
 
 use rmail_core::command::Invocation;
 
+use super::config_block::ConfigBlock;
 use super::form::Field;
 use super::model::Cmd;
 use super::report::ReportColumn;
@@ -124,6 +126,13 @@ pub enum Answer {
     /// and one type carrying either would leave every reader of it asking which
     /// it was holding.
     Form(Box<FormRequest>),
+    /// A block of TOML for the operator to paste, and no request at all
+    /// (task 98).
+    ///
+    /// The verb reaches no capability — `:hook add` and `:notify set` both name
+    /// settings nothing writes over the wire — so there is nothing to issue and
+    /// nothing to wait for. See `tui::config_block`.
+    Block(Box<ConfigBlock>),
     /// The verb needs something the screen does not have — no account loaded,
     /// no message under the cursor. Carries what to say about it.
     ///
@@ -336,4 +345,5 @@ pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Opti
         .or_else(|| ai_policy::answer(invocation, target, generation))
         .or_else(|| account::answer(invocation, target, generation))
         .or_else(|| token::answer(invocation, target, generation))
+        .or_else(|| automation::answer(invocation, target, generation))
 }
