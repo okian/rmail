@@ -328,13 +328,78 @@ fn to_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
+        // Task 105's six. They were silently dropped before — `keys.toml` could
+        // not name them either, so a binding on `<home>` was unwritable rather
+        // than merely unbound, and pressing the key did nothing with no way to
+        // find out why.
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
         _ => return None,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    // `panic!` in a branch that cannot happen reads better here than the
+    // `unreachable!` dance, and this module is test-only — the same exemption
+    // `tui::model::tests` takes.
+    #![allow(clippy::panic)]
+
     use super::*;
+
+    /// Every key `keys.toml` can name, and the terminal event that produces it.
+    ///
+    /// The pairing is the point. A key the keymap can *name* but this function
+    /// drops is worse than one neither knows about: the binding is writable, the
+    /// file loads, the help screen lists it, and pressing the key does nothing —
+    /// which is exactly the state task 105 found the six cursor keys in.
+    const EVERY_KEY: &[(KeyCode, Key)] = &[
+        (KeyCode::Enter, Key::Enter),
+        (KeyCode::Esc, Key::Esc),
+        (KeyCode::Tab, Key::Tab),
+        (KeyCode::Backspace, Key::Backspace),
+        (KeyCode::Up, Key::Up),
+        (KeyCode::Down, Key::Down),
+        (KeyCode::Left, Key::Left),
+        (KeyCode::Right, Key::Right),
+        (KeyCode::Home, Key::Home),
+        (KeyCode::End, Key::End),
+        (KeyCode::PageUp, Key::PageUp),
+        (KeyCode::PageDown, Key::PageDown),
+    ];
+
+    #[test]
+    fn every_named_key_survives_the_trip_from_the_terminal() {
+        for (code, key) in EVERY_KEY {
+            assert_eq!(
+                to_key(*code, KeyModifiers::NONE),
+                Some(*key),
+                "{code:?} did not reach the model"
+            );
+            // And what it reaches round-trips through the notation the keymap
+            // writes, so a binding on it can actually be written down.
+            let text = key.to_string();
+            let chord = rmail_core::keymap::Chord::parse(&text)
+                .unwrap_or_else(|error| panic!("{text} is not a chord: {error}"));
+            assert_eq!(chord.keys(), [*key], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_key_this_build_has_no_name_for_is_dropped_rather_than_guessed() {
+        // The closed-set property this function exists for: the model's key
+        // handling is a set it can be tested exhaustively against, so an
+        // unmapped key stops here rather than arriving as something else.
+        assert_eq!(to_key(KeyCode::F(5), KeyModifiers::NONE), None);
+        assert_eq!(to_key(KeyCode::Insert, KeyModifiers::NONE), None);
+        // Control plus anything but a character is dropped too, for the same
+        // reason: `<c-home>` is not a chord this grammar can write.
+        assert_eq!(to_key(KeyCode::Home, KeyModifiers::CONTROL), None);
+    }
 
     #[test]
     fn a_recognized_theme_name_is_applied() {

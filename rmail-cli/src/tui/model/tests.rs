@@ -4198,3 +4198,185 @@ fn push_toast_never_evicts_the_undo_toast() {
         "a flood of other toasts must not evict an active undo offer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the leader map and the shadow lint (task 105)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_leader_chord_runs_the_verb_its_action_names() {
+    // The key and the typed line are one code path: `<space>tl` and `:tag list`
+    // both end in the same command, so a key cannot do something the line could
+    // not — and the leader map needs no dispatch of its own.
+    let mut model = loaded();
+    let by_key = issued(&keys(&mut model, " tl"));
+
+    let mut typed = loaded();
+    command(&mut typed, "tag list");
+    let by_line = issued(&press(&mut typed, Key::Enter));
+
+    assert!(
+        matches!(by_key.first(), Some(Cmd::TagList { .. })),
+        "{by_key:?}"
+    );
+    // The generation differs (each is the first request of its own session), so
+    // the shape is what is compared.
+    assert_eq!(by_key.len(), by_line.len(), "{by_key:?} vs {by_line:?}");
+    assert!(matches!(by_line.first(), Some(Cmd::TagList { .. })));
+}
+
+#[test]
+fn every_leader_chord_reaches_something_or_says_why() {
+    // Over the whole map: a chord that reported "not a command this build has"
+    // would be a default binding failing, and a chord that silently did nothing
+    // would be worse. A refusal is a legitimate outcome — `:rule run` needs a
+    // selection — but it has to be a *reason*, not silence.
+    let leader: Vec<(String, Action)> = Keymap::defaults()
+        .layer(Mode::Normal)
+        .filter(|(chord, _)| chord.to_string().starts_with("<space>"))
+        .map(|(chord, action)| (chord.to_string(), action))
+        .collect();
+    assert!(!leader.is_empty());
+    for (chord, action) in leader {
+        let mut model = loaded();
+        // Start focused on the pane the action is *not* about, so a focus move is
+        // a real change rather than a no-op — otherwise `<space>gf` on a model
+        // already focused there would look identical to a dead binding.
+        model.focus = if action == Action::FocusMessages {
+            Focus::Folders
+        } else {
+            Focus::Messages
+        };
+        let before = format!("{model:?}");
+        let cmds = issued(&run_action_for_test(&mut model, action));
+        // The whole model, not just the status line: several of these change
+        // state and issue nothing (a focus move), and several issue a command and
+        // say nothing (a report opening).
+        assert!(
+            !cmds.is_empty() || format!("{model:?}") != before,
+            "{chord} ({}) did nothing at all",
+            action.id()
+        );
+        assert!(
+            !model.status.contains("not a command this build has"),
+            "{chord}: {}",
+            model.status
+        );
+    }
+}
+
+/// Run `action` the way a key press does.
+fn run_action_for_test(model: &mut Model, action: Action) -> Vec<Cmd> {
+    let keymap = Keymap::defaults();
+    let chords = keymap.chords_for(Mode::Normal, action);
+    let chord = chords.first().expect("the action is bound");
+    let mut out = Vec::new();
+    for key in chord.keys() {
+        out = update(model, Msg::Key(*key));
+    }
+    out
+}
+
+#[test]
+fn the_startup_lint_reports_a_keymap_whose_bindings_cannot_all_be_typed() {
+    // Task 91 built the check; task 105 runs it on every load, including the
+    // first — which is what makes it a startup lint with no startup path of its
+    // own. A cross-layer shadow is legal, cannot be refused at load time (the two
+    // bindings are in different modes, so neither `bind` sees the other), and
+    // leaves a chord nobody can ever type.
+    let mut model = loaded();
+    let mut keymap = Keymap::defaults();
+    keymap
+        .bind(Mode::Viewer, Chord::parse("g").unwrap(), Action::AiPanel)
+        .expect("`g` alone is legal in the viewer");
+    update(
+        &mut model,
+        Msg::Keymap {
+            result: Ok(keymap),
+            announce: true,
+        },
+    );
+    assert!(
+        model.status.contains("can never be typed"),
+        "{}",
+        model.status
+    );
+    assert!(model.status.contains(":keys check"), "{}", model.status);
+}
+
+#[test]
+fn a_clean_keymap_says_only_that_it_reloaded() {
+    // Or the warning would fire on every install and mean nothing.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Keymap {
+            result: Ok(Keymap::defaults()),
+            announce: true,
+        },
+    );
+    assert_eq!(model.status, "key bindings reloaded");
+}
+
+#[test]
+fn keys_check_lists_the_dead_bindings_and_the_ones_that_bury_them() {
+    let mut model = loaded();
+    let mut keymap = Keymap::defaults();
+    keymap
+        .bind(Mode::Viewer, Chord::parse("g").unwrap(), Action::AiPanel)
+        .expect("legal");
+    model.keymap = keymap;
+    let cmds = issued(&command_and_run(&mut model, "keys check"));
+    assert!(cmds.is_empty(), "it reaches no daemon: {cmds:?}");
+    let pane = open_pane(&model);
+    assert!(pane.complete, "the answer is in this process");
+    assert!(!pane.rows.is_empty());
+    let row = &pane.rows[0];
+    assert_eq!(row.cells[0], "viewer");
+    assert_eq!(row.cells[2], "g", "the binding that fires instead");
+    assert!(
+        pane.rows.iter().any(|row| row.cells[1] == "gg"),
+        "{:?}",
+        pane.rows
+    );
+    assert!(
+        model.status.contains("can never be typed"),
+        "{}",
+        model.status
+    );
+}
+
+#[test]
+fn keys_check_on_a_clean_keymap_says_so_rather_than_showing_an_empty_table() {
+    let mut model = loaded();
+    command_and_run(&mut model, "keys check");
+    let pane = open_pane(&model);
+    assert!(pane.rows.is_empty());
+    assert!(
+        model.status.contains("every binding can be typed"),
+        "{}",
+        model.status
+    );
+}
+
+/// Type `line` on the `:` command line and submit it.
+fn command_and_run(model: &mut Model, line: &str) -> Vec<Cmd> {
+    command(model, line);
+    press(model, Key::Enter)
+}
+
+/// The report that is up.
+fn open_pane(model: &Model) -> &crate::tui::report::ReportPane {
+    match model.overlay.as_ref() {
+        Some(Overlay::Report(pane)) => pane,
+        other => panic!("expected a report, found {other:?}"),
+    }
+}
+
+/// The commands that are not the history write every dispatch appends.
+fn issued(cmds: &[Cmd]) -> Vec<Cmd> {
+    cmds.iter()
+        .filter(|cmd| !matches!(cmd, Cmd::SaveHistory { .. }))
+        .cloned()
+        .collect()
+}

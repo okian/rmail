@@ -2974,8 +2974,30 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                     // "live" stops being true the moment the overlay that
                     // shows it is actually open.
                     reload_help(model);
-                    if announce {
-                        model.info("key bindings reloaded");
+                    // The lint task 91 built the check for, run on every load
+                    // including the first — which is what makes it a *startup*
+                    // lint without a startup path of its own. A binding that
+                    // shadows a longer one in a farther layer is legal, cannot
+                    // be refused at load time (the two are in different modes,
+                    // so neither `bind` sees the other), and leaves a chord
+                    // nobody can ever type. Saying so beats letting somebody
+                    // conclude their `keys.toml` is broken.
+                    //
+                    // The status line rather than stdout: this process's stdout
+                    // *is* the alternate screen, so a `println!` would be
+                    // written into cells ratatui does not know it wrote and
+                    // would sit there for the session. `:keys check` is the
+                    // detail the line points at.
+                    let shadowed = model.keymap.shadowed_across_layers();
+                    if shadowed.is_empty() {
+                        if announce {
+                            model.info("key bindings reloaded");
+                        }
+                    } else {
+                        model.fail(format!(
+                            "{} binding(s) can never be typed — :keys check lists them",
+                            shadowed.len()
+                        ));
                     }
                 }
                 // The bindings already loaded keep working: a typo saved
@@ -3721,6 +3743,24 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
         Action::Help => open_help(model),
         Action::HelpRebind => open_help_rebind(model),
         Action::SettingsOpen => open_settings(model, None),
+        Action::KeysCheck => run_verb(model, "keys check"),
+        // Task 105's leader map. Each runs the verb its own id names, through
+        // `run_verb` — so a key and the typed line are one code path, and the
+        // key cannot do anything the line could not.
+        Action::TagList => run_verb(model, "tag list"),
+        Action::TagSuggest => run_verb(model, "tag suggest"),
+        Action::RuleList => run_verb(model, "rule list"),
+        Action::RuleRun => run_verb(model, "rule run"),
+        Action::SyncStatus => run_verb(model, "sync status"),
+        Action::IndexStatus => run_verb(model, "index status"),
+        Action::AiStatus => run_verb(model, "ai status"),
+        Action::AttachList => run_verb(model, "attach list"),
+        Action::LinksList => run_verb(model, "links"),
+        Action::NoteList => run_verb(model, "note list"),
+        Action::NoteWatch => run_verb(model, "note watch"),
+        Action::WebhookList => run_verb(model, "webhook list"),
+        Action::HookList => run_verb(model, "hook list"),
+        Action::SavedList => run_verb(model, "saved list"),
         Action::ManualOpen => open_manual(model),
         Action::ManualBack => manual_jump(model, Jump::Back),
         Action::ManualForward => manual_jump(model, Jump::Forward),
@@ -5552,6 +5592,44 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         };
         return use_account(model, id);
     }
+    if verb == "keys check" {
+        // Hand-written next to `:keys set` and for the same reason: it reads the
+        // keymap in this process and reaches no capability. Every hit is a
+        // binding somebody wrote that the keyboard can never deliver, which is a
+        // fact about a local file and nothing a daemon knows.
+        let shadowed = model.keymap.shadowed_across_layers();
+        let generation = model.generation + 1;
+        model.generation = generation;
+        close_command(model);
+        let rows: Vec<ReportRow> = shadowed
+            .iter()
+            .map(|(mode, dead, killer)| {
+                ReportRow::new([mode.id().to_owned(), dead.to_string(), killer.to_string()])
+                    .toned(report::ReportTone::Bad)
+            })
+            .collect();
+        let found = rows.len();
+        let mut pane = ReportPane::new(
+            invocation,
+            "keys check — bindings the keyboard can never deliver",
+            vec![
+                ReportColumn::new("mode", 12),
+                ReportColumn::new("never fires", 16),
+                ReportColumn::new("because this does", 16),
+            ],
+            generation,
+        );
+        // Complete on arrival: the answer is in this process, so a border
+        // reading "asking…" would describe a request that was never made.
+        pane.apply(generation, ReportFill::Replace, rows, true);
+        model.overlay = Some(Overlay::Report(Box::new(pane)));
+        model.info(match found {
+            0 => "every binding can be typed".to_owned(),
+            1 => "1 binding can never be typed — unbind the shorter one".to_owned(),
+            n => format!("{n} bindings can never be typed — unbind the shorter ones"),
+        });
+        return Vec::new();
+    }
     if verb == "settings" {
         // Hand-written for the reason `manual grep` is: the section is not
         // something an `Action` can carry. Left open on a name this build does
@@ -5722,7 +5800,26 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
     // `outbox reschedule --at`, `waiting --overdue`…), and `commands::answer` is
     // what reads them — the same way `keys set`'s hand-written `--mode` is read
     // above.
-    if invocation.action.is_none() {
+    // Who implements this verb: the answer table, or an `Action`.
+    //
+    // Asked of the table directly rather than inferred from the invocation.
+    // Neither proxy works. "It has no action" was true until task 105's leader
+    // map gave thirteen table verbs an action as well — the verb is the
+    // capability's surface and the action is only the key that reaches it — and
+    // routing on that would send `:tag list` to `run_action`, whose arm runs
+    // `:tag list`, forever. "It has a capability" is false the other way:
+    // `Action::Delete`'s auto-derived `:message delete` carries `MailDelete`
+    // through `Capability::for_action`, and the table has no arm for it.
+    //
+    // `commands::answer` is pure — no overlay, no request, no `Model` — so
+    // asking it here and again inside cannot drift, and it is the only thing that
+    // actually knows.
+    //
+    // Before the generic flag check below, for the reason it always was: these
+    // verbs declare flags of their own and `commands::answer` is what reads them.
+    if invocation.action.is_none()
+        || commands::answer(&invocation, &target_of(model), model.generation + 1).is_some()
+    {
         return run_answered_command(model, invocation);
     }
     if let Some(flag) = invocation.flags.first() {
@@ -6522,6 +6619,31 @@ fn report_summary(pane: &ReportPane) -> String {
         0 => format!("{verb} — nothing to report"),
         1 => format!("{verb} — 1 row · r re-runs"),
         n => format!("{verb} — {n} rows · r re-runs"),
+    }
+}
+
+/// Run a `:` line, as though it had been typed.
+///
+/// What a key bound to a domain action does — task 105's leader map is a page of
+/// them — and the reason it goes through [`run_invocation`] rather than reaching
+/// the answer table directly: the range check, the argument guard, the
+/// hand-written cases and the confirmation gate are all there, and a key that
+/// skipped them would be a key that could do something no typed line can.
+///
+/// A line that does not parse is a bug in a *default binding*, not in anything a
+/// user did, so it is reported rather than unwrapped — this client must not panic
+/// with a terminal in raw mode. `keymap::tests::every_action_runs_a_line_that_parses`
+/// is what keeps it unreachable.
+fn run_verb(model: &mut Model, line: &str) -> Vec<Cmd> {
+    match command::parse(line) {
+        Ok(command::Resolution::Invocation(invocation)) => {
+            close_command(model);
+            run_invocation(model, *invocation)
+        }
+        _ => {
+            model.fail(format!("{line} is not a command this build has"));
+            Vec::new()
+        }
     }
 }
 

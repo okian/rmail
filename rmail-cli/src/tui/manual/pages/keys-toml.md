@@ -119,3 +119,29 @@ The file is re-read once a second and compared by content, not by
 modification time — mtime has one-second granularity on real filesystems, so
 two edits within the same second are invisible to it, and two edits in a row
 is exactly what trying a binding looks like.
+
+## Bindings that can never be typed
+
+There is no timeout here. An exact match fires immediately, so `g` bound in one
+mode makes `gg` in that same mode untypeable — and that case is refused outright,
+when the file loads or when `:keys set` writes it.
+
+The case that *cannot* be refused is across layers. `Viewer` inherits `Normal`,
+so a `g` bound in the viewer buries `Normal`'s `gg` there and nowhere else:
+neither binding is illegal, neither mode can see the other's, and the result is a
+chord you can write, save and never fire.
+
+{{cmd:keys check}} lists them: the mode you meet it in, the binding that never
+fires, and the one that fires instead. It also runs on every load — including the
+first — and the status line says how many it found, because a chord that silently
+does nothing reads as a broken client rather than a shadowed binding.
+
+The fix is always the same: unbind the shorter one, or move it.
+
+## The new key names
+
+`<left>`, `<right>`, `<home>`, `<end>`, `<pageup>` and `<pagedown>` are bindable.
+They were not before — the terminal's own key events for them were dropped before
+they reached the keymap at all, so a binding on `<home>` was not merely unbound,
+it was unwritable. `<pgup>`, `<pgdown>` and `<pgdn>` are accepted as aliases,
+because somebody who writes vim's spelling means the same key.

@@ -12,6 +12,7 @@ no files on disk, so it still works on the day the daemon will not start.
 
 - [[tour]]
 - [[typing]]
+- [[leader]]
 - [[daemon]]
 - [[offline]]
 - [[manual]]

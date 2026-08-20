@@ -727,15 +727,37 @@ fn every_command_entry_names_a_verb_this_build_can_run() {
 
 #[test]
 fn a_verb_no_chord_reaches_is_still_offered_without_a_key_column() {
-    // `helpgrep` has no binding at all — it exists only in the grammar. The
-    // palette could not offer it, because its vocabulary was `Action::ALL`;
+    // The property, over the whole list rather than one example: a verb no
+    // `Action` backs has no chord to show, and is offered anyway. The palette
+    // could not offer these at all, because its vocabulary was `Action::ALL`;
     // this list's is the registry, which is strictly wider.
-    let entries = command_matches("helpgrep", &Keymap::defaults());
-    let found = entries
-        .iter()
-        .find(|entry| entry.verb == "helpgrep")
-        .expect("helpgrep is a verb");
-    assert!(found.chords.is_empty(), "{:?}", found.chords);
+    //
+    // `helpgrep` was the example until task 105 gave `manual.grep` a leader
+    // chord — which is the right outcome for that verb and the wrong example for
+    // this claim, since what the claim is about is verbs with no action.
+    let keymap = Keymap::defaults();
+    let entries = command_matches("", &keymap);
+    let mut without_an_action = 0_usize;
+    for entry in &entries {
+        let path: Vec<&str> = entry.verb.split(' ').collect();
+        let Some(verb) = command::verb_at(&path) else {
+            continue;
+        };
+        if verb.action.is_some() {
+            continue;
+        }
+        without_an_action += 1;
+        assert!(
+            entry.chords.is_empty(),
+            "{} has no action and yet shows {:?}",
+            entry.verb,
+            entry.chords
+        );
+    }
+    assert!(
+        without_an_action > 0,
+        "the registry has verbs no action backs, so this proved something"
+    );
 }
 
 // ---------------------------------------------------------------------------

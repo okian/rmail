@@ -165,7 +165,11 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
     // verb added to the table without a registry entry fails by name.
     let mut answered = BTreeSet::new();
     for verb in command::children_of(&[]) {
-        if verb.action.is_some() || verb.capability.is_none() {
+        // Capability, not "and no action": task 105's leader map gave thirteen of
+        // these verbs an action as well — the key that reaches them — and
+        // skipping those would have quietly dropped thirteen entries from what
+        // this sweep claims to cover.
+        if verb.capability.is_none() {
             continue;
         }
         // Asked with a placeholder argument per declared positional, because a
@@ -303,6 +307,22 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
         "stats ask",
         "stats response-time",
         "subs",
+        // -- task 105 --------------------------------------------------------
+        // Verbs that gained a leader-map action, and were therefore skipped by
+        // this sweep until its filter was fixed.
+        "ai status",
+        "hook list",
+        "index status",
+        "links",
+        "note list",
+        "note watch",
+        "rule list",
+        "rule run",
+        "saved list",
+        "sync status",
+        "tag list",
+        "tag suggest",
+        "webhook list",
     ]
     .iter()
     .map(|verb| (*verb).to_owned())

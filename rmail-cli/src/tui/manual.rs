@@ -651,10 +651,18 @@ pub const PAGES: &[Page] = &[
         documents: &[],
     },
     Page {
+        anchor: "leader",
+        title: "The leader map",
+        body: Body::Authored(include_str!("manual/pages/leader.md")),
+        // Every action in the map is documented where its domain is; this page
+        // is the vocabulary, not their home.
+        documents: &[],
+    },
+    Page {
         anchor: "keys-toml",
         title: "keys.toml",
         body: Body::Authored(include_str!("manual/pages/keys-toml.md")),
-        documents: &["help.rebind", "keys set"],
+        documents: &["help.rebind", "keys set", "keys check"],
     },
     Page {
         anchor: "config-file",

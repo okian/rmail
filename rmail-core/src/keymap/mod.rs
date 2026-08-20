@@ -104,6 +104,18 @@ pub enum Key {
     Up,
     /// Cursor down.
     Down,
+    /// Cursor left.
+    Left,
+    /// Cursor right.
+    Right,
+    /// Home.
+    Home,
+    /// End.
+    End,
+    /// Page up.
+    PageUp,
+    /// Page down.
+    PageDown,
 }
 
 impl Key {
@@ -141,6 +153,12 @@ impl fmt::Display for Key {
             Self::Backspace => f.write_str("<bs>"),
             Self::Up => f.write_str("<up>"),
             Self::Down => f.write_str("<down>"),
+            Self::Left => f.write_str("<left>"),
+            Self::Right => f.write_str("<right>"),
+            Self::Home => f.write_str("<home>"),
+            Self::End => f.write_str("<end>"),
+            Self::PageUp => f.write_str("<pageup>"),
+            Self::PageDown => f.write_str("<pagedown>"),
         }
     }
 }
@@ -271,6 +289,16 @@ fn named_key(name: &str) -> Option<Key> {
         "bs" | "backspace" => Key::Backspace,
         "up" => Key::Up,
         "down" => Key::Down,
+        "left" => Key::Left,
+        "right" => Key::Right,
+        "home" => Key::Home,
+        "end" => Key::End,
+        // vim's spellings as well as the plain ones: somebody who writes
+        // `<pageup>` and somebody who writes `<pgup>` mean the same key, and a
+        // grammar that took one and refused the other would be a grammar with a
+        // trap in it.
+        "pageup" | "pgup" => Key::PageUp,
+        "pagedown" | "pgdown" | "pgdn" => Key::PageDown,
         "space" => Key::Char(' '),
         "lt" => Key::Char('<'),
         _ => return None,
@@ -341,6 +369,25 @@ actions! {
     Help          => "help",                "this help";
     HelpRebind    => "help.rebind",         "rebind the highlighted key";
     SettingsOpen  => "settings",            "the settings screen: every switch this build has";
+    KeysCheck     => "keys.check",           "list bindings the keyboard can never deliver";
+    // Task 105's leader map. Each of these runs a `:` verb that takes no
+    // arguments and acts on what is on screen — which is what makes it bindable
+    // at all, and what the leader groups are made of. The verb is the surface;
+    // the action is the key that reaches it, and `parity` records both.
+    TagList       => "tag.list",             "every tag, and how many messages carry it";
+    TagSuggest    => "tag.suggest",          "what the model would tag this message";
+    RuleList      => "rule.list",            "the standing rules, and whether each is on";
+    RuleRun       => "rule.run",             "dry-run the rules over the selection";
+    SyncStatus    => "sync.status",           "what the fetcher is doing, per folder";
+    IndexStatus   => "index.status",          "what the indexer is doing";
+    AiStatus      => "ai.status",             "what the AI queue is doing";
+    AttachList    => "attach.list",           "what is attached to the open message";
+    LinksList     => "links",                 "the links in this message, classified";
+    NoteList      => "note.list",             "the notes on this message";
+    NoteWatch     => "note.watch",            "the notes on this message, live";
+    WebhookList   => "webhook.list",          "where mail leaves this machine";
+    HookList      => "hook.list",             "what runs here when mail arrives";
+    SavedList     => "saved.list",            "the searches you have stored";
     CommandOpen   => "command",             "the : command line: run any verb by name";
     ManualOpen    => "manual",              "the manual: guides, concepts and the generated reference";
     ManualBack    => "manual.back",         "back to the manual page you came from";
@@ -802,6 +849,71 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     // state and the switches behind it are the same subject.
     (Mode::Menu, "s", Action::SettingsOpen),
     (Mode::Normal, "gs", Action::SettingsOpen),
+    // -- the leader map (task 105) -------------------------------------------
+    //
+    // `<space>` opens a page of grouped commands, one letter per domain. Bound
+    // in `Normal` *only*, and that is not a shortfall: `Viewer` and `Visual`
+    // both chain through `Normal` ([`Mode::chain`]), so every chord here is
+    // live in all three — and binding it three times would be three copies free
+    // to drift apart in somebody's `keys.toml`.
+    //
+    // Every member is an existing action, and every action runs a `:` verb that
+    // takes no arguments and acts on what is on screen. That is what makes a
+    // domain bindable at all: a verb needing an address or a query has nothing a
+    // keystroke could supply, and belongs on the `:` line (or on the settings
+    // screen, which puts it there for you).
+    //
+    // The *labels* the band draws are derived, never written here: task 91's
+    // `common_id_prefix` names a group only when its members share a leading id
+    // segment, and says "N commands" when they do not. A group like `<space>d`
+    // spans three services on purpose and reads as a count for exactly that
+    // reason — inventing "daemon" for it is the hand-written group table the
+    // derivation exists to avoid.
+    //
+    // `<space>a` — AI.
+    (Mode::Normal, " ap", Action::AiPanel),
+    (Mode::Normal, " aq", Action::AiQuick),
+    (Mode::Normal, " as", Action::AiStatus),
+    // `<space>t` — tags.
+    (Mode::Normal, " tl", Action::TagList),
+    (Mode::Normal, " ts", Action::TagSuggest),
+    // `<space>r` — rules.
+    (Mode::Normal, " rl", Action::RuleList),
+    (Mode::Normal, " rr", Action::RuleRun),
+    // `<space>d` — the daemon's three subsystems.
+    (Mode::Normal, " ds", Action::SyncStatus),
+    (Mode::Normal, " di", Action::IndexStatus),
+    (Mode::Normal, " da", Action::AiStatus),
+    // `<space>c` — configuration.
+    (Mode::Normal, " cc", Action::SettingsOpen),
+    (Mode::Normal, " ck", Action::KeysCheck),
+    // `<space>s` — search and what is saved.
+    (Mode::Normal, " ss", Action::SearchOpen),
+    // Deliberately not `search.explain`: it toggles the why-panel over a
+    // *result*, so from the message list it is a key that does nothing where it
+    // is bound. It stays where it belongs, on `x` in `Mode::Menu`. The test that
+    // walks this map and refuses an inert member is what caught it.
+    (Mode::Normal, " sf", Action::FinderOpen),
+    (Mode::Normal, " sl", Action::SavedList),
+    // `<space>o` — the outbox.
+    (Mode::Normal, " oo", Action::OutboxOpen),
+    (Mode::Normal, " ou", Action::OutboxCancel),
+    // `<space>x` — what is inside a message.
+    (Mode::Normal, " xa", Action::AttachList),
+    (Mode::Normal, " xl", Action::LinksList),
+    // `<space>n` — notes.
+    (Mode::Normal, " nl", Action::NoteList),
+    (Mode::Normal, " nw", Action::NoteWatch),
+    // `<space>g` — going somewhere.
+    (Mode::Normal, " gf", Action::FocusFolders),
+    (Mode::Normal, " gm", Action::FocusMessages),
+    // `<space>w` — what leaves the machine, and what runs on it.
+    (Mode::Normal, " ww", Action::WebhookList),
+    (Mode::Normal, " wh", Action::HookList),
+    // `<space>h` — help.
+    (Mode::Normal, " hh", Action::Help),
+    (Mode::Normal, " hm", Action::ManualOpen),
+    (Mode::Normal, " hg", Action::ManualGrep),
 ];
 
 impl Default for Keymap {

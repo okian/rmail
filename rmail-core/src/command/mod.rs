@@ -1237,7 +1237,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["index", "status"],
             capability: Some(Capability::IndexStatus),
-            action: None,
+            action: Some(Action::IndexStatus),
             positionals: &[],
             flags: &[],
             cli_alias: None,
@@ -1348,7 +1348,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["sync", "status"],
             capability: Some(Capability::SyncStatus),
-            action: None,
+            action: Some(Action::SyncStatus),
             positionals: &[],
             flags: &[],
             cli_alias: None,
@@ -1357,7 +1357,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["ai", "status"],
             capability: Some(Capability::AiGetUsage),
-            action: None,
+            action: Some(Action::AiStatus),
             positionals: &[],
             flags: &[],
             cli_alias: None,
@@ -1447,7 +1447,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["tag", "list"],
             capability: Some(Capability::TagListTags),
-            action: None,
+            action: Some(Action::TagList),
             positionals: &[],
             flags: &[],
             cli_alias: Some("tags"),
@@ -1474,7 +1474,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["tag", "suggest"],
             capability: Some(Capability::TagSuggestTags),
-            action: None,
+            action: Some(Action::TagSuggest),
             positionals: &[],
             flags: &[],
             cli_alias: Some("suggest-tags"),
@@ -1519,7 +1519,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["rule", "list"],
             capability: Some(Capability::RuleListRules),
-            action: None,
+            action: Some(Action::RuleList),
             positionals: &[],
             flags: &[],
             cli_alias: None,
@@ -1546,7 +1546,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["rule", "run"],
             capability: Some(Capability::RuleEvaluateRules),
-            action: None,
+            action: Some(Action::RuleRun),
             positionals: &[],
             flags: RULE_NAME,
             cli_alias: None,
@@ -2144,7 +2144,7 @@ fn explicit() -> Vec<Verb> {
             // returned them — and a round trip to re-fetch what is on screen
             // would be a second source of truth for one listing.
             capability: None,
-            action: None,
+            action: Some(Action::AttachList),
             positionals: &[],
             flags: &[],
             cli_alias: None,
@@ -2261,7 +2261,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["links"],
             capability: Some(Capability::LinkExtractLinks),
-            action: None,
+            action: Some(Action::LinksList),
             positionals: MESSAGE_ID,
             flags: MODEL,
             cli_alias: None,
@@ -2279,7 +2279,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["note", "list"],
             capability: Some(Capability::NoteListNotes),
-            action: None,
+            action: Some(Action::NoteList),
             positionals: &[],
             flags: THREAD,
             cli_alias: Some("notes"),
@@ -2306,7 +2306,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["note", "watch"],
             capability: Some(Capability::NoteWatchNotes),
-            action: None,
+            action: Some(Action::NoteWatch),
             positionals: &[],
             flags: THREAD,
             cli_alias: None,
@@ -2315,7 +2315,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["saved", "list"],
             capability: Some(Capability::SavedSearchListSavedSearches),
-            action: None,
+            action: Some(Action::SavedList),
             positionals: &[],
             flags: &[],
             cli_alias: None,
@@ -2415,7 +2415,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["webhook", "list"],
             capability: Some(Capability::WebhookList),
-            action: None,
+            action: Some(Action::WebhookList),
             positionals: &[],
             flags: REVEAL_FLAGS,
             cli_alias: None,
@@ -2487,7 +2487,7 @@ fn explicit() -> Vec<Verb> {
         Verb {
             path: vec!["hook", "list"],
             capability: Some(Capability::HookListHooks),
-            action: None,
+            action: Some(Action::HookList),
             positionals: &[],
             flags: &[],
             cli_alias: None,

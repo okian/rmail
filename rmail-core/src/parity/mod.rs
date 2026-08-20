@@ -398,7 +398,7 @@ commands! {
         tool: "sync_status",
         effect: Read,
         cli: [],
-        actions: [],
+        actions: [SyncStatus],
         summary: "Report per-folder sync progress, strategy and last error.",
     }
     SyncPause {
@@ -738,7 +738,7 @@ commands! {
         tool: "list_saved_searches",
         effect: Read,
         cli: [],
-        actions: [],
+        actions: [SavedList],
         summary: "List the stored saved searches.",
     }
     SavedSearchDeleteSavedSearch {
@@ -927,7 +927,7 @@ commands! {
         tool: "index_status",
         effect: Read,
         cli: ["index status"],
-        actions: [],
+        actions: [IndexStatus],
         summary: "Per-stage index coverage, queue depth, embedding model and lag.",
     }
     IndexReindex {
@@ -1003,7 +1003,7 @@ commands! {
         tool: "list_tags",
         effect: Read,
         cli: ["tags"],
-        actions: [],
+        actions: [TagList],
         summary: "List an account's tags with their colors, hierarchy and message counts.",
     }
     TagCreateTag {
@@ -1038,7 +1038,7 @@ commands! {
         tool: "suggest_tags",
         effect: Mutate,
         cli: ["suggest-tags"],
-        actions: [],
+        actions: [TagSuggest],
         summary: "Classify a message against the tag taxonomy and stream its pending suggestions.",
     }
     TagResolveSuggestion {
@@ -1096,7 +1096,7 @@ commands! {
         tool: "list_notes",
         effect: Read,
         cli: ["notes"],
-        actions: [],
+        actions: [NoteList],
         summary: "List the notes on a message or thread, newest first.",
     }
     NoteWatchNotes {
@@ -1104,7 +1104,7 @@ commands! {
         tool: "watch_notes",
         effect: Read,
         cli: [],
-        actions: [],
+        actions: [NoteWatch],
         summary: "Stream note additions, edits and deletions as they happen.",
     }
 
@@ -1384,7 +1384,7 @@ commands! {
         tool: "get_ai_usage",
         effect: Read,
         cli: ["ai status", "ai cost"],
-        actions: [],
+        actions: [AiStatus],
         summary: "Queue depth, today's and this month's tokens and cost, headroom, pause state.",
     }
     AiSetPaused {
@@ -1515,7 +1515,7 @@ commands! {
         // `SearchService/Search` is on.
         effect: Read,
         cli: ["links"],
-        actions: [],
+        actions: [LinksList],
         summary: "Extract, deduplicate and rank a message's links, flagging targets that misrepresent themselves.",
     }
 
@@ -1575,7 +1575,7 @@ commands! {
         tool: "list_webhooks",
         effect: Read,
         cli: ["webhook list"],
-        actions: [],
+        actions: [WebhookList],
         summary: "List the registered outbound destinations (never their signing keys).",
     }
     WebhookRemove {
@@ -1671,7 +1671,7 @@ commands! {
         tool: "list_rules",
         effect: Read,
         cli: [],
-        actions: [],
+        actions: [RuleList],
         summary: "List the configured rules and their predicates and actions.",
     }
     RuleEvaluateRules {
@@ -1679,7 +1679,7 @@ commands! {
         tool: "run_rules_on_query",
         effect: Mutate,
         cli: [],
-        actions: [],
+        actions: [RuleRun],
         summary: "Run rules over the messages a query selects and fire their actions.",
     }
     // Both are `Mutate` despite acting on no mail, because `Effect`'s line is
@@ -1724,7 +1724,7 @@ commands! {
         tool: "list_hooks",
         effect: Read,
         cli: ["hook list"],
-        actions: [],
+        actions: [HookList],
         summary: "List the configured event hooks, enabled or not.",
     }
     HookTestHook {
@@ -2015,6 +2015,15 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     // claimed every switch's capability at once would make this table say
     // nothing about any of them.
     Action::SettingsOpen,
+    // Task 105's shadow lint. Local because the answer is in this process:
+    // `Keymap::shadowed_across_layers` walks the bindings the client holds, and
+    // a daemon knows nothing about the operator's `keys.toml`.
+    Action::KeysCheck,
+    // Task 105's leader-map key for `:attach list`, which is itself local: the
+    // open message's parts came back with the message, so listing them reaches
+    // nothing. Every other leader action names a capability and is declared on
+    // it.
+    Action::AttachList,
     Action::VisualToggle,
     Action::VisualSwapEnds,
     Action::OpenHtml,

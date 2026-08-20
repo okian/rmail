@@ -641,3 +641,237 @@ fn modes_name_themselves_the_way_keys_toml_spells_them() {
     assert!(!Mode::Prompt.allows_chords());
     assert!(Mode::Menu.takes_counts() && Mode::Menu.allows_chords());
 }
+
+// ---------------------------------------------------------------------------
+// the leader map, and the keys it needed (task 105)
+// ---------------------------------------------------------------------------
+
+/// Every default binding whose chord starts with `<space>`.
+fn leader_bindings() -> Vec<(Chord, Action)> {
+    let keymap = Keymap::defaults();
+    keymap
+        .layer(Mode::Normal)
+        .filter(|(chord, _)| chord.keys().first() == Some(&Key::Char(' ')))
+        .map(|(chord, action)| (chord.clone(), action))
+        .collect()
+}
+
+#[test]
+fn the_leader_map_covers_the_twelve_groups_the_vocabulary_names() {
+    // The group letters, read off the bindings rather than restated: a group
+    // added without a member, or a member bound under a letter nobody documented,
+    // fails here rather than being noticed by a reader.
+    let mut letters: Vec<char> = leader_bindings()
+        .iter()
+        .filter_map(|(chord, _)| match chord.keys().get(1) {
+            Some(Key::Char(c)) => Some(*c),
+            _ => None,
+        })
+        .collect();
+    letters.sort_unstable();
+    letters.dedup();
+    assert_eq!(
+        letters,
+        ['a', 'c', 'd', 'g', 'h', 'n', 'o', 'r', 's', 't', 'w', 'x'],
+        "the twelve groups"
+    );
+}
+
+#[test]
+fn every_leader_chord_is_three_keys_and_fires_on_its_last() {
+    // Three keys, so `<space>` is a page and each letter is a shelf on it — and
+    // nothing under a shelf is left waiting for a fourth key, which the engine
+    // has no timeout to wait with.
+    let keymap = Keymap::defaults();
+    let bindings = leader_bindings();
+    assert!(!bindings.is_empty());
+    for (chord, action) in bindings {
+        assert_eq!(
+            chord.keys().len(),
+            3,
+            "{chord} is not <space> + group + key"
+        );
+        let mut pending = Pending::default();
+        let resolutions = feed(&keymap, Mode::Normal, &mut pending, "");
+        assert!(resolutions.is_empty());
+        // Fed key by key: the first two must hold and the third must fire.
+        let keys = chord.keys().to_vec();
+        for (at, key) in keys.iter().enumerate() {
+            match keymap.resolve(Mode::Normal, &mut pending, *key) {
+                Resolution::Pending => assert!(at < 2, "{chord} fired late"),
+                Resolution::Run { action: ran, .. } => {
+                    assert_eq!(at, 2, "{chord} fired early");
+                    assert_eq!(ran, action, "{chord}");
+                }
+                other => panic!("{chord} at {at}: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn every_group_label_is_derived_from_its_members_rather_than_written_down() {
+    // Task 91's `common_id_prefix`, applied to whatever is bound under each
+    // letter. A group whose members share a leading segment is named by it; one
+    // whose members do not is left unnamed for `tui::whichkey` to report as a
+    // count — which is the derivation refusing to invent a name, and the whole
+    // reason there is no group table anywhere.
+    let keymap = Keymap::defaults();
+    let found = keymap.continuations(Mode::Normal, &[Key::Char(' ')]);
+    assert_eq!(found.len(), 12, "one continuation per group: {found:?}");
+    for continuation in &found {
+        let members: Vec<Action> = leader_bindings()
+            .iter()
+            .filter(|(chord, _)| chord.keys().get(1) == Some(&continuation.key))
+            .map(|(_, action)| *action)
+            .collect();
+        let expected = common_id_prefix(members.iter().copied());
+        match &continuation.leads {
+            Leads::Group { label, members: n } => {
+                assert_eq!(*label, expected, "{:?}", continuation.key);
+                assert_eq!(*n, members.len(), "{:?}", continuation.key);
+            }
+            // A one-member group reads as a Run, which is `continuations`' own
+            // rule — no group here has one, and this arm says so rather than
+            // passing silently if one ever does.
+            other => panic!(
+                "{:?} has {} member(s): {other:?}",
+                continuation.key,
+                members.len()
+            ),
+        }
+    }
+}
+
+#[test]
+fn the_leader_is_live_in_the_viewer_and_in_a_visual_selection() {
+    // Bound once, in `Normal`, and reached from all three because both inherit
+    // it. Three copies would be three things to keep in step.
+    let keymap = Keymap::defaults();
+    for mode in [Mode::Normal, Mode::Viewer, Mode::Visual] {
+        let mut pending = Pending::default();
+        let resolutions = feed(&keymap, mode, &mut pending, " tl");
+        assert_eq!(
+            resolutions.last(),
+            Some(&Resolution::Run {
+                action: Action::TagList,
+                count: None
+            }),
+            "{}",
+            mode.id()
+        );
+    }
+    // And not from a layer that stops at `Global`, which is what the chain is
+    // for.
+    let mut pending = Pending::default();
+    let resolutions = feed(&keymap, Mode::Pick, &mut pending, " tl");
+    assert!(
+        !resolutions
+            .iter()
+            .any(|r| matches!(r, Resolution::Run { .. })),
+        "the leader reached a modal: {resolutions:?}"
+    );
+}
+
+#[test]
+fn every_leader_action_names_a_verb_the_registry_has() {
+    // A leader key runs the verb its own id names. An action whose id named no
+    // verb would be a key that reports "not a command this build has" — which is
+    // a default binding failing, not anything a user did.
+    for (chord, action) in leader_bindings() {
+        let path: Vec<&str> = action.id().split('.').collect();
+        assert!(
+            crate::command::verb_at(&path).is_some(),
+            "{chord} runs {} and there is no such verb",
+            action.id()
+        );
+    }
+}
+
+#[test]
+fn the_six_new_keys_round_trip_through_notation() {
+    for (key, text) in [
+        (Key::Left, "<left>"),
+        (Key::Right, "<right>"),
+        (Key::Home, "<home>"),
+        (Key::End, "<end>"),
+        (Key::PageUp, "<pageup>"),
+        (Key::PageDown, "<pagedown>"),
+    ] {
+        assert_eq!(key.to_string(), text);
+        assert_eq!(chord(text).keys(), [key], "{text}");
+    }
+    // And in a chord with other keys, which is where a mis-parse would show up
+    // as a binding that half-works.
+    assert_eq!(chord("g<home>").keys(), [Key::Char('g'), Key::Home]);
+}
+
+#[test]
+fn the_new_key_names_accept_vims_spellings_too() {
+    // Somebody who writes `<pgup>` means the same key as somebody who writes
+    // `<pageup>`, and a grammar that took one and refused the other would be a
+    // grammar with a trap in it. They *display* as one spelling, because a file
+    // this client rewrites has to be consistent with itself.
+    assert_eq!(chord("<pgup>").keys(), [Key::PageUp]);
+    for text in ["<pgdown>", "<pgdn>"] {
+        assert_eq!(chord(text).keys(), [Key::PageDown], "{text}");
+    }
+    assert_eq!(chord("<pgup>").to_string(), "<pageup>");
+}
+
+#[test]
+fn no_default_binding_can_ever_be_shadowed_in_its_own_layer() {
+    // The invariant `bind` enforces for a user's file, asserted for the built-ins
+    // — which are installed through `insert` and therefore *not* checked at load
+    // time. Task 105 added thirty chords under one prefix; a single-key binding
+    // added later on `<space>` would make every one of them untypeable, and this
+    // is what refuses it.
+    let keymap = Keymap::defaults();
+    for mode in std::iter::once(&Mode::Global).chain(Mode::CONFIGURABLE) {
+        let bindings: Vec<Chord> = keymap
+            .layer(*mode)
+            .map(|(chord, _)| chord.clone())
+            .collect();
+        for one in &bindings {
+            for other in &bindings {
+                if one == other {
+                    continue;
+                }
+                assert!(
+                    !(one.keys().len() < other.keys().len()
+                        && other.keys()[..one.keys().len()] == *one.keys()),
+                    "in {}, {one} would fire and {other} could never be typed",
+                    mode.id()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_defaults_shadow_nothing_across_layers_either() {
+    // The lint task 105 runs at startup, asserted over the built-ins: a shipped
+    // keymap that tripped its own warning on a clean install would make the
+    // warning meaningless.
+    assert!(
+        Keymap::defaults().shadowed_across_layers().is_empty(),
+        "{:?}",
+        Keymap::defaults().shadowed_across_layers()
+    );
+}
+
+#[test]
+fn palette_is_still_a_working_alias_of_command() {
+    // Task 85 shipped `palette`; task 89 replaced what it opens with the `:`
+    // line. The id stays because a `keys.toml` binding it must keep working —
+    // task 105's migration promise is that nothing shipped was removed.
+    assert_eq!(Action::from_id("palette"), Some(Action::PaletteOpen));
+    assert_eq!(Action::from_id("command"), Some(Action::CommandOpen));
+    let keymap = Keymap::defaults();
+    assert!(
+        !keymap
+            .chords_for(Mode::Normal, Action::CommandOpen)
+            .is_empty(),
+        "`:` still opens it"
+    );
+}

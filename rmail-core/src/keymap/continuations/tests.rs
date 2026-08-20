@@ -71,14 +71,14 @@ fn the_default_map_offers_g_after_a_pending_g() {
 #[test]
 fn a_prefix_of_several_bindings_is_a_group_labelled_by_their_common_id() {
     let mut keymap = Keymap::defaults();
-    bind(&mut keymap, Mode::Normal, " a", Action::AiPanel);
-    bind(&mut keymap, Mode::Normal, " q", Action::AiQuick);
+    bind(&mut keymap, Mode::Normal, "za", Action::AiPanel);
+    bind(&mut keymap, Mode::Normal, "zq", Action::AiQuick);
     let found = keymap.continuations(Mode::Normal, &[]);
     let space = found
         .iter()
-        .find(|c| c.key == Key::Char(' '))
+        .find(|c| c.key == Key::Char('z'))
         .cloned()
-        .unwrap_or_else(|| panic!("expected a continuation for `<space>`: {found:?}"));
+        .unwrap_or_else(|| panic!("expected a continuation for `z`: {found:?}"));
     match space.leads {
         Leads::Group { label, members } => {
             assert_eq!(
@@ -98,14 +98,14 @@ fn a_group_whose_members_share_no_leading_segment_is_left_unlabelled() {
     // arbitrary collection is exactly the hand-maintained table this
     // derivation replaces. A renderer shows the member count instead.
     let mut keymap = Keymap::defaults();
-    bind(&mut keymap, Mode::Normal, " h", Action::Help);
-    bind(&mut keymap, Mode::Normal, " s", Action::SearchOpen);
+    bind(&mut keymap, Mode::Normal, "zh", Action::Help);
+    bind(&mut keymap, Mode::Normal, "zs", Action::SearchOpen);
     let found = keymap.continuations(Mode::Normal, &[]);
     let space = found
         .iter()
-        .find(|c| c.key == Key::Char(' '))
+        .find(|c| c.key == Key::Char('z'))
         .cloned()
-        .unwrap_or_else(|| panic!("expected a continuation for `<space>`: {found:?}"));
+        .unwrap_or_else(|| panic!("expected a continuation for `z`: {found:?}"));
     match space.leads {
         Leads::Group { label, members } => {
             assert!(label.is_empty(), "{label:?}");
@@ -120,14 +120,14 @@ fn a_label_is_segments_rather_than_characters() {
     // `manual.back` and `menu.accept` share the letter `m` and no segment.
     // Character-wise prefixing would answer `m`, which names nothing.
     let mut keymap = Keymap::defaults();
-    bind(&mut keymap, Mode::Menu, " b", Action::ManualBack);
-    bind(&mut keymap, Mode::Menu, " a", Action::MenuAccept);
+    bind(&mut keymap, Mode::Menu, "zb", Action::ManualBack);
+    bind(&mut keymap, Mode::Menu, "za", Action::MenuAccept);
     let found = keymap.continuations(Mode::Menu, &[]);
     let space = found
         .iter()
-        .find(|c| c.key == Key::Char(' '))
+        .find(|c| c.key == Key::Char('z'))
         .cloned()
-        .unwrap_or_else(|| panic!("expected a continuation for `<space>`: {found:?}"));
+        .unwrap_or_else(|| panic!("expected a continuation for `z`: {found:?}"));
     match space.leads {
         Leads::Group { label, .. } => assert!(label.is_empty(), "{label:?}"),
         other => panic!("expected a group, found {other:?}"),
@@ -137,13 +137,13 @@ fn a_label_is_segments_rather_than_characters() {
 #[test]
 fn a_one_member_group_is_labelled_by_that_members_whole_id() {
     let mut keymap = Keymap::defaults();
-    bind(&mut keymap, Mode::Normal, " x", Action::Archive);
+    bind(&mut keymap, Mode::Normal, "zx", Action::Archive);
     let found = keymap.continuations(Mode::Normal, &[]);
     let space = found
         .iter()
-        .find(|c| c.key == Key::Char(' '))
+        .find(|c| c.key == Key::Char('z'))
         .cloned()
-        .unwrap_or_else(|| panic!("expected a continuation for `<space>`: {found:?}"));
+        .unwrap_or_else(|| panic!("expected a continuation for `z`: {found:?}"));
     match space.leads {
         Leads::Group { label, members } => {
             assert_eq!(label, "message.archive");
@@ -213,16 +213,16 @@ fn a_chord_bound_in_two_layers_of_one_chain_counts_once() {
     // `Visual` and `Normal` both reachable from Visual; binding the same chord
     // in both is one way to press it, not two members of a group.
     let mut keymap = Keymap::defaults();
-    bind(&mut keymap, Mode::Normal, " a", Action::AiPanel);
-    bind(&mut keymap, Mode::Visual, " a", Action::AiQuick);
+    bind(&mut keymap, Mode::Normal, "za", Action::AiPanel);
+    bind(&mut keymap, Mode::Visual, "za", Action::AiQuick);
     let found = keymap.continuations(Mode::Visual, &[]);
-    let space = found
+    let prefix = found
         .iter()
-        .find(|c| c.key == Key::Char(' '))
+        .find(|c| c.key == Key::Char('z'))
         .cloned()
-        .unwrap_or_else(|| panic!("expected a continuation for `<space>`: {found:?}"));
-    match space.leads {
-        Leads::Group { members, .. } => assert_eq!(members, 1, "{space:?}"),
+        .unwrap_or_else(|| panic!("expected a continuation for `z`: {found:?}"));
+    match prefix.leads {
+        Leads::Group { members, .. } => assert_eq!(members, 1, "{prefix:?}"),
         other => panic!("expected a group, found {other:?}"),
     }
 }
@@ -230,13 +230,13 @@ fn a_chord_bound_in_two_layers_of_one_chain_counts_once() {
 #[test]
 fn a_continuation_that_completes_a_chord_buries_the_longer_ones_under_it() {
     // The cross-layer case `bind` cannot refuse: `Normal` has the three-key
-    // `<space>ab`, and `Visual` binds the two-key `<space>a`. In Visual, `a`
-    // after `<space>` runs Visual's binding and nothing ever waits for `b`.
+    // `zab`, and `Visual` binds the two-key `za`. In Visual, `a` after `z` runs
+    // Visual's binding and nothing ever waits for `b`.
     let mut keymap = Keymap::defaults();
-    bind(&mut keymap, Mode::Normal, " ab", Action::AiPanel);
-    bind(&mut keymap, Mode::Visual, " a", Action::AiQuick);
+    bind(&mut keymap, Mode::Normal, "zab", Action::AiPanel);
+    bind(&mut keymap, Mode::Visual, "za", Action::AiQuick);
 
-    let found = keymap.continuations(Mode::Visual, &keys(" "));
+    let found = keymap.continuations(Mode::Visual, &keys("z"));
     let a = found
         .iter()
         .find(|c| c.key == Key::Char('a'))
@@ -248,13 +248,13 @@ fn a_continuation_that_completes_a_chord_buries_the_longer_ones_under_it() {
             .iter()
             .map(|(chord, action)| format!("{chord} -> {}", action.id()))
             .collect::<Vec<_>>(),
-        ["<space>ab -> ai.panel"],
+        ["zab -> ai.panel"],
         "the band has to say so: a binding that silently does nothing is what \
          this field exists to surface"
     );
 
     // And in Normal, where nothing shadows it, the same key is a group.
-    let found = keymap.continuations(Mode::Normal, &keys(" "));
+    let found = keymap.continuations(Mode::Normal, &keys("z"));
     let a = found
         .iter()
         .find(|c| c.key == Key::Char('a'))

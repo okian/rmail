@@ -414,7 +414,22 @@ fn an_edit_that_would_produce_an_unusable_keymap_is_refused() {
 
 #[test]
 fn a_chord_needing_quoting_survives_a_round_trip() {
-    for text in ["?", "<c-p>", "gg", "<space>"] {
+    // `<space>z` rather than a bare `<space>`: task 105 made `<space>` a leader,
+    // so binding it alone is now legitimately refused — and the property here is
+    // about *quoting a chord into TOML and reading it back*, not about which
+    // chords happen to be free. The three new spellings are here for the same
+    // reason: they are what task 105 added, and a `Display` that did not
+    // round-trip through `Chord::parse` would be a binding a user could write and
+    // never see take effect.
+    for text in [
+        "?",
+        "<c-p>",
+        "gg",
+        "<space>z",
+        "<home>",
+        "<pagedown>",
+        "<left><right>",
+    ] {
         let updated = edit("", Mode::Normal, &chord(text), Some(Action::Help)).unwrap();
         let after = match parse(&updated, "keys.toml") {
             Ok(keymap) => keymap,
