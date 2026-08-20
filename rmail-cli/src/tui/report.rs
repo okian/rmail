@@ -166,6 +166,18 @@ pub struct ReportRow {
     /// and a bang are honoured, and a row cannot do something no `:` line
     /// can. `None` for a row that is only information.
     pub on_enter: Option<Invocation>,
+    /// The row's *no* — what `report.reject` runs.
+    ///
+    /// A second gesture, because a row that can be accepted inline and only
+    /// rejected by typing makes the safe answer the awkward one, and task 95's
+    /// tag suggestions are exactly that shape: a stream of guesses where the
+    /// common reply is "not that one".
+    ///
+    /// Named for the only thing a second gesture on a row has meant so far. A
+    /// later task wanting a *third* should think hard before adding one rather
+    /// than renaming this to something like `on_alt`, which would be a name
+    /// that says nothing about what pressing the key does.
+    pub on_reject: Option<Invocation>,
 }
 
 impl ReportRow {
@@ -183,6 +195,7 @@ impl ReportRow {
                 .collect(),
             tone: ReportTone::Plain,
             on_enter: None,
+            on_reject: None,
         }
     }
 
@@ -197,6 +210,13 @@ impl ReportRow {
     #[must_use]
     pub fn running(mut self, invocation: Invocation) -> Self {
         self.on_enter = Some(invocation);
+        self
+    }
+
+    /// The same row, with something for `report.reject` to run.
+    #[must_use]
+    pub fn rejecting(mut self, invocation: Invocation) -> Self {
+        self.on_reject = Some(invocation);
         self
     }
 }

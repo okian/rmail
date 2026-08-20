@@ -31,12 +31,14 @@
 mod tests;
 
 use rmail_proto::v1::{
-    Account as ProtoAccount, Attachment, AuthStatusResponse, Citation as ProtoCitation,
-    CreateDraftRequest, DayUsage, DraftAddress, FindResult, FinderStatusResponse, FolderStatus,
-    FullMessage, GetSpendResponse, IndexDrift, IndexGcReport, IndexKind, IndexProgress,
-    IndexStatusResponse, ItemKind, ListEntitiesResponse, Message as ProtoMessage, OutboxEntry,
-    OutboxState, RankExplanation, RetrievalTrace, SearchHit, Summary, SyncFolderResponse,
-    SyncStatusResponse, UsageStats,
+    Account as ProtoAccount, Attachment, AuthStatusResponse, BulkTagResponse,
+    Citation as ProtoCitation, CreateDraftRequest, DayUsage, DraftAddress, EvaluationStats,
+    FindResult, FinderStatusResponse, FolderStatus, FullMessage, GetSpendResponse, IndexDrift,
+    IndexGcReport, IndexKind, IndexProgress, IndexStatusResponse, ItemKind, ListEntitiesResponse,
+    ListRulesResponse, ListTagRulesResponse, ListTagsResponse, Message as ProtoMessage,
+    MessageOutcome, OutboxEntry, OutboxState, RankExplanation, RetrievalTrace, SearchHit, Summary,
+    SyncFolderResponse, SyncStatusResponse, SynthesizeRuleResponse, TagRuleMode, TagSource,
+    TagSuggestion, TagSyncMode, UsageStats,
 };
 
 use rmail_core::command;
@@ -1090,4 +1092,323 @@ pub fn finder_status_rows(response: &FinderStatusResponse) -> Vec<ReportRow> {
         ),
         ReportRow::new(["refreshed".to_owned(), when(response.refreshed_at)]),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// the tag and rule reports (task 95)
+// ---------------------------------------------------------------------------
+
+/// `TagService.ListTags` as a table.
+///
+/// A tag with no messages is drawn muted rather than hidden: it is a tag
+/// somebody created and has not used, and hiding it would make `:tag new`
+/// look as though it had done nothing.
+#[must_use]
+pub fn tag_rows(response: &ListTagsResponse) -> Vec<ReportRow> {
+    response
+        .tags
+        .iter()
+        .map(|counted| {
+            let tag = counted.tag.clone().unwrap_or_default();
+            ReportRow::new([
+                tag.name,
+                counted.message_count.to_string(),
+                tag_sync(tag.sync_mode),
+                tag.color.unwrap_or_else(|| "—".to_owned()),
+            ])
+            .toned(if counted.message_count == 0 {
+                ReportTone::Muted
+            } else {
+                ReportTone::Plain
+            })
+        })
+        .collect()
+}
+
+/// What a `TagSyncMode` discriminant means.
+fn tag_sync(mode: i32) -> String {
+    match TagSyncMode::try_from(mode) {
+        Ok(TagSyncMode::Local) => "local".to_owned(),
+        Ok(TagSyncMode::Imap) => "imap".to_owned(),
+        Ok(TagSyncMode::Auto) => "auto".to_owned(),
+        // A mode this build does not know, rendered rather than guessed at — the
+        // same rule `FinderKind::Unknown` follows.
+        Ok(TagSyncMode::Unspecified) | Err(_) => format!("mode {mode}"),
+    }
+}
+
+/// One `AddTag` outcome as a row.
+///
+/// Per message rather than a count, because the interesting answer is the one a
+/// count hides: a tag that applied to four of five and failed on the fifth.
+#[must_use]
+pub fn tag_applied_row(message_id: i64, name: &str, source: &str) -> ReportRow {
+    ReportRow::new([message_id.to_string(), name.to_owned(), source.to_owned()])
+        .toned(ReportTone::Ok)
+}
+
+/// One failed application as a row.
+#[must_use]
+pub fn tag_failed_row(message_id: i64, name: &str, why: &str) -> ReportRow {
+    ReportRow::new([message_id.to_string(), name.to_owned(), why.to_owned()]).toned(ReportTone::Bad)
+}
+
+/// What a `TagSource` discriminant means, for the outcome column.
+#[must_use]
+pub fn tag_source(source: i32) -> String {
+    match TagSource::try_from(source) {
+        Ok(TagSource::User) => "applied".to_owned(),
+        Ok(TagSource::Rule) => "applied by a rule".to_owned(),
+        Ok(TagSource::Ai) => "applied by the model".to_owned(),
+        Ok(TagSource::Imap) => "applied from IMAP".to_owned(),
+        Ok(TagSource::Unspecified) | Err(_) => "applied".to_owned(),
+    }
+}
+
+/// `TagService.BulkTag` as a table.
+#[must_use]
+pub fn tag_bulk_rows(response: &BulkTagResponse) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new([
+            "messages selected".to_owned(),
+            response.message_count.to_string(),
+        ]),
+        // Applied can be lower than selected without anything being wrong: a
+        // message that already carried the tag is not tagged twice. Said as its
+        // own row so the gap is visible rather than looking like a partial
+        // failure.
+        ReportRow::new(["tags applied".to_owned(), response.applied.to_string()]).toned(
+            if response.applied == 0 {
+                ReportTone::Muted
+            } else {
+                ReportTone::Ok
+            },
+        ),
+    ]
+}
+
+/// One streamed `TagSuggestion` as a row that can be accepted or rejected.
+///
+/// Both actions ride on the row, because a suggestion list where accepting is
+/// inline and rejecting is not would make the safe answer the awkward one.
+#[must_use]
+pub fn tag_suggestion_row(suggestion: &TagSuggestion) -> ReportRow {
+    let tag = suggestion.tag.clone().unwrap_or_default();
+    let confidence = format!("{:.0}%", suggestion.confidence * 100.0);
+    let row = ReportRow::new([tag.name, confidence, suggestion.rationale.clone()]).toned(
+        // Low confidence is not a fault — it is the reason the suggestion is
+        // pending rather than applied — so it is muted, not warned about.
+        if suggestion.confidence >= 0.8 {
+            ReportTone::Ok
+        } else {
+            ReportTone::Muted
+        },
+    );
+    let id = suggestion.message_tag_id;
+    match (
+        resolve_invocation("accept", id),
+        resolve_invocation("reject", id),
+    ) {
+        (Some(accept), Some(reject)) => row.running(accept).rejecting(reject),
+        // Unreachable: both verbs are declared, and
+        // `command::tests::every_real_verb_is_reachable_by_typing_its_own_path`
+        // is what keeps them so. A row that does nothing beats a panic in a
+        // client holding a terminal in raw mode.
+        _ => row,
+    }
+}
+
+/// The `:tag accept <id>` / `:tag reject <id>` invocation a suggestion row runs.
+///
+/// Parsed rather than built field by field, so the row runs exactly what typing
+/// that line runs — including the capability task 90's gate reads.
+///
+/// Bang'd, which is that gate being deliberately skipped for these two rows.
+/// Both verbs mutate, so without it every answer on a suggestion list would open
+/// a modal — and a screen whose whole purpose is answering a stream of small,
+/// reversible guesses cannot ask about each one. The gesture *is* the consent:
+/// the row says which tag and why, and the border says Enter accepts and `n`
+/// rejects. `:tag reject` is the undoing direction anyway, so the gate would be
+/// asking hardest about the safest answer.
+fn resolve_invocation(which: &str, id: i64) -> Option<command::Invocation> {
+    match command::parse(&format!("tag {which} {id}!")) {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
+    }
+}
+
+/// `TagService.ListTagRules` as a table.
+#[must_use]
+pub fn tag_rule_rows(response: &ListTagRulesResponse) -> Vec<ReportRow> {
+    response
+        .rules
+        .iter()
+        .map(|rule| {
+            let auto = matches!(TagRuleMode::try_from(rule.mode), Ok(TagRuleMode::Auto));
+            ReportRow::new([
+                rule.name.clone(),
+                rule.tag_name.clone(),
+                if auto { "auto" } else { "suggest" }.to_owned(),
+                format!("{:.0}%", rule.min_conf * 100.0),
+                if rule.enabled { "on" } else { "off" }.to_owned(),
+            ])
+            // `auto` is the mode in which a model's guess changes the mailbox
+            // with nobody looking. Not a fault — somebody asked for it — but the
+            // one row on this screen worth finding at a glance.
+            .toned(if !rule.enabled {
+                ReportTone::Muted
+            } else if auto {
+                ReportTone::Warn
+            } else {
+                ReportTone::Plain
+            })
+        })
+        .collect()
+}
+
+/// `RuleService.ListRules` as a table.
+#[must_use]
+pub fn rule_rows(response: &ListRulesResponse) -> Vec<ReportRow> {
+    response
+        .rules
+        .iter()
+        .map(|rule| {
+            ReportRow::new([
+                rule.name.clone(),
+                if rule.enabled { "on" } else { "off" }.to_owned(),
+                when(rule.updated_at),
+            ])
+            .toned(if rule.enabled {
+                ReportTone::Plain
+            } else {
+                ReportTone::Muted
+            })
+        })
+        .collect()
+}
+
+/// A `MessageOutcome` table, plus the evaluation's own statistics.
+///
+/// The stats go first, because the question somebody asks of a dry run is "how
+/// much did this match" and a hundred rows above the answer is a hundred rows
+/// they have to scroll past to find it.
+#[must_use]
+pub fn rule_outcome_rows(
+    outcomes: &[MessageOutcome],
+    stats: Option<&EvaluationStats>,
+    window_days: Option<u32>,
+) -> Vec<ReportRow> {
+    let mut rows = Vec::new();
+    if let Some(stats) = stats {
+        let mut summary = format!(
+            "{} of {} matched · {} model call(s)",
+            stats.matches, stats.messages, stats.model_calls
+        );
+        if let Some(days) = window_days {
+            summary.push_str(&format!(" · {days} day(s)"));
+        }
+        rows.push(
+            ReportRow::new([
+                "— summary —".to_owned(),
+                summary,
+                String::new(),
+                String::new(),
+            ])
+            .toned(if stats.errors > 0 {
+                ReportTone::Warn
+            } else {
+                ReportTone::Ok
+            }),
+        );
+        if stats.errors > 0 {
+            rows.push(
+                ReportRow::new([
+                    "— errors —".to_owned(),
+                    format!("{} message(s) could not be evaluated", stats.errors),
+                    String::new(),
+                    String::new(),
+                ])
+                .toned(ReportTone::Bad),
+            );
+        }
+    }
+    rows.extend(outcomes.iter().map(|outcome| {
+        let matched: Vec<String> = outcome
+            .rules
+            .iter()
+            .filter(|rule| rule.matched)
+            .map(|rule| rule.rule.clone())
+            .collect();
+        let row = ReportRow::new([
+            outcome.message_id.to_string(),
+            outcome.from.clone(),
+            outcome.subject.clone(),
+            if matched.is_empty() {
+                "—".to_owned()
+            } else {
+                matched.join(", ")
+            },
+        ]);
+        if outcome.error.is_empty() {
+            row.toned(if matched.is_empty() {
+                ReportTone::Muted
+            } else {
+                ReportTone::Plain
+            })
+        } else {
+            ReportRow::new([
+                outcome.message_id.to_string(),
+                outcome.from.clone(),
+                outcome.subject.clone(),
+                format!("failed: {}", outcome.error),
+            ])
+            .toned(ReportTone::Bad)
+        }
+    }));
+    rows
+}
+
+/// `RuleService.SynthesizeRule` as a table: what it drafted, then its dry run.
+///
+/// The dropped-`claude_is` note is drawn as its own row and coloured, because it
+/// is the one thing about a drafted rule somebody has to know: the model asked
+/// for a criterion the daemon refused to include, so the rule that will actually
+/// run is *narrower* than what was asked for.
+#[must_use]
+pub fn rule_draft_rows(response: &SynthesizeRuleResponse) -> Vec<ReportRow> {
+    let mut rows = vec![ReportRow::new([
+        "— drafted —".to_owned(),
+        response.name.clone(),
+        String::new(),
+        String::new(),
+    ])
+    .toned(ReportTone::Ok)];
+    if !response.claude_is_dropped.is_empty() {
+        rows.push(
+            ReportRow::new([
+                "— dropped —".to_owned(),
+                response.claude_is_dropped.clone(),
+                String::new(),
+                String::new(),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    if !response.notes.is_empty() {
+        rows.push(
+            ReportRow::new([
+                "— notes —".to_owned(),
+                response.notes.clone(),
+                String::new(),
+                String::new(),
+            ])
+            .toned(ReportTone::Muted),
+        );
+    }
+    rows.extend(rule_outcome_rows(
+        &response.dry_run,
+        response.stats.as_ref(),
+        Some(response.window_days),
+    ));
+    rows
 }

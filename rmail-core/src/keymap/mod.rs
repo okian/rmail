@@ -367,6 +367,7 @@ actions! {
     OutboxOpen    => "outbox",              "the outbox: scheduled, failed and undoable sends";
     OutboxCancel  => "outbox.cancel",       "cancel the highlighted send (undo)";
     ReportRerun   => "report.rerun",        "run this report's own : line again";
+    ReportReject  => "report.reject",       "the no half of a report row that offers both";
     PromptAccept  => "prompt.accept",       "accept what has been typed";
     PromptComplete => "prompt.complete",    "complete the operator being typed";
     MenuAccept    => "menu.accept",         "use the highlighted row";
@@ -679,6 +680,11 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     // `Normal`'s `r` is `message.reply`, and a report is the one thing in this
     // layer that has a line to run again.
     (Mode::Menu, "r", Action::ReportRerun),
+    // `n` is the *no* to `<enter>`'s yes on a report row that offers both (task
+    // 95's tag suggestions). Bound here rather than reusing `Mode::Confirm`'s
+    // `n`, because this is not a modal question: the list stays up and the next
+    // row is answered next.
+    (Mode::Menu, "n", Action::ReportReject),
     // Back to the query line of whichever overlay is up.
     (Mode::Menu, ":", Action::CommandOpen),
     (Mode::Menu, "/", Action::SearchOpen),

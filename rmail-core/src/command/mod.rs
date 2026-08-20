@@ -67,6 +67,15 @@ pub struct Positional {
     pub name: &'static str,
     /// Whether the verb refuses without it.
     pub required: bool,
+    /// Whether this one takes every remaining word.
+    ///
+    /// Free text: an instruction to synthesize a rule from, a pattern to grep
+    /// for. An unquoted sentence is what somebody types, and a verb declaring one
+    /// argument while its caller joins several is a declaration that does not
+    /// describe the verb — which is what a dispatcher comparing counts against
+    /// the declaration then refuses. Only ever the *last* declared positional;
+    /// `tests::a_variadic_positional_is_always_the_last_one` is what holds that.
+    pub rest: bool,
 }
 
 /// A `--flag` a verb accepts. Long-only, per the grammar's own rule — "no
@@ -77,6 +86,9 @@ pub struct Flag {
     /// The name, without its leading `--`.
     pub name: &'static str,
     /// Whether `--name value` (true) or a bare `--name` switch (false).
+    ///
+    /// Both spellings of a value: `--name value` and `--name=value` parse
+    /// identically, which [`bind`] is what makes true.
     pub takes_value: bool,
 }
 
@@ -241,6 +253,111 @@ fn explicit() -> Vec<Verb> {
     const PATTERN: &[Positional] = &[Positional {
         name: "pattern",
         required: false,
+        // `:helpgrep two words` searches for both, which
+        // `model::run_invocation` has always done by joining them — declared
+        // here now so the declaration says what the verb does.
+        rest: true,
+    }];
+    /// `:tag new`'s optional shape.
+    const TAG_NEW_FLAGS: &[Flag] = &[
+        Flag {
+            name: "color",
+            takes_value: true,
+        },
+        Flag {
+            name: "sync",
+            takes_value: true,
+        },
+    ];
+    /// `:tag rules set`'s knobs, spelled as `mail tag-rules set` spells them —
+    /// `--disabled` and not `--off`, because two surfaces over one capability
+    /// disagreeing about a flag name is the drift `crate::parity` exists to
+    /// prevent. A switch because "stored but retired" is a state `SetTagRule`
+    /// has and "delete the rule" is not one it offers.
+    const TAG_RULE_FLAGS: &[Flag] = &[
+        Flag {
+            name: "mode",
+            takes_value: true,
+        },
+        Flag {
+            name: "min-conf",
+            takes_value: true,
+        },
+        Flag {
+            name: "disabled",
+            takes_value: false,
+        },
+    ];
+    /// How far back a synthesis or a backtest looks.
+    const DAYS: &[Flag] = &[Flag {
+        name: "days",
+        takes_value: true,
+    }];
+    /// Narrow an evaluation to one rule by name.
+    const RULE_NAME: &[Flag] = &[Flag {
+        name: "rule",
+        takes_value: true,
+    }];
+    /// `:rule correct`'s direction. Present means "this message is *not* what
+    /// that prompt says"; absent means it is. A switch rather than a value,
+    /// because those are the only two answers `RecordCorrection` records.
+    const CORRECT_FLAGS: &[Flag] = &[Flag {
+        name: "no",
+        takes_value: false,
+    }];
+    /// One tag name. Optional so the verb stays typeable (see `KIND`); the
+    /// caller refuses a missing one.
+    const TAG: &[Positional] = &[Positional {
+        name: "tag",
+        required: false,
+        rest: false,
+    }];
+    /// A filter-only query and the tag to apply to everything it selects.
+    const QUERY_AND_TAG: &[Positional] = &[
+        Positional {
+            name: "query",
+            required: false,
+            rest: false,
+        },
+        Positional {
+            name: "tag",
+            required: false,
+            rest: false,
+        },
+    ];
+    /// A pending suggestion's `message_tag_id`, as the suggest report shows it.
+    const SUGGESTION: &[Positional] = &[Positional {
+        name: "id",
+        required: false,
+        rest: false,
+    }];
+    /// A tag rule's own name and the tag it applies.
+    const RULE_AND_TAG: &[Positional] = &[
+        Positional {
+            name: "name",
+            required: false,
+            rest: false,
+        },
+        Positional {
+            name: "tag",
+            required: false,
+            rest: false,
+        },
+    ];
+    /// A name, for a verb that addresses one thing it already has.
+    const NAME: &[Positional] = &[Positional {
+        name: "name",
+        required: false,
+        rest: false,
+    }];
+    /// Free text: an instruction to synthesize from, or a `claude_is` prompt to
+    /// correct. Joined from every positional, because an unquoted sentence is
+    /// what somebody types and reading only its first word is a silent
+    /// truncation — the same rule `:helpgrep`'s pattern follows.
+    const TEXT: &[Positional] = &[Positional {
+        name: "text",
+        required: false,
+        rest: true,
     }];
     /// The entity kind `:index entities` lists — `email`, `phone`, `amount`.
     /// Not enumerated here: the daemon's own refusal names every kind it knows,
@@ -257,6 +374,7 @@ fn explicit() -> Vec<Verb> {
     const KIND: &[Positional] = &[Positional {
         name: "kind",
         required: false,
+        rest: false,
     }];
     vec![
         Verb {
@@ -299,10 +417,12 @@ fn explicit() -> Vec<Verb> {
                 Positional {
                     name: "option",
                     required: false,
+                    rest: false,
                 },
                 Positional {
                     name: "value",
                     required: false,
+                    rest: false,
                 },
             ],
             flags: &[],
@@ -519,6 +639,150 @@ fn explicit() -> Vec<Verb> {
             positionals: &[],
             flags: &[],
             cli_alias: Some("find"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "add"],
+            capability: Some(Capability::TagAddTag),
+            action: None,
+            positionals: TAG,
+            flags: &[],
+            cli_alias: Some("tag"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "rm"],
+            capability: Some(Capability::TagRemoveTag),
+            action: None,
+            positionals: TAG,
+            flags: &[],
+            cli_alias: Some("untag"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "list"],
+            capability: Some(Capability::TagListTags),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: Some("tags"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "new"],
+            capability: Some(Capability::TagCreateTag),
+            action: None,
+            positionals: NAME,
+            flags: TAG_NEW_FLAGS,
+            cli_alias: Some("tags create"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "bulk"],
+            capability: Some(Capability::TagBulkTag),
+            action: None,
+            positionals: QUERY_AND_TAG,
+            flags: &[],
+            cli_alias: Some("tag-bulk"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "suggest"],
+            capability: Some(Capability::TagSuggestTags),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: Some("suggest-tags"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "accept"],
+            capability: Some(Capability::TagResolveSuggestion),
+            action: None,
+            positionals: SUGGESTION,
+            flags: &[],
+            cli_alias: Some("accept-tags"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "reject"],
+            capability: Some(Capability::TagResolveSuggestion),
+            action: None,
+            positionals: SUGGESTION,
+            flags: &[],
+            cli_alias: Some("reject-tags"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "rules"],
+            capability: Some(Capability::TagListTagRules),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: Some("tag-rules list"),
+            description: None,
+        },
+        Verb {
+            path: vec!["tag", "rules", "set"],
+            capability: Some(Capability::TagSetTagRule),
+            action: None,
+            positionals: RULE_AND_TAG,
+            flags: TAG_RULE_FLAGS,
+            cli_alias: Some("tag-rules set"),
+            description: None,
+        },
+        Verb {
+            path: vec!["rule", "list"],
+            capability: Some(Capability::RuleListRules),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["rule", "new"],
+            capability: Some(Capability::RuleSynthesizeRule),
+            action: None,
+            positionals: TEXT,
+            flags: DAYS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["rule", "add"],
+            capability: Some(Capability::RuleCreateRule),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["rule", "run"],
+            capability: Some(Capability::RuleEvaluateRules),
+            action: None,
+            positionals: &[],
+            flags: RULE_NAME,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["rule", "backtest"],
+            capability: Some(Capability::RuleBacktestRule),
+            action: None,
+            positionals: NAME,
+            flags: DAYS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["rule", "correct"],
+            capability: Some(Capability::RuleRecordCorrection),
+            action: None,
+            positionals: TEXT,
+            flags: CORRECT_FLAGS,
+            cli_alias: None,
             description: None,
         },
     ]
@@ -914,15 +1178,18 @@ pub fn parse(text: &str) -> Result<Resolution, CommandError> {
     let (bang, rest) = strip_bang(rest);
     let tokens = tokenize(rest)?;
 
-    let mut words: Vec<String> = Vec::new();
-    let mut flags: Vec<ParsedFlag> = Vec::new();
-    for token in tokens {
-        match token {
-            Token::Word(word) => words.push(word),
-            Token::Flag { name, value } => flags.push(ParsedFlag { name, value }),
-        }
-    }
-    parse_verb(&words, range, flags, bang)
+    // Words in order, flag values included: which words are values cannot be
+    // known before the verb is, because it is the [`Verb`] that declares whether
+    // a flag takes one. `parse_verb` resolves the verb from these and then
+    // re-walks the ordered tokens to separate the two — see [`bind`].
+    let words: Vec<String> = tokens
+        .iter()
+        .filter_map(|token| match token {
+            Token::Word(word) => Some(word.clone()),
+            Token::Flag { .. } => None,
+        })
+        .collect();
+    parse_verb(&words, &tokens, range, bang)
 }
 
 /// The verb-resolving half of [`parse`]: longest-matching-prefix of `words`
@@ -938,8 +1205,8 @@ pub fn parse(text: &str) -> Result<Resolution, CommandError> {
 /// splitting it into two.
 fn parse_verb(
     words: &[String],
+    tokens: &[Token],
     range: Option<Range>,
-    flags: Vec<ParsedFlag>,
     bang: bool,
 ) -> Result<Resolution, CommandError> {
     if words.is_empty() {
@@ -953,7 +1220,7 @@ fn parse_verb(
     for split in (1..=words.len()).rev() {
         let flat: Vec<&str> = words[..split].iter().flat_map(|w| split_path(w)).collect();
         if let Some(verb) = verb_at(&flat) {
-            let positionals = words[split..].to_vec();
+            let (flags, positionals) = bind(verb, tokens, split)?;
             check_flags(verb, &flags)?;
             check_positionals(verb, &positionals)?;
             return Ok(Resolution::Invocation(Box::new(Invocation {
@@ -981,6 +1248,85 @@ fn parse_verb(
         path: words.join(" "),
         suggestion: closest(&words.join(" ")),
     })
+}
+
+/// Split the tokens after the verb path into its flags and its positionals,
+/// pairing a value-taking flag with the word that follows it.
+///
+/// `--sync imap` and `--sync=imap` are the same thing, which is what
+/// [`Flag::takes_value`] has always claimed and what nothing implemented until
+/// task 95's verbs became the first in the registry to declare a flag at all:
+/// before that the claim was unreachable, and the test that looked like it
+/// checked both spellings only ever built the `=` one.
+///
+/// Done here rather than in [`tokenize`] because only the [`Verb`] knows which
+/// flags take values — a tokenizer that guessed would swallow the positional
+/// after a switch. `skip` is how many *words* the verb path used, so the words
+/// counted past it are the ones left over for arguments.
+///
+/// Two limits are worth naming, both consequences of resolving the verb before
+/// any flag's arity is known — which is the only order available, since it is the
+/// verb that declares its flags.
+///
+/// `tag rules --mode set` resolves as the longer verb `tag rules set` with a
+/// valueless `--mode`, and reports that: longest-prefix is the rule everywhere
+/// else in this grammar, and making flags an exception would mean the verb a line
+/// names depended on which flags it carried.
+///
+/// A *space-separated* value ahead of the verb path (`tag --sync imap new`) is
+/// indistinguishable from another path segment and fails as an unknown verb. The
+/// `=` form carries its value inside one token and works anywhere. vim's `:` has
+/// the same shape — the command comes first.
+fn bind(
+    verb: &Verb,
+    tokens: &[Token],
+    skip: usize,
+) -> Result<(Vec<ParsedFlag>, Vec<String>), CommandError> {
+    let mut flags: Vec<ParsedFlag> = Vec::new();
+    let mut positionals: Vec<String> = Vec::new();
+    let mut seen_words = 0;
+    let mut awaiting: Option<String> = None;
+    for token in tokens {
+        match token {
+            Token::Word(word) => {
+                // A word owed to a flag is that flag's value wherever it sits,
+                // including inside the span the verb path was counted from —
+                // `tag --mode=x new` and `tag --mode x new` have to agree.
+                if let Some(name) = awaiting.take() {
+                    flags.push(ParsedFlag {
+                        name,
+                        value: Some(word.clone()),
+                    });
+                    continue;
+                }
+                seen_words += 1;
+                if seen_words > skip {
+                    positionals.push(word.clone());
+                }
+            }
+            Token::Flag { name, value } => {
+                if let Some(name) = awaiting.take() {
+                    // A value-taking flag followed by another flag: nothing to
+                    // pair it with, and `check_flags` is what says so by name.
+                    flags.push(ParsedFlag { name, value: None });
+                }
+                let declared = verb.flags.iter().find(|flag| flag.name == *name);
+                match declared {
+                    Some(declared) if declared.takes_value && value.is_none() => {
+                        awaiting = Some(name.clone());
+                    }
+                    _ => flags.push(ParsedFlag {
+                        name: name.clone(),
+                        value: value.clone(),
+                    }),
+                }
+            }
+        }
+    }
+    if let Some(name) = awaiting {
+        flags.push(ParsedFlag { name, value: None });
+    }
+    Ok((flags, positionals))
 }
 
 fn check_flags(verb: &Verb, flags: &[ParsedFlag]) -> Result<(), CommandError> {

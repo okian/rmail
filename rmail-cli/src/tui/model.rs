@@ -745,6 +745,13 @@ pub enum Msg {
     },
     /// A second passed while an undo countdown was running, unix seconds.
     Tick(i64),
+    /// `:rule new` drafted a rule (task 95).
+    ///
+    /// Separate from the Report the draft is *shown* in, because the two have
+    /// different lifetimes: somebody reads the dry run, closes the report,
+    /// thinks, and then types `:rule add`. Not a `Msg::Done` either — nothing
+    /// finished, and the counter would go negative.
+    RuleDrafted(String),
     /// One subsystem's standing, from the heartbeat (task 92).
     ///
     /// Deliberately not a [`Msg::Done`]: nobody asked for it and nothing
@@ -1114,6 +1121,141 @@ pub enum Cmd {
     },
     /// `FinderService.RebuildIndex`.
     FinderRebuild,
+    /// `TagService.ListTags`.
+    TagList {
+        /// Which report this is.
+        generation: u64,
+        /// Whose tags.
+        account_id: i64,
+    },
+    /// `TagService.AddTag`/`RemoveTag` over the selection.
+    TagApply {
+        /// Which report this is.
+        generation: u64,
+        /// The messages, as `Target::selection` gave them.
+        message_ids: Vec<i64>,
+        /// The tag.
+        name: String,
+        /// Whether to remove it rather than add it.
+        remove: bool,
+    },
+    /// `TagService.CreateTag`.
+    TagCreate {
+        /// Whose tag.
+        account_id: i64,
+        /// Its name.
+        name: String,
+        /// A colour, if one was given.
+        color: Option<String>,
+        /// Its IMAP sync mode, if one was given.
+        sync: Option<commands::tag::Sync>,
+    },
+    /// `TagService.BulkTag` — everything a query selects, in one transaction.
+    TagBulk {
+        /// Which report this is.
+        generation: u64,
+        /// Whose mail.
+        account_id: i64,
+        /// The filter-only query.
+        query: String,
+        /// The tag to apply.
+        name: String,
+    },
+    /// `TagService.SuggestTags` — a streamed classification of one message.
+    TagSuggest {
+        /// Which report this is.
+        generation: u64,
+        /// Which message.
+        message_id: i64,
+    },
+    /// `TagService.ResolveSuggestion`.
+    TagResolve {
+        /// Which pending suggestion.
+        message_tag_id: i64,
+        /// Accept it or discard it.
+        resolve: commands::tag::Resolve,
+    },
+    /// `TagService.ListTagRules`.
+    TagRules {
+        /// Which report this is.
+        generation: u64,
+        /// Whose rules.
+        account_id: i64,
+    },
+    /// `TagService.SetTagRule`.
+    TagRuleSet {
+        /// Whose rule.
+        account_id: i64,
+        /// The rule's own name.
+        name: String,
+        /// The tag it applies.
+        tag: String,
+        /// Whether a confident suggestion applies itself.
+        mode: commands::tag::RuleMode,
+        /// The confidence it needs, in whole percent — see
+        /// `commands::tag::percent` on why not an `f64`.
+        min_conf_pct: u32,
+        /// Whether the rule is stored enabled.
+        enabled: bool,
+    },
+    /// `RuleService.ListRules`.
+    RuleList {
+        /// Which report this is.
+        generation: u64,
+        /// Whose rules.
+        account_id: i64,
+    },
+    /// `RuleService.SynthesizeRule` — draft a rule from words, with a dry run.
+    RuleSynthesize {
+        /// Which report this is.
+        generation: u64,
+        /// Whose mail the dry run reads.
+        account_id: i64,
+        /// What the rule should do, in the caller's own words.
+        instruction: String,
+        /// How far back the dry run looks, or the daemon's default.
+        days: Option<u32>,
+    },
+    /// `RuleService.CreateRule` — store the drafted TOML.
+    RuleCreate {
+        /// Whose rule.
+        account_id: i64,
+        /// The document, as `SynthesizeRule` produced it.
+        toml: String,
+    },
+    /// `RuleService.EvaluateRules` — a dry run over named messages.
+    RuleEvaluate {
+        /// Which report this is.
+        generation: u64,
+        /// Whose rules.
+        account_id: i64,
+        /// The messages to evaluate.
+        message_ids: Vec<i64>,
+        /// One rule by name, or every enabled one.
+        rule: Option<String>,
+    },
+    /// `RuleService.BacktestRule`.
+    RuleBacktest {
+        /// Which report this is.
+        generation: u64,
+        /// Whose mail.
+        account_id: i64,
+        /// Which rule.
+        name: String,
+        /// How far back, or the daemon's default.
+        days: Option<u32>,
+    },
+    /// `RuleService.RecordCorrection`.
+    RuleCorrect {
+        /// Whose examples.
+        account_id: i64,
+        /// The message the correction is about.
+        message_id: i64,
+        /// The `claude_is` criterion being corrected.
+        prompt: String,
+        /// What the answer should have been.
+        expected: bool,
+    },
     /// Stop a stream nobody is reading any more.
     ///
     /// Leaving an overlay is the one case the generation stamp does not
@@ -1233,6 +1375,13 @@ pub struct Model {
     /// is [`Model::message_idx`], so extending the selection is the ordinary
     /// cursor movement and needs no second set of bindings.
     pub visual: Option<usize>,
+    /// The TOML `:rule new` last drafted, which `:rule add` stores.
+    ///
+    /// Session state rather than a field on the Report it was shown in: a draft
+    /// outlives the report (somebody reads the dry run, closes it, thinks, then
+    /// adds it), and a `ReportPane` holding domain-specific payload would be the
+    /// generic overlay growing one field per verb.
+    pub rule_draft: Option<String>,
     /// What the heartbeat has learned about the daemon's subsystems.
     ///
     /// Never counted into [`Model::inflight`]: that counter is what the busy
@@ -1322,6 +1471,7 @@ impl Model {
             generation: 0,
             visual: None,
             daemon: Daemon::default(),
+            rule_draft: None,
             keymap: Keymap::defaults(),
             pending: Pending::default(),
             inflight: 0,
@@ -1843,6 +1993,13 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 }
             }
             apply_note(model, note);
+            Vec::new()
+        }
+        Msg::RuleDrafted(toml) => {
+            // Replaces whatever was drafted before: `:rule add` stores "the
+            // draft", and two of them would make which one it meant depend on
+            // the order two reports happened to answer in.
+            model.rule_draft = Some(toml);
             Vec::new()
         }
         Msg::Daemon { subsystem, result } => {
@@ -2419,6 +2576,7 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
         Action::OutboxOpen => open_outbox(model),
         Action::OutboxCancel => undo_send(model),
         Action::ReportRerun => rerun_report(model),
+        Action::ReportReject => reject_report_row(model),
         Action::PromptAccept => prompt_accept(model),
         Action::PromptComplete => prompt_complete(model),
         Action::MenuAccept => menu_accept(model),
@@ -3919,8 +4077,17 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
     // whatever a verb declares (task 89's own note says so), so a verb that
     // accepted them silently would be the "quietly accepts an argument it never
     // mentions" the grammar's docs call out.
-    let declared = command::verb_at(&path_of(&invocation)).map_or(0, |verb| verb.positionals.len());
-    if invocation.positionals.len() > declared {
+    let declaration = command::verb_at(&path_of(&invocation));
+    let declared = declaration.map_or(0, |verb| verb.positionals.len());
+    // A verb whose last declared positional takes the rest has no upper bound:
+    // `:rule new archive newsletters from marketing` is one instruction, and
+    // reading only its first word is the silent truncation `:helpgrep`'s docs
+    // call out. `Positional::rest` is where that is declared rather than being a
+    // list of verb names here.
+    let variadic = declaration
+        .and_then(|verb| verb.positionals.last())
+        .is_some_and(|positional| positional.rest);
+    if !variadic && invocation.positionals.len() > declared {
         return complain(
             model,
             match declared {
@@ -4232,6 +4399,11 @@ fn target_of(model: &Model) -> Target {
         // so `:ai process` acts on the same message `.` would analyse rather
         // than on a second notion of "the current one".
         message_id: target_message(model),
+        // `targets` is what every bulk-capable action reads, which is what makes
+        // `:'<,'>tag add work` do exactly what the key does with the same
+        // selection up.
+        selection: targets(model),
+        rule_draft: model.rule_draft.clone(),
     }
 }
 
@@ -4311,6 +4483,24 @@ fn run_report_row(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         },
     });
     Vec::new()
+}
+
+/// `n` — the *no* half of a report row that offers both (task 95).
+///
+/// Goes through [`run_report_row`]'s own gate rather than dispatching directly,
+/// so a rejection that happens to reach a mutating capability asks first for the
+/// same reason an acceptance does. A row with no rejection is a no-op rather than
+/// a complaint: `n` is bound in the whole `Menu` layer, and most rows there have
+/// nothing to say no to.
+fn reject_report_row(model: &mut Model) -> Vec<Cmd> {
+    let rejection = match model.overlay.as_ref() {
+        Some(Overlay::Report(pane)) => pane.row().and_then(|row| row.on_reject.clone()),
+        _ => None,
+    };
+    match rejection {
+        Some(invocation) => run_report_row(model, invocation),
+        None => Vec::new(),
+    }
 }
 
 /// Run a row's command with the report down, and put the report back unless

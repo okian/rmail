@@ -41,6 +41,8 @@ fn screen() -> Target {
         account_id: 7,
         mailbox_id: Some(1),
         message_id: Some(10),
+        selection: vec![10],
+        rule_draft: None,
     }
 }
 
@@ -50,6 +52,8 @@ fn empty() -> Target {
         account_id: 0,
         mailbox_id: None,
         message_id: None,
+        selection: Vec::new(),
+        rule_draft: None,
     }
 }
 
@@ -182,10 +186,26 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
         "index status",
         "index stop",
         "index verify",
+        "rule add",
+        "rule backtest",
+        "rule correct",
+        "rule list",
+        "rule new",
+        "rule run",
         "sync now",
         "sync pause",
         "sync resume",
         "sync status",
+        "tag accept",
+        "tag add",
+        "tag bulk",
+        "tag list",
+        "tag new",
+        "tag reject",
+        "tag rm",
+        "tag rules",
+        "tag rules set",
+        "tag suggest",
     ]
     .iter()
     .map(|verb| (*verb).to_owned())
@@ -479,12 +499,12 @@ fn a_verb_this_build_has_no_answer_for_is_not_a_refusal() {
     // for a feature that is present and has nothing to act on yet.
     //
     // Built by hand because the registry has no such verb yet — which is the
-    // point: this is the exact shape task 95's `:tag add` will arrive in, and
-    // the table has to answer `None` for it rather than guessing.
+    // point: this is the exact shape task 96's `:ai budget status` will arrive
+    // in, and the table has to answer `None` for it rather than guessing.
     let later_task = Invocation {
         range: None,
-        verb: vec!["tag".to_owned(), "add".to_owned()],
-        capability: Some(Capability::TagAddTag),
+        verb: vec!["ai".to_owned(), "budget".to_owned(), "status".to_owned()],
+        capability: Some(Capability::AiPolicyGetSpend),
         action: None,
         positionals: Vec::new(),
         flags: Vec::new(),

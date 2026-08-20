@@ -51,18 +51,25 @@ use rmail_proto::v1::compose_service_client::ComposeServiceClient;
 use rmail_proto::v1::finder_service_client::FinderServiceClient;
 use rmail_proto::v1::index_service_client::IndexServiceClient;
 use rmail_proto::v1::mail_service_client::MailServiceClient;
+use rmail_proto::v1::rule_service_client::RuleServiceClient;
 use rmail_proto::v1::search_service_client::SearchServiceClient;
 use rmail_proto::v1::send_scheduler_service_client::SendSchedulerServiceClient;
 use rmail_proto::v1::sync_service_client::SyncServiceClient;
+use rmail_proto::v1::tag_service_client::TagServiceClient;
 use rmail_proto::v1::{
-    analyze_event, ask_chunk, AnalyzeMessageRequest, AskRequest, AuthStatusRequest, CancelRequest,
-    ClearPasswordRequest, CopyRequest, DeleteRequest, EventKind, ExplainRequest, FindRequest,
-    FinderRebuildRequest, FinderStatusRequest, GetMessageRequest, GetSpendRequest,
-    GetSummaryRequest, GetUsageRequest, IndexGcRequest, IndexProgress, IndexStatusRequest,
-    ListAccountsRequest, ListEntitiesRequest, ListMessagesRequest, ListOutboxRequest, MoveRequest,
-    PauseRequest, RebuildRequest, ReindexMode, ReindexRequest, ResumeRequest, RetryFailedRequest,
-    SearchRequest, SetFlagsRequest, SetIndexPausedRequest, SetPausedRequest, SuggestReplyRequest,
-    SyncFolderRequest, SyncMode, SyncStatusRequest, VerifyIndexRequest, WatchEventsRequest,
+    analyze_event, ask_chunk, bulk_tag_request, target, AddTagRequest, AnalyzeMessageRequest,
+    AskRequest, AuthStatusRequest, BacktestRuleRequest, BulkTagRequest, CancelRequest,
+    ClearPasswordRequest, CopyRequest, CreateRuleRequest, CreateTagRequest, DeleteRequest,
+    EvaluateRulesRequest, EventKind, ExplainRequest, FindRequest, FinderRebuildRequest,
+    FinderStatusRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest, GetUsageRequest,
+    IndexGcRequest, IndexProgress, IndexStatusRequest, ListAccountsRequest, ListEntitiesRequest,
+    ListMessagesRequest, ListOutboxRequest, ListRulesRequest, ListTagRulesRequest, ListTagsRequest,
+    MoveRequest, PauseRequest, RebuildRequest, RecordCorrectionRequest, ReindexMode,
+    ReindexRequest, RemoveTagRequest, ResolveSuggestionRequest, ResumeRequest, RetryFailedRequest,
+    SearchRequest, SetFlagsRequest, SetIndexPausedRequest, SetPausedRequest, SetTagRuleRequest,
+    SuggestReplyRequest, SuggestTagsRequest, SyncFolderRequest, SyncMode, SyncStatusRequest,
+    SynthesizeRuleRequest, TagRuleMode, TagSuggestion, TagSyncMode, Target, VerifyIndexRequest,
+    WatchEventsRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
@@ -154,6 +161,8 @@ pub struct GrpcExec {
     auth: ClientAuthServiceClient<Conn>,
     index: IndexServiceClient<Conn>,
     policy: AiPolicyServiceClient<Conn>,
+    tags: TagServiceClient<Conn>,
+    rules: RuleServiceClient<Conn>,
     /// The task feeding the search overlay, so the next keystroke can abort
     /// it. One slot per stream kind: a search and a find can be outstanding
     /// at once (they are different overlays), but two searches cannot.
@@ -241,7 +250,9 @@ impl GrpcExec {
             scheduler: SendSchedulerServiceClient::new(channel.clone()),
             auth: ClientAuthServiceClient::new(channel.clone()),
             index: IndexServiceClient::new(channel.clone()),
-            policy: AiPolicyServiceClient::new(channel),
+            policy: AiPolicyServiceClient::new(channel.clone()),
+            tags: TagServiceClient::new(channel.clone()),
+            rules: RuleServiceClient::new(channel),
             searching: Mutex::new(None),
             finding: Mutex::new(None),
             asking: Mutex::new(None),
@@ -878,6 +889,285 @@ impl CmdExec for GrpcExec {
                     }
                 });
             }
+            Cmd::TagList {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.tags.clone();
+                self.report(generation, out, async move {
+                    call(client.list_tags(ListTagsRequest { account_id }))
+                        .await
+                        .map(|r| wire::tag_rows(&r.into_inner()))
+                });
+            }
+            Cmd::TagApply {
+                generation,
+                message_ids,
+                name,
+                remove,
+            } => {
+                let mut client = self.tags.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    apply_tags(&mut client, &message_ids, &name, remove, &sink).await;
+                });
+            }
+            Cmd::TagCreate {
+                account_id,
+                name,
+                color,
+                sync,
+            } => {
+                let mut client = self.tags.clone();
+                self.spawn(out, async move {
+                    let label = format!("tag {name} created");
+                    Msg::Done {
+                        label,
+                        result: call(client.create_tag(CreateTagRequest {
+                            account_id,
+                            name,
+                            color,
+                            sync_mode: sync.map(|sync| tag_sync_mode(sync) as i32),
+                            parent_id: None,
+                        }))
+                        .await
+                        .map(|_| Effect::None),
+                    }
+                });
+            }
+            Cmd::TagBulk {
+                generation,
+                account_id,
+                query,
+                name,
+            } => {
+                let mut client = self.tags.clone();
+                self.report(generation, out, async move {
+                    call(client.bulk_tag(BulkTagRequest {
+                        account_id,
+                        selector: Some(bulk_tag_request::Selector::Query(query)),
+                        names: vec![name],
+                    }))
+                    .await
+                    .map(|r| wire::tag_bulk_rows(&r.into_inner()))
+                });
+            }
+            Cmd::TagSuggest {
+                generation,
+                message_id,
+            } => {
+                let mut client = self.tags.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    stream_suggestions(
+                        client.suggest_tags(SuggestTagsRequest { message_id }),
+                        sink,
+                    )
+                    .await;
+                });
+            }
+            Cmd::TagResolve {
+                message_tag_id,
+                resolve,
+            } => {
+                let mut client = self.tags.clone();
+                self.spawn(out, async move {
+                    Msg::Done {
+                        label: match resolve {
+                            commands::tag::Resolve::Accept => "suggestion accepted".to_owned(),
+                            commands::tag::Resolve::Reject => "suggestion rejected".to_owned(),
+                        },
+                        result: call(client.resolve_suggestion(ResolveSuggestionRequest {
+                            message_tag_id,
+                            accept: resolve.accept(),
+                        }))
+                        .await
+                        .map(|_| Effect::None),
+                    }
+                });
+            }
+            Cmd::TagRules {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.tags.clone();
+                self.report(generation, out, async move {
+                    call(client.list_tag_rules(ListTagRulesRequest { account_id }))
+                        .await
+                        .map(|r| wire::tag_rule_rows(&r.into_inner()))
+                });
+            }
+            Cmd::TagRuleSet {
+                account_id,
+                name,
+                tag,
+                mode,
+                min_conf_pct,
+                enabled,
+            } => {
+                let mut client = self.tags.clone();
+                self.spawn(out, async move {
+                    let label = format!("tag rule {name} stored");
+                    Msg::Done {
+                        label,
+                        result: call(client.set_tag_rule(SetTagRuleRequest {
+                            account_id,
+                            name,
+                            tag_name: tag,
+                            mode: match mode {
+                                commands::tag::RuleMode::Suggest => TagRuleMode::Suggest as i32,
+                                commands::tag::RuleMode::Auto => TagRuleMode::Auto as i32,
+                            },
+                            // Back to a fraction at the wire seam, which is the
+                            // only place it has to be one — see
+                            // `commands::tag::percent` on why the `Cmd` carries
+                            // whole percent instead.
+                            min_conf: f64::from(min_conf_pct) / 100.0,
+                            enabled,
+                        }))
+                        .await
+                        .map(|_| Effect::None),
+                    }
+                });
+            }
+            Cmd::RuleList {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.rules.clone();
+                self.report(generation, out, async move {
+                    call(client.list_rules(ListRulesRequest { account_id }))
+                        .await
+                        .map(|r| wire::rule_rows(&r.into_inner()))
+                });
+            }
+            Cmd::RuleSynthesize {
+                generation,
+                account_id,
+                instruction,
+                days,
+            } => {
+                let mut client = self.rules.clone();
+                let reporter = out.clone();
+                self.report(generation, out, async move {
+                    let response = call(client.synthesize_rule(SynthesizeRuleRequest {
+                        account_id,
+                        instruction,
+                        days: days.unwrap_or(0),
+                    }))
+                    .await?
+                    .into_inner();
+                    // The draft travels back to the model as well as to the
+                    // report, because `:rule add` stores it and a document that
+                    // only ever existed inside a rendered row could not be
+                    // stored at all.
+                    let _ = reporter.send(Msg::RuleDrafted(response.toml.clone()));
+                    Ok(wire::rule_draft_rows(&response))
+                });
+            }
+            Cmd::RuleCreate { account_id, toml } => {
+                let mut client = self.rules.clone();
+                self.spawn(out, async move {
+                    let result = call(client.create_rule(CreateRuleRequest { account_id, toml }))
+                        .await
+                        .map(|response| {
+                            response
+                                .into_inner()
+                                .rule
+                                .map_or_else(|| "the rule".to_owned(), |rule| rule.name)
+                        });
+                    match result {
+                        Ok(name) => Msg::Done {
+                            label: format!("rule {name} stored"),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "rule add".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::RuleEvaluate {
+                generation,
+                account_id,
+                message_ids,
+                rule,
+            } => {
+                let mut client = self.rules.clone();
+                self.report(generation, out, async move {
+                    call(client.evaluate_rules(EvaluateRulesRequest {
+                        account_id,
+                        message_ids,
+                        rule_names: rule.into_iter().collect(),
+                    }))
+                    .await
+                    .map(|r| {
+                        let response = r.into_inner();
+                        wire::rule_outcome_rows(&response.messages, response.stats.as_ref(), None)
+                    })
+                });
+            }
+            Cmd::RuleBacktest {
+                generation,
+                account_id,
+                name,
+                days,
+            } => {
+                let mut client = self.rules.clone();
+                self.report(generation, out, async move {
+                    call(client.backtest_rule(BacktestRuleRequest {
+                        account_id,
+                        rule_name: name,
+                        // Empty, because this backtests a rule the daemon already
+                        // has: `rule_toml` is for testing a document that is not
+                        // stored yet, which is `:rule new`'s own dry run.
+                        rule_toml: String::new(),
+                        days: days.unwrap_or(0),
+                    }))
+                    .await
+                    .map(|r| {
+                        let response = r.into_inner();
+                        let window = response.window_days;
+                        wire::rule_outcome_rows(
+                            &response.messages,
+                            response.stats.as_ref(),
+                            Some(window),
+                        )
+                    })
+                });
+            }
+            Cmd::RuleCorrect {
+                account_id,
+                message_id,
+                prompt,
+                expected,
+            } => {
+                let mut client = self.rules.clone();
+                self.spawn(out, async move {
+                    let result = call(client.record_correction(RecordCorrectionRequest {
+                        account_id,
+                        message_id,
+                        prompt,
+                        expected,
+                    }))
+                    .await;
+                    match result {
+                        // The example count is the whole answer: it is how
+                        // somebody knows whether a criterion has enough
+                        // corrections behind it to have changed.
+                        Ok(response) => Msg::Done {
+                            label: format!(
+                                "correction recorded — {} example(s) for that criterion",
+                                response.into_inner().example_count
+                            ),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "rule correct".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
             Cmd::CancelStream { which } => {
                 let slot = match which {
                     Stream::Search => &self.searching,
@@ -1198,6 +1488,20 @@ impl ReportSink {
         });
     }
 
+    /// One frame of rows that *extend* what is already shown, for a stream that
+    /// sends each row once — `SuggestTags`' discipline rather than the snapshot
+    /// one above.
+    fn append(&self, rows: Vec<ReportRow>, complete: bool) {
+        let _ = self.out.send(Msg::Report {
+            generation: self.generation,
+            event: ReportEvent::Frame {
+                fill: ReportFill::Append,
+                rows,
+                complete,
+            },
+        });
+    }
+
     /// The stream failed. Rows already delivered are kept by the pane.
     fn failed(&self, error: String) {
         let _ = self.out.send(Msg::Report {
@@ -1308,6 +1612,94 @@ where
             },
             Some(Err(status)) => return sink.failed(status.message().to_owned()),
             None => return sink.failed("the daemon ended the analysis early".to_owned()),
+        }
+    }
+}
+
+/// The `TagSyncMode` a `--sync` value means.
+const fn tag_sync_mode(sync: commands::tag::Sync) -> TagSyncMode {
+    match sync {
+        commands::tag::Sync::Local => TagSyncMode::Local,
+        commands::tag::Sync::Imap => TagSyncMode::Imap,
+        commands::tag::Sync::Auto => TagSyncMode::Auto,
+    }
+}
+
+/// Apply or remove one tag across a selection, a row per message.
+///
+/// Sequential rather than concurrent, and deliberately: these reflect to IMAP,
+/// and fanning a fifty-message selection out into fifty simultaneous STORE
+/// commands is the "500 concurrent IMAP mutations from one keystroke" that
+/// `model::MAX_BULK` exists to prevent. The report fills in as each lands, which
+/// is also what makes progress visible on a slow server.
+///
+/// Every frame carries every row so far, because `ReportFill::Replace` is the
+/// snapshot discipline the streamed reports share — see
+/// `wire::index_progress_rows`.
+async fn apply_tags(
+    client: &mut TagServiceClient<Conn>,
+    message_ids: &[i64],
+    name: &str,
+    remove: bool,
+    sink: &ReportSink,
+) {
+    if message_ids.is_empty() {
+        return sink.rows(Vec::new(), true);
+    }
+    let mut rows: Vec<ReportRow> = Vec::new();
+    for (index, message_id) in message_ids.iter().enumerate() {
+        let target = Some(Target {
+            of: Some(target::Of::MessageId(*message_id)),
+        });
+        let names = vec![name.to_owned()];
+        let outcome = if remove {
+            call(client.remove_tag(RemoveTagRequest { target, names }))
+                .await
+                .map(|_| "removed".to_owned())
+        } else {
+            call(client.add_tag(AddTagRequest { target, names }))
+                .await
+                .map(|response| {
+                    response
+                        .into_inner()
+                        .applications
+                        .first()
+                        .map_or_else(|| "applied".to_owned(), |a| wire::tag_source(a.source))
+                })
+        };
+        rows.push(match outcome {
+            Ok(what) => wire::tag_applied_row(*message_id, name, &what),
+            // Kept going rather than abandoned: a tag that failed on one message
+            // is a fact about that message, and stopping would leave the rest
+            // untagged for no reason the reader could see.
+            Err(error) => wire::tag_failed_row(*message_id, name, &error),
+        });
+        sink.rows(rows.clone(), index + 1 == message_ids.len());
+    }
+}
+
+/// Drain a `SuggestTags` stream into a Report.
+///
+/// Appends rather than replaces, which is the one streamed report here that
+/// does: `SuggestTags` sends each suggestion once, so this is
+/// `SearchService.Search`'s discipline and not the finder's. The stream ending
+/// without a failure *is* the end of the suggestions — there is no terminal
+/// frame to wait for — so the last thing this does is complete the report.
+async fn stream_suggestions<S>(request: S, sink: ReportSink)
+where
+    S: Future<Output = Result<tonic::Response<tonic::Streaming<TagSuggestion>>, tonic::Status>>,
+{
+    let mut stream = match request.await {
+        Ok(response) => response.into_inner(),
+        Err(status) => return sink.failed(status.message().to_owned()),
+    };
+    loop {
+        match stream.next().await {
+            Some(Ok(suggestion)) => {
+                sink.append(vec![wire::tag_suggestion_row(&suggestion)], false);
+            }
+            Some(Err(status)) => return sink.failed(status.message().to_owned()),
+            None => return sink.append(Vec::new(), true),
         }
     }
 }

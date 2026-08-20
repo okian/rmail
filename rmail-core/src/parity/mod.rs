@@ -2023,4 +2023,7 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     // row is what declares it. One action claiming every reportable capability
     // would make this table say nothing about any of them.
     Action::ReportRerun,
+    // Task 95's `n`, local for exactly the same reason: it runs whatever the
+    // highlighted row's own verb reaches.
+    Action::ReportReject,
 ];

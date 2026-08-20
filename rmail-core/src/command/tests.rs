@@ -232,6 +232,7 @@ fn folder_verb() -> Verb {
         positionals: &[Positional {
             name: "folder",
             required: true,
+            rest: false,
         }],
         flags: &[
             Flag {
@@ -843,6 +844,7 @@ fn a_positional_taking_verb_shadowed_by_a_longer_one_is_caught() {
         positionals: &[Positional {
             name: "query",
             required: false,
+            rest: false,
         }],
         flags: &[],
         cli_alias: None,
@@ -932,7 +934,7 @@ fn no_action_maps_to_more_than_one_capability() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_flag_with_an_equals_value_parses_the_same_as_a_space_separated_one() {
+fn a_flag_with_an_equals_value_tokenizes_with_its_value_attached() {
     let text = r#"test --since=7d"#;
     let tokens = tokenize(text).unwrap();
     assert_eq!(
@@ -944,6 +946,108 @@ fn a_flag_with_an_equals_value_parses_the_same_as_a_space_separated_one() {
                 value: Some("7d".to_owned()),
             },
         ]
+    );
+}
+
+/// The two spellings of a value are the same thing, which is what
+/// [`Flag::takes_value`] claims.
+///
+/// This used to be asserted by a test *named* for both spellings whose body only
+/// built the `=` one — and the claim was unreachable anyway, because no verb in
+/// the registry declared a flag until task 95's did. `tokenize` cannot pair them:
+/// only the [`Verb`] knows which flags take values, so the pairing is `parse`'s
+/// (`bind`'s) and has to be asserted through `parse`.
+#[test]
+fn a_space_separated_flag_value_parses_the_same_as_an_equals_one() {
+    for text in [
+        "tag new invoices --sync imap",
+        "tag new invoices --sync=imap",
+    ] {
+        let Ok(Resolution::Invocation(invocation)) = parse(text) else {
+            panic!("{text:?} should parse");
+        };
+        assert_eq!(
+            invocation.flags,
+            vec![ParsedFlag {
+                name: "sync".to_owned(),
+                value: Some("imap".to_owned()),
+            }],
+            "{text}"
+        );
+        assert_eq!(
+            invocation.positionals,
+            vec!["invoices".to_owned()],
+            "{text}: and the value is not also an argument"
+        );
+    }
+}
+
+#[test]
+fn a_switch_flag_does_not_swallow_the_argument_after_it() {
+    // The reason the pairing cannot live in `tokenize`: `--disabled` takes no
+    // value, so the word after it is a positional. A tokenizer guessing would
+    // have to guess wrong for one of these two.
+    let Ok(Resolution::Invocation(invocation)) = parse("tag rules set --disabled news news") else {
+        panic!("should parse");
+    };
+    assert_eq!(
+        invocation.positionals,
+        vec!["news".to_owned(), "news".to_owned()]
+    );
+    assert_eq!(
+        invocation.flags,
+        vec![ParsedFlag {
+            name: "disabled".to_owned(),
+            value: None,
+        }]
+    );
+}
+
+#[test]
+fn a_value_taking_flag_with_nothing_after_it_is_still_refused_by_name() {
+    // The pairing must not turn "no value" into "the next flag's name".
+    assert!(matches!(
+        parse("tag new invoices --sync"),
+        Err(CommandError::MissingFlagValue { .. })
+    ));
+    assert!(matches!(
+        parse("tag rules set a b --mode --disabled"),
+        Err(CommandError::MissingFlagValue { .. })
+    ));
+}
+
+/// A flag before the verb keeps its value only in the `=` spelling, and this is
+/// the limitation rather than an oversight.
+///
+/// Which words belong to the verb path is decided *before* any flag's arity is
+/// known — that is the order [`parse_verb`] has to work in, since only the verb
+/// declares its flags — so a space-separated value sitting ahead of the path is
+/// indistinguishable from another path segment. vim's `:` has the same shape: the
+/// command comes first. The `=` form carries its value inside one token and is
+/// therefore unaffected.
+#[test]
+fn a_flag_before_the_verb_keeps_its_value_only_when_glued_to_it() {
+    let Ok(Resolution::Invocation(invocation)) = parse("tag --sync=imap new invoices") else {
+        panic!("the glued form should parse");
+    };
+    assert_eq!(invocation.verb, ["tag", "new"]);
+    assert_eq!(invocation.positionals, vec!["invoices".to_owned()]);
+    assert_eq!(
+        invocation.flags,
+        vec![ParsedFlag {
+            name: "sync".to_owned(),
+            value: Some("imap".to_owned()),
+        }]
+    );
+
+    // And the space-separated form ahead of the path is not a verb at all,
+    // reported as such rather than resolving to something else.
+    assert!(
+        matches!(
+            parse("tag --sync imap new invoices"),
+            Ok(Resolution::Children { .. }) | Err(CommandError::UnknownVerb { .. })
+        ),
+        "a value read as a path segment has to fail, not resolve"
     );
 }
 

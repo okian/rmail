@@ -36,6 +36,10 @@
 //! rides on the spec rather than in a second table, so a verb cannot be added
 //! without the author looking at the field.
 
+pub mod daemon;
+pub mod rule;
+pub mod tag;
+
 #[cfg(test)]
 mod tests;
 
@@ -77,7 +81,7 @@ impl Pause {
 ///
 /// Passed in rather than read here, because this module has no `Model` — which
 /// is the property that makes every claim below checkable without building one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     /// The account on screen, or 0 when none has loaded.
     pub account_id: i64,
@@ -85,6 +89,20 @@ pub struct Target {
     pub mailbox_id: Option<i64>,
     /// The message the viewer or the list cursor is on, if any.
     pub message_id: Option<i64>,
+    /// The messages a range applies to: the visual selection when there is one,
+    /// otherwise just [`Target::message_id`].
+    ///
+    /// `model::targets`' own answer, passed in rather than re-derived — which is
+    /// what makes `:'<,'>tag add work` need no code of its own. Task 89's rule is
+    /// that a `:` line carrying `'<,'>` does what the key does with the same
+    /// selection up, and a second notion of "these messages" here is exactly how
+    /// the two would drift.
+    pub selection: Vec<i64>,
+    /// The TOML `:rule new` last drafted, if it has drafted one this session.
+    ///
+    /// `:rule add`'s whole argument — see `rule`'s module docs on why a rule is
+    /// stored from a draft rather than typed or read from a file.
+    pub rule_draft: Option<String>,
 }
 
 /// What a verb answers with.
@@ -122,7 +140,7 @@ pub struct Request {
 
 impl Request {
     /// A verb that answers with rows.
-    fn rows(cmd: Cmd, title: &str, columns: Vec<ReportColumn>) -> Answer {
+    pub(super) fn rows(cmd: Cmd, title: &str, columns: Vec<ReportColumn>) -> Answer {
         Answer::Rows(Box::new(Self {
             cmd,
             title: title.to_owned(),
@@ -132,7 +150,7 @@ impl Request {
     }
 
     /// A verb that answers with a fact.
-    fn fact(cmd: Cmd, title: &str) -> Answer {
+    pub(super) fn fact(cmd: Cmd, title: &str) -> Answer {
         Answer::Fact(Box::new(Self {
             cmd,
             title: title.to_owned(),
@@ -142,299 +160,89 @@ impl Request {
     }
 }
 
-/// Ask the same question of a verb the confirmation gate asks: what does it
-/// answer with, and does it ask first.
-///
-/// `None` for a verb this build has no answer for — which is a real state, not
-/// an oversight: the registry declares verbs for tasks 95 onward, and
-/// `tui::model` reports "no report for it" rather than pretending.
-#[must_use]
-pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Option<Answer> {
-    let verb = invocation.verb.join(" ");
-    let bang = invocation.bang;
-    Some(match verb.as_str() {
-        // -- the index ------------------------------------------------------
-        "index status" => Request::rows(
-            Cmd::IndexStatus { generation },
-            "index — coverage and queue",
-            vec![
-                ReportColumn::new("stage", 12),
-                ReportColumn::new("state", 10),
-                ReportColumn::new("coverage", 10),
-                ReportColumn::new("pending", 9),
-                ReportColumn::new("quarantined", 12),
-            ],
-        ),
-        "index run" => Request::rows(
-            Cmd::IndexReindex {
-                generation,
-                mode: Reindex::Drain,
-                mailbox_id: None,
-            },
-            "index run — draining the queue",
-            progress_columns(),
-        ),
-        "index reindex" => {
-            let Some(mailbox_id) = target.mailbox_id else {
-                return Some(Answer::Refused(
-                    "reindex works on the open folder — open one first".to_owned(),
-                ));
-            };
-            Request::rows(
-                Cmd::IndexReindex {
-                    generation,
-                    mode: Reindex::Selection,
-                    mailbox_id: Some(mailbox_id),
-                },
-                "index reindex — this folder",
-                progress_columns(),
-            )
-        }
-        "index rebuild" => {
-            let mut answer = Request::rows(
-                Cmd::IndexRebuild { generation },
-                "index rebuild — from scratch",
-                progress_columns(),
-            );
-            // The one verb here that asks when typed in full, and the reason is
-            // not that it mutates — `:index gc` mutates and does not ask.
-            // Rebuild drops every derived row and re-derives it, which on a
-            // large mailbox is minutes of work and leaves search degraded while
-            // it runs. That is the shape of thing worth one keystroke of
-            // friction, and the acceptance names it specifically.
-            if let Answer::Rows(request) = &mut answer {
-                request.confirm = (!bang).then(|| {
-                    "rebuild the whole index? every derived row is dropped and \
-                     re-derived, and search is degraded until it finishes [y/N]"
-                        .to_owned()
-                });
-            }
-            answer
-        }
-        "index verify" => Request::rows(
-            Cmd::IndexVerify { generation },
-            "index verify — drift",
-            vec![
-                ReportColumn::new("check", 26),
-                ReportColumn::new("rows adrift", 12),
-            ],
-        ),
-        "index gc" => Request::rows(
-            Cmd::IndexGc { generation },
-            "index gc — reclaimed",
-            vec![ReportColumn::new("what", 22), ReportColumn::new("rows", 10)],
-        ),
-        "index entities" => {
-            // Refused here rather than sent: `ListEntities` rejects an empty
-            // kind, so a bare `:index entities` would be a round trip whose only
-            // outcome is an error. The positional is declared *optional* so the
-            // verb stays typeable — see `command::explicit`'s `KIND` — which
-            // puts the refusal on this side.
-            let Some(kind) = invocation.positionals.first().cloned() else {
-                return Some(Answer::Refused(
-                    "name a kind to list — email, phone, amount…".to_owned(),
-                ));
-            };
-            Request::rows(
-                Cmd::IndexEntities {
-                    generation,
-                    kind: kind.clone(),
-                },
-                &format!("index entities — {kind}"),
-                vec![
-                    ReportColumn::new("kind", 12),
-                    ReportColumn::new("value", 34),
-                    ReportColumn::new("mentions", 9),
-                    ReportColumn::new("messages", 9),
-                ],
-            )
-        }
-        "index start" => Request::fact(
-            Cmd::IndexSetPaused {
-                pause: Pause::Start,
-            },
-            "starting the indexer…",
-        ),
-        "index stop" => Request::fact(
-            Cmd::IndexSetPaused { pause: Pause::Stop },
-            "stopping the indexer…",
-        ),
-
-        // -- sync -----------------------------------------------------------
-        "sync status" => {
-            let Some(account_id) = account(target) else {
-                return Some(no_account());
-            };
-            Request::rows(
-                Cmd::SyncStatusReport {
-                    generation,
-                    account_id,
-                },
-                "sync — every folder",
-                vec![
-                    ReportColumn::new("folder", 26),
-                    ReportColumn::new("messages", 10),
-                    ReportColumn::new("walked", 8),
-                    ReportColumn::new("last sync", 18),
-                ],
-            )
-        }
-        "sync now" => {
-            let Some(account_id) = account(target) else {
-                return Some(no_account());
-            };
-            Request::rows(
-                Cmd::SyncNow {
-                    generation,
-                    account_id,
-                },
-                "sync now",
-                vec![
-                    ReportColumn::new("folder", 22),
-                    ReportColumn::new("strategy", 12),
-                    ReportColumn::new("new", 6),
-                    ReportColumn::new("flags", 7),
-                    ReportColumn::new("expunged", 9),
-                ],
-            )
-        }
-        "sync pause" => {
-            let Some(account_id) = account(target) else {
-                return Some(no_account());
-            };
-            Request::fact(
-                Cmd::SyncSetPaused {
-                    account_id,
-                    pause: Pause::Stop,
-                },
-                "pausing sync…",
-            )
-        }
-        "sync resume" => {
-            let Some(account_id) = account(target) else {
-                return Some(no_account());
-            };
-            Request::fact(
-                Cmd::SyncSetPaused {
-                    account_id,
-                    pause: Pause::Start,
-                },
-                "resuming sync…",
-            )
-        }
-
-        // -- the AI pipeline ------------------------------------------------
-        "ai status" => Request::rows(
-            Cmd::AiUsage {
-                generation,
-                costs: false,
-            },
-            "ai — the dispatch loop",
-            vec![
-                ReportColumn::new("what", 18),
-                ReportColumn::new("value", 42),
-            ],
-        ),
-        // The same RPC as `ai status`, and deliberately its own verb rather
-        // than a flag: `mail` spells both (`AiGetUsage.cli()` lists them), and a
-        // TUI that made one of them `--costs` would be the surface where the
-        // spelling diverged.
-        "ai cost" => Request::rows(
-            Cmd::AiUsage {
-                generation,
-                costs: true,
-            },
-            "ai — spend and caps",
-            vec![
-                ReportColumn::new("window", 14),
-                ReportColumn::new("spent", 12),
-                ReportColumn::new("cap", 12),
-                ReportColumn::new("tokens", 16),
-            ],
-        ),
-        "ai pause" => Request::fact(
-            Cmd::AiSetPaused { pause: Pause::Stop },
-            "pausing AI dispatch…",
-        ),
-        "ai resume" => Request::fact(
-            Cmd::AiSetPaused {
-                pause: Pause::Start,
-            },
-            "resuming AI dispatch…",
-        ),
-        "ai retry" => Request::fact(Cmd::AiRetry, "retrying quarantined AI jobs…"),
-        "ai process" => {
-            let Some(message_id) = target.message_id else {
-                return Some(Answer::Refused("no message selected".to_owned()));
-            };
-            Request::rows(
-                Cmd::AiProcess {
-                    generation,
-                    message_id,
-                },
-                "ai process — this message",
-                vec![
-                    ReportColumn::new("what", 16),
-                    ReportColumn::new("value", 44),
-                ],
-            )
-        }
-
-        // -- the finder index -----------------------------------------------
-        "finder status" => Request::rows(
-            Cmd::FinderStatus { generation },
-            "finder index",
-            vec![
-                ReportColumn::new("what", 18),
-                ReportColumn::new("value", 30),
-            ],
-        ),
-        "finder rebuild" => Request::fact(Cmd::FinderRebuild, "rebuilding the finder index…"),
-
-        // -- client auth (task 90) ------------------------------------------
-        "auth status" => Request::rows(
-            Cmd::AuthStatus { generation },
-            "auth — access to rmail's own API",
-            vec![
-                ReportColumn::new("setting", 21),
-                ReportColumn::new("state", 48),
-            ],
-        ),
-        "auth clear" => Request::fact(Cmd::AuthClear, "clearing the password…"),
-
-        _ => return None,
-    })
-}
-
 /// What a verb needing an account says when none has loaded.
 ///
 /// A named refusal rather than a `None` from [`answer`], because the two mean
 /// different things to the caller: `None` is "this build has no answer for that
 /// verb", and reporting a missing account as that would send somebody looking
 /// for a feature that is present and simply has nothing to act on yet. Named
-/// once rather than written at each of the four call sites, so they cannot
-/// disagree about how to say it.
-fn no_account() -> Answer {
+/// once rather than written at each call site, so they cannot disagree about how
+/// to say it.
+pub(super) fn no_account() -> Answer {
     Answer::Refused("no account loaded yet".to_owned())
-}
-
-/// The columns every streamed indexing progress Report draws.
-///
-/// One shape for `run`, `reindex` and `rebuild` because the RPCs answer with the
-/// same `IndexProgress`: three verbs with three column layouts over one message
-/// would be three chances to disagree about what `remaining` means.
-fn progress_columns() -> Vec<ReportColumn> {
-    vec![
-        ReportColumn::new("counter", 14),
-        ReportColumn::new("jobs", 12),
-    ]
 }
 
 /// The account on screen, if one has loaded.
 ///
 /// Zero means none: every account id in this API is a positive row id, and the
 /// proto spells `0` as "every account" for the RPCs that accept it — which is a
-/// different question from the one a bar zone or a folder listing is asking.
-fn account(target: &Target) -> Option<i64> {
+/// different question from the one a folder listing or a tag table is asking.
+pub(super) fn account(target: &Target) -> Option<i64> {
     (target.account_id != 0).then_some(target.account_id)
+}
+
+/// The `n`th positional, if it was given.
+pub(super) fn nth(invocation: &Invocation, index: usize) -> Option<String> {
+    invocation.positionals.get(index).cloned()
+}
+
+/// The first positional, if it was given.
+pub(super) fn first(invocation: &Invocation) -> Option<String> {
+    nth(invocation, 0)
+}
+
+/// Every positional, joined with spaces.
+///
+/// What a verb taking free text reads: an unquoted sentence is what somebody
+/// types, and using only its first word is the silent truncation `:helpgrep`'s
+/// own docs call out. Empty when nothing was given.
+pub(super) fn joined(invocation: &Invocation) -> String {
+    invocation.positionals.join(" ")
+}
+
+/// A value-taking flag's value, if it was given.
+pub(super) fn flag(invocation: &Invocation, name: &str) -> Option<String> {
+    invocation
+        .flags
+        .iter()
+        .find(|flag| flag.name == name)
+        .and_then(|flag| flag.value.clone())
+}
+
+/// Whether a switch flag was given.
+pub(super) fn switch(invocation: &Invocation, name: &str) -> bool {
+    invocation.flags.iter().any(|flag| flag.name == name)
+}
+
+/// How many days a `--days` flag asked for, or `None` for the daemon's default.
+///
+/// Refused rather than clamped when it is not a number: a backtest over zero days
+/// because `--days seven` did not parse is an answer about nothing, presented as
+/// an answer about something.
+pub(super) fn days(invocation: &Invocation) -> Result<Option<u32>, String> {
+    match flag(invocation, "days") {
+        None => Ok(None),
+        Some(text) => text
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| format!("--days {text:?}: a whole number of days")),
+    }
+}
+
+/// What a verb answers with, asked of each domain in turn.
+///
+/// `None` for a verb no domain answers for — which is a real state, not an
+/// oversight: the registry declares verbs for tasks 96 onward, and `tui::model`
+/// reports "no answer for it" rather than pretending.
+///
+/// The domains are tried in order and the first answer wins. They cannot
+/// overlap: every arm matches on a whole verb path, and
+/// `command::tests::no_two_real_verbs_share_the_same_path` is what makes a path
+/// unambiguous in the first place — so "first wins" is a statement about
+/// evaluation order, not a precedence rule anybody has to remember.
+#[must_use]
+pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Option<Answer> {
+    daemon::answer(invocation, target, generation)
+        .or_else(|| tag::answer(invocation, target, generation))
+        .or_else(|| rule::answer(invocation, target, generation))
 }
