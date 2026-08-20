@@ -33,6 +33,7 @@ use super::overlays::{
     ReplyPane, SearchFocus, SearchPane, Toast,
 };
 use super::report::{ReportColumn, ReportPane, ReportTone};
+use super::settings;
 use super::status;
 use super::theme::Theme;
 use super::whichkey::{self, Band, Entry, Kind};
@@ -71,8 +72,9 @@ pub fn render(model: &Model, frame: &mut Frame) {
         Screen::Viewer => render_main_with_panel(model, frame, rows[0], render_viewer),
         // Full width, and deliberately without the AI panel: the manual is
         // not about a message, so there is nothing for that column to be
-        // about either.
+        // about either. The settings screen is the same case.
         Screen::Manual => render_manual(model, frame, rows[0]),
+        Screen::Settings => render_settings(model, frame, rows[0]),
     }
     if model.shown_toast().is_some() {
         render_toast(model, frame, rows[1]);
@@ -1488,6 +1490,103 @@ fn form_title(pane: &FormPane) -> String {
     };
     format!("{} · {state}", overlays::safe_line(&pane.title))
 }
+
+/// The settings screen: the section list on the left, its fields on the right
+/// (task 101).
+///
+/// Two columns rather than one long list, because fourteen sections and their
+/// fields do not fit vertically and a screen that scrolled past its own table of
+/// contents would make `<tab>` the only way to know where you are.
+fn render_settings(model: &Model, frame: &mut Frame, area: Rect) {
+    let theme = &model.theme;
+    let Some(settings) = model.settings.as_ref() else {
+        return;
+    };
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(SETTINGS_SECTIONS), Constraint::Min(1)])
+        .split(area);
+
+    let sections: Vec<ListItem> = settings::Section::ALL
+        .iter()
+        .map(|section| {
+            let selected = *section == settings.section;
+            ListItem::new(Line::styled(
+                format!(" {}", section.title()),
+                if selected {
+                    theme.accent
+                } else {
+                    Style::default()
+                },
+            ))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(
+        settings::Section::ALL
+            .iter()
+            .position(|section| *section == settings.section),
+    );
+    let list_area = inner(theme, frame, columns[0], "settings");
+    frame.render_stateful_widget(
+        List::new(sections).highlight_style(selected_style(theme, false)),
+        list_area,
+        &mut state,
+    );
+
+    let fields = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner(
+            theme,
+            frame,
+            columns[1],
+            &format!("{} · <tab> next section", settings.section.title()),
+        ));
+    let items: Vec<ListItem> = settings
+        .fields
+        .iter()
+        .map(|field| {
+            let style = match &field.kind {
+                // A read-only field is drawn as one, so a reader knows before
+                // pressing `<enter>` that nothing here writes it.
+                settings::FieldKind::ReadOnly(_) => theme.muted,
+                _ => Style::default(),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", fitted(field.label, SETTINGS_LABEL)),
+                    theme.muted,
+                ),
+                Span::styled(overlays::safe_line(&field.value()), style),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(
+        settings.cursor.min(settings.fields.len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selected_style(theme, true)),
+        fields[0],
+        &mut state,
+    );
+    // The highlighted field's hint, on its own line: every hint at once is a
+    // wall of text, and the one that matters is the one under the cursor.
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            settings.field().map_or("", |field| field.hint),
+            theme.muted,
+        )),
+        fields[1],
+    );
+}
+
+/// How wide the section column is.
+const SETTINGS_SECTIONS: u16 = 20;
+
+/// How wide a settings field's label column is.
+const SETTINGS_LABEL: usize = 26;
 
 /// One row's cells, each padded or truncated to its column's declared width.
 ///

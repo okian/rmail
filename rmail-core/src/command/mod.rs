@@ -729,6 +729,13 @@ fn explicit() -> Vec<Verb> {
             rest: true,
         },
     ];
+    /// Which page of the settings screen to open on. Optional: the bare verb
+    /// reopens whatever section was last on screen.
+    const SECTION: &[Positional] = &[Positional {
+        name: "section",
+        required: false,
+        rest: false,
+    }];
     /// A filesystem path — the one verb here that reads one, and its docs in
     /// `tui::commands::content` say why it has to.
     const PATH: &[Positional] = &[Positional {
@@ -2039,6 +2046,22 @@ fn explicit() -> Vec<Verb> {
             description: Some("Switch which account this session is looking at."),
         },
         // -- content, export and analytics (task 99) ---------------------------
+        Verb {
+            path: vec!["settings"],
+            // No capability: every field on that screen writes through a `:`
+            // line of its own, and the verb on *that* line is what declares one
+            // — see `parity::LOCAL_ACTIONS`. The delegate is kept so `?` and the
+            // key reference link `gs` to this verb, but the section positional is
+            // not something an `Action` can carry, so `rmail_cli`'s dispatch
+            // reads it before the generic action path (the same early,
+            // hand-written case `manual grep` is).
+            capability: None,
+            action: Some(Action::SettingsOpen),
+            positionals: SECTION,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
         Verb {
             path: vec!["message", "open"],
             // Neither, for the reason `:account use` has neither. It does reach

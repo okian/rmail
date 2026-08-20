@@ -2008,6 +2008,13 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     Action::ManualNext,
     Action::ManualPrev,
     Action::ManualGrep,
+    // Task 101's settings screen. Local for the reason `command` is, only more
+    // literally: every field's write is a `:` line, and the verb on that line is
+    // what declares the capability. Opening the screen reaches nothing, and
+    // `<tab>`bing between its sections reaches nothing — a settings screen that
+    // claimed every switch's capability at once would make this table say
+    // nothing about any of them.
+    Action::SettingsOpen,
     Action::VisualToggle,
     Action::VisualSwapEnds,
     Action::OpenHtml,

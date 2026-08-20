@@ -70,6 +70,7 @@ use super::overlays::{
     QuickAction, QuickPane, ReplyPane, SearchFocus, SearchPane, Toast, UndoToast,
 };
 use super::report::{self, ReportColumn, ReportFill, ReportPane, ReportRow};
+use super::settings::{self, SettingsState};
 use super::status::{Daemon, Health, Subsystem};
 use super::theme::Theme;
 use crate::keymap::file::{self as keys_file, keys_path_from_env};
@@ -256,6 +257,9 @@ pub enum Screen {
     /// [`set_screen`] on why that is a second field rather than a payload
     /// here.
     Manual,
+    /// The settings screen (task 101). Its state is [`Model::settings`], a
+    /// second field for the reason the manual's is.
+    Settings,
 }
 
 /// The screen the manual was opened from, so leaving it goes back there.
@@ -280,7 +284,7 @@ impl Origin {
     const fn of(screen: Screen) -> Self {
         match screen {
             Screen::Viewer => Self::Viewer,
-            Screen::List | Screen::Manual => Self::List,
+            Screen::List | Screen::Manual | Screen::Settings => Self::List,
         }
     }
 }
@@ -2347,6 +2351,16 @@ pub struct Model {
     /// place either is assigned, and `the_manual_state_and_the_screen_agree`
     /// is what holds them to it.
     pub manual: Option<ManualState>,
+    /// The settings screen's state, when it is the screen. `Some` exactly when
+    /// [`Model::screen`] is [`Screen::Settings`], held to it the same way and by
+    /// the same function.
+    pub settings: Option<SettingsState>,
+    /// Which section the settings screen was last on, so reopening it goes back
+    /// there rather than to the first one.
+    ///
+    /// Outside [`Model::settings`] because it outlives the screen — which is the
+    /// same reason `rule_draft` and `block` are session state.
+    last_settings_section: Option<settings::Section>,
     /// The modal layer, if any.
     pub overlay: Option<Overlay>,
     /// Whether the collapsible AI panel is showing.
@@ -2480,6 +2494,8 @@ impl Model {
             focus: Focus::Messages,
             screen: Screen::List,
             manual: None,
+            settings: None,
+            last_settings_section: None,
             overlay: None,
             ai_panel: false,
             summary: None,
@@ -2611,6 +2627,10 @@ impl Model {
                 // (and `o` meaning swap-ends there rather than open-html) is
                 // wrong. [`Model::selection`] draws the same line for the same
                 // reason.
+                // Before the visual selection for the reason the manual is:
+                // the settings screen can be opened mid-selection, and while it
+                // is up the keyboard belongs to it.
+                Screen::Settings => Mode::Settings,
                 Screen::List if self.is_selecting() => Mode::Visual,
                 Screen::List => Mode::Normal,
                 Screen::Viewer => Mode::Viewer,
@@ -2710,6 +2730,9 @@ fn set_screen(model: &mut Model, screen: Screen) {
     model.screen = screen;
     if screen != Screen::Manual {
         model.manual = None;
+    }
+    if screen != Screen::Settings {
+        model.settings = None;
     }
 }
 
@@ -3670,6 +3693,15 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
         Action::CursorUp => move_cursor(model, Direction::Up, count),
         Action::CursorTop => jump(model, Edge::Top, count),
         Action::CursorBottom => jump(model, Edge::Bottom, count),
+        // `<tab>` means "the next thing over", and what that is depends on the
+        // screen: the other pane on the list, the next section of the settings
+        // screen. One action dispatched on the surface rather than two, for the
+        // reason `cursor.down` is one action driving four cursors — and because
+        // `settings.section` as an id would auto-derive a `:settings section`
+        // verb that shadowed `:settings <section>`, which
+        // `command::tests::no_real_verb_that_takes_positionals_is_shadowed_by_a_longer_one`
+        // refuses and rightly.
+        Action::FocusToggle if model.screen == Screen::Settings => next_settings_section(model),
         Action::FocusToggle => set_focus(
             model,
             match model.focus {
@@ -3688,6 +3720,7 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
         }
         Action::Help => open_help(model),
         Action::HelpRebind => open_help_rebind(model),
+        Action::SettingsOpen => open_settings(model, None),
         Action::ManualOpen => open_manual(model),
         Action::ManualBack => manual_jump(model, Jump::Back),
         Action::ManualForward => manual_jump(model, Jump::Forward),
@@ -3773,6 +3806,8 @@ enum Cursor {
     /// (which is what the viewer has) because a manual row is followable:
     /// `<enter>` takes the link on it.
     Manual,
+    /// The settings screen's highlighted field.
+    Settings,
 }
 
 fn active_cursor(model: &Model) -> Option<Cursor> {
@@ -3787,6 +3822,7 @@ fn active_cursor(model: &Model) -> Option<Cursor> {
         None => match model.screen {
             Screen::Viewer => Some(Cursor::Scroll),
             Screen::Manual => Some(Cursor::Manual),
+            Screen::Settings => Some(Cursor::Settings),
             Screen::List => Some(match model.focus {
                 Focus::Folders => Cursor::Folders,
                 Focus::Messages => Cursor::Messages,
@@ -3814,6 +3850,10 @@ fn cursor_span(model: &Model, cursor: Cursor) -> Option<(usize, usize)> {
             let manual = model.manual.as_ref()?;
             let lines = manual_doc(model)?.lines.len();
             (manual.cursor_in(lines), lines)
+        }
+        Cursor::Settings => {
+            let settings = model.settings.as_ref()?;
+            (settings.cursor, settings.fields.len())
         }
     };
     (len > 0).then(|| (idx, len - 1))
@@ -3849,6 +3889,11 @@ fn set_cursor(model: &mut Model, cursor: Cursor, at: usize) {
         Cursor::Manual => {
             if let Some(manual) = model.manual.as_mut() {
                 manual.cursor = at;
+            }
+        }
+        Cursor::Settings => {
+            if let Some(settings) = model.settings.as_mut() {
+                settings.cursor = at;
             }
         }
     }
@@ -4010,6 +4055,13 @@ fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
     if model.is_selecting() {
         model.visual = None;
         model.info("selection cleared");
+        return Vec::new();
+    }
+    // Before the viewer check, and before the visual selection above: the
+    // settings screen is the innermost thing when it is up.
+    if model.screen == Screen::Settings {
+        set_screen(model, Screen::List);
+        model.info("closed settings");
         return Vec::new();
     }
     if model.screen == Screen::Viewer {
@@ -5500,6 +5552,27 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         };
         return use_account(model, id);
     }
+    if verb == "settings" {
+        // Hand-written for the reason `manual grep` is: the section is not
+        // something an `Action` can carry. Left open on a name this build does
+        // not have, so the complaint lands on the command line with the offending
+        // word still there to fix.
+        let section = match invocation.positionals.first() {
+            None => None,
+            Some(name) => match settings::Section::from_id(name) {
+                Some(section) => Some(section),
+                None => {
+                    let names: Vec<&str> = settings::Section::ALL
+                        .iter()
+                        .map(|section| section.id())
+                        .collect();
+                    return complain(model, format!("{name:?}: one of {}", names.join(", ")));
+                }
+            },
+        };
+        close_command(model);
+        return open_settings(model, section);
+    }
     if verb == "message open" {
         // Hand-written next to `:attach list` and for the same reason: it reaches
         // no capability of its own. What it does is navigate, which no `Answer`
@@ -5682,12 +5755,34 @@ enum PaneOption {
     AiPanel,
 }
 
-/// `:set <option> <value>` — the pane widths and the AI panel width are the
-/// only tunables this grammar reaches yet. A fuller settings surface is task
-/// 101's `Screen::Settings`; when it lands, this is where a new `Invocation`
-/// it wants to issue for one of its own fields should keep landing too,
-/// rather than a second `:set`-shaped path growing next to it.
+/// `:set <option> <value>` — the pane widths, the AI panel width and the theme.
+///
+/// Task 101's settings screen lands its own `Invocation`s here rather than
+/// growing a second `:set`-shaped path next to it, which is what this function's
+/// docs asked for before that screen existed. `theme` is the field it added, and
+/// `Model::theme`'s own docs anticipated it by name: the theme lives on the model
+/// rather than being a parameter `view::render` takes, so switching it is an
+/// ordinary state mutation and not a second channel into the renderer.
 fn set_option(model: &mut Model, option: &str, value: &str) -> Vec<Cmd> {
+    // Ahead of the percentage options because it is not one. Not remembered
+    // across sessions: that would be a config write, and `:set` writes nothing
+    // anywhere else either.
+    if option == "theme" {
+        let Some(name) = super::theme::ThemeName::from_id(value) else {
+            let names: Vec<&str> = super::theme::ThemeName::ALL
+                .iter()
+                .map(|theme| theme.id())
+                .collect();
+            return complain(
+                model,
+                format!("theme {value:?}: one of {}", names.join(", ")),
+            );
+        };
+        model.theme = name.resolve();
+        close_command(model);
+        model.info(format!("theme {}", name.id()));
+        return Vec::new();
+    }
     // `option` is matched into `PaneOption` before `value` is parsed: `set
     // bogus abc` should say `bogus` is not an option this build has, not
     // that `abc` is not a number — the second reads as though `bogus` were
@@ -6144,6 +6239,118 @@ fn use_account(model: &mut Model, id: i64) -> Vec<Cmd> {
     ]
 }
 
+/// `:settings [<section>]`, `gs`, and `s` from any Report.
+///
+/// Opened on `section`, or on whatever section was last open — so `<tab>`ing to
+/// Notifications, closing, and reopening puts you back there rather than at
+/// Accounts. The state is rebuilt either way, because a field's selection is
+/// where the last `<enter>` left it and carrying that across a close would be
+/// remembering a value nothing has read back.
+fn open_settings(model: &mut Model, section: Option<settings::Section>) -> Vec<Cmd> {
+    // The one overlay it may open over is a list overlay, the same rule `:` and
+    // the manual follow: a Report answering `s` is a Report asking to be
+    // replaced, and it takes its stream down with it.
+    let stop = if model.mode() == Mode::Menu {
+        model.overlay.take().map(|overlay| cancels(&overlay))
+    } else if screen_is_clear(model) {
+        None
+    } else {
+        return Vec::new();
+    };
+    let section = section
+        .or(model.last_settings_section)
+        .unwrap_or(settings::Section::Accounts);
+    model.last_settings_section = Some(section);
+    set_screen(model, Screen::Settings);
+    model.settings = Some(settings::SettingsState::new(section));
+    announce_settings(model);
+    stop.unwrap_or_default()
+}
+
+/// `<tab>` — the next section.
+fn next_settings_section(model: &mut Model) -> Vec<Cmd> {
+    let Some(settings) = model.settings.as_mut() else {
+        return Vec::new();
+    };
+    let next = settings.section.next();
+    settings.go(next);
+    model.last_settings_section = Some(next);
+    announce_settings(model);
+    Vec::new()
+}
+
+/// What the status line says about the section on screen.
+fn announce_settings(model: &mut Model) {
+    let Some(settings) = model.settings.as_ref() else {
+        return;
+    };
+    let title = settings.section.title();
+    let fields = settings.fields.len();
+    model.info(format!(
+        "settings › {title} — {fields} field(s) · <tab> next section · Esc closes"
+    ));
+}
+
+/// `<enter>` on a settings field.
+///
+/// Every write here goes through `run_invocation`, which is the whole point of
+/// the screen: there is no private path to the daemon, so a field cannot reach a
+/// capability no verb reaches, cannot skip a confirmation a verb asks for, and
+/// cannot do anything a typed line could not.
+fn accept_setting(model: &mut Model) -> Vec<Cmd> {
+    let Some(settings) = model.settings.as_ref() else {
+        return Vec::new();
+    };
+    let Some(field) = settings.field() else {
+        return Vec::new();
+    };
+    let label = field.label;
+    match field.accept() {
+        settings::Accepted::Run { line, at } => {
+            if let Some(settings) = model.settings.as_mut() {
+                if let Some(field) = settings.fields.get_mut(settings.cursor) {
+                    field.at = at;
+                }
+            }
+            let invocation = match settings::invocation(line) {
+                Ok(invocation) => invocation,
+                // Unreachable: `settings::tests::every_line_parses` walks every
+                // field. Reported rather than unwrapped, because a client
+                // holding a terminal in raw mode must not panic.
+                Err(error) => {
+                    model.fail(format!("{label}: {error}"));
+                    return Vec::new();
+                }
+            };
+            record_command(model, line);
+            run_invocation(model, invocation)
+        }
+        // The command line, with the verb on it and the cursor after it. The one
+        // kind that runs nothing: an address, a token label, a chord and an
+        // action are things only the person at the keyboard has, so there is no
+        // write for the screen to express.
+        settings::Accepted::Type { line } => {
+            let mut cmds = open_command(model);
+            if let Some(Overlay::Command(pane)) = model.overlay.as_mut() {
+                pane.input = if line.ends_with('=') {
+                    line.to_owned()
+                } else {
+                    format!("{line} ")
+                };
+            }
+            refresh_command(model);
+            model.info(format!("{label} — finish the line and press Enter"));
+            cmds.extend(std::iter::empty());
+            cmds
+        }
+        settings::Accepted::Say { why } => {
+            model.fail(format!("{label}: {why}"));
+            Vec::new()
+        }
+        settings::Accepted::Nothing => Vec::new(),
+    }
+}
+
 /// What the screen can offer a verb that needs a target.
 fn target_of(model: &Model) -> Target {
     Target {
@@ -6515,6 +6722,8 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Row(Box<command::Invocation>),
         /// A form's highlighted field, or its apply row.
         Field,
+        /// The settings screen's highlighted field.
+        Setting,
         /// The row under the cursor is a manual link.
         ManualLink,
         /// The highlighted key reference row (task 102).
@@ -6544,6 +6753,7 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Some(Overlay::Form(_)) => Chosen::Field,
         Some(Overlay::Help(pane)) => help::selected(pane).map_or(Chosen::Close, Chosen::Run),
         None if model.screen == Screen::Manual => Chosen::ManualLink,
+        None if model.screen == Screen::Settings => Chosen::Setting,
         _ => Chosen::Nothing,
     };
     match chosen {
@@ -6552,6 +6762,7 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Chosen::Quick(action) => run_quick(model, action),
         Chosen::Row(invocation) => run_report_row(model, *invocation),
         Chosen::Field => edit_or_apply_form(model),
+        Chosen::Setting => accept_setting(model),
         Chosen::ManualLink => follow_manual_link(model),
         // Not `run_named` for this one action: `open_help_rebind` reads the
         // key reference's own `pane` (the highlighted action, and which
@@ -6867,9 +7078,10 @@ fn target_subject(model: &Model) -> Option<(i64, String)> {
         Screen::List => model
             .current_message()
             .map(|row| (row.id, row.subject.clone())),
-        // The manual is not about a message, and an action that needs one
-        // must say "no message selected" rather than reach behind the page.
-        Screen::Manual => None,
+        // Neither the manual nor the settings screen is about a message, and an
+        // action that needs one must say "no message selected" rather than reach
+        // behind the page.
+        Screen::Manual | Screen::Settings => None,
     }
 }
 
@@ -6879,6 +7091,6 @@ fn target_message(model: &Model) -> Option<i64> {
     match model.screen {
         Screen::Viewer => model.open.as_ref().map(|o| o.id),
         Screen::List => model.current_message().map(|m| m.id),
-        Screen::Manual => None,
+        Screen::Manual | Screen::Settings => None,
     }
 }

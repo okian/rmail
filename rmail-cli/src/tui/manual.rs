@@ -358,6 +358,12 @@ pub const PAGES: &[Page] = &[
         ],
     },
     Page {
+        anchor: "settings",
+        title: "The settings screen",
+        body: Body::Authored(include_str!("manual/pages/settings.md")),
+        documents: &["settings"],
+    },
+    Page {
         anchor: "content",
         title: "Reading what is in the mail",
         body: Body::Authored(include_str!("manual/pages/content.md")),

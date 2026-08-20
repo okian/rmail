@@ -484,10 +484,22 @@ fn a_binding_that_would_make_another_unreachable_is_refused() {
     assert!(error.contains("gg"), "{error}");
     assert!(error.contains("unbind"), "the way out is named: {error}");
 
-    // Unbinding the longer one first is exactly what the message says to do.
+    // Unbinding the longer ones first is exactly what the message says to do —
+    // and there is more than one, since task 101 bound `gs` under the same
+    // prefix. `g` stays refused until every chord it would bury is gone, which
+    // is the rule rather than an accident of how many there were.
     assert_eq!(
         keymap.unbind(Mode::Normal, &chord("gg")),
         Some(Action::CursorTop)
+    );
+    let error = match keymap.bind(Mode::Normal, chord("g"), Action::Quit) {
+        Ok(()) => panic!("g was allowed while another chord still needed it"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("gs"), "{error}");
+    assert_eq!(
+        keymap.unbind(Mode::Normal, &chord("gs")),
+        Some(Action::SettingsOpen)
     );
     assert!(keymap.bind(Mode::Normal, chord("g"), Action::Quit).is_ok());
 }

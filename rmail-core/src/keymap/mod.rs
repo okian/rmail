@@ -340,6 +340,7 @@ actions! {
     Quit          => "quit",                "quit from anywhere";
     Help          => "help",                "this help";
     HelpRebind    => "help.rebind",         "rebind the highlighted key";
+    SettingsOpen  => "settings",            "the settings screen: every switch this build has";
     CommandOpen   => "command",             "the : command line: run any verb by name";
     ManualOpen    => "manual",              "the manual: guides, concepts and the generated reference";
     ManualBack    => "manual.back",         "back to the manual page you came from";
@@ -417,6 +418,14 @@ pub enum Mode {
     Confirm,
     /// The help overlay.
     Help,
+    /// The settings screen (task 101).
+    ///
+    /// A layer of its own rather than a reuse of [`Mode::Menu`], and it restates
+    /// `j`/`k`/`gg`/`G`/`<tab>`/`<enter>` rather than inheriting `Normal` — the
+    /// same reason `Menu` and `Pick` already restate them. A settings screen that
+    /// fell through to `Normal` would answer `a` with "archive" over a list of
+    /// fields, and `d` with "delete" over one that is not a message.
+    Settings,
 }
 
 impl Mode {
@@ -433,6 +442,7 @@ impl Mode {
         Mode::Pick,
         Mode::Confirm,
         Mode::Help,
+        Mode::Settings,
     ];
 
     /// The name this mode has in `keys.toml` and on the command line.
@@ -449,6 +459,7 @@ impl Mode {
             Self::Pick => "pick",
             Self::Confirm => "confirm",
             Self::Help => "help",
+            Self::Settings => "settings",
         }
     }
 
@@ -476,6 +487,7 @@ impl Mode {
             Self::Pick => &[Mode::Pick, Mode::Global],
             Self::Confirm => &[Mode::Confirm, Mode::Global],
             Self::Help => &[Mode::Help, Mode::Global],
+            Self::Settings => &[Mode::Settings, Mode::Global],
         }
     }
 
@@ -759,6 +771,37 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Help, "<c-o>", Action::ManualBack),
     (Mode::Help, "<c-i>", Action::ManualForward),
     (Mode::Help, "<tab>", Action::ManualForward),
+    // The settings screen (task 101). Every navigation binding is restated
+    // rather than inherited, for the reason `Mode::Settings`' own docs give: a
+    // screen of fields that fell through to `Normal` would answer `a` with
+    // "archive" and `d` with "delete" over rows that are not messages.
+    (Mode::Settings, "j", Action::CursorDown),
+    (Mode::Settings, "<down>", Action::CursorDown),
+    (Mode::Settings, "k", Action::CursorUp),
+    (Mode::Settings, "<up>", Action::CursorUp),
+    (Mode::Settings, "gg", Action::CursorTop),
+    (Mode::Settings, "G", Action::CursorBottom),
+    // `<enter>` on a field does whatever that field's kind means — toggle,
+    // cycle a choice, run a command, open a config block. One action
+    // dispatched on the field, for the reason `cursor.down` is one action
+    // driving four cursors.
+    (Mode::Settings, "<enter>", Action::MenuAccept),
+    // `<tab>` moves between sections. `focus.toggle` rather than an action of
+    // its own: the key means "the next thing over" and what that is depends on
+    // the screen, which is the same shape `cursor.down` has. An id under
+    // `settings.` would also auto-derive a `:settings section` verb that
+    // shadowed `:settings <section>`.
+    (Mode::Settings, "<tab>", Action::FocusToggle),
+    (Mode::Settings, "q", Action::Cancel),
+    // The `:` line reaches every one of these fields by name, which is the
+    // property the whole screen is built on — see `tui::settings`.
+    (Mode::Settings, ":", Action::CommandOpen),
+    (Mode::Settings, "?", Action::Help),
+    (Mode::Settings, "K", Action::ManualOpen),
+    // From a Report, which is what the acceptance asks for: a table of daemon
+    // state and the switches behind it are the same subject.
+    (Mode::Menu, "s", Action::SettingsOpen),
+    (Mode::Normal, "gs", Action::SettingsOpen),
 ];
 
 impl Default for Keymap {

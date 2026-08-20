@@ -2299,17 +2299,24 @@ fn enter_on_the_key_reference_runs_the_highlighted_action() {
     // through task 102 the `?` overlay itself had no row cursor, so it fell
     // through to closing. It has one now.
     //
-    // `<c-o>` cycles backward through `Mode::CONFIGURABLE`, which wraps
-    // `Normal` (index 0) straight to `Help` (its last entry) in one press —
-    // landing on a mode where `c`/`help.rebind` is a row: unique enough
-    // (nothing else's id or description mentions "rebind") that filtering
-    // for it cannot leave more than the one match, and running it is
-    // independently verifiable — it replaces the overlay with a pre-filled
-    // command line — without this test depending on which action this
-    // build's defaults happen to sort first anywhere else.
+    // `<c-o>` cycles backward through `Mode::CONFIGURABLE` until it reaches the
+    // layer `c`/`help.rebind` is bound in — unique enough (nothing else's id or
+    // description mentions "rebind") that filtering for it cannot leave more than
+    // one match, and running it is independently verifiable: it replaces the
+    // overlay with a pre-filled command line, without this test depending on
+    // which action this build's defaults happen to sort first anywhere else.
+    //
+    // Cycled until it arrives rather than a fixed number of presses:
+    // `CONFIGURABLE` grows — task 101 added `Settings` — and counting presses
+    // was really asserting where `Help` sat in that list.
     let mut model = loaded();
     press(&mut model, Key::Char('?'));
-    press(&mut model, Key::ctrl('o'));
+    for _ in 0..Mode::CONFIGURABLE.len() {
+        if matches!(model.overlay.as_ref(), Some(Overlay::Help(pane)) if pane.mode == Mode::Help) {
+            break;
+        }
+        press(&mut model, Key::ctrl('o'));
+    }
     press(&mut model, Key::Char('/'));
     keys(&mut model, "rebind");
     press(&mut model, Key::Enter);
@@ -2713,11 +2720,14 @@ fn j_and_k_move_the_key_references_own_row_cursor() {
 
 #[test]
 fn tab_and_ctrl_o_cycle_the_key_references_mode_both_ways() {
-    // `<c-o>` (back) from `Normal`, `Mode::CONFIGURABLE`'s first entry,
-    // wraps to `Help`, its last — proving the cycle actually wraps rather
-    // than merely clamping at an end. `<c-i>` is then checked as a second,
-    // independent forward step from `Normal` rather than assumed identical
-    // to `<tab>` just because both are bound to `Action::ManualForward`.
+    // `<c-o>` (back) from `Normal`, `Mode::CONFIGURABLE`'s first entry, wraps to
+    // its *last* — proving the cycle actually wraps rather than merely clamping
+    // at an end. Read off the list rather than named, because it grows: task 101
+    // appended `Settings`, and a test naming `Help` here was asserting the list's
+    // contents rather than the wrap.
+    let last = *Mode::CONFIGURABLE
+        .last()
+        .expect("there is at least one configurable mode");
     let mut model = loaded();
     press(&mut model, Key::Char('?'));
     model.info("2 message(s)");
@@ -2726,7 +2736,7 @@ fn tab_and_ctrl_o_cycle_the_key_references_mode_both_ways() {
     press(&mut model, Key::ctrl('o'));
     assert_eq!(
         help_pane_mode(&model),
-        Mode::Help,
+        last,
         "back from the first wraps to the last"
     );
 
@@ -4021,7 +4031,16 @@ fn c_on_a_key_reference_row_opens_the_same_prefilled_rebind_enter_does() {
     // this only checks what gets pre-filled, never submits it.
     let mut model = loaded();
     press(&mut model, Key::Char('?'));
-    press(&mut model, Key::ctrl('o'));
+    // Cycle to the layer `help.rebind` is actually bound in rather than counting
+    // `<c-o>` presses: `Mode::CONFIGURABLE` grows — task 101 added `Settings` to
+    // it — and a test that pressed a fixed number of times was really asserting
+    // where `Help` happened to sit in that list.
+    for _ in 0..Mode::CONFIGURABLE.len() {
+        if matches!(model.overlay.as_ref(), Some(Overlay::Help(pane)) if pane.mode == Mode::Help) {
+            break;
+        }
+        press(&mut model, Key::ctrl('o'));
+    }
     press(&mut model, Key::Char('/'));
     keys(&mut model, "rebind");
     press(&mut model, Key::Enter);

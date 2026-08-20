@@ -274,7 +274,30 @@ pub struct StatusBar {
 /// Computed from the longest [`Mode::id`] rather than measured from whatever
 /// mode happens to be active: a zone whose width depends on its content is not
 /// a zone, and every fact after it would move when the mode changed.
-pub const MODE_WIDTH: usize = 13;
+///
+/// Computed *literally*, not written down and described as computed. It was a
+/// hardcoded `13` until task 101 added an eleventh layer whose label is fourteen
+/// columns wide — a constant that claims to be derived and is not is a constant
+/// that goes stale silently.
+pub const MODE_WIDTH: usize = mode_width();
+
+/// The longest label [`mode_label`] can produce.
+const fn mode_width() -> usize {
+    /// `-- ` before and ` --` after.
+    const DECORATION: usize = 6;
+    // `Mode::Global` is labelled too — `mode_label` is total over the enum —
+    // even though it is never active on its own, so it is measured with the rest.
+    let mut longest = Mode::Global.id().len();
+    let mut at = 0;
+    while at < Mode::CONFIGURABLE.len() {
+        let len = Mode::CONFIGURABLE[at].id().len();
+        if len > longest {
+            longest = len;
+        }
+        at += 1;
+    }
+    longest + DECORATION
+}
 
 /// The width the daemon zone reserves per indicator: glyph, label, and a space.
 pub const INDICATOR_WIDTH: usize = 7;

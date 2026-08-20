@@ -41,14 +41,30 @@ fn offered(found: &[Continuation]) -> Vec<String> {
 fn the_default_map_offers_g_after_a_pending_g() {
     let keymap = Keymap::defaults();
     let found = keymap.continuations(Mode::Normal, &keys("g"));
-    assert_eq!(offered(&found), ["g"], "`gg` is the only chord under `g`");
-    match &found.first().map(|c| &c.leads) {
-        Some(Leads::Run(action)) => assert_eq!(*action, Action::CursorTop),
+    // Every chord under `g`, each leading somewhere. Asserted by name rather
+    // than by count, because the set grows — task 101 added `gs` — and a count
+    // was really asserting how many chords this build binds under `g`.
+    let offered = offered(&found);
+    for key in ["g", "s"] {
+        assert!(offered.contains(&key.to_owned()), "{offered:?}");
+    }
+    let leads = |key: &str| {
+        found
+            .iter()
+            .find(|c| c.key.to_string() == key)
+            .map(|c| c.leads.clone())
+    };
+    match leads("g") {
+        Some(Leads::Run(action)) => assert_eq!(action, Action::CursorTop),
         other => panic!("expected `gg` to complete a binding, found {other:?}"),
+    }
+    match leads("s") {
+        Some(Leads::Run(action)) => assert_eq!(action, Action::SettingsOpen),
+        other => panic!("expected `gs` to complete a binding, found {other:?}"),
     }
     assert!(
         found.iter().all(|c| c.buried.is_empty()),
-        "nothing longer than `gg` is bound, so nothing under it is dead"
+        "nothing longer than two keys is bound under `g`, so nothing is dead"
     );
 }
 
@@ -143,14 +159,12 @@ fn continuations_walk_the_whole_chain_not_just_the_nearest_layer() {
     // `Normal`'s `gg` — a band that showed only the nearest layer would say a
     // key does nothing while the engine runs it.
     let keymap = Keymap::defaults();
-    assert_eq!(
-        offered(&keymap.continuations(Mode::Visual, &keys("g"))),
-        ["g"]
-    );
-    assert_eq!(
-        offered(&keymap.continuations(Mode::Viewer, &keys("g"))),
-        ["g"]
-    );
+    // `contains`, not equality: `Normal`'s `g` prefix has grown a second
+    // continuation (`gs`, task 101), and asserting the whole list was asserting
+    // how many chords this build binds under `g` rather than that the chain was
+    // walked at all.
+    assert!(offered(&keymap.continuations(Mode::Visual, &keys("g"))).contains(&"g".to_owned()));
+    assert!(offered(&keymap.continuations(Mode::Viewer, &keys("g"))).contains(&"g".to_owned()));
 }
 
 #[test]
@@ -344,14 +358,22 @@ fn a_shorter_chord_in_a_nearer_layer_kills_the_longer_one_it_prefixes() {
     // `Normal`'s `gg` can never be typed while the viewer is up.
     bind(&mut keymap, Mode::Viewer, "g", Action::AiPanel);
     let found = keymap.shadowed_across_layers();
-    let reported: Vec<(String, String, String)> = found
+    let mut reported: Vec<(String, String, String)> = found
         .iter()
         .map(|(mode, dead, killer)| (mode.id().to_owned(), dead.to_string(), killer.to_string()))
         .collect();
+    reported.sort();
+    // Every chord `g` kills, not one of them: `Normal` binds `gg` and — since
+    // task 101 — `gs`, and both become untypeable in the viewer the moment `g`
+    // fires there. A report naming only the first would understate what the
+    // binding cost.
     assert_eq!(
         reported,
-        [("viewer".to_owned(), "gg".to_owned(), "g".to_owned())],
-        "reported for the mode somebody meets it in, naming the dead binding \
+        [
+            ("viewer".to_owned(), "gg".to_owned(), "g".to_owned()),
+            ("viewer".to_owned(), "gs".to_owned(), "g".to_owned()),
+        ],
+        "reported for the mode somebody meets it in, naming each dead binding \
          and the one that fires instead"
     );
 }

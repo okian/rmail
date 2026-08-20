@@ -73,6 +73,7 @@ pub mod manual;
 pub mod model;
 pub mod overlays;
 pub mod report;
+pub mod settings;
 pub mod status;
 pub mod term;
 pub mod theme;

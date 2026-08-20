@@ -393,7 +393,19 @@ fn the_band_reads_the_mode_the_model_is_in() {
     let mut normal = loaded();
     keys(&mut normal, "g");
     assert_eq!(normal.mode(), Mode::Normal);
-    assert_eq!(offered(&shown(&normal)), ["g", "<esc>", "<c-c>"]);
+    let in_normal = offered(&shown(&normal));
+    // What is offered, not the exact list: `Normal` has grown a second `g`
+    // continuation since (`gs`, task 101's settings screen), and asserting the
+    // whole list was asserting how many chords this build happens to bind under
+    // `g` rather than which layer the band read.
+    assert!(in_normal.contains(&"g".to_owned()), "{in_normal:?}");
+    assert!(
+        !in_normal.contains(&"/".to_owned()),
+        "`g/` belongs to the manual's layer, not this one: {in_normal:?}"
+    );
+    for way_out in ["<esc>", "<c-c>"] {
+        assert!(in_normal.contains(&way_out.to_owned()), "{in_normal:?}");
+    }
 
     let mut help = loaded();
     press(&mut help, Key::Char('?'));

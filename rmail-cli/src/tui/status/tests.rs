@@ -155,11 +155,16 @@ fn every_reachable_mode() -> Vec<(Mode, Model)> {
     press(&mut help, Key::Char('?'));
     out.push((Mode::Help, help));
 
+    let mut settings = loaded();
+    press(&mut settings, Key::Char('g'));
+    press(&mut settings, Key::Char('s'));
+    out.push((Mode::Settings, settings));
+
     out
 }
 
 // ---------------------------------------------------------------------------
-// all ten modes
+// every layer
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -169,10 +174,13 @@ fn every_mode_has_its_own_label() {
         .copied()
         .chain(std::iter::once(Mode::Global))
         .collect();
+    // Derived rather than written down: the count grew when task 101 added
+    // `Settings`, and a literal here was asserting how many layers this build
+    // happened to have rather than that the bar labels all of them.
     assert_eq!(
         modes.len(),
-        10,
-        "ten layers, and the bar labels all of them"
+        Mode::CONFIGURABLE.len() + 1,
+        "every configurable layer, plus the global one the bar also labels"
     );
     let labels: BTreeSet<String> = modes.iter().copied().map(mode_label).collect();
     assert_eq!(
@@ -196,10 +204,10 @@ fn every_mode_has_its_own_label() {
 
 #[test]
 fn every_reachable_mode_draws_its_label_on_the_bar() {
-    // Nine of the ten: `Mode::Global` is never active on its own, which is why
-    // it is absent from `Mode::CONFIGURABLE` too. It is still labelled, because
-    // `mode_label` is total over the enum and a mode a later task promotes
-    // should not need an edit here.
+    // Every layer but `Mode::Global`, which is never active on its own — which is
+    // why it is absent from `Mode::CONFIGURABLE` too. It is still labelled,
+    // because `mode_label` is total over the enum and a mode a later task
+    // promotes should not need an edit here.
     for (mode, model) in every_reachable_mode() {
         assert_eq!(
             model.mode(),
