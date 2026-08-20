@@ -39,7 +39,7 @@
 #[cfg(test)]
 mod tests;
 
-use rmail_core::command::{self, Invocation, ParsedFlag};
+use rmail_core::command::{self, quoted, Invocation, ParsedFlag};
 
 use super::overlays::{safe_line, truncate_chars};
 
@@ -396,18 +396,4 @@ impl FormPane {
             }
         }
     }
-}
-
-/// One token of a rebuilt `:` line, quoted when it needs to be.
-///
-/// A field takes whatever was typed into it, which includes spaces and quotes;
-/// pasting that into a line unquoted would either split one value into two
-/// tokens or end the line early. Quoted the way `command::tokenize` reads it
-/// back — `"` around, `\"` for an embedded one — so what comes out of the
-/// parser is what went into the field.
-fn quoted(value: &str) -> String {
-    if !value.is_empty() && !value.contains([' ', '\t', '"']) {
-        return value.to_owned();
-    }
-    format!("\"{}\"", value.replace('"', "\\\""))
 }

@@ -44,6 +44,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use rmail_proto::v1::account_service_client::AccountServiceClient;
+use rmail_proto::v1::admin_service_client::AdminServiceClient;
 use rmail_proto::v1::ai_policy_service_client::AiPolicyServiceClient;
 use rmail_proto::v1::ai_safety_service_client::AiSafetyServiceClient;
 use rmail_proto::v1::ai_service_client::AiServiceClient;
@@ -61,25 +62,28 @@ use rmail_proto::v1::tag_service_client::TagServiceClient;
 use rmail_proto::v1::{
     analyze_event, ask_chunk, bulk_tag_request, draft_reply_event, target, AddTagRequest,
     AiProviderKind, AnalyzeMessageRequest, AskRequest, AuditEntry, AuditFilter, AuthStatusRequest,
-    BacktestRuleRequest, BudgetCaps, BudgetClass, BudgetWindowCaps, BulkTagRequest, CallStatus,
-    CancelRequest, ClearPasswordRequest, ConfirmInjectionRequest, CopyRequest,
-    CreateFollowupRequest, CreateRuleRequest, CreateTagRequest, DeleteDraftRequest, DeleteRequest,
-    DraftNudgeRequest, DraftReplyRequest, EvaluateRulesRequest, EventKind, ExplainRequest,
-    ExportLedgerRequest, FindRequest, FinderRebuildRequest, FinderStatusRequest,
-    GetAiProviderRequest, GetDraftRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest,
-    GetUsageRequest, IdRequest, IndexGcRequest, IndexProgress, IndexStatusRequest,
-    ListAccountsRequest, ListDraftRevisionsRequest, ListDraftsRequest, ListEntitiesRequest,
-    ListFollowupsRequest, ListMessagesRequest, ListOutboxRequest, ListRulesRequest,
-    ListTagRulesRequest, ListTagsRequest, ListWaitingOnRequest, MoveRequest, PauseRequest,
+    AutoconfigureRequest, BacktestRuleRequest, BeginOAuthRequest, BudgetCaps, BudgetClass,
+    BudgetWindowCaps, BulkTagRequest, CallStatus, CancelRequest, ClearPasswordRequest,
+    CompleteOAuthRequest, ConfirmInjectionRequest, CopyRequest, CreateAccountRequest,
+    CreateFollowupRequest, CreateRuleRequest, CreateTagRequest, CredentialRef,
+    DeleteAccountRequest, DeleteDraftRequest, DeleteRequest, DraftNudgeRequest, DraftReplyRequest,
+    EvaluateRulesRequest, EventKind, ExplainRequest, ExportLedgerRequest, FindRequest,
+    FinderRebuildRequest, FinderStatusRequest, GetAccountRequest, GetAiProviderRequest,
+    GetDraftRequest, GetMessageRequest, GetSpendRequest, GetSummaryRequest, GetUsageRequest,
+    IdRequest, IndexGcRequest, IndexProgress, IndexStatusRequest, ListAccountsRequest,
+    ListDraftRevisionsRequest, ListDraftsRequest, ListEntitiesRequest, ListFollowupsRequest,
+    ListMessagesRequest, ListOutboxRequest, ListRulesRequest, ListTagRulesRequest, ListTagsRequest,
+    ListTokensRequest, ListWaitingOnRequest, MintTokenRequest, MoveRequest, PauseRequest,
     PreflightCheckRequest, QueryAiCallsRequest, RebuildRequest, RecordCorrectionRequest,
-    ReindexMode, ReindexRequest, RemoveTagRequest, RenderDraftRequest, RescheduleRequest,
-    ResolveSuggestionRequest, ResumeRequest, RetryFailedRequest, RewriteDraftRequest,
-    ScanInjectionRequest, ScheduleSendRequest, SearchRequest, SelectDraftRevisionRequest,
-    SetAiProviderRequest, SetBudgetRequest, SetFlagsRequest, SetIndexPausedRequest,
-    SetPausedRequest, SetTagRuleRequest, SuggestReplyRequest, SuggestSendTimeRequest,
-    SuggestTagsRequest, SyncFolderRequest, SyncMode, SyncStatusRequest, SynthesizeRuleRequest,
-    TagRuleMode, TagSuggestion, TagSyncMode, Target, UpdateBodyRequest, UpdateDraftRequest,
-    VerifyIndexRequest, WatchEventsRequest,
+    RefreshTokenRequest, ReindexMode, ReindexRequest, RemoveTagRequest, RenderDraftRequest,
+    RescheduleRequest, ResolveSuggestionRequest, ResumeRequest, RetryFailedRequest,
+    RevokeTokenRequest, RewriteDraftRequest, ScanInjectionRequest, ScheduleSendRequest,
+    SearchRequest, SelectDraftRevisionRequest, SetAiProviderRequest, SetBudgetRequest,
+    SetFlagsRequest, SetIndexPausedRequest, SetPausedRequest, SetTagRuleRequest,
+    SuggestReplyRequest, SuggestSendTimeRequest, SuggestTagsRequest, SyncFolderRequest, SyncMode,
+    SyncStatusRequest, SynthesizeRuleRequest, TagRuleMode, TagSuggestion, TagSyncMode, Target,
+    TestConnectionRequest, UpdateBodyRequest, UpdateDraftRequest, VerifyIndexRequest,
+    WatchEventsRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::AbortHandle;
@@ -99,8 +103,8 @@ use super::history;
 use super::html::{self, CommandOpener};
 use super::model::drive::CmdExec;
 use super::model::{
-    wire, write_keybinding, AskEvent, Cmd, Effect, FinderEvent, FormEvent, Msg, ReplyEvent,
-    ReportEvent, SearchEvent, Stream,
+    wire, write_keybinding, AskEvent, Cmd, Credential, Effect, FinderEvent, FormEvent, Msg,
+    ReplyEvent, ReportEvent, SearchEvent, Stream,
 };
 use super::report::{ReportFill, ReportRow, ReportTone};
 use super::status::{Health, Subsystem};
@@ -174,6 +178,7 @@ pub struct GrpcExec {
     policy: AiPolicyServiceClient<Conn>,
     safety: AiSafetyServiceClient<Conn>,
     audit: AuditServiceClient<Conn>,
+    admin: AdminServiceClient<Conn>,
     tags: TagServiceClient<Conn>,
     rules: RuleServiceClient<Conn>,
     /// The task feeding the search overlay, so the next keystroke can abort
@@ -208,6 +213,11 @@ pub struct GrpcExec {
     /// it rather than leaving two loops polling for two accounts — and so
     /// `shutdown` has one handle to stop.
     beating: Mutex<Option<AbortHandle>>,
+    /// `MailService.WatchEvents`. Superseding for the reason `beating` is, and
+    /// since task 97 that matters: `:account use` re-issues `Cmd::Watch`, and a
+    /// plain spawn would leave one open stream per switch — each still sending
+    /// `Msg::Changed` for an account nobody is looking at.
+    watching: Mutex<Option<AbortHandle>>,
     ticking: Mutex<Option<AbortHandle>>,
     /// The command-history write. Superseding, because `write_atomic`'s temp
     /// path is per-*process*: two commands in quick succession would
@@ -271,6 +281,7 @@ impl GrpcExec {
             policy: AiPolicyServiceClient::new(channel.clone()),
             safety: AiSafetyServiceClient::new(channel.clone()),
             audit: AuditServiceClient::new(channel.clone()),
+            admin: AdminServiceClient::new(channel.clone()),
             tags: TagServiceClient::new(channel.clone()),
             rules: RuleServiceClient::new(channel),
             searching: Mutex::new(None),
@@ -280,6 +291,7 @@ impl GrpcExec {
             explaining: Mutex::new(None),
             reporting: Mutex::new(None),
             beating: Mutex::new(None),
+            watching: Mutex::new(None),
             ticking: Mutex::new(None),
             saving: Mutex::new(None),
             opener: CommandOpener::platform(),
@@ -1184,6 +1196,203 @@ impl CmdExec for GrpcExec {
                         },
                         Err(error) => Msg::Done {
                             label: "rule correct".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+
+            // -- accounts and tokens (task 97) --------------------------------
+            Cmd::AccountList { generation, open } => {
+                let mut client = self.accounts.clone();
+                self.report(generation, out, async move {
+                    call(client.list(ListAccountsRequest {}))
+                        .await
+                        .map(|r| wire::account_rows(&r.into_inner(), open))
+                });
+            }
+            Cmd::AccountShow {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.accounts.clone();
+                self.report(generation, out, async move {
+                    call(client.get(GetAccountRequest { id: account_id }))
+                        .await
+                        .map(|r| wire::account_fields(&r.into_inner()))
+                });
+            }
+            Cmd::AccountDiscover {
+                generation,
+                email,
+                credential,
+                allow_model,
+            } => {
+                let mut client = self.accounts.clone();
+                let reporter = out.clone();
+                self.report(generation, out, async move {
+                    let response = call(client.autoconfigure(AutoconfigureRequest {
+                        email: email.clone(),
+                        credential: credential.as_ref().map(credential_ref),
+                        allow_model_fallback: allow_model,
+                    }))
+                    .await?
+                    .into_inner();
+                    // The block travels back to the model as well as into the
+                    // report, for the reason a rule draft does: `:account toml`
+                    // opens it after the report has been closed, and a document
+                    // that only ever existed inside a rendered row could not be
+                    // opened at all.
+                    if !response.toml.is_empty() {
+                        let _ = reporter.send(Msg::AccountToml(response.toml.clone()));
+                    }
+                    Ok(wire::autoconfigure_rows(&email, &response))
+                });
+            }
+            Cmd::AccountCreate { name, settings } => {
+                let mut client = self.accounts.clone();
+                self.spawn(out, async move {
+                    let request = new_account(name, &settings);
+                    match call(client.create(request)).await {
+                        Ok(response) => Msg::Done {
+                            label: wire::account_created(&response.into_inner()),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "account new".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::AccountTest {
+                generation,
+                account_id,
+            } => {
+                let mut client = self.accounts.clone();
+                self.report(generation, out, async move {
+                    call(client.test_connection(TestConnectionRequest { id: account_id }))
+                        .await
+                        .map(|r| wire::account_test_rows(&r.into_inner()))
+                });
+            }
+            Cmd::AccountDelete { account_id } => {
+                let mut client = self.accounts.clone();
+                self.spawn(out, async move {
+                    match call(client.delete(DeleteAccountRequest { id: account_id })).await {
+                        Ok(_) => Msg::Done {
+                            label: format!("account {account_id} deleted"),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "account rm".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::AccountLogin {
+                generation,
+                account_id,
+                provider,
+                client_id,
+                client_secret_command,
+                scopes,
+                open_browser,
+            } => {
+                let mut client = self.accounts.clone();
+                let opener = self.opener.clone();
+                self.stream_report(generation, out, move |sink| async move {
+                    oauth_login(
+                        &mut client,
+                        BeginOAuthRequest {
+                            account_id,
+                            provider,
+                            client_id,
+                            client_secret_command,
+                            scopes,
+                        },
+                        open_browser.then_some(opener),
+                        sink,
+                    )
+                    .await;
+                });
+            }
+            Cmd::AccountRefresh {
+                generation,
+                account_id,
+                force,
+            } => {
+                let mut client = self.accounts.clone();
+                self.report(generation, out, async move {
+                    call(client.refresh_token(RefreshTokenRequest { account_id, force }))
+                        .await
+                        .map(|r| wire::refresh_rows(&r.into_inner()))
+                });
+            }
+            Cmd::TokenList { generation } => {
+                let mut client = self.admin.clone();
+                self.report(generation, out, async move {
+                    call(client.list_tokens(ListTokensRequest {}))
+                        .await
+                        .map(|r| wire::token_rows(&r.into_inner()))
+                });
+            }
+            Cmd::TokenCreate {
+                generation,
+                name,
+                scopes,
+                ttl_secs,
+            } => {
+                let mut client = self.admin.clone();
+                self.report(generation, out, async move {
+                    call(client.mint_token(MintTokenRequest {
+                        name,
+                        scopes,
+                        ttl_secs,
+                    }))
+                    .await
+                    .map(|r| wire::minted_rows(&r.into_inner()))
+                });
+            }
+            Cmd::TokenRevoke { token_id } => {
+                let mut client = self.admin.clone();
+                self.spawn(out, async move {
+                    match call(client.revoke_token(RevokeTokenRequest { id: token_id })).await {
+                        Ok(_) => Msg::Done {
+                            label: format!("token {token_id} revoked"),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: "token revoke".to_owned(),
+                            result: Err(error),
+                        },
+                    }
+                });
+            }
+            Cmd::OpenText {
+                text,
+                extension,
+                label,
+            } => {
+                let opener = self.opener.clone();
+                self.spawn(out, async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        html::open_text(&extension, &text, &opener)
+                            .map_err(|error| format!("{error:#}"))
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("opening: {error}")));
+                    match result {
+                        // The path, because the handler the platform picked may
+                        // not be one the reader expected — and a file they can
+                        // find is a file they can open by hand.
+                        Ok(path) => Msg::Done {
+                            label: format!("{label} — {}", path.display()),
+                            result: Ok(Effect::None),
+                        },
+                        Err(error) => Msg::Done {
+                            label: label.clone(),
                             result: Err(error),
                         },
                     }
@@ -2369,6 +2578,107 @@ async fn apply_tags(
     }
 }
 
+/// Run the whole OAuth flow, reporting each half as it lands.
+///
+/// Two RPCs and one report, because they are two halves of one act: `BeginOAuth`
+/// binds a loopback port and returns the URL, `CompleteOAuth` blocks until the
+/// browser comes back. A client that issued only the first would leave a port
+/// held for a flow nobody could finish.
+///
+/// The URL is reported *before* the second call, not after: the second one blocks
+/// until a human has consented, and a report that showed nothing until then would
+/// be a report withholding the one thing the human needs to act on.
+///
+/// The browser is launched after that frame is sent, for the same reason. A
+/// launch that fails is reported and the flow continues — the URL is on screen,
+/// which is the whole point of drawing it.
+async fn oauth_login(
+    client: &mut AccountServiceClient<Conn>,
+    request: BeginOAuthRequest,
+    opener: Option<CommandOpener>,
+    sink: ReportSink,
+) {
+    let started = match call(client.begin_o_auth(request)).await {
+        Ok(response) => response.into_inner(),
+        Err(error) => return sink.failed(error),
+    };
+    sink.rows(wire::oauth_started_rows(&started), false);
+    if let Some(opener) = opener {
+        let url = started.authorization_url.clone();
+        let launched = tokio::task::spawn_blocking(move || html::open_url(&url, &opener)).await;
+        if !matches!(launched, Ok(Ok(()))) {
+            sink.rows(
+                [
+                    wire::oauth_started_rows(&started),
+                    vec![wire::oauth_no_browser_row()],
+                ]
+                .concat(),
+                false,
+            );
+        }
+    }
+    // No client-side deadline: this call is *supposed* to block while a human
+    // reads a consent screen, and `RPC_TIMEOUT` would abandon the flow while
+    // they were still deciding. The daemon releases the port at
+    // `started.expires_at`, which the report says, and `Esc` aborts the task.
+    match client
+        .complete_o_auth(CompleteOAuthRequest {
+            flow_id: started.flow_id.clone(),
+        })
+        .await
+    {
+        Ok(response) => sink.rows(wire::oauth_done_rows(&response.into_inner()), true),
+        Err(status) => sink.failed(status.message().to_owned()),
+    }
+}
+
+/// One credential *reference* on the wire — how to obtain the password, never
+/// the password.
+fn credential_ref(credential: &Credential) -> CredentialRef {
+    use rmail_proto::v1::credential_ref::Source;
+    CredentialRef {
+        source: Some(match credential {
+            Credential::Command(value) => Source::PasswordCommand(value.clone()),
+            Credential::Env(value) => Source::PasswordEnv(value.clone()),
+            Credential::Keychain(value) => Source::Keychain(value.clone()),
+            Credential::OAuth(value) => Source::Oauth(value.clone()),
+        }),
+    }
+}
+
+/// A `:account new` line's `(flag, value)` pairs as the RPC's request.
+///
+/// A value that does not parse is *dropped*, which leaves that setting unset.
+/// Reachable only from a line `commands::account::settings` already checked, so
+/// this is the belt to that braces — and dropping is the safe direction: a port
+/// that arrived as `0` would be stored as a port nothing can connect to.
+fn new_account(name: String, settings: &[(String, String)]) -> CreateAccountRequest {
+    let text = |flag: &str| {
+        settings
+            .iter()
+            .find(|(name, _)| name == flag)
+            .map(|(_, value)| value.clone())
+    };
+    let port = |flag: &str| text(flag).and_then(|value| value.parse::<u32>().ok());
+    let credential = [
+        ("password-command", Credential::Command as fn(String) -> _),
+        ("password-env", Credential::Env),
+        ("keychain", Credential::Keychain),
+        ("oauth", Credential::OAuth),
+    ]
+    .into_iter()
+    .find_map(|(flag, wrap)| text(flag).map(wrap));
+    CreateAccountRequest {
+        name,
+        imap_server: text("imap-server"),
+        imap_port: port("imap-port"),
+        username: text("username"),
+        smtp_server: text("smtp-server"),
+        smtp_port: port("smtp-port"),
+        credential: credential.as_ref().map(credential_ref),
+    }
+}
+
 /// Drain an `ExportLedger` stream into a Report.
 ///
 /// Appends, like `SuggestTags`: the ledger sends each entry once, newest first.
@@ -2648,7 +2958,7 @@ impl GrpcExec {
     fn watch(&self, account_id: i64, out: UnboundedSender<Msg>) {
         let mut client = self.mail.clone();
         let cancel = self.cancel.clone();
-        tokio::spawn(async move {
+        self.spawn_superseding(&self.watching, async move {
             let request = WatchEventsRequest {
                 account_id,
                 since_seq: 0,

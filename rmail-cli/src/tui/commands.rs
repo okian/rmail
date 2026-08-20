@@ -36,11 +36,13 @@
 //! rides on the spec rather than in a second table, so a verb cannot be added
 //! without the author looking at the field.
 
+pub mod account;
 pub mod ai_policy;
 pub mod compose;
 pub mod daemon;
 pub mod rule;
 pub mod tag;
+pub mod token;
 
 #[cfg(test)]
 mod tests;
@@ -146,6 +148,15 @@ pub struct Request {
     /// `None` for almost everything; see the module docs on why this is a
     /// per-verb judgement and not `effect()`.
     pub confirm: Option<String>,
+    /// Whether `r` must refuse to re-run this report (task 97).
+    ///
+    /// False for almost everything, and a per-verb judgement rather than
+    /// `effect().is_mutating()` for the same reason `confirm` is: `:sync now`
+    /// mutates and re-running it is exactly what `r` is for. What this marks is
+    /// the narrower case of a verb that *produced* something a second run would
+    /// produce again — `:token create` mints a token, and a reader pressing `r`
+    /// to refresh a pane would mint another.
+    pub once: bool,
 }
 
 /// One verb's form: what to read, and the fields the answer fills in.
@@ -171,6 +182,7 @@ impl Request {
             title: title.to_owned(),
             columns,
             confirm: None,
+            once: false,
         }))
     }
 
@@ -190,6 +202,7 @@ impl Request {
             title: title.to_owned(),
             columns: Vec::new(),
             confirm: None,
+            once: false,
         }))
     }
 }
@@ -321,4 +334,6 @@ pub fn answer(invocation: &Invocation, target: &Target, generation: u64) -> Opti
         .or_else(|| rule::answer(invocation, target, generation))
         .or_else(|| compose::answer(invocation, target, generation))
         .or_else(|| ai_policy::answer(invocation, target, generation))
+        .or_else(|| account::answer(invocation, target, generation))
+        .or_else(|| token::answer(invocation, target, generation))
 }

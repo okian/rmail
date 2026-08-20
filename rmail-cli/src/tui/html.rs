@@ -149,10 +149,72 @@ impl Opener for CommandOpener {
 ///
 /// If the file cannot be created or the opener cannot be run.
 pub fn open_in_browser(message_id: i64, html: &str, opener: &dyn Opener) -> Result<PathBuf> {
-    let path = temp_path(message_id);
+    let path = temp_path(message_id, "html");
     write_private(&path, wrap(html).as_bytes())?;
     opener.open(&path)?;
     Ok(path)
+}
+
+/// Write `text` somewhere private and open it. Returns the file written.
+///
+/// The copy affordance a report row offers for a block somebody has to paste
+/// elsewhere — task 97's `[[accounts]]` block, say. There is no clipboard
+/// dependency in this workspace and adding one is a platform matrix; a private
+/// file handed to the platform opener is the mechanism this module already exists
+/// for, and it lands the text in an editor it can be copied from.
+///
+/// Written under the same pid-scoped prefix every file here shares, so [`sweep`]
+/// removes it on the way out. Mode `0600`, for the same reason a message body
+/// gets it: an account's server settings are not other users' business either.
+///
+/// No wrapper and no CSP, unlike [`open_in_browser`]: this text is not markup
+/// and is not going to a browser. `extension` is what decides the handler, so it
+/// is the caller's — and it is checked to be alphanumeric rather than trusted,
+/// because it becomes part of a filename.
+///
+/// Blocking, like its sibling: callers run it on a blocking task, never on the
+/// event loop.
+///
+/// # Errors
+///
+/// If `extension` is not alphanumeric, the file cannot be created, or the opener
+/// cannot be run.
+pub fn open_text(extension: &str, text: &str, opener: &dyn Opener) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !extension.is_empty() && extension.chars().all(|c| c.is_ascii_alphanumeric()),
+        "{extension:?} is not a usable file extension"
+    );
+    let path = temp_path(0, extension);
+    write_private(&path, text.as_bytes())?;
+    opener.open(&path)?;
+    Ok(path)
+}
+
+/// Hand `url` to the platform opener.
+///
+/// The same one argv entry a path goes in — `open` and `xdg-open` both take a
+/// URL there — so the "never a fragment of a shell command" invariant this module
+/// documents holds unchanged, and nothing is written to disk: there is nothing to
+/// write, and a `file://` redirect would put the URL through one more layer than
+/// it needs.
+///
+/// `https` only, and refused rather than trusted. The URLs this opens come from
+/// the daemon (task 97's OAuth authorization URL), so a `file://` or a custom
+/// scheme here would mean something had already gone wrong — but "the value is
+/// safe today" is not the property worth relying on when handing an argument to
+/// whatever handler the platform has registered for its scheme.
+///
+/// Blocking, like the rest of this module.
+///
+/// # Errors
+///
+/// If `url` is not an `https` URL, or the opener cannot be run.
+pub fn open_url(url: &str, opener: &dyn Opener) -> Result<()> {
+    anyhow::ensure!(
+        url.starts_with("https://") && !url.contains(char::is_whitespace),
+        "refusing to open {url:?}: only https URLs"
+    );
+    opener.open(Path::new(url))
 }
 
 /// Create `path` with mode `0600` and write `contents` to it.
@@ -199,17 +261,22 @@ fn prefix() -> String {
     format!("rmail-msg-{}-", std::process::id())
 }
 
-/// A fresh path in the user's temp directory for one message.
+/// A fresh path in the user's temp directory.
 ///
 /// pid plus a monotonic counter, matching `note_cli::temp_note_path`'s
 /// reasoning: there is no `tempfile` dependency in this workspace, and this
 /// is enough to avoid colliding with another `mail tui` in another terminal.
 /// Collision is not the security boundary in any case — [`write_private`]'s
 /// `create_new` is, and it fails closed.
-fn temp_path(message_id: i64) -> PathBuf {
+///
+/// `id` names what the file is about (a message id, or 0 for text that is about
+/// nothing in particular) and `extension` decides which handler the platform
+/// picks. Both end up in a filename, and both callers supply values that are
+/// either this process's own or already checked — see [`open_text`].
+fn temp_path(id: i64, extension: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("{}{n}-{message_id}.html", prefix()))
+    std::env::temp_dir().join(format!("{}{n}-{id}.{extension}", prefix()))
 }
 
 /// Delete every HTML file *this process* wrote. Best effort: a file the

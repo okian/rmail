@@ -264,6 +264,14 @@ pub struct ReportPane {
     /// returns, so a refresh issued then races it and may redraw the state from
     /// before the change — a wrong answer with no marking at all.
     pub stale: bool,
+    /// Whether `r` must refuse to re-run this report (task 97).
+    ///
+    /// A report is normally a *view*, and `r` re-reads it. A handful of verbs
+    /// instead *produce* something — `:token create` mints a token — and for
+    /// those a second run is a second thing produced rather than a fresher look
+    /// at the first. `commands::Request::once` is where the judgement is
+    /// declared, per verb; `model::rerun_report` is what honours it.
+    pub once: bool,
 }
 
 impl ReportPane {
@@ -285,7 +293,15 @@ impl ReportPane {
             complete: false,
             error: None,
             stale: false,
+            once: false,
         }
+    }
+
+    /// The same report, marked un-re-runnable. See [`ReportPane::once`].
+    #[must_use]
+    pub fn only_once(mut self) -> Self {
+        self.once = true;
+        self
     }
 
     /// The highlighted row.

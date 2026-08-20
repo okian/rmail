@@ -32,18 +32,21 @@ mod tests;
 
 use rmail_proto::v1::{
     Account as ProtoAccount, AiProviderKind, Attachment, AuditEntry, AuthStatusResponse,
-    BudgetClass, BulkTagResponse, CallStatus, Citation as ProtoCitation, CreateDraftRequest,
-    DayUsage, Draft, DraftAddress, DraftNudgeResponse, DraftReplyContext, DraftRevision,
-    EvaluationStats, FindResult, FinderStatusResponse, FolderStatus, Followup, FollowupState,
-    FullMessage, GetAiProviderResponse, GetSpendResponse, IndexDrift, IndexGcReport, IndexKind,
-    IndexProgress, IndexStatusResponse, InjectionSeverity, ItemKind, ListDraftRevisionsResponse,
-    ListDraftsResponse, ListEntitiesResponse, ListRulesResponse, ListTagRulesResponse,
-    ListTagsResponse, Message as ProtoMessage, MessageOutcome, OutboxEntry, OutboxState,
-    PreflightCheckResponse, PreflightDegradation, PreflightFindingKind, PreflightSeverity,
-    RankExplanation, RenderedDraft, RetrievalTrace, RewriteLength, RewriteTone,
+    AutoconfigureResponse, BeginOAuthResponse, BudgetClass, BulkTagResponse, CallStatus,
+    Citation as ProtoCitation, CompleteOAuthResponse, CreateDraftRequest, DayUsage, Draft,
+    DraftAddress, DraftNudgeResponse, DraftReplyContext, DraftRevision, EvaluationStats,
+    FindResult, FinderStatusResponse, FolderStatus, Followup, FollowupState, FullMessage,
+    GetAiProviderResponse, GetSpendResponse, IndexDrift, IndexGcReport, IndexKind, IndexProgress,
+    IndexStatusResponse, InjectionSeverity, ItemKind, ListAccountsResponse,
+    ListDraftRevisionsResponse, ListDraftsResponse, ListEntitiesResponse, ListRulesResponse,
+    ListTagRulesResponse, ListTagsResponse, ListTokensResponse, Message as ProtoMessage,
+    MessageOutcome, MintTokenResponse, OutboxEntry, OutboxState, PreflightCheckResponse,
+    PreflightDegradation, PreflightFindingKind, PreflightSeverity, RankExplanation,
+    RefreshTokenResponse, RenderedDraft, RetrievalTrace, RewriteLength, RewriteTone,
     ScanInjectionResponse, SearchHit, SetAiProviderResponse, SetBudgetResponse,
     SuggestSendTimeResponse, Summary, SyncFolderResponse, SyncStatusResponse,
-    SynthesizeRuleResponse, TagRuleMode, TagSource, TagSuggestion, TagSyncMode, UsageStats,
+    SynthesizeRuleResponse, TagRuleMode, TagSource, TagSuggestion, TagSyncMode,
+    TestConnectionResponse, UsageStats,
 };
 
 use rmail_core::command;
@@ -2233,4 +2236,463 @@ pub fn audit_row(entry: &AuditEntry) -> ReportRow {
     } else {
         ReportTone::Plain
     })
+}
+
+// ---------------------------------------------------------------------------
+// accounts and tokens (task 97)
+// ---------------------------------------------------------------------------
+
+/// A credential source as the listing names it, and never the credential.
+///
+/// `Account::credential_kind` is one of `none|command|env|keychain|oauth` and
+/// `credential_ref` is the command, the variable name or the service — which is
+/// *how to obtain* the password, so it is safe to draw. The password itself never
+/// crosses this API at all.
+fn credential_label(kind: &str, reference: Option<&str>) -> String {
+    match reference {
+        Some(reference) if !reference.is_empty() => format!("{kind} {reference}"),
+        _ => kind.to_owned(),
+    }
+}
+
+/// A host and port as one cell, or `-` when the account has none stored.
+fn endpoint(host: Option<&String>, port: Option<u32>) -> String {
+    match (host, port) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.clone(),
+        (None, _) => "-".to_owned(),
+    }
+}
+
+/// `AccountService.List` as the `:account list` table.
+///
+/// The row for the account on screen carries `:account use <id>`, which is what
+/// makes the listing the way somebody switches: a row's action *is* an
+/// `Invocation`, so the gesture and the typed line are the same thing. Every
+/// row carries it, including the open one — `use_account` answers that with
+/// "already looking at it" rather than a reload, which is a better outcome than
+/// a row that does nothing when pressed.
+#[must_use]
+pub fn account_rows(response: &ListAccountsResponse, open: i64) -> Vec<ReportRow> {
+    response
+        .accounts
+        .iter()
+        .map(|account| {
+            let row = ReportRow::new([
+                account.id.to_string(),
+                account.name.clone(),
+                account.username.clone().unwrap_or_else(|| "-".to_owned()),
+                endpoint(account.imap_server.as_ref(), account.imap_port),
+                credential_label(&account.credential_kind, account.credential_ref.as_deref()),
+            ])
+            .toned(if open == account.id {
+                ReportTone::Ok
+            } else {
+                ReportTone::Plain
+            });
+            match use_invocation(account.id) {
+                Some(invocation) => row.running(invocation),
+                // Unreachable: `account use` is declared, and
+                // `command::tests::every_real_verb_is_reachable_by_typing_its_own_path`
+                // is what keeps it so. A row that does nothing beats a panic in
+                // a client holding a terminal in raw mode.
+                None => row,
+            }
+        })
+        .collect()
+}
+
+/// The `:account use <id>` invocation a listing row runs.
+///
+/// Parsed rather than built field by field, so the row runs exactly what typing
+/// that line runs. Bang'd for the reason the tag suggestions are: the gesture is
+/// the consent — the row says which account, and the border says Enter switches —
+/// and switching is entirely reversible by switching back.
+fn use_invocation(account_id: i64) -> Option<command::Invocation> {
+    match command::parse(&format!("account use {account_id}!")) {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
+    }
+}
+
+/// One account's settings as the `:account show` table.
+#[must_use]
+pub fn account_fields(account: &ProtoAccount) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new(["id".to_owned(), account.id.to_string()]),
+        ReportRow::new(["name".to_owned(), account.name.clone()]),
+        ReportRow::new([
+            "login".to_owned(),
+            account.username.clone().unwrap_or_else(|| "-".to_owned()),
+        ]),
+        ReportRow::new([
+            "imap".to_owned(),
+            endpoint(account.imap_server.as_ref(), account.imap_port),
+        ]),
+        ReportRow::new([
+            "smtp".to_owned(),
+            endpoint(account.smtp_server.as_ref(), account.smtp_port),
+        ]),
+        ReportRow::new([
+            "credential".to_owned(),
+            credential_label(&account.credential_kind, account.credential_ref.as_deref()),
+        ])
+        .toned(if account.credential_kind == "none" {
+            // Not an error — an account can exist before its credential does —
+            // but it is why a sync would fail, so it is not drawn as ordinary
+            // data either.
+            ReportTone::Warn
+        } else {
+            ReportTone::Plain
+        }),
+        ReportRow::new(["created".to_owned(), when(account.created_at)]),
+        ReportRow::new(["updated".to_owned(), when(account.updated_at)]),
+    ]
+}
+
+/// What `AccountService.Create` stored, as the one line the status line says.
+#[must_use]
+pub fn account_created(account: &ProtoAccount) -> String {
+    format!(
+        "account {} stored — :account use {} to look at it, :sync now to fill it",
+        account.name, account.id
+    )
+}
+
+/// `AccountService.TestConnection` as a table.
+#[must_use]
+pub fn account_test_rows(response: &TestConnectionResponse) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new([
+            "login".to_owned(),
+            if response.ok { "ok" } else { "failed" }.to_owned(),
+        ])
+        .toned(if response.ok {
+            ReportTone::Ok
+        } else {
+            ReportTone::Bad
+        }),
+        // The detail is the answer when it failed and the capability list when
+        // it did not, so it is drawn either way.
+        ReportRow::new(["detail".to_owned(), response.detail.clone()]),
+    ]
+}
+
+/// `AccountService.Autoconfigure` as the `:account add` table.
+///
+/// Three things a reader needs, in the order they need them: whether this is
+/// safe to apply, what it says, and how to apply it.
+///
+/// The last two rows are the affordances the proposal exists for. One writes the
+/// `[[accounts]]` block to a private file and opens it, which is how a block gets
+/// copied into `rmail.toml` without this client growing a clipboard dependency.
+/// The other carries a `:account new …` line built flag by flag from what was
+/// discovered — so applying the proposal is a `:` line somebody could have typed,
+/// and the settings on it are visible before it runs.
+#[must_use]
+pub fn autoconfigure_rows(email: &str, response: &AutoconfigureResponse) -> Vec<ReportRow> {
+    let mut rows = vec![ReportRow::new([
+        "source".to_owned(),
+        match response.source.as_str() {
+            // Named rather than passed through, because "model" is the one
+            // source a reader must treat differently: it is a guess, validated
+            // but still a guess, and the proto says so.
+            "model" => "model — a guess, validated but not discovered".to_owned(),
+            other => other.to_owned(),
+        },
+    ])
+    .toned(if response.source == "model" {
+        ReportTone::Warn
+    } else {
+        ReportTone::Plain
+    })];
+    for (label, server) in [
+        ("imap", response.imap.as_ref()),
+        ("smtp", response.smtp.as_ref()),
+    ] {
+        let Some(server) = server else {
+            continue;
+        };
+        rows.push(ReportRow::new([
+            label.to_owned(),
+            format!(
+                "{}:{} {} · login {}",
+                server.host, server.port, server.security, server.username
+            ),
+        ]));
+    }
+    rows.push(
+        ReportRow::new([
+            "verified".to_owned(),
+            if response.login_validated {
+                "yes — a real IMAP login succeeded".to_owned()
+            } else if response.validation_detail.is_empty() {
+                "no credential given, so nothing was checked".to_owned()
+            } else {
+                response.validation_detail.clone()
+            },
+        ])
+        .toned(if response.login_validated {
+            ReportTone::Ok
+        } else {
+            // Muted rather than warned about: no credential means no check was
+            // asked for, and drawing that red would cry wolf on the ordinary
+            // case. A check that *failed* puts its reason in the same cell.
+            ReportTone::Muted
+        }),
+    );
+    if response.existing_account_id != 0 {
+        rows.push(
+            ReportRow::new([
+                "existing".to_owned(),
+                format!(
+                    "account {} is already configured for this address — nothing was changed",
+                    response.existing_account_id
+                ),
+            ])
+            .toned(ReportTone::Warn),
+        );
+    }
+    for warning in &response.warnings {
+        rows.push(ReportRow::new(["warning".to_owned(), warning.clone()]).toned(ReportTone::Warn));
+    }
+    if !response.toml.is_empty() {
+        let row = ReportRow::new([
+            "toml".to_owned(),
+            "open the [[accounts]] block, to paste into rmail.toml".to_owned(),
+        ]);
+        rows.push(match toml_invocation() {
+            Some(invocation) => row.running(invocation),
+            // Unreachable: `account toml` is declared. A row that does nothing
+            // beats a panic in a client holding a terminal in raw mode.
+            None => row,
+        });
+    }
+    // Offered only when there is no account for this address yet: `Create` would
+    // otherwise make a second one, and the report already says which account
+    // exists. The TOML row is still there either way, which is the answer for
+    // somebody who really does want two.
+    if response.existing_account_id == 0 {
+        if let Some(invocation) = new_account_invocation(email, response) {
+            rows.push(
+                ReportRow::new([
+                    "apply".to_owned(),
+                    format!(":{}", invocation.verb.join(" ")),
+                ])
+                .toned(ReportTone::Ok)
+                .running(invocation),
+            );
+        }
+    }
+    rows
+}
+
+/// The `:account new …` invocation the `apply` row runs, built from what was
+/// discovered.
+///
+/// Every value goes through `command::quoted`, which is not decoration: a
+/// username comes out of an autoconfig document fetched over the network, so it
+/// is untrusted text, and one containing a space pasted onto a line unquoted
+/// would split into two tokens and ask the verb about something nobody typed.
+///
+/// Not bang'd. Creating an account is a mutation task 90's gate should ask about,
+/// and this is the row where asking is right: the proposal may have come from a
+/// model, and `[y/N]` in front of it is the one moment a reader is looking at
+/// both the settings and the question.
+fn new_account_invocation(
+    email: &str,
+    response: &AutoconfigureResponse,
+) -> Option<command::Invocation> {
+    let imap = response.imap.as_ref()?;
+    let mut line = format!("account new {}", command::quoted(email));
+    line.push_str(&format!(
+        " --imap-server={} --imap-port={} --username={}",
+        command::quoted(&imap.host),
+        imap.port,
+        command::quoted(&imap.username),
+    ));
+    if let Some(smtp) = response.smtp.as_ref() {
+        line.push_str(&format!(
+            " --smtp-server={} --smtp-port={}",
+            command::quoted(&smtp.host),
+            smtp.port,
+        ));
+    }
+    match command::parse(&line) {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
+    }
+}
+
+/// The `:account toml` invocation the `toml` row runs.
+///
+/// A verb rather than a row-only gesture, for the reachability rule this client
+/// holds everywhere: a report row's action *is* an `Invocation`, so an
+/// affordance that only a row could reach would be one nobody could type — and
+/// the verb registry is also the command index, so it would document nothing
+/// either.
+///
+/// Bang'd: opening a file this process wrote, read-only, in the platform's own
+/// handler is not a thing to ask about.
+fn toml_invocation() -> Option<command::Invocation> {
+    match command::parse("account toml!") {
+        Ok(command::Resolution::Invocation(invocation)) => Some(*invocation),
+        _ => None,
+    }
+}
+
+/// `AccountService.BeginOAuth` as the first frame of the `:account login` flow.
+///
+/// The URL is drawn even when the client is about to hand it to a browser: a
+/// browser that does not launch, or launches somewhere the user is not logged
+/// in, leaves the URL as the only way to finish — and a flow whose URL scrolled
+/// past unread is a flow that cannot be recovered.
+#[must_use]
+pub fn oauth_started_rows(response: &BeginOAuthResponse) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new([
+            "open".to_owned(),
+            // Bounded by the report's own cell cap, and safe-lined by
+            // `ReportRow::new`, like every other remote string here.
+            response.authorization_url.clone(),
+        ])
+        .toned(ReportTone::Ok),
+        ReportRow::new(["redirect".to_owned(), response.redirect_uri.clone()]),
+        ReportRow::new([
+            "expires".to_owned(),
+            format!("{} — the port is released then", when(response.expires_at)),
+        ]),
+        ReportRow::new([
+            "waiting".to_owned(),
+            "for the browser to come back…".to_owned(),
+        ])
+        .toned(ReportTone::Muted),
+    ]
+}
+
+/// The row that says the browser did not launch.
+///
+/// Appended to the first frame rather than replacing it, so the URL stays where
+/// it was: the launch failing is exactly when the URL is the only way to finish.
+#[must_use]
+pub fn oauth_no_browser_row() -> ReportRow {
+    ReportRow::new([
+        "browser".to_owned(),
+        "could not be launched — open the URL above by hand".to_owned(),
+    ])
+    .toned(ReportTone::Warn)
+}
+
+/// `AccountService.CompleteOAuth` as the terminal frame of the same flow.
+#[must_use]
+pub fn oauth_done_rows(response: &CompleteOAuthResponse) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new(["account".to_owned(), response.account_id.to_string()]),
+        ReportRow::new(["provider".to_owned(), response.provider.clone()]),
+        ReportRow::new(["granted".to_owned(), scope_list(&response.scopes)]),
+        ReportRow::new([
+            "access token".to_owned(),
+            format!("expires {}", when(response.expires_at)),
+        ]),
+        ReportRow::new([
+            "refresh token".to_owned(),
+            "stored in the Keychain by the daemon — it never crossed this process".to_owned(),
+        ])
+        .toned(ReportTone::Ok),
+    ]
+}
+
+/// `AccountService.RefreshToken` as a table.
+#[must_use]
+pub fn refresh_rows(response: &RefreshTokenResponse) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new([
+            "refreshed".to_owned(),
+            if response.refreshed {
+                "yes — this went to the provider".to_owned()
+            } else {
+                "no — the stored token was still good".to_owned()
+            },
+        ])
+        .toned(if response.refreshed {
+            ReportTone::Ok
+        } else {
+            ReportTone::Muted
+        }),
+        ReportRow::new(["provider".to_owned(), response.provider.clone()]),
+        ReportRow::new(["expires".to_owned(), when(response.expires_at)]),
+        ReportRow::new(["scopes".to_owned(), scope_list(&response.scopes)]),
+    ]
+}
+
+/// A scope list, or a word saying there were none.
+///
+/// An empty cell reads as a rendering fault; "none" reads as the answer.
+fn scope_list(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        return "none reported".to_owned();
+    }
+    scopes.join(", ")
+}
+
+/// `AdminService.ListTokens` as the `:token list` table. Metadata only — this
+/// RPC never returns a secret or its hash.
+#[must_use]
+pub fn token_rows(response: &ListTokensResponse) -> Vec<ReportRow> {
+    response
+        .tokens
+        .iter()
+        .map(|token| {
+            ReportRow::new([
+                token.id.to_string(),
+                token.name.clone(),
+                if token.revoked { "revoked" } else { "active" }.to_owned(),
+                token.last_used_at.map_or_else(
+                    // Distinct from `when(0)`'s "never", which would be true of
+                    // both: a token that has never been used and a daemon that
+                    // does not record it are different facts.
+                    || "unknown".to_owned(),
+                    when,
+                ),
+                token.expires_at.map_or_else(|| "never".to_owned(), when),
+                scope_list(&token.scopes),
+            ])
+            .toned(if token.revoked {
+                ReportTone::Muted
+            } else {
+                ReportTone::Ok
+            })
+        })
+        .collect()
+}
+
+/// `AdminService.MintToken` as the one table that carries a secret.
+///
+/// The secret is a row and nothing else — not the status line, not the history,
+/// not a field on the model — so closing the pane is what makes it unrecoverable,
+/// which is exactly what the daemon has already made it: only an argon2id hash is
+/// persisted, so `ListTokens` cannot show it and neither can anything else.
+///
+/// The marker row says so in as many words, immediately after it. A reader who
+/// does not know will close the pane, and there is no second chance to tell them.
+#[must_use]
+pub fn minted_rows(response: &MintTokenResponse) -> Vec<ReportRow> {
+    vec![
+        ReportRow::new(["id".to_owned(), response.id.to_string()]),
+        ReportRow::new(["name".to_owned(), response.name.clone()]),
+        ReportRow::new(["scopes".to_owned(), scope_list(&response.scopes)]),
+        ReportRow::new([
+            "expires".to_owned(),
+            response.expires_at.map_or_else(|| "never".to_owned(), when),
+        ]),
+        ReportRow::new(["token".to_owned(), response.token.clone()]).toned(ReportTone::Ok),
+        ReportRow::new([
+            "keep it".to_owned(),
+            format!(
+                "this cannot be shown again — only revoked, with :token revoke {}",
+                response.id
+            ),
+        ])
+        .toned(ReportTone::Bad),
+    ]
 }

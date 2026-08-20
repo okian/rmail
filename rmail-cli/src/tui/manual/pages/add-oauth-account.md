@@ -34,8 +34,8 @@ visible in the process list and in shell history.
 ## Check it before you trust it
 
 {{capability:AccountTestConnection}} performs a real login and reports the
-server's capabilities. It has no mail verb of its own yet, so the generic
-client is how you call it:
+server's capabilities. It has no `mail` verb of its own yet; in the TUI it is
+{{cmd:account test}}, and outside it the generic client is how you call it:
 
 ```
 mail api call AccountService.TestConnection '{"id": 1}'
@@ -65,5 +65,7 @@ client that otherwise keeps working — see [[offline]].
 
 ## Where to read next
 
+- [[accounts-and-tokens]] — the same ground from inside the TUI, plus the
+  capability tokens that let anything else call this daemon.
 - [[practice-accounts]] — why the second account is often the right answer.
 - [[troubleshooting]] — when the login does not come back.

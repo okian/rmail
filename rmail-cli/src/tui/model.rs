@@ -788,6 +788,12 @@ pub enum Msg {
     /// thinks, and then types `:rule add`. Not a `Msg::Done` either — nothing
     /// finished, and the counter would go negative.
     RuleDrafted(String),
+    /// `:account add` discovered a `[[accounts]]` block (task 97).
+    ///
+    /// Its own message for the reason [`Msg::RuleDrafted`] is: the block
+    /// outlives the report it is shown in, and nothing finished, so a
+    /// [`Msg::Done`] would decrement a counter it never incremented.
+    AccountToml(String),
     /// One subsystem's standing, from the heartbeat (task 92).
     ///
     /// Deliberately not a [`Msg::Done`]: nobody asked for it and nothing
@@ -1361,6 +1367,131 @@ pub enum Cmd {
         /// How far back, or the daemon's default.
         days: Option<u32>,
     },
+    /// `AccountService.List` — the `:account list` report.
+    ///
+    /// Its own command rather than a second use of [`Cmd::LoadAccounts`]: that
+    /// one is the session's own startup read, and its answer *picks* an account
+    /// and starts the folder load. A report asking to see the accounts must not
+    /// move the one being looked at.
+    AccountList {
+        /// Which report this is.
+        generation: u64,
+        /// The account on screen, or 0 for none — so the listing can mark which
+        /// one this session is looking at. Carried rather than read at the wire
+        /// seam, because the executor holds no model.
+        open: i64,
+    },
+    /// `AccountService.Get`.
+    AccountShow {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+    },
+    /// `AccountService.Autoconfigure` — discover an address's settings and
+    /// report a proposal. Writes nothing.
+    AccountDiscover {
+        /// Which report this is.
+        generation: u64,
+        /// The address to configure.
+        email: String,
+        /// How to obtain the password, if one was given — never the password.
+        /// Supplied, the discovery is verified by a real IMAP login.
+        credential: Option<Credential>,
+        /// Let a model propose settings when every probe misses.
+        allow_model: bool,
+    },
+    /// `AccountService.Create`.
+    AccountCreate {
+        /// The account's name, which for every provider this targets is also
+        /// its address.
+        name: String,
+        /// The settings to store, as `(flag, value)` text pairs — the wire seam
+        /// is the one place a port becomes a number.
+        settings: Vec<(String, String)>,
+    },
+    /// `AccountService.TestConnection`.
+    AccountTest {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+    },
+    /// `AccountService.Delete`.
+    AccountDelete {
+        /// Which account.
+        account_id: i64,
+    },
+    /// `AccountService.BeginOAuth` followed by `CompleteOAuth` — the whole
+    /// loopback+PKCE flow, reported as it goes.
+    ///
+    /// One command for two RPCs because they are two halves of one act: the
+    /// first returns a URL and binds a port, the second blocks until the
+    /// browser comes back, and a client that issued only the first would leave
+    /// a port held for a flow nobody could finish. `mail account login` does
+    /// exactly the same two calls.
+    AccountLogin {
+        /// Which report this is.
+        generation: u64,
+        /// Which account the grant belongs to.
+        account_id: i64,
+        /// `google`/`gmail` or `microsoft`/`outlook`.
+        provider: String,
+        /// The OAuth client id of a registered native application. Not a
+        /// secret.
+        client_id: String,
+        /// A command whose stdout is the client secret, for providers that
+        /// require one from a native client. The secret never crosses the API.
+        client_secret_command: Option<String>,
+        /// Scopes to request; empty means the provider's defaults.
+        scopes: Vec<String>,
+        /// Whether to hand the authorization URL to the platform opener.
+        open_browser: bool,
+    },
+    /// `AccountService.RefreshToken`.
+    AccountRefresh {
+        /// Which report this is.
+        generation: u64,
+        /// Which account.
+        account_id: i64,
+        /// Refresh even if the stored token has not expired yet.
+        force: bool,
+    },
+    /// `AdminService.ListTokens` — metadata only, never a secret.
+    TokenList {
+        /// Which report this is.
+        generation: u64,
+    },
+    /// `AdminService.MintToken`.
+    TokenCreate {
+        /// Which report this is.
+        generation: u64,
+        /// The token's label.
+        name: String,
+        /// The scopes to grant.
+        scopes: Vec<String>,
+        /// Seconds from now until it expires, or `None` for no expiry.
+        ttl_secs: Option<i64>,
+    },
+    /// `AdminService.RevokeToken`.
+    TokenRevoke {
+        /// Which token.
+        token_id: i64,
+    },
+    /// Write text to a private temp file and hand it to the platform opener.
+    ///
+    /// The copy affordance a report row offers for a block somebody has to
+    /// paste elsewhere. There is no clipboard dependency in this workspace and
+    /// adding one is a platform matrix; a private file handed to the platform
+    /// opener is the mechanism "open HTML in browser" already uses.
+    OpenText {
+        /// The text to write.
+        text: String,
+        /// The file extension, which is what decides the handler.
+        extension: String,
+        /// What to call it on the status line.
+        label: String,
+    },
     /// `AiPolicyService.GetSpend` — the `:ai budget status` report.
     BudgetStatus {
         /// Which report this is.
@@ -1672,6 +1803,25 @@ pub enum Stream {
     Report,
 }
 
+/// How to obtain an account's password — never the password itself.
+///
+/// The proto's `CredentialRef` oneof, as the command grammar spells it. A
+/// separate type rather than three `Option<String>`s on the command, so
+/// "exactly one source" is what the type says and not something every reader
+/// has to check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Credential {
+    /// A shell command whose stdout is the password.
+    Command(String),
+    /// The name of an environment variable holding the password.
+    Env(String),
+    /// A macOS Keychain generic-password service name.
+    Keychain(String),
+    /// The Keychain service holding an OAuth2 grant. The account authenticates
+    /// with XOAUTH2 rather than a password.
+    OAuth(String),
+}
+
 /// Which kind of draft `Cmd::Draft` creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DraftKind {
@@ -1686,10 +1836,18 @@ pub enum DraftKind {
 pub struct Model {
     /// The account being shown, once `AccountService.List` has answered.
     ///
-    /// One at a time: switching accounts inside the session belongs with the
-    /// modal keymap and the overlays (tasks 84/85), and `mail tui --account`
-    /// covers the multi-account case in the meantime.
+    /// One at a time on screen, and since task 97 the one on screen can change:
+    /// `:account use <id>` picks another of [`Model::accounts`] without
+    /// restarting.
     pub account: Option<Account>,
+    /// Every account the daemon listed.
+    ///
+    /// Kept rather than consumed picking [`Model::account`], because
+    /// `:account use` needs to know an id is real before it clears the screen —
+    /// and because refusing an id the daemon has never mentioned is a better
+    /// answer than a `NOT_FOUND` two round trips and one blank folder pane
+    /// later. `:account list` re-reads it; nothing else writes it.
+    pub accounts: Vec<Account>,
     /// The account id `--account` asked for, if any.
     preferred_account: Option<i64>,
     /// Folders of the shown account.
@@ -1755,6 +1913,14 @@ pub struct Model {
     /// is [`Model::message_idx`], so extending the selection is the ordinary
     /// cursor movement and needs no second set of bindings.
     pub visual: Option<usize>,
+    /// The `[[accounts]]` block `:account add` last discovered, which
+    /// `:account toml` opens.
+    ///
+    /// Session state rather than a field on the Report it was shown in, for the
+    /// reason [`Model::rule_draft`] is: it outlives the report — somebody reads
+    /// the proposal, closes it, thinks, then wants the block — and a generic
+    /// overlay growing one field per verb is how it stops being generic.
+    pub account_toml: Option<String>,
     /// The TOML `:rule new` last drafted, which `:rule add` stores.
     ///
     /// Session state rather than a field on the Report it was shown in: a draft
@@ -1827,6 +1993,7 @@ impl Model {
     pub fn for_account(preferred_account: Option<i64>) -> Self {
         Self {
             account: None,
+            accounts: Vec::new(),
             preferred_account,
             folders: Vec::new(),
             folder_idx: 0,
@@ -1851,6 +2018,7 @@ impl Model {
             generation: 0,
             visual: None,
             daemon: Daemon::default(),
+            account_toml: None,
             rule_draft: None,
             keymap: Keymap::defaults(),
             pending: Pending::default(),
@@ -2124,16 +2292,27 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             model.inflight = model.inflight.saturating_sub(1);
             match result {
                 Ok(accounts) => {
+                    // Stored before one is picked, and stored even when picking
+                    // fails: `:account list` and `:account use` both read this,
+                    // and a session that could not choose an account is exactly
+                    // the session that needs to be able to list them.
+                    model.accounts = accounts;
                     let chosen = match model.preferred_account {
                         // An explicit `--account` that does not exist is a
                         // typo worth reporting, not something to silently
                         // substitute the first account for.
-                        Some(wanted) => accounts.into_iter().find(|a| a.id == wanted).ok_or(
-                            format!("no account {wanted} — list them with `mail accounts`"),
-                        ),
-                        None => accounts
-                            .into_iter()
-                            .next()
+                        Some(wanted) => model
+                            .accounts
+                            .iter()
+                            .find(|a| a.id == wanted)
+                            .cloned()
+                            .ok_or(format!(
+                                "no account {wanted} — list them with `mail accounts`"
+                            )),
+                        None => model
+                            .accounts
+                            .first()
+                            .cloned()
                             .ok_or_else(|| "no accounts configured".to_owned()),
                     };
                     let account = match chosen {
@@ -2400,6 +2579,14 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 }
             }
             apply_note(model, note);
+            Vec::new()
+        }
+        Msg::AccountToml(toml) => {
+            // Replaces whatever was discovered before, for the reason a second
+            // rule draft does: `:account toml` opens "the block", and two of
+            // them would make which one it meant depend on the order two
+            // reports happened to answer in.
+            model.account_toml = Some(toml);
             Vec::new()
         }
         Msg::RuleDrafted(toml) => {
@@ -4820,6 +5007,43 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
             .unwrap_or("normal");
         return set_keybinding(model, &keys_path_from_env(), mode, chord, action);
     }
+    if verb == "account use" {
+        // Hand-written for the reason `set` and `keys set` are: it reaches no
+        // capability, and the id it takes is not something an `Action` can
+        // carry. Left open on a bad id (`complain` writes into the command
+        // pane's own error line) and closed only once the switch has happened.
+        let Some(id) = invocation.positionals.first() else {
+            return complain(
+                model,
+                "account use needs an id — :account list has them".to_owned(),
+            );
+        };
+        let Ok(id) = id.parse::<i64>() else {
+            return complain(
+                model,
+                format!("{id:?} is not an account id — :account list has them"),
+            );
+        };
+        return use_account(model, id);
+    }
+    if verb == "account toml" {
+        // Hand-written next to `:account use` and for the same reason: it
+        // reaches no capability. Closed only once there is something to open,
+        // so the complaint lands on the command line the way `:set`'s does.
+        let Some(toml) = model.account_toml.clone() else {
+            return complain(
+                model,
+                "nothing discovered yet — :account add <address> proposes a block".to_owned(),
+            );
+        };
+        close_command(model);
+        model.info("opening the [[accounts]] block…");
+        return vec![Cmd::OpenText {
+            text: toml,
+            extension: "toml".to_owned(),
+            label: "the [[accounts]] block".to_owned(),
+        }];
+    }
     if verb == "reply" {
         // Hand-written for the reason `set`/`keys set` are: `--ai` branches
         // between two things an `Action` cannot carry — delegating to the
@@ -5264,14 +5488,90 @@ fn run_daemon_command(model: &mut Model, invocation: command::Invocation) -> Vec
         model.info(request.title);
         return vec![request.cmd];
     }
-    model.overlay = Some(Overlay::Report(Box::new(ReportPane::new(
-        invocation,
-        request.title,
-        request.columns,
-        generation,
-    ))));
+    let mut pane = ReportPane::new(invocation, request.title, request.columns, generation);
+    if request.once {
+        pane = pane.only_once();
+    }
+    model.overlay = Some(Overlay::Report(Box::new(pane)));
     model.info(format!("{verb} — r re-runs · Esc closes"));
     vec![request.cmd]
+}
+
+/// `:account use <id>` — look at another account without restarting.
+///
+/// Everything on screen belongs to the account it came from: the folder list,
+/// the message rows, the open message, the analysis panel, the visual selection.
+/// So this clears all of it rather than leaving one account's rows under a header
+/// naming another, and then issues exactly what `Msg::Accounts` issues when the
+/// first account loads — one path for "start looking at this account", not two
+/// that can drift.
+///
+/// Refused for an id the daemon has never listed, rather than sent: a
+/// `LoadFolders` for an account that does not exist answers `NOT_FOUND` two
+/// round trips later, by which point the screen has already been cleared.
+fn use_account(model: &mut Model, id: i64) -> Vec<Cmd> {
+    let Some(account) = model
+        .accounts
+        .iter()
+        .find(|account| account.id == id)
+        .cloned()
+    else {
+        return complain(
+            model,
+            match model.accounts.is_empty() {
+                true => "no accounts listed yet — :account list reads them".to_owned(),
+                false => format!("no account {id} — :account list has the ids"),
+            },
+        );
+    };
+    close_command(model);
+    if model.account.as_ref().is_some_and(|open| open.id == id) {
+        // Not an error, and deliberately not a reload either: somebody asking
+        // for the account they are already on wants nothing to happen, and
+        // throwing away their cursor and their open message to fetch the same
+        // rows again would be the opposite of nothing.
+        model.info(format!("already looking at {}", account.name));
+        return Vec::new();
+    }
+    let name = account.name.clone();
+    model.account = Some(account);
+    // Every one of these is about the account being left. `folder_idx` and
+    // `message_idx` go to zero rather than being clamped, because a cursor is a
+    // position in a list and this is a different list.
+    model.folders = Vec::new();
+    model.folder_idx = 0;
+    model.open_folder = None;
+    model.messages = Vec::new();
+    model.message_idx = 0;
+    model.open = None;
+    model.opening = None;
+    model.scroll = 0;
+    model.visual = None;
+    model.summary = None;
+    model.summary_for = None;
+    model.summary_failed = None;
+    model.summary_pinned = None;
+    model.focus = Focus::Folders;
+    // The viewer and the manual are screens over an account's mail; the list is
+    // where a freshly switched account can actually be looked at.
+    set_screen(model, Screen::List);
+    // The undo toast counts down a send from the account being left, and `u`
+    // would cancel an outbox entry that is no longer on screen.
+    remove_undo_toast(model);
+    let account_id = id;
+    model.info(format!("{name} — loading folders…"));
+    // Two counted requests, and two that are not, for exactly the reasons
+    // `Msg::Accounts` gives: nobody asked for the event stream or the heartbeat
+    // and neither ever finishes. Both supersede rather than accumulate — see
+    // `tui::grpc`'s `watching` and `beating` slots — so switching accounts twice
+    // does not leave two streams open on the daemon.
+    model.inflight += 2;
+    vec![
+        Cmd::LoadFolders { account_id },
+        Cmd::Watch { account_id },
+        Cmd::LoadOutbox { account_id },
+        Cmd::Heartbeat { account_id },
+    ]
 }
 
 /// What the screen can offer a verb that needs a target.
@@ -5312,6 +5612,15 @@ fn rerun_report(model: &mut Model) -> Vec<Cmd> {
         return Vec::new();
     };
     let verb = pane.invocation.verb.join(" ");
+    // A report whose verb *produced* something rather than read it. `r` means
+    // "ask this again", and asking `:token create` again mints a second token —
+    // so this refuses rather than doing it, and says which key does re-ask.
+    if pane.once {
+        model.fail(format!(
+            "{verb} ran once — Esc, then type it again to run another"
+        ));
+        return Vec::new();
+    }
     let invocation = command::Invocation {
         bang: true,
         ..pane.invocation.clone()

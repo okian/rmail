@@ -167,6 +167,14 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
         }
     }
     let expected: BTreeSet<String> = [
+        "account add",
+        "account list",
+        "account login",
+        "account new",
+        "account refresh",
+        "account rm",
+        "account show",
+        "account test",
         "auth clear",
         "auth status",
         "ai audit",
@@ -232,6 +240,9 @@ fn every_answer_belongs_to_a_verb_the_registry_declares() {
         "tag rules",
         "tag rules set",
         "tag suggest",
+        "token create",
+        "token list",
+        "token revoke",
         "waiting",
     ]
     .iter()

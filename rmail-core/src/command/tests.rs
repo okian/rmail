@@ -1077,3 +1077,67 @@ fn extra_whitespace_between_tokens_is_ignored() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// quoting, the inverse of the above
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_quoted_value_comes_back_out_of_the_parser_unchanged() {
+    // The property `quoted` exists for: a client rebuilding a `:` line from
+    // values it holds gets back exactly what it put in. Round-tripped through
+    // `tokenize` rather than asserted against expected text, because what
+    // matters is the parser's reading of it, not its spelling.
+    for value in [
+        "5",
+        "imap.example.com",
+        "a b",
+        "a\tb",
+        "say \"hello\"",
+        "--not-a-flag",
+        "",
+        "trailing ",
+    ] {
+        let line = format!("x --v={}", quoted(value));
+        let tokens = tokenize(&line).unwrap_or_else(|error| panic!("{line:?}: {error}"));
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("x".to_owned()),
+                Token::Flag {
+                    name: "v".to_owned(),
+                    value: Some(value.to_owned()),
+                },
+            ],
+            "{value:?} did not round-trip"
+        );
+    }
+}
+
+#[test]
+fn a_value_needing_nothing_is_left_alone() {
+    // Quoting everything would make a line built from held values unreadable
+    // next to the same line typed by hand — and these lines are shown to people
+    // (a report row's border, the command history).
+    assert_eq!(quoted("993"), "993");
+    assert_eq!(quoted("imap.example.com"), "imap.example.com");
+    // And an empty value is a token rather than nothing, so a positional cannot
+    // vanish and shift every one after it.
+    assert_eq!(quoted(""), "\"\"");
+}
+
+#[test]
+fn a_quoted_positional_stays_one_positional() {
+    // The failure mode this prevents: a discovered username with a space in it,
+    // pasted into a line unquoted, becomes two tokens — and the verb is asked
+    // about something nobody typed.
+    let line = format!("x {}", quoted("ada lovelace"));
+    let tokens = tokenize(&line).unwrap_or_else(|error| panic!("{line:?}: {error}"));
+    assert_eq!(
+        tokens,
+        vec![
+            Token::Word("x".to_owned()),
+            Token::Word("ada lovelace".to_owned()),
+        ]
+    );
+}

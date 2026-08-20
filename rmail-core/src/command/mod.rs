@@ -496,6 +496,137 @@ fn explicit() -> Vec<Verb> {
         required: false,
         rest: false,
     }];
+    /// An account's row id, shown by `:account list`. Optional for the same
+    /// reason `DRAFT_ID` is.
+    const ACCOUNT_ID: &[Positional] = &[Positional {
+        name: "account_id",
+        required: false,
+        rest: false,
+    }];
+    /// A capability token's row id, shown by `:token list` and by the row
+    /// `:token create` mints. Optional for the same reason `DRAFT_ID` is.
+    const TOKEN_ID: &[Positional] = &[Positional {
+        name: "token_id",
+        required: false,
+        rest: false,
+    }];
+    /// The address `:account add` discovers settings for.
+    const EMAIL: &[Positional] = &[Positional {
+        name: "email",
+        required: false,
+        rest: false,
+    }];
+    /// `:account add`'s credential *reference* — how to obtain the password,
+    /// never the password, which is what lets the discovery be verified by a
+    /// real login — plus the switch that lets a model propose settings when
+    /// every probe misses.
+    ///
+    /// Every flag here is named as `mail account add` names it, because two
+    /// surfaces over one capability disagreeing about a flag name is the drift
+    /// `parity` exists to prevent.
+    const AUTOCONFIGURE_FLAGS: &[Flag] = &[
+        Flag {
+            name: "password-command",
+            takes_value: true,
+        },
+        Flag {
+            name: "password-env",
+            takes_value: true,
+        },
+        Flag {
+            name: "keychain",
+            takes_value: true,
+        },
+        Flag {
+            name: "ai",
+            takes_value: false,
+        },
+    ];
+    /// `:account new`'s servers, login and credential — the settings
+    /// `:account add` discovers, as flags, so the row that applies a proposal
+    /// is a `:` line somebody could have typed.
+    const NEW_ACCOUNT_FLAGS: &[Flag] = &[
+        Flag {
+            name: "imap-server",
+            takes_value: true,
+        },
+        Flag {
+            name: "imap-port",
+            takes_value: true,
+        },
+        Flag {
+            name: "username",
+            takes_value: true,
+        },
+        Flag {
+            name: "smtp-server",
+            takes_value: true,
+        },
+        Flag {
+            name: "smtp-port",
+            takes_value: true,
+        },
+        Flag {
+            name: "password-command",
+            takes_value: true,
+        },
+        Flag {
+            name: "password-env",
+            takes_value: true,
+        },
+        Flag {
+            name: "keychain",
+            takes_value: true,
+        },
+        Flag {
+            name: "oauth",
+            takes_value: true,
+        },
+    ];
+    /// `:account login`'s provider and native-client details. `--oauth` names
+    /// the provider, as `mail account login --oauth google` does.
+    const OAUTH_FLAGS: &[Flag] = &[
+        Flag {
+            name: "oauth",
+            takes_value: true,
+        },
+        Flag {
+            name: "client-id",
+            takes_value: true,
+        },
+        Flag {
+            name: "client-secret-command",
+            takes_value: true,
+        },
+        Flag {
+            name: "scope",
+            takes_value: true,
+        },
+        Flag {
+            name: "no-browser",
+            takes_value: false,
+        },
+    ];
+    /// `:account refresh`'s one switch.
+    const FORCE: &[Flag] = &[Flag {
+        name: "force",
+        takes_value: false,
+    }];
+    /// `:token create`'s label, scopes and expiry.
+    const MINT_FLAGS: &[Flag] = &[
+        Flag {
+            name: "name",
+            takes_value: true,
+        },
+        Flag {
+            name: "scope",
+            takes_value: true,
+        },
+        Flag {
+            name: "ttl",
+            takes_value: true,
+        },
+    ];
     vec![
         Verb {
             path: vec!["manual", "grep"],
@@ -1322,6 +1453,137 @@ fn explicit() -> Vec<Verb> {
             // always supplies a summary first.
             description: None,
         },
+        // -- accounts and tokens (task 97) -------------------------------------
+        Verb {
+            path: vec!["account", "list"],
+            capability: Some(Capability::AccountList),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["account", "show"],
+            capability: Some(Capability::AccountGet),
+            action: None,
+            positionals: ACCOUNT_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["account", "add"],
+            capability: Some(Capability::AccountAutoconfigure),
+            action: None,
+            positionals: EMAIL,
+            flags: AUTOCONFIGURE_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["account", "new"],
+            capability: Some(Capability::AccountCreate),
+            action: None,
+            positionals: NAME,
+            flags: NEW_ACCOUNT_FLAGS,
+            cli_alias: None,
+            // `AccountCreate` has no CLI verb at all, so there is no summary
+            // to inherit — see this verb's own docs in `tui::commands::account`
+            // on why it is spelled `new` next to `:tag new`.
+            description: Some("Add an account from settings, as `:account add` discovered them."),
+        },
+        Verb {
+            path: vec!["account", "login"],
+            capability: Some(Capability::AccountBeginOAuth),
+            action: None,
+            positionals: ACCOUNT_ID,
+            flags: OAUTH_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["account", "refresh"],
+            capability: Some(Capability::AccountRefreshToken),
+            action: None,
+            positionals: ACCOUNT_ID,
+            flags: FORCE,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["account", "test"],
+            capability: Some(Capability::AccountTestConnection),
+            action: None,
+            positionals: ACCOUNT_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["account", "rm"],
+            capability: Some(Capability::AccountDelete),
+            action: None,
+            positionals: ACCOUNT_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["account", "use"],
+            // Neither, for the reason `set` has neither: switching the account
+            // this session is looking at reaches no RPC, and the id it takes is
+            // not something an `Action` can carry. `tui::model`'s
+            // `run_invocation` is where it is answered, next to `:set`.
+            capability: None,
+            action: None,
+            positionals: ACCOUNT_ID,
+            flags: &[],
+            cli_alias: None,
+            description: Some("Switch which account this session is looking at."),
+        },
+        Verb {
+            path: vec!["account", "toml"],
+            // Neither, for the reason `account use` has neither: opening the
+            // `[[accounts]]` block `:account add` last discovered is a client
+            // affordance over session state, not a capability, and it is a verb
+            // rather than a row-only gesture because a row's action *is* an
+            // `Invocation` — an affordance nobody could type would document
+            // nothing either.
+            capability: None,
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: Some("Open the [[accounts]] block the last `:account add` discovered."),
+        },
+        Verb {
+            path: vec!["token", "list"],
+            capability: Some(Capability::AdminListTokens),
+            action: None,
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["token", "create"],
+            capability: Some(Capability::AdminMintToken),
+            action: None,
+            positionals: &[],
+            flags: MINT_FLAGS,
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
+            path: vec!["token", "revoke"],
+            capability: Some(Capability::AdminRevokeToken),
+            action: None,
+            positionals: TOKEN_ID,
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
     ]
 }
 
@@ -1587,6 +1849,31 @@ enum Token {
 /// of the line" — that would silently produce different token boundaries
 /// than the input actually has — it is [`CommandError::UnterminatedQuote`]
 /// instead.
+/// One value, quoted so [`parse`] reads it back unchanged.
+///
+/// The inverse of [`tokenize`]'s quoting, and it lives next to it for that
+/// reason: a client rebuilding a `:` line from values it holds — a form applying
+/// its fields, a report row carrying settings a probe discovered — needs exactly
+/// the escaping the parser undoes, and a second copy of that rule somewhere else
+/// is a copy that drifts.
+///
+/// Left alone when it needs nothing: quoting every value would make a line built
+/// from one unreadable next to the same line typed by hand. Wrapped in `"` with
+/// embedded quotes escaped otherwise — a value carrying a space would split into
+/// two tokens, and one carrying a quote would end the line early, so either way
+/// the line would parse to something nobody asked for.
+///
+/// An empty value comes back as `""`, which is a token: the alternative is
+/// nothing at all, and a positional that vanished would shift every one after
+/// it.
+#[must_use]
+pub fn quoted(value: &str) -> String {
+    if !value.is_empty() && !value.contains([' ', '\t', '"']) {
+        return value.to_owned();
+    }
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
 fn tokenize(text: &str) -> Result<Vec<Token>, CommandError> {
     let mut tokens = Vec::new();
     let mut chars = text.chars().peekable();
