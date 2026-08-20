@@ -8,7 +8,17 @@ save with no restart.
 
 $RMAIL_KEYS, if set. Otherwise keys.toml beside the master config file — so
 pointing $RMAIL_CONFIG at a second profile moves both, which is what a second
-profile means.
+profile means. With neither variable set that is ~/.config/rmail/keys.toml,
+and on a fresh install no such file exists: every binding you have comes from
+the built-in map compiled into the binary. mail keys list prints the path it
+read as its own first line, so it answers which of the two variables won
+without you working it out.
+
+At most 256 kilobytes of the file is read. The whole built-in map is under
+two kilobytes, so the cap is three orders of magnitude of headroom, and it
+exists because the path is itself a setting — a typo can aim $RMAIL_KEYS at
+something that is not a config file at all, and reading that forever, once a
+second, behind a TUI that never says why is the failure worth ruling out.
 
 ## It is a delta, not a replacement
 
@@ -28,7 +38,9 @@ how a keymap file becomes a thing people stop upgrading.
 ## Sections are layers
 
 One table per layer, named by the layer's id. Only the configurable layers may
-be named; [[modes]] lists them and says which falls through to which. A
+be named; [[modes]] lists them and says which falls through to which. There
+are nine — normal, viewer, visual, insert, prompt, menu, pick, confirm and
+help — and global, the layer that holds Esc and Ctrl-C, is not one of them. A
 binding added to the wrong layer is the most common mistake here — see
 [[practice-keymap]].
 
@@ -43,6 +55,13 @@ j        gg       G        ?
 ```
 
 Quote them in a shell: the angle brackets are redirections.
+
+Four keys is the longest chord any layer can bind, and nothing raises it: a
+fifth key makes the line a refusal at load time rather than a binding. The
+bracket names are a closed list — esc and escape, cr and enter and return,
+tab, bs and backspace, up, down, space, and lt for a literal < — plus c- with
+one character after it. Those names are matched without case, so <C-P> and
+<c-p> are one binding; a bare character keeps its case, so G and g are two.
 
 ## A chord fires as soon as it is complete
 
@@ -85,6 +104,12 @@ An edit rewrites one line and leaves every other byte — comments included —
 where it was, then re-parses the result and refuses to write unless the only
 binding that changed is the one asked for.
 
+Both set and unset write to the normal layer unless --mode names another one,
+and list takes the same flag to print one layer instead of all nine. What
+unset removes is a line this file added; where there is no such line it
+refuses rather than writing the empty string, because suppressing a built-in
+binding is the other request and one you make by hand.
+
 ## Rebinding from the ? overlay
 
 {{keys:help.rebind}} on a highlighted row opens the command line pre-filled
@@ -111,7 +136,10 @@ so a row from that mode's own chain never needs to spell it out.
   the status line and the previous keymap keeps working, because a typo
   mid-edit must not leave you holding a TUI whose keys have all changed.
 - A missing file is not an error. It is the state every install starts in.
-- Esc and Ctrl-C cannot be bound or unbound at all.
+- Esc and Ctrl-C cannot be bound or unbound at all, and no chord may begin
+  with either. They are the two bindings in the global layer, which is the
+  one layer this file may not name, and a chord starting with Esc would make
+  a bare Esc merely pending — one keystroke from a mode nobody can leave.
 
 ## Reload
 
@@ -119,6 +147,15 @@ The file is re-read once a second and compared by content, not by
 modification time — mtime has one-second granularity on real filesystems, so
 two edits within the same second are invisible to it, and two edits in a row
 is exactly what trying a binding looks like.
+
+The poll runs on a thread of its own, so a slow filesystem stalls no request
+in flight, and a second is the longest someone editing a binding in the next
+window will believe the file was read. Deleting the file counts as a change:
+the next poll restores the built-in bindings rather than keeping the ones it
+used to define. The first read, at startup, says nothing — a status line
+announcing that the keymap loaded would stamp on the boot progress you are
+actually waiting for — but an error is announced whenever it happens,
+startup included.
 
 ## Bindings that can never be typed
 
@@ -145,3 +182,23 @@ They were not before — the terminal's own key events for them were dropped bef
 they reached the keymap at all, so a binding on `<home>` was not merely unbound,
 it was unwritable. `<pgup>`, `<pgdown>` and `<pgdn>` are accepted as aliases,
 because somebody who writes vim's spelling means the same key.
+
+## The numbers here, and which of them are settings
+
+Two are, and neither belongs to the environment overlay the rest of rmail's
+settings take — the RMAIL_SYNC__INTERVAL shape. $RMAIL_KEYS names the file
+and $RMAIL_CONFIG moves it by moving the directory it sits in, and both are
+read before the config system exists, which is why there is no keys table in
+the [[config-file]] and no environment variable for an individual binding. A
+binding is a line in this file or it is a built-in.
+
+The rest are constants in the binary, with no key and no variable behind
+them: four keys in the longest chord, 9,999 as the largest count typed in
+front of one, 256 kilobytes as the most of this file that is read, one second
+between polls. The first two bound a key you can hold down, and what a stuck
+key is allowed to consume does not vary from one person to the next.
+
+The bindings themselves default to the built-in map, which is what you are
+running until this file says otherwise. [[keys]] is that map as it stands
+after the file has been applied, {{keys:help}} is the same list inside the
+client, and mail keys list is the command-line form.

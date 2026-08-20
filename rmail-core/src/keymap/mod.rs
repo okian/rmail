@@ -359,6 +359,8 @@ actions! {
     CursorUp      => "cursor.up",           "up";
     CursorTop     => "cursor.top",          "first row (or row N with a count)";
     CursorBottom  => "cursor.bottom",       "last row (or row N with a count)";
+    CursorPageDown => "cursor.page-down",   "a page down (or N pages with a count)";
+    CursorPageUp  => "cursor.page-up",      "a page up (or N pages with a count)";
     FocusToggle   => "focus.toggle",        "switch between the folder and message panes";
     FocusFolders  => "focus.folders",       "focus the folder pane";
     FocusMessages => "focus.messages",      "focus the message pane";
@@ -669,6 +671,27 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Normal, "<up>", Action::CursorUp),
     (Mode::Normal, "gg", Action::CursorTop),
     (Mode::Normal, "G", Action::CursorBottom),
+    // Paging, in every layer that has something to page (task 106). `<c-d>`
+    // and `<c-u>` are restated in `Prompt`, `Menu`, `Pick` and `Help` below
+    // rather than bound once here, because those layers' chains stop at
+    // `Global` — the same reason each of them restates `j`/`k`.
+    //
+    // The two layers that do *not* get them are `Insert` and `Confirm`, and
+    // that is the absence of something to move rather than an omission: a
+    // one-line text field and a yes/no question have no rows and no scroll
+    // offset, so `active_cursor` finds nothing there and the key would be a
+    // documented binding that does nothing wherever it was pressed.
+    //
+    // `<pagedown>`/`<pageup>` are bound alongside the vim spelling wherever it
+    // is, and only because task 105 made them deliverable — the terminal's own
+    // events for those keys were dropped before they reached this table, so
+    // binding them before now would have been writing a line that could never
+    // fire. Two spellings of one action rather than two actions: somebody who
+    // reaches for the key with the name on it means what `<c-d>` means.
+    (Mode::Normal, "<c-d>", Action::CursorPageDown),
+    (Mode::Normal, "<c-u>", Action::CursorPageUp),
+    (Mode::Normal, "<pagedown>", Action::CursorPageDown),
+    (Mode::Normal, "<pageup>", Action::CursorPageUp),
     (Mode::Normal, "<tab>", Action::FocusToggle),
     (Mode::Normal, "h", Action::FocusFolders),
     (Mode::Normal, "l", Action::FocusMessages),
@@ -724,6 +747,13 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Prompt, "<tab>", Action::PromptComplete),
     (Mode::Prompt, "<up>", Action::CursorUp),
     (Mode::Prompt, "<down>", Action::CursorDown),
+    // A control chord is not text, so paging the hits underneath a query line
+    // takes nothing away from the line itself — which is the whole reason
+    // `Prompt` binds `<up>`/`<down>` and not `k`/`j`.
+    (Mode::Prompt, "<c-d>", Action::CursorPageDown),
+    (Mode::Prompt, "<c-u>", Action::CursorPageUp),
+    (Mode::Prompt, "<pagedown>", Action::CursorPageDown),
+    (Mode::Prompt, "<pageup>", Action::CursorPageUp),
     // Menu is a list again, so the list bindings come back — restated rather
     // than inherited from Normal, because an overlay whose chain reached
     // Normal would let `d` delete the mail behind it.
@@ -733,6 +763,10 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Menu, "<up>", Action::CursorUp),
     (Mode::Menu, "gg", Action::CursorTop),
     (Mode::Menu, "G", Action::CursorBottom),
+    (Mode::Menu, "<c-d>", Action::CursorPageDown),
+    (Mode::Menu, "<c-u>", Action::CursorPageUp),
+    (Mode::Menu, "<pagedown>", Action::CursorPageDown),
+    (Mode::Menu, "<pageup>", Action::CursorPageUp),
     (Mode::Menu, "<enter>", Action::MenuAccept),
     (Mode::Menu, "x", Action::SearchExplain),
     (Mode::Menu, "u", Action::OutboxCancel),
@@ -755,6 +789,10 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Pick, "<up>", Action::CursorUp),
     (Mode::Pick, "gg", Action::CursorTop),
     (Mode::Pick, "G", Action::CursorBottom),
+    (Mode::Pick, "<c-d>", Action::CursorPageDown),
+    (Mode::Pick, "<c-u>", Action::CursorPageUp),
+    (Mode::Pick, "<pagedown>", Action::CursorPageDown),
+    (Mode::Pick, "<pageup>", Action::CursorPageUp),
     (Mode::Pick, "<enter>", Action::PickAccept),
     (Mode::Pick, "q", Action::Cancel),
     (Mode::Confirm, "y", Action::ConfirmAccept),
@@ -784,6 +822,13 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Help, "<up>", Action::CursorUp),
     (Mode::Help, "gg", Action::CursorTop),
     (Mode::Help, "G", Action::CursorBottom),
+    // A manual page is the longest thing in the client, so this is the layer
+    // paging matters most in — and the one where a reader arrives already
+    // expecting a pager's keys.
+    (Mode::Help, "<c-d>", Action::CursorPageDown),
+    (Mode::Help, "<c-u>", Action::CursorPageUp),
+    (Mode::Help, "<pagedown>", Action::CursorPageDown),
+    (Mode::Help, "<pageup>", Action::CursorPageUp),
     // `K` in this layer *is* a change: it used to be unbound in the `?`
     // overlay and now closes it and opens the manual. Deliberate — the two are
     // halves of the same thing, the reference and the prose behind it — and

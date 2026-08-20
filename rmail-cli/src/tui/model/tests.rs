@@ -541,6 +541,164 @@ fn ctrl_c_quits_from_anywhere_including_a_modal() {
 }
 
 // ---------------------------------------------------------------------------
+// paging (task 106)
+// ---------------------------------------------------------------------------
+
+/// A model with `n` messages loaded, for the movements that need more rows
+/// than a page.
+fn with_messages(n: i64) -> Model {
+    let mut model = loaded();
+    model.messages = (0..n).map(row).collect();
+    model
+}
+
+/// The default terminal is 24 rows, so a page is 24 - 3 chrome - 1 overlap.
+const PAGE: usize = 20;
+
+#[test]
+fn ctrl_d_and_ctrl_u_page_the_message_list_and_clamp_at_the_ends() {
+    let mut model = with_messages(60);
+
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(model.message_idx, PAGE);
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(model.message_idx, PAGE * 2);
+    press(&mut model, Key::ctrl('d'));
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(
+        model.message_idx, 59,
+        "clamped at the last row rather than wrapping or overshooting"
+    );
+
+    press(&mut model, Key::ctrl('u'));
+    assert_eq!(model.message_idx, 59 - PAGE);
+    press(&mut model, Key::ctrl('u'));
+    press(&mut model, Key::ctrl('u'));
+    press(&mut model, Key::ctrl('u'));
+    assert_eq!(model.message_idx, 0, "clamped at the first row");
+}
+
+#[test]
+fn a_page_is_as_tall_as_the_terminal_says_it_is() {
+    let mut model = with_messages(200);
+
+    update(&mut model, Msg::Resize { rows: 50 });
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(model.message_idx, 46, "50 rows, less chrome, less overlap");
+
+    // A terminal shorter than its own chrome still has to move by something,
+    // and one row is the correct degenerate answer.
+    update(&mut model, Msg::Resize { rows: 2 });
+    let before = model.message_idx;
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(model.message_idx, before + 1);
+}
+
+#[test]
+fn a_resize_says_nothing_on_the_status_line() {
+    let mut model = loaded();
+    model.info("something worth reading");
+    let cmds = update(&mut model, Msg::Resize { rows: 40 });
+    assert!(cmds.is_empty(), "a resize asks the daemon for nothing");
+    assert_eq!(
+        model.status, "something worth reading",
+        "resizing a window is not news"
+    );
+}
+
+#[test]
+fn a_count_before_a_page_key_means_pages_rather_than_rows() {
+    let mut model = with_messages(200);
+    keys(&mut model, "3");
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(
+        model.message_idx,
+        PAGE * 3,
+        "3j is already three rows, so a count here is three screens"
+    );
+}
+
+#[test]
+fn the_viewer_pages_its_body() {
+    let mut model = loaded();
+    model.screen = Screen::Viewer;
+    model.open = Some(OpenMessage {
+        id: 10,
+        body: (0..100).map(|n| format!("line {n}")).collect(),
+        ..OpenMessage::default()
+    });
+
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(model.scroll, PAGE);
+    press(&mut model, Key::ctrl('u'));
+    assert_eq!(model.scroll, 0);
+    press(&mut model, Key::ctrl('u'));
+    assert_eq!(model.scroll, 0, "clamped at the top");
+}
+
+#[test]
+fn the_manual_pages_its_page() {
+    let mut model = manual_open();
+    let lines = manual_doc(&model).expect("a rendered page").lines.len();
+    assert!(lines > PAGE, "the front page is longer than one screen");
+
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(manual(&model).cursor, PAGE);
+    press(&mut model, Key::ctrl('u'));
+    assert_eq!(manual(&model).cursor, 0);
+}
+
+#[test]
+fn a_list_overlay_pages_with_the_same_key() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('c')); // the folder picker
+    assert_eq!(model.mode(), Mode::Pick);
+
+    press(&mut model, Key::ctrl('d'));
+    match &model.overlay {
+        Some(Overlay::Pick { idx, .. }) => assert_eq!(
+            *idx,
+            model.folders.len() - 1,
+            "a list shorter than a page pages to its end"
+        ),
+        other => panic!("expected the folder picker, found {other:?}"),
+    }
+    press(&mut model, Key::ctrl('u'));
+    match &model.overlay {
+        Some(Overlay::Pick { idx, .. }) => assert_eq!(*idx, 0),
+        other => panic!("expected the folder picker, found {other:?}"),
+    }
+}
+
+#[test]
+fn paging_does_nothing_where_there_is_nothing_to_page() {
+    // An empty list, a confirmation, and the command line: three states where
+    // the key is either bound to a cursor that has no rows or not bound at
+    // all, and in none of them may it reach the mail behind the overlay.
+    let mut model = loaded();
+    model.messages.clear();
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(model.message_idx, 0);
+
+    let mut model = with_messages(60);
+    press(&mut model, Key::Char('d')); // delete asks first
+    assert_eq!(model.mode(), Mode::Confirm);
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(
+        model.message_idx, 0,
+        "a yes/no question does not page the list underneath it"
+    );
+
+    let mut model = with_messages(60);
+    press(&mut model, Key::Char(':'));
+    press(&mut model, Key::ctrl('d'));
+    assert_eq!(
+        model.message_idx, 0,
+        "the command line's own layer pages nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // help
 // ---------------------------------------------------------------------------
 

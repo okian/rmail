@@ -66,3 +66,28 @@ socket, because a cleared password makes that session moot — the same thing
 
 See [[daemon]] for what the gate is and how to set one up, and
 [[practice-tokens]] for the other half of the same subject.
+
+## What is capped here, and what is set elsewhere
+
+A report keeps 500 rows, and 160 characters of any one cell. Neither is a
+setting: the caps are there so a stream that misbehaves cannot grow this
+client without bound while you read it. The daemon caps its own result sets
+well below 500 rows, so that is not a number a report you asked for reaches;
+the cell cap is, because one field of an answer can be as long as whatever
+produced it. Past the 500th row an arriving frame takes only the room left,
+or is truncated to fit, and the border counts the rows the pane actually
+holds — that count, not the verb's own idea of how many there are, is what
+you are reading. A cell cut at 160 characters ends in an ellipsis; each
+column then fits its cell to the width the report declared, which is a
+second cut at a different width and implies nothing about the first.
+
+Neither verb here takes an argument or a flag, so there is nothing on the
+line to default — {{cmd:auth status}} and {{cmd:auth clear}} are each the
+whole command. The gate the report describes does have defaults, and they
+live in the [[config-file]]'s client_auth table: there is no password until
+mail auth setup sets one, require_for_local is false, so a socket peer is
+trusted on its kernel-verified uid alone, and a session a login mints lasts
+30 days. The environment overlay is the usual shape,
+RMAIL_CLIENT_AUTH__REQUIRE_FOR_LOCAL. Which of those holds on this daemon
+right now is a question for the report rather than for the file — the file
+is where you change the gate, not where you check it.

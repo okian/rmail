@@ -1982,6 +1982,8 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     Action::CursorUp,
     Action::CursorTop,
     Action::CursorBottom,
+    Action::CursorPageDown,
+    Action::CursorPageUp,
     Action::FocusToggle,
     Action::FocusFolders,
     Action::FocusMessages,

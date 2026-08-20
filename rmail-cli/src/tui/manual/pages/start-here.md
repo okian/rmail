@@ -44,6 +44,7 @@ no files on disk, so it still works on the day the daemon will not start.
 - [[triage-by-selection]]
 - [[rule-from-mistake]]
 - [[halve-the-ai-bill]]
+- [[add-any-account]]
 - [[add-oauth-account]]
 - [[find-the-clause]]
 - [[digest-to-slack]]
@@ -78,6 +79,7 @@ Each of these is one habit and the one sentence that justifies it.
 - [[capabilities]]
 - [[keys-toml]]
 - [[config-file]]
+- [[provider-settings]]
 - [[troubleshooting]]
 
 ## The shape of the screen
@@ -94,6 +96,8 @@ whole of it.
   the way it does in vim: 5j goes down five rows.
 - {{keys:cursor.top}} and {{keys:cursor.bottom}} go to the ends — or, with a
   count, to that row.
+- {{keys:cursor.page-down}} and {{keys:cursor.page-up}} move a screenful, in
+  every layer that has rows to move through.
 - {{keys:focus.toggle}} switches between the folder pane and the message
   list; {{keys:focus.folders}} and {{keys:focus.messages}} go straight to one.
 - {{keys:quit}} leaves from anywhere and cannot be rebound. Neither can Esc,

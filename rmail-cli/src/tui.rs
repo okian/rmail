@@ -157,6 +157,17 @@ pub async fn run(socket: &Path, args: TuiArgs) -> Result<()> {
         Arc::clone(&stop),
     );
 
+    // The window's height, before anything else: the model assumes 24 rows
+    // until it is told otherwise, and a `<c-d>` pressed on the first frame of
+    // a tall terminal should move a whole screen rather than the default's.
+    // Sent as a message for the same reason the resizes that follow it are —
+    // `model::update` is pure and reads no terminal. An unreadable size is not
+    // a startup failure: the default stands, and the first real resize
+    // corrects it.
+    if let Ok(size) = terminal.size() {
+        let _ = tx.send(Msg::Resize { rows: size.height });
+    }
+
     // Boot is a message like any other, so the first loads follow exactly the
     // same path a key press would — nothing special-cased at startup.
     let _ = tx.send(Msg::Boot);
@@ -290,22 +301,41 @@ fn spawn_input(
                 // still arrives) and quits on the next Ctrl-C.
                 Err(_) => return,
             }
-            let Ok(Event::Key(key)) = event::read() else {
+            let Ok(event) = event::read() else {
                 continue;
             };
-            // Windows (and some terminals) report press *and* release; only
-            // one of them is a keystroke.
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            let Some(mapped) = to_key(key.code, key.modifiers) else {
+            let Some(msg) = to_msg(event) else {
                 continue;
             };
-            if tx.send(Msg::Key(mapped)).is_err() {
+            if tx.send(msg).is_err() {
                 return;
             }
         }
     })
+}
+
+/// Translate a terminal event into a message, or drop it.
+///
+/// The one place events become messages, and pure so that it can be tested
+/// without a tty. Everything the model does not model is dropped here rather
+/// than reaching it — a paste, a mouse click, a focus change — which is what
+/// keeps `model::update`'s message set a closed one.
+fn to_msg(event: Event) -> Option<Msg> {
+    match event {
+        Event::Key(key) => {
+            // Windows (and some terminals) report press *and* release; only
+            // one of them is a keystroke.
+            if key.kind != KeyEventKind::Press {
+                return None;
+            }
+            to_key(key.code, key.modifiers).map(Msg::Key)
+        }
+        // Only the height, which is what a page is measured in; `view` is
+        // handed the width as part of its `Rect` on every frame and needs no
+        // copy of it in the model. See `Msg::Resize`.
+        Event::Resize(_, rows) => Some(Msg::Resize { rows }),
+        _ => None,
+    }
 }
 
 /// Translate a crossterm key into the model's vocabulary.
@@ -431,5 +461,50 @@ mod tests {
         apply_theme_arg(&mut model, None);
         assert_eq!(model.theme, theme::Theme::default());
         assert_eq!(model.level, model::Level::Info);
+    }
+
+    /// The event-to-message mapping, which is the only part of the input thread
+    /// that can be tested without a tty.
+    #[test]
+    fn events_the_model_understands_become_messages_and_the_rest_are_dropped() {
+        use ratatui::crossterm::event::{KeyEvent, KeyEventState, MouseEvent, MouseEventKind};
+
+        let press = |code| {
+            KeyEvent::new_with_kind_and_state(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+                KeyEventState::NONE,
+            )
+        };
+
+        assert!(matches!(
+            to_msg(Event::Key(press(KeyCode::Char('j')))),
+            Some(Msg::Key(Key::Char('j')))
+        ));
+        // A resize carries the height only; the width is `view`'s business.
+        assert!(matches!(
+            to_msg(Event::Resize(120, 44)),
+            Some(Msg::Resize { rows: 44 })
+        ));
+        // A release is not a keystroke, and a mouse event is not modelled at
+        // all — both stop here rather than reaching `update`.
+        let release = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+            KeyEventState::NONE,
+        );
+        assert!(to_msg(Event::Key(release)).is_none());
+        assert!(to_msg(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .is_none());
+        // A key the vocabulary has no name for is dropped here too, which is
+        // what keeps `Msg::Key`'s set closed.
+        assert!(to_msg(Event::Key(press(KeyCode::F(5)))).is_none());
     }
 }

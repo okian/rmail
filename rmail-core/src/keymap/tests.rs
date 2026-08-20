@@ -155,6 +155,53 @@ fn defaults_are_all_installable() {
     );
 }
 
+/// Task 106's "page up and down everywhere": stated as set equality over the
+/// layers, so a layer added later is a failure here rather than a key that
+/// quietly does nothing in it.
+///
+/// [`Mode::Insert`] and [`Mode::Confirm`] are the declared exceptions — a text
+/// field and a yes/no question have nothing to page — and they are named here
+/// so that binding one by accident fails too.
+#[test]
+fn paging_is_bound_in_every_layer_that_has_something_to_page() {
+    let keymap = Keymap::defaults();
+    // Both spellings, in every one of those layers: the vim chord and the key
+    // with the name on it, which task 105 made deliverable.
+    let paging = [
+        (Key::ctrl('d'), Action::CursorPageDown),
+        (Key::ctrl('u'), Action::CursorPageUp),
+        (Key::PageDown, Action::CursorPageDown),
+        (Key::PageUp, Action::CursorPageUp),
+    ];
+    for (key, action) in paging {
+        let bound: Vec<&str> = Mode::CONFIGURABLE
+            .iter()
+            .filter(|mode| keymap.lookup(**mode, &Chord::new(vec![key]).unwrap()) == Some(action))
+            .map(|mode| mode.id())
+            .collect();
+        assert_eq!(
+            bound,
+            ["normal", "viewer", "visual", "prompt", "menu", "pick", "help"],
+            "{} is not bound where it should be",
+            action.id()
+        );
+    }
+    // `Viewer` and `Visual` are in that list by inheritance rather than by a
+    // binding of their own, which is the whole reason the check is written
+    // against `lookup` (what a key press resolves to) instead of `layer`.
+    for mode in [Mode::Viewer, Mode::Visual] {
+        assert_eq!(
+            keymap
+                .layer(mode)
+                .filter(|(chord, _)| chord.keys() == [Key::ctrl('d')])
+                .count(),
+            0,
+            "{} restates a binding it inherits",
+            mode.id()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // resolution
 // ---------------------------------------------------------------------------

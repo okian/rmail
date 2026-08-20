@@ -27,3 +27,16 @@ toggling each row, so a range is as predictable as a single message.
 If the pass keeps stalling on a message, the message needs a decision you do
 not have yet — flag it and move on. If the same kind of message stalls you
 every week, it needs a rule instead: [[rule-from-mistake]].
+
+## Where these keys and their limits come from
+
+The chords above are the built-in bindings, and [[keys-toml]] is the only
+place they change; nothing else about the pass is configuration. One action
+takes at most 100 messages at a time, and past that the range is refused
+with both counts rather than truncated to a hundred rows you would then have
+to identify — the cap is compiled into the binary, with no config table and
+no environment override behind it, and [[bulk]] carries the reasoning.
+{{keys:message.archive}} has no destination setting either: it takes the
+first of Archive, Archives and All Mail that the account has and that is not
+the folder you are looking at, matched on the folder's last path segment,
+and refuses the key on an account with none of the three — see [[archive]].

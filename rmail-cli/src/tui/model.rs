@@ -136,6 +136,38 @@ const DEFAULT_FOLDER_WIDTH_PCT: u16 = 20;
 const DEFAULT_PREVIEW_WIDTH_PCT: u16 = 40;
 const DEFAULT_AI_PANEL_WIDTH_PCT: u16 = 30;
 
+/// The terminal height a model assumes until a [`Msg::Resize`] tells it
+/// otherwise — the classic 80x24, which is also the smallest terminal this
+/// screen was ever designed for.
+///
+/// It matters for exactly one thing, [`page_rows`], and the consequence of
+/// being wrong is a page that is a few rows short of the window rather than
+/// anything incorrect: the movement is clamped to the list either way. A
+/// default rather than an `Option` because "how tall is the terminal" has a
+/// sensible answer before the first frame and a `None` would have to be
+/// answered with a number here anyway.
+const DEFAULT_VIEWPORT_ROWS: u16 = 24;
+
+/// Rows of a frame that are never the scrolling pane: the status line, and the
+/// two border rows of the pane itself.
+///
+/// Deliberately a floor rather than the real chrome, which varies with what is
+/// on screen — a toast, the WhichKey band and the command line each take a row
+/// when they are up, and `view` is the only thing that knows. Understating it
+/// makes a page slightly *taller* than the visible rows in those layouts,
+/// which costs at most the row of overlap [`PAGE_OVERLAP`] adds; overstating
+/// it would make every page short in the common case. Keeping the arithmetic
+/// here also keeps `view`'s layout out of the model, which is what lets
+/// `update` stay a pure function of messages.
+const CHROME_ROWS: u16 = 3;
+
+/// Rows a page deliberately does not advance, so the line that was at the
+/// bottom of the screen is still on it afterwards.
+///
+/// One is what `less` and vim's own page keys keep, and the reason is that a
+/// page boundary in the middle of a paragraph is unreadable without it.
+const PAGE_OVERLAP: usize = 1;
+
 /// The most characters a text prompt accepts.
 ///
 /// Long enough for any address or subject a person types, short enough that a
@@ -829,6 +861,18 @@ pub enum Msg {
         generation: u64,
         /// What arrived.
         event: FormEvent,
+    },
+    /// The terminal is this many rows tall — sent once at startup and again on
+    /// every resize.
+    ///
+    /// A message rather than something read from the terminal where it is
+    /// needed, because [`update`] is pure: the window's height is an input
+    /// event that arrives on the same channel as a key press (crossterm
+    /// delivers it on the same event stream), not a thing the model may go and
+    /// ask for. Only the height, for the reason [`Model::viewport_rows`] gives.
+    Resize {
+        /// The new row count.
+        rows: u16,
     },
     /// `keys.toml` was read (see [`crate::keymap::file::Source`]).
     Keymap {
@@ -2455,6 +2499,18 @@ pub struct Model {
     /// The collapsible AI panel's share of the width it is given, as a
     /// percentage. `:set ai-panel-width` tunes it.
     pub ai_panel_width_pct: u16,
+    /// How many rows the terminal has, as of the last [`Msg::Resize`].
+    ///
+    /// The one fact about the *window* this model keeps, and it is here
+    /// because `cursor.page-down` cannot be answered without it: a page is a
+    /// property of the terminal, not of the mailbox. Everything else about
+    /// geometry stays in `view`, which is handed a `Rect` per frame — see
+    /// [`page_rows`] for what this is and is not used for.
+    ///
+    /// Width is deliberately absent: nothing in the model's arithmetic needs
+    /// it, and a field the model only stores is a field that can go stale
+    /// without anything noticing.
+    pub viewport_rows: u16,
 }
 
 impl Default for Model {
@@ -2520,6 +2576,7 @@ impl Model {
             folder_width_pct: DEFAULT_FOLDER_WIDTH_PCT,
             preview_width_pct: DEFAULT_PREVIEW_WIDTH_PCT,
             ai_panel_width_pct: DEFAULT_AI_PANEL_WIDTH_PCT,
+            viewport_rows: DEFAULT_VIEWPORT_ROWS,
         }
     }
 
@@ -2956,6 +3013,13 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             model.fail(format!(
                 "live updates stopped ({why}) — the list is no longer refreshing itself"
             ));
+            Vec::new()
+        }
+        Msg::Resize { rows } => {
+            // Silent: a resize is something the user did to their own window
+            // and can see the result of, and a status line about it would push
+            // off whatever the last thing that happened was.
+            model.viewport_rows = rows;
             Vec::new()
         }
         Msg::Keymap { result, announce } => {
@@ -3715,6 +3779,8 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
         Action::CursorUp => move_cursor(model, Direction::Up, count),
         Action::CursorTop => jump(model, Edge::Top, count),
         Action::CursorBottom => jump(model, Edge::Bottom, count),
+        Action::CursorPageDown => page(model, Direction::Down, count),
+        Action::CursorPageUp => page(model, Direction::Up, count),
         // `<tab>` means "the next thing over", and what that is depends on the
         // screen: the other pane on the list, the next section of the settings
         // screen. One action dispatched on the surface rather than two, for the
@@ -3959,6 +4025,54 @@ fn move_cursor(model: &mut Model, direction: Direction, count: Option<u32>) -> V
     // is 3 or `keymap::MAX_COUNT`. A count never multiplies *commands* — no
     // arm of `run_action` issues more than the one the action names.
     let by = rows(count);
+    let at = match direction {
+        Direction::Down => idx.saturating_add(by).min(last),
+        Direction::Up => idx.saturating_sub(by),
+    };
+    set_cursor(model, cursor, at);
+    Vec::new()
+}
+
+/// How many rows one `cursor.page-down` moves, given the terminal the last
+/// [`Msg::Resize`] described.
+///
+/// The visible rows of the scrolling pane, less [`PAGE_OVERLAP`], and never
+/// less than one: a terminal shorter than its own chrome still has to page by
+/// *something*, and one row is `cursor.down`, which is the correct degenerate
+/// answer rather than a movement of zero that reads as a dead key.
+fn page_rows(model: &Model) -> usize {
+    usize::from(model.viewport_rows.saturating_sub(CHROME_ROWS))
+        .saturating_sub(PAGE_OVERLAP)
+        .max(1)
+}
+
+/// `<c-d>`/`<c-u>` — move the active cursor by a screenful.
+///
+/// The same movement [`move_cursor`] makes over a different distance, and
+/// deliberately built on the same three pieces ([`active_cursor`],
+/// [`cursor_span`], [`set_cursor`]) rather than on a scroll offset of its own:
+/// every surface with a cursor pages, and none of them needs to know that it
+/// does. Which is also why there is no arm here for "the viewer" or "the
+/// manual" — the viewer's cursor *is* its scroll offset and the manual's is a
+/// row, and both are already `Cursor` variants.
+///
+/// A count means pages, the way vim's own page keys read a count, so `3<c-d>`
+/// is three screens rather than three rows — `3j` is already three rows. It
+/// multiplies arithmetic that is clamped either way, never a command.
+///
+/// The command line is the one layer that binds these and does nothing with
+/// them: it reports no list cursor at all (its `<up>`/`<down>` are its
+/// history), so `active_cursor` finds nothing and the key is inert there
+/// rather than paging the mail behind it.
+fn page(model: &mut Model, direction: Direction, count: Option<u32>) -> Vec<Cmd> {
+    let Some(cursor) = active_cursor(model) else {
+        return Vec::new();
+    };
+    let Some((idx, last)) = cursor_span(model, cursor) else {
+        return Vec::new();
+    };
+    unpin_summary(model, cursor);
+    let by = page_rows(model).saturating_mul(rows(count));
     let at = match direction {
         Direction::Down => idx.saturating_add(by).min(last),
         Direction::Up => idx.saturating_sub(by),

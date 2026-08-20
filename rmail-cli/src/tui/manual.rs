@@ -199,6 +199,8 @@ pub const PAGES: &[Page] = &[
             "cursor.up",
             "cursor.top",
             "cursor.bottom",
+            "cursor.page-down",
+            "cursor.page-up",
             "focus.toggle",
             "focus.folders",
             "focus.messages",
@@ -531,6 +533,12 @@ pub const PAGES: &[Page] = &[
         documents: &[],
     },
     Page {
+        anchor: "add-any-account",
+        title: "Worked example: add any account",
+        body: Body::Authored(include_str!("manual/pages/add-any-account.md")),
+        documents: &[],
+    },
+    Page {
         anchor: "add-oauth-account",
         title: "Worked example: add a Gmail account",
         body: Body::Authored(include_str!("manual/pages/add-oauth-account.md")),
@@ -668,6 +676,12 @@ pub const PAGES: &[Page] = &[
         anchor: "config-file",
         title: "The config file",
         body: Body::Authored(include_str!("manual/pages/config-file.md")),
+        documents: &[],
+    },
+    Page {
+        anchor: "provider-settings",
+        title: "Provider settings",
+        body: Body::Authored(include_str!("manual/pages/provider-settings.md")),
         documents: &[],
     },
     Page {
