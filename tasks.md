@@ -1226,10 +1226,1761 @@ Known backend gaps this phase deliberately does **not** paper over (Settings sho
 - **note (eleven pages' numbers were checked by hand):** the sweep ran a writer and an independent verifier per page; eleven verifiers died on a spend limit (`practice-index`, `practice-sending`, `practice-keymap`, `practice-accounts`, `practice-tokens`, `practice-rules`, `practice-notifications`, `practice-attachments`, `keys-toml`, `config-file`, `troubleshooting`). Every default those pages state was re-checked against the source instead: the notify table (off, `high`, `auto`, quiet hours off, 60m age bound), the send table (10s window, 5 retries, 30s doubling to 30m, 10m late tolerance, preflight on with `block_at = "block"` and 15 recipients), the rules table (5s tick, 200 batch, 8 examples, 30 dry-run days), `index.extract` (25 MB, OCR off, `["eng"]`), `ai.ask` (`claude-sonnet-5`, top_k 12, 8000/2000/1024), `MAX_KEYS_BYTES` 256 KB, `mail daemon start --timeout` 30s against the 5s socket probe, and `token create`'s required `--scope` with its eight-scope vocabulary. Two host scripts kept the mechanical half honest between container runs: one reproduces the manual's build invariants (markers resolve, fences balance, no unwrappable token, `documents` claims cited, every page linked) and one runs each fenced `mail …` line through the real clap tree.
 - **note (the brief was wrong before it was right):** the sweep's reference lists were extracted from the *shared checkout*, which another session was mid-task-95 in, so they carried `tag rules`, `tag rules set` and `rule backtest` — verbs that do not exist at this commit. Three pages cited them as `{{cmd:…}}` before the host checker caught it; they now name the capability or write the `mail` line as prose. A brief derived from a working tree is a brief that documents someone else's uncommitted work.
 
+---
+
+# PART VI — TUI v2 "Cockpit" (ground-up redesign per `tui.md`)
+
+Decomposed from `tui.md` ("rmail TUI — Design Specification", codename Cockpit; committed
+as `5f79822`). `tui.md` is this part's PRD — every acceptance below cites the section it
+implements (`§N`) so drift is checkable by re-reading one paragraph, not the whole
+document. **Read `tui.md` in full before touching any task in this part**; it is 1539
+lines and every clause is load-bearing.
+
+**What this part is, precisely (`tui.md`'s own framing, §0/§21):** a redesign of *what the
+view draws and how interaction feels*, not of the architecture underneath it. Part V's
+invariants carry over **verbatim** and are re-asserted here as a standing constraint on
+every task, not repeated per-task:
+
+- Elm-style model: pure, synchronous, clockless `update(&mut Model, Msg) -> Vec<Cmd>`;
+  `Model::mode()` derived, never stored.
+- `view.rs` stays the **one** ratatui-aware module; no other module imports ratatui.
+- One vocabulary: every bindable `Action` is a parity capability or `LOCAL_ACTIONS`; keys
+  and `:` lines share `run_verb`; the CI drift check (`every_tui_action_is_a_capability_or_declared_local`)
+  stays green through every task below.
+- Generated discoverability: help/which-key/keybar/manual footers derive from the live
+  `Keymap` + verb registry; drift is a failing test, not a docs task.
+- `terminal_safe` sanitizes every untrusted string before it reaches a `Line`/`Span`.
+- Stream discipline: every stream generation-stamped; supersession aborts client-side;
+  daemon `CANCELLED` on a superseded stream is silence.
+- Thin client: gRPC only, no SQLite/IMAP/filesystem state beyond `keys.toml`/`tui.toml`/
+  history; attach < 200 ms, first frame paints before any RPC returns.
+- `keys.toml` hot-reload, shadow lint, chord grammar, history ring + secret filter, and the
+  `Report`/`Form`/`ConfigBlock` engines all keep their current call contracts (this part
+  relocates *where* they render — inside cards/overlays — never *how they're driven*).
+
+**No backend/proto work in this part.** Every RPC `tui.md` §17's wiring map names was
+verified against `proto/*/v1/*.proto` before writing this breakdown — all of it already
+exists and already has a v1 CLI caller (tasks 1–82). `tui.md` §19's thirteen daemon gaps
+are honest UI-side degradations by design (labeled, never faked) — task 175 wires the
+labels; **no task in this part adds an RPC**. If an acceptance below turns out to need
+one, stop and amend `tui.md`/this file rather than inventing a client-side workaround
+that papers over it (law 6, §1.1).
+
+**Cross-cutting acceptance, implicit in every task below** (the reviewer checks these on
+every diff in this part; restating them 73 times would just make them easier to skim
+past): the ten laws of §1.1 — spatial stability, one meaning per key (deviations only via
+the §8.3 arbitration table), the Esc ladder is the *only* place Esc is handled, overlays
+add keys and never rebind one, no invisible state, honest counts (`~`, `•`, `(partial)`),
+optimistic+undoable over confirmed, never block/never blank a frame, model text in `ai`
+tint **and** `«»` guillemets, and the daemon decodes/the client only renders. A task whose
+diff violates one of these is not done regardless of what its own acceptance says.
+
+**Supersedes, task by task (`tui.md` §21 "Replaced"/"Deleted concepts"):** the three-screen
+`Screen` enum → frame + collections + full-frame apps (dismantled across 119, 150–156);
+single `Option<Overlay>` → stack of ≤3 (108); headers-only preview → full Reader card with
+body (126–127); the bespoke AI panel column → rail tab `✦` (128); `O` outbox overlay →
+outbox collection (157). Part V's tasks stay checked — they shipped and were correct for
+the design they targeted — but by the time Part VI's task 179 closes, none of the
+superseded rendering paths should still be reachable from a live keybinding.
+
+**Sizing note:** these are larger than most Part I–V tasks — `tui.md` itself says so
+(§1.3's defect table, §4.2's arithmetic proofs, §18's binding checklist are each already
+implementor-grade detail this file does not need to re-derive). A task below is still
+independently shippable and independently testable; "a few hours" becomes "up to a day"
+for the handful of genuinely architectural ones (107, 119, 132), which is why those are
+sequenced first and everything else depends on them transitively.
+
+## 107. Card/deck router — `layout_mode` and `DeckPlan`
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/layout.rs`: `fn layout_mode(area: Rect) -> DeckPlan`, the single
+    source of truth for which of the four cards (Sidebar/List/Reader/Rail) are visible,
+    their `Rect`s, drawer placement, and focus-ring order — §2.2.1, §4.2, §4.3.
+  - Implements the five width breakpoints (XS<80, S 80–119, M 120–159, L 160–199, XL≥200)
+    and their exact constraints table (§4.2) and the five height tiers with their documented
+    drop orders (§4.3) — nothing silently vanishes; `DeckPlan` exposes what a bar shed at
+    this size so a caller can render the one-keypress-away hint.
+  - The L-floor arithmetic in §4.2 (`160−5−22−34=99`, `Fill(5)/Fill(5)`→List≈49/Reader≈50)
+    holds as a literal unit test, not just a comment.
+  - No two cards' `Rect`s ever overlap and no `Rect` ever exceeds `area` at any size in the
+    tested range — the Adaptive-design "126>120" defect class (§4.2) cannot recur silently.
+  - Nothing in this task renders anything yet — `view.rs` is not touched; this is the pure
+    function later card tasks (120–131) consume. `DeckPlan` deliberately has no `Style`/
+    `Color` field (layout is not paint).
+- **verify:** `cargo nextest run -p rmail-cli tui::layout` (breakpoint table, height-tier
+  drop order, the L-floor arithmetic assertion, and a property test sweeping every width
+  20..400 and height 10..100 asserting no overlap/no overflow — the exact matrix §18 craft
+  rule 2 and Appendix A both call for)
+
+## 108. Overlay stack (replaces the single-overlay slot)
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** no
+- **acceptance:**
+  - `Model`'s `Option<Overlay>` becomes `overlay_stack: Vec<Overlay>` capped at depth 3
+    (§2.2.2, §3.1) — `push_overlay` refuses a fourth with a status-line explanation rather
+    than silently dropping the oldest (which would close something the user still has open).
+  - Every existing overlay call site (finder, command line, pickers, attachment browser,
+    confirm, help, quick menu, image viewer) migrates to push/pop against the stack;
+    behavior is preserved for the single-overlay case (today's tests keep passing).
+  - `Esc` pops exactly the innermost overlay (stack step 2 of §4.6 — the full ladder is
+    task 115; this task only guarantees the stack itself pops one, LIFO, correctly).
+  - Render order is back-to-front by stack index; only the topmost overlay receives key
+    input (lower ones are visually present — e.g. confirm-over-picker — but inert).
+  - The which-key band is explicitly **not** an overlay (§3.1) — confirmed by a test that
+    a pending chord and an open overlay can coexist without the band occupying a stack slot.
+- **verify:** `cargo nextest run -p rmail-cli tui::overlays` (push/pop/cap-at-3/refusal
+  message, z-order rendering, input routed only to the top, which-key band excluded)
+
+## 109. Zoom + drawer state
+- [ ] status
+- **depends-on:** 107
+- **parallel-safe:** no
+- **acceptance:**
+  - `Model` gains `zoom: Option<Card>` (per-card sticky: survives focus changes and
+    resizes) and drawer state derived from `(focus, layout_mode(area))` rather than stored
+    — "focus leads, layout follows" (§4.4): focusing a card the breakpoint hides summons it
+    as an ephemeral drawer (sidebar left `Length(24)`, rail right `Length(34)`, full-frame
+    at XS); moving focus away closes it with no separate "open overlay" key.
+  - `Z` toggles zoom on the focused card, full-bleed inside the card area (§4.5). Zoomed
+    List renders as the headed sortable triage table (implemented fully in 143; this task
+    only wires the zoom *state* and a placeholder full-bleed render so the toggle is
+    observable and tested before 143 lands).
+  - `\` (rail) and `C-b` (sidebar) flip *default visibility* at breakpoints that can afford
+    the card, and focus-summon the drawer at narrower ones — same key, same meaning, §4.4's
+    "there are no separate open-sidebar-overlay keys" is a literal test (grepping for a
+    second binding would fail it).
+  - Zoomed Sidebar is permitted (rule-consistency, §4.5) even though it has no special
+    render — a test asserts `Z` on the focused sidebar doesn't panic or dead-end focus.
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (zoom toggle per card persists
+  across a resize and a focus change, drawer summon/dismiss at each breakpoint via
+  `layout_mode`, `\`/`C-b` dual behavior at wide vs. narrow widths)
+
+## 110. Filter engine (client-side predicate grammar subset)
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/filter.rs`: parses and evaluates, over **loaded rows only**, the
+    client-safe subset of the search operator grammar — `from: to: subject: is: has: tag:
+    ai:` plus free text (§10) — with zero RPCs and sub-frame latency.
+  - Any operator outside the safe subset (`before:`, `after:`, `on:`, `date:`, `note:`,
+    `~`, `=`, NL text, anything server-only) is **rejected inline**: the parser returns a
+    typed `Unsupported(operator)` rather than silently ignoring it or erroring generically,
+    so the caller can render it red with "use `/` for that" (§10) — wiring that rendering
+    into the actual `f` prompt is task 141; this task proves the parser's classification is
+    exhaustive over every operator §9.2 lists.
+  - Predicate evaluation is pure `(FilterExpr, &Row) -> bool`, unit-tested against the
+    fixture rows already used by list tests — no new RPC, no new `Cmd`.
+- **verify:** `cargo nextest run -p rmail-cli tui::filter` (every safe operator matches/
+  excludes correctly, every unsafe operator classifies as `Unsupported` by name, negation
+  and free-text-over-loaded-fields both work, empty filter is a no-op identity)
+
+## 111. Client unread ledger
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/ledger.rs`: per-folder unread estimates maintained from loaded
+    rows on first load, then adjusted incrementally from `WatchEvents` deltas (a message
+    arriving unread increments, a `\Seen` flag change decrements) — §2.2.4.
+  - Every derived count renders with the `~` prefix (law 6); a folder never visited this
+    session renders `•`, never a bare number — the ledger's public read API returns an enum
+    (`Unknown`, `Estimated(u64)`) precisely so a call site cannot accidentally print a raw
+    integer and lie about precision.
+  - A folder swept clean by a bulk action (mark-all-read) or one that receives a burst of
+    new mail while unfocused both converge to the correct estimate without a full re-list —
+    proven by a test that replays an event sequence and checks the running count at each step,
+    not just the final one.
+- **verify:** `cargo nextest run -p rmail-cli tui::ledger` (initial estimate from a loaded
+  page, increment/decrement from synthetic `WatchEvents` deltas, `Unknown` vs `Estimated`
+  rendering contract, convergence under an interleaved event replay)
+
+## 112. Undo stack (session-local inverse operations)
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/undo.rs`: a session-local stack of inverse operations
+    (move-back, unflag, untag, restore-from-trash, `CancelScheduled` within its window),
+    each carrying the idempotency key its forward action used so a retried undo cannot
+    double-apply (§2.2.8).
+  - **No redo** — the stack has no forward-replay method at all, not merely an unbound one;
+    §2.2.8's stated reason (inverse-op redo over a drifting IMAP mailbox lies) is enforced
+    by the type not existing, so a future task cannot casually add one without deleting this
+    acceptance first.
+  - `u` pops and issues the inverse `Cmd`; an empty stack renders "nothing to undo" in the
+    message zone rather than being silently inert (honesty over polish, law 6/9 of §1.1 —
+    a keypress that does nothing and says nothing is indistinguishable from a dropped key).
+  - The undo-send special case (chip, not a toast, driven by `undo_deadline`) is **not**
+    built here — that's task 146, which reuses this stack's `CancelScheduled` entry.
+- **verify:** `cargo nextest run -p rmail-cli tui::undo` (push/pop ordering, idempotency
+  key carried through to the reissued `Cmd`, empty-stack message, no public redo method —
+  a compile-fail test via `trybuild` or a doc-comment-checked absence is acceptable)
+
+## 113. Lens engine (pinned queries, honest counts)
+- [ ] status
+- **depends-on:** 111
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/lens.rs`: a `Lens` (name, compiled query, auto-assigned stable
+    mnemonic letter) list seeded with the four built-ins (`is:unread`, `ai:needs-reply`,
+    `ai:category:newsletter`, `ai:category:receipt`) plus user-pinned ones (§5.2).
+  - Count honesty machine implemented exactly as §5.2 specifies: Unread lens count comes
+    from the ledger (111) rendered `~9`; any lens visited this session keeps its last result
+    count, trailing `·` if `WatchEvents` dirtied its scope since; never-visited renders `•`;
+    **no background counting by default** — a `lenses.count_refresh` field
+    (`"manual"|"on-idle"`) gates the one optional bounded refresh sweep, default `"manual"`.
+  - `''` flips to the last-visited lens (a one-slot history, not the full stack); `<`/`>`
+    cycle; mnemonic letters are stable across a session (re-deriving them on every render
+    would make `'r` sometimes point at a different lens than the keybar just showed).
+- **verify:** `cargo nextest run -p rmail-cli tui::lens` (mnemonic stability across
+  re-renders, the full count-honesty state machine — unvisited/visited/stale/refreshing —
+  `''` flip, and that `count_refresh="manual"` issues zero RPCs on an idle tick)
+
+## 114. `tui.toml` local prefs store
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/prefs.rs`: a serde struct covering exactly §2.2.6's field list —
+    theme, icon tier, density per collection-kind, sort per collection-kind, rail
+    visibility + active tab, sidebar visibility, panel width overrides, hints on/off, mouse
+    capture, undo-advance direction — with documented defaults for every field (no field is
+    ever genuinely absent; unset means "use the shipped default", never "unknown").
+  - Write-through, debounced 1 s (matches `keys.toml`'s existing hot-reload cadence in
+    spirit, but this direction is writes, not reads) — a burst of ten preference changes in
+    one second produces one disk write, proven with a fake clock rather than a real sleep.
+  - Malformed or partially-written `tui.toml` (a crash mid-write, a hand-edit typo) falls
+    back to defaults for the unparseable fields only, not the whole file — one bad key must
+    not lose every other preference — and is reported once in the notification feed, never
+    silently.
+  - File path follows the same XDG convention as `keys.toml`/history (co-located, not a new
+    top-level dotfile).
+- **verify:** `cargo nextest run -p rmail-cli tui::prefs` (round-trip every field including
+  each collection-kind's per-kind sort/density map, debounce coalesces a burst to one
+  write via a fake clock, partial-corruption recovery keeps the unaffected fields, missing
+  file produces documented defaults)
+
+## 115. The Esc ladder (one rule, implemented once)
+- [ ] status
+- **depends-on:** 108, 109, 110, 112
+- **parallel-safe:** no
+- **acceptance:**
+  - One function, `fn resolve_escape(model: &Model) -> EscStep`, implements the exact
+    8-step precedence in §4.6 and is the **only** place `KeyCode::Esc` is matched anywhere
+    in `tui/model.rs` — a grep-based test (`esc_is_handled_in_exactly_one_place`) fails the
+    build if a second match arm on Esc appears anywhere in the module.
+  - All eight steps are individually reachable and individually tested: pending chord/count
+    clears without touching an overlay beneath it; innermost overlay closes without
+    canceling a stream also in flight; an active stream (search/ask/analyze/find) cancels
+    with the daemon `CANCELLED` handled as silence (stream discipline invariant), leaving
+    the previous collection's kept rows in place; zoom clears before the ladder considers
+    navigation; visual mode exits before marks clear (two steps, proven as two, not one);
+    an active filter clears; a non-root breadcrumb pops one level; at root, nothing fires
+    and the status hint names `q` / `Ctrl-C Ctrl-C`.
+  - `q` is a **separate** binding implementing only steps 7–8 (pop; at root, quit with a
+    1-line confirm if a send is in its undo window) — proven distinct from Esc by a test
+    that puts the model in a state where step 3 (cancel a stream) would fire for Esc and
+    asserts `q` does not touch the stream at all.
+  - `Ctrl-C Ctrl-C` (double-tap within 1 s) quits from any state, unbindable — not reachable
+    through `keys.toml` at all (a rebind attempt on it is refused by the shadow lint with a
+    named reason). A single `Ctrl-C` behaves exactly as Esc (delegates to `resolve_escape`,
+    does not duplicate its logic).
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (all eight steps individually,
+  the single-match-site grep test, `q` vs. Esc divergence, double-`Ctrl-C` timing window
+  including the boundary — 999 ms fires as Esc, 1001 ms after the first tap does not chain)
+
+## 116. Wrapped-text cache
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/wrap_cache.rs`: a cache keyed `(message_id, width, fold_state)`
+    over `textwrap`-produced `Vec<Line>`, invalidated on resize and on a fold toggle (quote/
+    signature/section) for the affected message only — §2.2.10, feeding §7.1/§7.4.
+  - Bounded size (an LRU or generation-based eviction) — a session that opens a thousand
+    messages does not grow this cache without limit; the bound and its eviction order are
+    asserted by a test, not left to "probably fine".
+  - Cache hit is O(1) and allocation-free on the read path (§18 rule 9, frame budget 4 ms)
+    — proven by a test that reads the same key 10,000 times and asserts wall time is
+    dominated by the first (miss) call, not the following hits.
+- **verify:** `cargo nextest run -p rmail-cli tui::wrap_cache` (key includes all three
+  dimensions independently — same message different width misses, same width different
+  fold-state misses — resize invalidation, bounded eviction order, hit-path allocation
+  count via a counting allocator or equivalent instrumentation)
+
+## 117. Color system v2 — token ramp, contrast lint, quantization, themes
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** no
+- **acceptance:**
+  - `theme.rs`'s `Theme` struct is extended to the full §13 token table — `fg`/`fg_muted`/
+    `fg_faint`, `bg_selection`/`bg_select_blur`, `border`/`border_focus`(=`accent`),
+    `match_hl`, `unread`/`to_me`/`flagged`(=`scheduled`), `pri_high`/`pri_crit`, `ok`/`warn`/
+    `err`/`info`, `ai`, `entity`, `link`, `quote1..4`, `acct1..6`, `diff_add_bg`/
+    `diff_del_bg` — every one a **named field**, never a bare literal at a call site (the
+    existing "no `Color::` literal outside `theme.rs`" lint, extended to cover every new
+    token).
+  - The contrast lint asserts the floors §13 states — body ≥ 7:1, muted ≥ 4.5:1, faint ≥
+    3:1 — computed by WCAG relative luminance against the *painted* `bg`, for **both**
+    `bg` and `bg_selection` backgrounds, as a compile-time-adjacent test (fails CI, not a
+    runtime check). The one documented exception is enforced as code, not a comment:
+    `fg_faint` inside a selection/cursor bar promotes to `fg_muted` in the row renderer,
+    with a test that specifically covers this promotion (§13's footnote).
+  - Truecolor values match §13's hex table exactly; a 256-color quantization path exists
+    and is hand-verified to keep `muted ≠ faint` post-quantization (a literal equality
+    assertion between the two quantized indices would catch a future accidental collapse).
+  - `dark`/`light`/`mono`/`high-contrast` all exist and satisfy the mono rule already
+    proven for v1 (no state carried by hue alone — every colored state pairs with a glyph
+    or `Modifier`) extended to every *new* token this task adds, not just the ones v1 had.
+    `NO_COLOR`/`TERM=dumb` renders attributes only, matching §13's exact list (bold unread,
+    reverse selection, underline links/focus, `«»` carries AI, glyphs carry the rest).
+- **verify:** `cargo nextest run -p rmail-cli tui::theme` (full token table present, lint
+  forbids stray `Color::` literals workspace-wide via a source-scan test, all four
+  contrast floors on both backgrounds for all four themes, `fg_faint`-in-selection
+  promotion, quantization keeps `muted≠faint`, `mono` and `NO_COLOR` carry every state by
+  non-color means)
+
+## 118. Icon tiers (`Icons` struct)
+- [ ] status
+- **depends-on:** 117
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/icons.rs`: the three-table `Icons` struct (unicode default /
+    nerd opt-in / ascii fallback) covering every glyph §6.1's table names — the 1 mark
+    cell + 4 glyph cells (unread, addressed/replied/forwarded, attachment/scheduled/note,
+    AI-and-safety with its precedence order) — plus every other glyph the spec names
+    elsewhere (`◷ ⧗ ⧉ ✦ ⚠ ▲ ‼` etc., collected once here rather than inlined per call site).
+  - Tier selection is a `tui.toml` field (114) with `unicode` as the default and an
+    explicit opt-in for `nerd`; `ascii` is the automatic fallback when the detected
+    terminal can't be trusted for wide glyphs (mirrors the existing `NO_COLOR`/`TERM=dumb`
+    detection pattern from theme.rs) — detection logic is unit-testable against injected
+    `TERM`/env values, not real terminal probing.
+  - Cell-4 (AI & safety) precedence order is enforced by construction — a function that
+    takes the set of active flags for a row and returns exactly one glyph, ordered
+    injection > critical > high > needs-reply > pending > artifact, tested with every
+    pairwise combination, not just the full-set case.
+  - Every glyph has a documented ASCII fallback (§6.1's table is exhaustive — `N`, `>`,
+    `r`, `f`, `@`, `~`, `n`, `!`, `!`, `^`, `?`, `.`, `+`) — a test asserts no unicode glyph
+    in the struct lacks an ascii counterpart.
+- **verify:** `cargo nextest run -p rmail-cli tui::icons` (all three tiers populated for
+  every named glyph, cell-4 precedence over all pairwise flag combinations, tier
+  auto-detection from injected env, exhaustive ascii-fallback coverage)
+
+## 119. Collection engine — the `Collection` trait and registry
+- [ ] status
+- **depends-on:** 107
+- **parallel-safe:** yes
+- **acceptance:**
+  - New `rmail-cli/src/tui/collection/mod.rs`: a `Collection` trait object the List card
+    renders polymorphically — §2.2.3, §3.3's k9s-model promise ("one table engine, many
+    resources"). Trait surface covers exactly what §3.3/§5.4/§16 require of every
+    implementer: declared columns per density, row verbs (mapped through the arbitration
+    table, task 135), title chips, and the detail renderer the Reader card shows for its
+    rows (§5.5's "for non-message collections the Reader renders that collection's detail").
+  - Two reference implementations ship in this task to prove the trait is sufficient
+    without over-fitting to one shape: `FolderCollection` (flat, paginated, the existing
+    `Mail.List` data reshaped behind the trait) and `SearchCollection` (streamed, ranked,
+    server-thread-collapsed) — chosen because they're the two most different existing data
+    shapes (flat-paginated vs. streamed-ranked) and between them exercise every trait
+    method at least once.
+  - `gm`/`gu`/`go`/`gf`/`gw`/`gn`/`gj`/`gd`/`gv`/`gi`/`gr`/`gs`/`gh` (§3.2, §16) resolve
+    through **one** registry lookup (collection-kind → constructor), not thirteen
+    hand-written dispatch arms — proven by a test that every `g`-chord target in §8.2's
+    goto table has a registry entry, so a future collection (157–174) is "add one registry
+    row" rather than "add a match arm in N places".
+  - `go` (outbox) and `gm` (mail) are proven to share every generic List/Reader verb (open,
+    scroll, mark, sort-where-applicable) through the same code path — §3.3's literal claim
+    ("`go` is exactly `gm` with a different collection loaded") is a test, not a comment.
+  - This task does **not** wire the real outbox/follow-ups/etc. data (157+ do); its `go`
+    registry entry may point at a minimal stub collection proving only that the registry
+    mechanism works end-to-end.
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (trait object dispatch for
+  both reference impls, registry completeness against every §8.2 `g`-chord, the `go`≡`gm`
+  shared-code-path proof, column/row-verb/title-chip/detail-renderer contract satisfied by
+  both impls)
+
+## 120. Outer grid, header band, banner row
+- [ ] status
+- **depends-on:** 107, 114
+- **parallel-safe:** no
+- **acceptance:**
+  - `view.rs`'s top-level layout switches to the exact §4.1 vertical stack via
+    `Layout::vertical(...).areas()`: header(1) → banner(0|1, reserved as 1 whenever any
+    banner-worthy condition exists this session so toggling never shifts rows) → lens
+    strip/breadcrumb(1, dropped <25 rows) → cards/full-frame(Fill) → which-key(0..2) →
+    status(1) → keybar(1, dropped <25 rows). Toasts float, no layout row (§4.1).
+  - Header band renders exactly §5.1's line: identity (`rmail ▸ account ▸ location`,
+    account segment tinted `acct1..6`; `∑ unified` in unified mode) — gauges (`SYNC`/`IDX`/
+    `AI`/`OUT`/`NET`, each with its documented tone ladder `? ✓ ↻ ‖ · ! ✗`) — session tally
+    + clock on the right. Fed by the existing 5 s heartbeat (task 92's `Cmd::Heartbeat`,
+    extended to the gauges this line adds) which **never** increments `inflight`, per the
+    invariant task 92 already established and this task must not regress.
+  - Header narrowing drop order matches §4.3 exactly: verb labels → `NET` → `OUT` → `IDX`
+    detail (dot stays) → session tally → clock — each step individually reachable by
+    shrinking the test terminal one column at a time, not just the endpoints.
+  - Banner row renders the offline/degradation states (populated fully by task 153; this
+    task only proves the reserved-row mechanic: a banner going from absent→present or
+    present→absent across two frames must not shift any row below it — a pixel/cell-level
+    regression test on frame layout, not a visual read).
+  - Cards use collapsed borders exactly as §4.1 specifies: one outer `Rounded` border, each
+    card right of the first draws `Borders::LEFT` only; `Padding::horizontal(1)` everywhere,
+    Reader adds vertical 1; focus shown by border/title color only, never weight; a closed
+    (fully-enclosed) border is always transient/overlay — asserted as a lint-style test over
+    every `Block` construction site in `view.rs`.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (the six-row vertical stack at
+  every height tier, header content and its exact narrowing drop order, banner reserved-row
+  no-shift property, collapsed-border rule enforced across every card, heartbeat still
+  excluded from `inflight`)
+
+## 121. Lens strip / breadcrumb row
+- [ ] status
+- **depends-on:** 113, 119
+- **parallel-safe:** no
+- **acceptance:**
+  - Row 2 renders the lens strip (§5.2) in Mail collections: every lens tab shows its
+    auto-assigned jump chord (`'a`, `'u`, …), its honest count per task 113's state
+    machine, and the right-side 4–6 key crib generated from the live keymap (not
+    hand-written — drift is the same failing-test pattern §8.6 establishes for the keybar).
+  - In non-mail collections and in zoomed Reader, the same row renders the breadcrumb
+    instead (§5.2, §3.2): `work ▸ INBOX ▸ ⧉ subject ▸ message 2/4` — the live navigation
+    stack, always visible, never requiring a keypress to reveal (law 5, no invisible
+    state).
+  - `<`/`>` cycle lenses, `''` flips to last (task 113's one-slot history), `'?` opens the
+    full switcher via the finder `/` scope (wiring the finder call is task 142; this task's
+    acceptance is satisfied if `'?` opens *a* finder scope stub that 142 completes).
+  - At <25 rows this row is dropped per §4.3's height-tier table and folds into the List
+    title instead (verified against `layout_mode`'s output from task 107, not a second
+    height check invented here).
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (lens tabs render chord+count for
+  every lens state from task 113, breadcrumb renders in non-mail/zoomed-reader contexts,
+  `<`/`>`/`''` all move the active lens correctly, row drops below 25 and folds per
+  `layout_mode`)
+
+## 122. Sidebar card
+- [ ] status
+- **depends-on:** 107, 111, 119
+- **parallel-safe:** no
+- **acceptance:**
+  - Renders the full §5.3 content top-to-bottom as one scrollable list with a cursor that
+    skips section headers: ACCOUNTS (active marker `▎`, accent dot, `~unread` from the
+    ledger), MAILBOXES (tree with `▸`/`▾` folds via `za`), QUEUES (Outbox/Follow-ups/
+    Waiting-on/Drafts/Notifications, each rendering its jump chord and badge — `2·1✗` /
+    `5·2!` overdue-marker format matches §5.3 exactly), VIEWS (saved searches + smart
+    folders), TAGS (top-N by count with `Tag.color` dots), and the 14-day volume sparkline
+    as a decorative footer.
+  - `f` filters the tree in place (reusing task 110's filter engine over sidebar rows, not
+    a second parser); Enter opens per row-kind (folder→collection, queue→its collection,
+    view→runs as lens, tag→pivot) through task 119's registry — no sidebar-specific
+    dispatch table duplicating it.
+  - Per-account braille spinner while that account syncs; `!` glyph in `err` tone on a
+    failed account — sourced from the existing per-account sync status the daemon already
+    reports (task 92's heartbeat plumbing), not a new poll.
+  - Folder unread counts follow the ledger's honesty rules from task 111 exactly (`~N` /
+    `•`) — a test specifically asserts the sidebar never prints a bare integer for a folder
+    unread count, closing the exact gap §5.3 calls out as a documented daemon limitation.
+  - Renders at `Length(22)` per §4.2's M/L/XL breakpoints and as a left drawer at narrower
+    ones (task 109's mechanism, not a second drawer implementation).
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (every §5.3 section renders with
+  correct chord/badge format, `za` folds a section, `f` narrows via the shared filter
+  engine, Enter dispatch for each row-kind through the collection registry, ledger honesty
+  on folder counts, width at each breakpoint via `layout_mode`)
+
+## 123. List card — title line, virtualized table, row anatomy
+- [ ] status
+- **depends-on:** 107, 119, 117, 118
+- **parallel-safe:** no
+- **acceptance:**
+  - Title line renders exactly §5.4's k9s-style state string: collection name, active
+    filter chip, active sort indicator, shown/total with `(partial)` when filtering a
+    partially-loaded folder, live-stream marker (`⠿ live`).
+  - Content is a virtualized `Table` building only the visible slice (`offset..offset+
+    height` from `TableState`) — a test with a 100k-row synthetic collection asserts the
+    per-frame build touches O(visible rows), not O(total), rows.
+  - Row anatomy matches §6.1/§6.2 exactly: the mark-gutter + 4-glyph cluster (via task
+    118's `Icons`) at fixed cell positions, and the **exact** column budget for every
+    breakpoint tier in §6.2's table (≥96 XL cozy 2-line, 72–95 L compact, 56–71 M, 40–55 at
+    the L-frame floor, <40 forced 2-line) — each tier's column widths literally sum to ≤
+    inner width, asserted per tier, not just "doesn't panic".
+  - Truncation is `unicode-width`-measured with `…`, never byte-sliced (a test with wide
+    CJK/emoji subjects proves this); From/Subject end-truncate, addresses/message-ids
+    middle-elide; tag chips are whole-or-`+N`, never mid-truncated.
+  - Dates render per §6.3's exact tiering (`<24h`→`14:02`, `<7d`→`Tue 14:02`, same-year→
+    `Aug 12`, older→`2024-08`) in `fg_muted`/`fg` (unread); scheduled/outbox rows show
+    relative future (`in 2h`) in `scheduled` amber.
+  - `zd` cycles compact/cozy/relaxed density, default compact (cozy at XL per §6.2),
+    persisted per collection-kind via task 114's prefs store.
+  - Scroll: 3-row scrolloff; `C-d`/`C-u` half-page with one-row overlap (reuses the exact
+    `PAGE_OVERLAP`/paging behavior task 106 already proved, extended to the new card
+    geometry, not reimplemented); nearing the loaded tail requests the next page via the
+    existing `x-rmail-next-page-token` header and renders one ghost row
+    `⠿ loading 500 more…`.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (title-line state string in every
+  combination of filter/sort/partial/live, virtualized build cost on a 100k-row fixture,
+  every §6.2 breakpoint's column-sum ≤ width, unicode-width truncation on wide-glyph
+  fixtures, date-tier boundaries including the year rollover, density cycle persistence,
+  scrolloff and page-overlap, tail-page ghost row)
+
+## 124. List card — search-hit rows and time-bucket headers
+- [ ] status
+- **depends-on:** 123
+- **parallel-safe:** no
+- **acceptance:**
+  - Search-hit rows add the §6.4 score meter (3-cell `▮▮▮`, one cell per `sources[]`
+    agreement — lexical/dense/entity) replacing the chip zone, plus highlighted matched
+    spans from `SearchHit.snippet.highlights` byte ranges rendered in `match_hl` bg+bold.
+  - `2 similar` near-duplicate-collapse chip and `⧉N` server-thread-collapse chip both
+    render per §6.4/§6.5, sourced from the fields the wire types already carry (no new RPC
+    field needed — verified against the existing `search.proto` message before writing
+    this task).
+  - Time-bucket section headers (`TODAY`/`YESTERDAY`/`THIS WEEK`/month/year) render on
+    date-sorted lists at ≥30 terminal rows per §6.5 — as non-addressable rows the cursor
+    skips entirely (`j`/`k`/`gg`/`G` never land the cursor on one; a test walks the full
+    list with `j` and asserts the cursor visits only real rows) — `fg_faint`, `─` fill; off
+    below 30 rows and off below the 30-row height tier per §4.3.
+  - Folder collections' `⧉N` thread chip counts only *loaded* rows sharing a `thread_id`
+    (§6.5's "the daemon lists messages; client re-threading over partial pages would lie")
+    — a test with a thread whose members span two pages asserts the chip undercounts
+    honestly rather than guessing the true total.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (score-meter cell count matches
+  `sources[]` length, highlight spans render at the correct byte-to-cell offsets under
+  unicode content, time buckets skip-only-cursor behavior, bucket visibility gated on both
+  row-count and height-tier, `⧉N` undercounts honestly across a split-page thread fixture)
+
+## 125. List card — selection, cursor, marks
+- [ ] status
+- **depends-on:** 123, 110
+- **parallel-safe:** no
+- **acceptance:**
+  - Cursor row renders full-row `bg_selection` + `▌` cap when its card is focused,
+    `bg_select_blur` with no cap when not — never `Modifier::REVERSED` anywhere in this
+    path (a source-scan test over the row renderer, matching the existing v1 convention).
+  - `x` toggles mark (`✓` in the gutter, own cell, never colliding with a glyph — proven by
+    a test asserting the mark cell and glyph cells never share a column index); `v` enters
+    visual range (`▪` on every covered row as motions extend it); any verb applied in
+    visual mode acts on the whole range and exits visual mode as one action, not one action
+    per row followed by a manual exit. `X` clears all marks.
+  - **Marks survive filtering and scrolling** (§6.6) — a mark set before a filter is
+    applied (task 110/141) is still set after the filter hides its row, and the status zone
+    (task 129) reads `3 marked (1 hidden)`; a bulk verb over marks that include hidden rows
+    prompts exactly once: `includes 1 filtered-out message — proceed? y/n`, never silently
+    acting on fewer than the user marked or silently including hidden ones without asking.
+  - Unread rows render bold; read rows in muted lenses (e.g. News) render `fg_muted` — the
+    lens-driven muting is a property of the active lens (task 113), not a per-row flag
+    invented here.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (cursor styling focused vs. blurred
+  with no `REVERSED` usage, mark/glyph cell disjointness, visual-range extend-then-apply-
+  then-exit as one unit, marks-survive-filter with the exact hidden-count message and the
+  one-time confirm prompt, muted-lens read-row styling)
+
+## 126. Reader card — master-detail link, header block, AI capsule
+- [ ] status
+- **depends-on:** 107, 119, 117
+- **parallel-safe:** no
+- **acceptance:**
+  - List cursor movement re-renders the Reader via a debounced (40 ms) generation-stamped
+    `Mail.Get`, **cancel-on-scroll** — a test that moves the cursor 20 times within 40 ms
+    asserts exactly one `Mail.Get` reaches the executor (not 20, not 0), reusing the
+    existing stream-generation/supersession discipline rather than a bespoke debounce.
+  - Cached headers render instantly on cursor move; the body region shows a 3-line shimmer
+    skeleton until `Get` lands — never a blank frame (law 8).
+  - Header block renders exactly §7.2's six weeded headers + relationship context (threads
+    count, reply latency from the cached contact insight, absent silently when uncached —
+    never a placeholder claiming data that isn't there); `i` toggles all raw headers inline,
+    scrollable.
+  - Injection-flagged messages insert the full-width banner directly under headers per
+    §7.2's exact copy and trigger condition (`ScanInjection.actions_withheld`) — AI actions
+    genuinely withheld in this state (not just visually flagged — a test asserts the
+    suggested-reply/tag-accept affordances are actually disabled, not merely bannered over).
+  - AI capsule (§7.3) reads the `<5 ms` `GetSummary` cache only — a test asserts opening
+    the Reader on a message with no cached summary issues **zero** `AnalyzeMessage` calls
+    (never a model call by itself); renders `⠋ pending`/`✗ failed — ! retries`/`✦ analyze
+    (!) — $` per state; all model text `«»`-quoted in `ai` tint (law 9); `(local)` chip
+    when the local model produced it.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (debounce-and-cancel-on-scroll
+  coalesces to one `Get`, skeleton-then-swap with no blank frame, six-header block content
+  and relationship-hint absence-when-uncached, injection banner condition and actual
+  affordance-disabling, AI capsule zero-model-call-on-cache-miss and all three state
+  renderings)
+
+## 127. Reader card — body rendering rules
+- [ ] status
+- **depends-on:** 126, 116
+- **parallel-safe:** no
+- **acceptance:**
+  - Measure clamp exactly per §7.1: `inner_width≥80` → `measure=min(inner_width−8,100)`
+    centered; `<80` → `measure=inner_width−2`, no centering. Applies identically to message
+    bodies, Digest, Ask answers, and the Manual (a shared function, not four copies) —
+    §1.2's mandated grafted fix, now a literal never-exceeds-100 / never-below-72-when-
+    affordable test rather than the "wraps at 132" defect §1.3 lists.
+  - Pre-wrapped via `textwrap` into cached `Vec<Line>` through task 116's wrap cache keyed
+    `(message_id, width, fold_state)` — not a fresh wrap per frame.
+  - Quotes: leading `>`-runs become a `▎` gutter, depth-colored `quote1..4` cycling; text
+    `fg_muted`; blocks >4 lines fold to `▸ 12 quoted lines — za`, expansion remembered per
+    message; `zq` folds/unfolds all quotes at once. Signatures (RFC 3676 `-- ` + heuristic)
+    render `fg_faint`, folded to one rule by default, `zs` toggles; legal-footer heuristic
+    likewise. Attribution lines render `fg_faint` (structure, not content).
+  - HTML mail prefers a non-trivial `text/plain` part; else daemon-extracted text + `html ·
+    H opens browser` chip — **no inline HTML engine**, confirmed by there being no new HTML
+    rendering dependency added anywhere in this task's diff (a `Cargo.lock` diff check, not
+    just a promise).
+  - Links: inline `[n]` markers at their spans from `ExtractLinks`; bottom LINKS strip
+    ordered by value score with kind chips and `⚠ spoofed-host` on `deceptive`; `gl` hint
+    mode echoes the URL in the status zone **before** opening (a test asserts the status
+    zone is written before any browser-open `Cmd` is issued, not after — this is the
+    phishing-defense property, and ordering is what makes it real); a `deceptive` link
+    additionally requires one extra `y`. `y`+number copies via OSC 52 + arboard with
+    `copied ✓` confirm. OSC 8 hyperlinks emitted additionally as progressive enhancement.
+  - Attachments strip: one row per attachment; `a` opens the attachment-browser overlay
+    with the arbitration-table verbs (Enter open, `s` save streamed with jobs-feed
+    progress, `v` view image via `ratatui-image` in its dedicated overlay only — never
+    in-flow, `t`/`i` extract, `?` ask-$) — Report overlays for results carry per-field
+    provenance (`parsed` vs `«model»`).
+  - Entities underlined in `entity` color at their spans, Enter-pivotable. Notes block
+    (`¶ NOTES`, markdown, newest-first, 6-line collapse, `Space n n`/`Space n e`, live
+    `WatchNotes` refresh). Thread strip: collapsed one-line prior messages above the body,
+    Enter expands in place, `[`/`]` walk the thread.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (measure clamp shared across all
+  four consumers with boundary widths 79/80/172/173, wrap-cache reuse across re-renders at
+  the same key, quote-depth cycling and fold/unfold, signature fold default + `zs`, no new
+  HTML-rendering dependency, link-hint status-before-open ordering and deceptive-link extra
+  confirm, attachment-browser verb table, notes live-refresh, thread-strip expand/walk)
+
+## 128. Rail card — tabbed context
+- [ ] status
+- **depends-on:** 126
+- **parallel-safe:** no
+- **acceptance:**
+  - Tabbed `[✦ AI] Thread Ents Contact Why Ask` per §5.6; always about the cursored row's
+    message, sharing the exact same 40 ms debounce/cancel-on-scroll discipline as the
+    Reader (task 126) — not a second, slightly different debounce implementation.
+  - `[`/`]` cycle tabs when rail is focused; direct jumps `ge`/`gc`/`w`/`A`/`ga` land on the
+    named tab from anywhere (through task 119's goto-chord registry, not a rail-local
+    dispatch).
+  - Thread tab: `GetThread` timeline (who/when/first-line), participant affinity, `«thread
+    summary»` when cached, waiting-on verdict; `j/k` select, Enter jumps. Ents tab:
+    message entities, Enter = `SearchEntities` pivot into the List (reusing task 119's
+    collection registry to load the pivot result, not a bespoke navigation). Contact tab:
+    `GetContactInsight(metrics_only)` card, Enter → full contact page (built in task 162;
+    this task's Enter may target a registry stub it completes). Why tab: rank explanation
+    for search hits (full implementation in task 140's search work; this task wires the tab
+    and its empty/non-search state honestly — "no ranked row" rather than a blank pane).
+    Ask tab: the RAG pane skeleton (full implementation task 171).
+  - `\` toggles the rail; at <L breakpoint it opens as a drawer via task 109's mechanism.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (tab cycling and direct-jump chords,
+  shared debounce/cancel proof against the Reader's, Thread/Ents tab content and pivot
+  navigation, Contact tab's cached-metrics card, Why/Ask tabs' honest empty states, `\`/
+  drawer behavior)
+
+## 129. Status bar v2
+- [ ] status
+- **depends-on:** 107, 112
+- **parallel-safe:** no
+- **acceptance:**
+  - Fixed zones left→right exactly per §5.7: `MODE` (derived, unchanged mechanism from
+    task 92) · scope (account/collection + filter + sort echo) · marks (with hidden
+    accounting from task 125) · **message zone** (the only flexing zone; errors land here,
+    stick until a keypress, and are *also* appended to the notification feed — a test
+    asserts both effects happen from one error, not either/or) · **undo-send chip**
+    (never evictable — task 146 supplies its content; this task guarantees the zone itself
+    can never be pushed off by anything else narrowing) · inflight `⧗N` · daemon glyph
+    cluster (mirrors the header when the header is folded, sourced from the same state, not
+    a second poll) · pending chord/count.
+  - Narrowing drop order matches §4.3's status-bar row exactly: daemon glyph cluster →
+    marks → scope; the message zone keeps its documented `MIN_MESSAGE` floor; the undo-send
+    chip is **never** dropped at any width (a test sweeps every width down to the minimum
+    supported terminal and asserts the chip is still present when armed).
+  - List-title filter-chip drop order (§4.3's third drop-order table) is also implemented
+    here since it's the same "nothing silently vanishes" mechanism: filter is the last
+    thing dropped from the title, and if it must go, the status scope zone shows `</f>` as
+    a fixed 3-cell reminder that a filter is still active.
+- **verify:** `cargo nextest run -p rmail-cli tui::status` (zone order and content, message
+  zone dual-effect on error, undo-chip un-droppable sweep, daemon-glyph header/status
+  mirror consistency, `</f>` reminder when the filter chip itself is dropped)
+
+## 130. Keybar v2
+- [ ] status
+- **depends-on:** 107
+- **parallel-safe:** no
+- **acceptance:**
+  - Renders the 8 highest-value keys for the focused card/collection, re-derived on every
+    focus change, generated from the live `Keymap` + verb registry — the existing drift-
+    test pattern (§8.6 point 1) extended to be collection-aware (a folder's 8 differ from
+    the outbox's 8, both derived, neither hand-written per-collection).
+  - Menus/pickers additionally display each row's direct key inline (the lazygit rule,
+    §5.8) — a test over every existing overlay's row-render path asserts a bound key is
+    shown when one exists.
+  - Row dropped entirely below the 25-row height tier per `layout_mode` (task 107), same
+    mechanism as the lens strip (task 121), not a second height check.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (8-key selection differs correctly
+  across at least three collection kinds and is regenerated on focus change, drift test
+  against the live keymap, direct-key-inline on overlay rows, height-tier drop)
+
+## 131. Toast float, notification feed, jobs feed
+- [ ] status
+- **depends-on:** 112
+- **parallel-safe:** no
+- **acceptance:**
+  - Toasts float bottom-right over the card area (`Clear` + 1-line block), taking **no**
+    layout row (§4.1/§12.4) — a test asserts adding/removing a toast never changes any
+    other widget's `Rect`. One visible + `+N` badge, queue of 5; Undo > priority > newest;
+    a live Undo is never evicted; TTL driven by countdown `Cmd`s, never a free-running tick
+    (reuses task 92's existing "no tick without a live spinner/countdown" discipline).
+  - Notification feed (`gn`, reached through task 119's registry as a collection): durable,
+    resumable `StreamAlerts since_id` merged with local error/toast history; tier-colored
+    rows with `«reason»`; Enter opens the message; `w` explains via `ScoreMessage`
+    (threshold, suppression, would-notify verdict) — every toast that was ever shown is
+    also findable here (a test creates a toast, lets it expire, and finds it in the feed).
+  - Jobs feed (`gj`, same registry mechanism): background operations (exports, attachment
+    saves, reindex drains, bulk actions) each with a `LineGauge`, cancel key, outcome row.
+    Missing done-sentinels (`ExportDone`, `IndexProgress.done`) are reported as **cut
+    short**, never as success — a test that terminates a job stream without its
+    done-sentinel asserts the row reads "cut short", not a green checkmark.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (toast float takes no layout row,
+  eviction priority order, TTL via countdown only, notification feed resumability and
+  toast↔feed correspondence, jobs feed done-sentinel honesty on a truncated stream)
+
+## 132. Modal engine v2 — card-focus semantics
+- [ ] status
+- **depends-on:** 107, 109
+- **parallel-safe:** no
+- **acceptance:**
+  - Resolves §1.3's headline defect table for this design: `h`/`l`/`Tab` are **always**
+    card focus (never a panel-specific meaning), and digits are **always** counts (never a
+    sidebar-focus shortcut) — both proven as the single dispatch rule in `on_key`, not a
+    per-mode special case that could regress later.
+  - `h` from the Reader card moves focus to the List (§1.3: "Reader is the promoted third
+    card, so `h` from it lands on the list — same muscle motion, one rule"); pop remains
+    exclusively `Esc`/`q` (task 115's ladder) — a test specifically re-creates the exact
+    v1-Cockpit-draft defect (`h`=focus-left in list but pop in Reader) and asserts it cannot
+    recur: `h` in the Reader never pops.
+  - `Enter` promotes focus rightward along master→detail (§3.2): list row → Reader focused
+    with full message rendered; outbox row → entry detail; citation → cited message
+    (pushes the breadcrumb). One function implements "promote," parameterized by the
+    focused collection's detail renderer (task 119's trait), not one `Enter` handler per
+    collection.
+  - `C-w h/j/k/l` gives explicit directional focus as an alternative to `h`/`l`/`Tab`,
+    resolving to the same focus-change code path (proven by a test that both produce
+    identical `Model` deltas for the same starting state).
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (h/l/Tab focus-only semantics
+  under every card and zoom state, digits-are-always-counts even with a card named by a
+  digit-adjacent chord, the h-in-Reader regression test, Enter's promote-rightward for at
+  least three different collection kinds via the trait, `C-w` directional parity)
+
+## 133. NORMAL keymap — List card core verbs
+- [ ] status
+- **depends-on:** 119, 132
+- **parallel-safe:** no
+- **acceptance:**
+  - Every core verb in §8.2's List-card table is bound and dispatches through `run_verb`
+    (the existing single dispatch path — no key does anything a typed `:` line could not):
+    `j/k`, `gg/G`, `C-d/C-u`, `Enter`, `e`, `d`, `D` (confirm), `m`/`M`, `U`, `s`, `r/R/F`,
+    `c`, `t/T`, `u` (task 112's stack), `b`, `f` (task 141), `/` (task 140), `C-p`, `:`,
+    `.`, `\`, `C-b`, `A`, `w`.
+  - Optimistic rendering for flag/tag/move/archive/delete: the row updates (slides out
+    for archive/trash/delete) on the **same frame** as the keypress, before any RPC
+    response — a test drives the key, inspects the very next rendered frame, and asserts
+    the row is already gone/changed, with reconciliation via `WatchEvents` proven
+    separately as a no-op when the optimistic guess matches the eventual truth.
+  - Refusal path: an RPC error rolls the optimistic change back **visibly** and posts
+    `err` toast naming the RPC and `Status` code, with `r retry` using the same idempotency
+    key (not a fresh mutation) — a test forces a `PERMISSION_DENIED` and asserts the row
+    is back exactly where it was, not merely "not gone".
+  - `Reader`/`Visual` inherit this table through `Normal` → `Global` chaining (the existing
+    layer mechanism), proven by a test that every List-card verb also resolves correctly
+    when the Reader card is focused and the action is meaningful there.
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (every listed verb dispatches
+  through `run_verb`, same-frame optimistic render for each mutating verb, visible
+  rollback + named-RPC toast + idempotent retry on refusal, layer inheritance into
+  Reader/Visual)
+
+## 134. Chord families — `g` `p` `o` `y` `z` `'` and leader `Space`
+- [ ] status
+- **depends-on:** 133
+- **parallel-safe:** no
+- **acceptance:**
+  - `g` goto chord: every target in §8.2's list (`gm gu go gf gw gn gj gd gv gi gr gs gh ge
+    gc ga gt gl g/ g1..g9 gx`) resolves through task 119's collection registry where
+    applicable, or a named direct action otherwise (`gl` link hints, `g/` manual grep,
+    `g1..g9` account switch, `gx` index status) — no goto target is a dead key.
+  - `p` pivot chord: `pt ps pd pr pc pg pe` each open a pre-filled search collection with
+    the pivot recorded as provenance (title reads `pivot ▸ <query>`; Esc pops back;
+    chained pivots show the full chain in the breadcrumb) — §8.2's exact query construction
+    per pivot kind (`pd`→`from:@domain`, `pc`→`from:X OR to:X`, etc.) is tested literally
+    against the compiled query string, not just "a search happened".
+  - `o` sort chord: wired in this task to dispatch (full sort semantics land in task 143;
+    here the chord resolves to the right sort-target action for `od of os oz op ou or oo
+    ot`, proven reachable, with `143` owning correctness of the resulting order).
+  - `y` yank chord (`ya ys ym yl yq yp`): OSC 52 + arboard, `copied ✓` in the status zone —
+    every sub-key copies the exact field §8.2 names, tested against fixture data with
+    punctuation/unicode in the copied field to catch a naive `format!` truncation bug.
+  - `z` view/fold chord (`za zq zs zd`): dispatches to the exact fold/density behaviors
+    already specified in tasks 122 (sidebar `za`), 127 (`za`/`zq`/`zs` on the Reader), 123
+    (`zd` density) — this task's job is proving the chord resolves to the *same* handlers,
+    not reimplementing folding a second time.
+  - `'` lens-mark chord and `''` flip dispatch into task 113's lens engine exactly.
+  - `Space` leader mirrors the full command tree per §8.2's group list — every leaf is a
+    real verb reachable by `:` too (the existing `every_tui_action_is_a_capability_or_
+    declared_local` drift check, exercised against every new leaf this task adds).
+- **verify:** `cargo nextest run -p rmail-cli tui::model` · `cargo nextest run -p rmail-core
+  keymap::` (every `g`/`p`/`y` sub-chord's exact effect including compiled pivot queries
+  and copied field content, `z`/`'` chords delegate to the already-tested handlers without
+  duplicating logic, leader tree fully reachable and every leaf capability-backed)
+
+## 135. The arbitration table (§8.3)
+- [ ] status
+- **depends-on:** 134
+- **parallel-safe:** no
+- **acceptance:**
+  - Every row of §8.3's table is implemented exactly as specified, and — this is the
+    task's real point — **nothing not listed in that table deviates from law 2** (one
+    meaning per key): a test enumerates every key this build binds to more than one
+    `Action` depending on context and asserts the enumeration is a subset of §8.3's table,
+    by key. A new context-dependent binding added later without a matching table row and a
+    matching CLAUDE.md-style justification fails this test by construction, not by review
+    diligence.
+  - The specific resolved conflicts are each individually tested: `o` sort vs. rail-✦AI
+    cycle-model vs. visual-mode swap-ends; `s` star vs. attachment-save vs. outbox
+    send-now; `e` archive vs. outbox-edit-body vs. invoice-CSV-export; `t` tag-palette vs.
+    outbox-reschedule; `R` reply-all vs. outbox-retry; `u` undo vs. outbox-cancel-scheduled
+    (proven to be the *same* underlying undo-stack operation, per §8.3's own rationale, not
+    two different code paths that happen to look similar); `a`/`x` attachment-browser vs.
+    accept/reject-suggestion; `!` force/re-analyze; `w` why-ranked vs. inert-on-waiting-on
+    rows (proven inert, not silently doing something else).
+  - The §8.3 footnote resolutions are each a test: archive=`e` not `a`; mark=`x` so
+    why-ranked=`w`; `/`=search with finder on `C-p`; `u`=universal undo; suggested-reply
+    opens via Enter-on-its-row rather than a global key; `zt`≡`]r`.
+- **verify:** `cargo nextest run -p rmail-core keymap::` · `cargo nextest run -p rmail-cli
+  tui::model` (the context-dependent-key enumeration ⊆ §8.3 table test, each named
+  conflict's three-way resolution individually, all six footnote resolutions)
+
+## 136. Which-key v2
+- [ ] status
+- **depends-on:** 134
+- **parallel-safe:** no
+- **acceptance:**
+  - Instant-on-pending-chord band, grouped by chord family, matches the existing v1
+    mechanism's proof obligations (task 91: a pure render-time function of existing state,
+    no new timer) extended to every new chord family task 134 adds.
+  - Shadowed entries (a binding overridden by a user's `keys.toml`) render struck-through
+    rather than being omitted — a user can see what they gave up, not just what they kept.
+  - Overflow renders `+N more (?)` when a group has more members than the band's row
+    budget allows, and `?` from that state opens the full help overlay pre-filtered to the
+    pending prefix (not a generic help open that loses context).
+- **verify:** `cargo nextest run -p rmail-cli tui::whichkey` (grouping by the new chord
+  families, struck-through shadowed entries, overflow threshold and `+N more (?)`
+  behavior, `?`-from-overflow context preservation)
+
+## 137. Teaching hints
+- [ ] status
+- **depends-on:** 133
+- **parallel-safe:** no
+- **acceptance:**
+  - After three consecutive uses of a slow path for the same action within a session (the
+    canonical example: typing `:archive` three times), a one-line status hint names the
+    direct key (`tip: e archives — :set hints off to silence`) per §8.6.
+  - Rate-limited to one hint per action per session — a fourth, fifth, sixth slow-path use
+    of the same action produces no further hints, tested explicitly (not just "eventually
+    stops").
+  - `:set hints off` silences all teaching hints for the session, persisted via task 114's
+    prefs store as the `hints` field.
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (three-strikes trigger with the
+  exact message format, one-hint-per-action-per-session cap proven past the fourth use,
+  `hints off` persistence and effect)
+
+## 138. Autocomplete popup engine (unified)
+- [ ] status
+- **depends-on:** 132
+- **parallel-safe:** no
+- **acceptance:**
+  - New shared popup anatomy (max 8 rows, opens adjacent to the input, `Tab` accepts,
+    `↑↓` move, typing filters, matched characters highlighted from positions, dim
+    right-aligned annotation for kind/description/resolved-value) implemented **once**
+    and reused by every surface in §8.7's table, not duplicated per surface — a test
+    instantiates the popup against fixture data from at least four of the ten listed
+    surfaces (search operators, `:` command line, compose To/Cc, tag palette) and asserts
+    identical rendering/interaction behavior modulo the source list.
+  - Each surface's ranking rule from §8.7's table is implemented as a pluggable ranker
+    (prefix / frecency / count-desc / tree-order / 5-tier / fuzzy / dir-first), not a
+    single hardcoded order — tested per surface against its documented ranking.
+  - Time-input surfaces (`C-l`, `b`, reschedule) additionally echo the **daemon-resolved
+    absolute time live** under the input from a dry-resolve call — a test asserts the echo
+    updates on each keystroke debounce, not only on submit, and that it reflects the
+    server's resolution rather than a client-side `chrono` guess when both are available.
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (shared popup behavior identical
+  across ≥4 surfaces, per-surface ranking correctness for all seven ranking kinds, live
+  time-echo updates per keystroke sourced from the dry-resolve RPC)
+
+## 139. Rebinding v2 — keys.toml shadow lint + `c` rebind flow
+- [ ] status
+- **depends-on:** 135
+- **parallel-safe:** no
+- **acceptance:**
+  - `keys.toml` hot-reload (1 s poll, unchanged cadence) and shadow lint both extend
+    cleanly over every new Action this part adds — the existing `:keys check` surface and
+    status-line warning need no new mechanism, only a bigger `Action` enum to validate
+    against (proven by re-running task 105's existing shadow-lint tests unmodified against
+    the v2 keymap and asserting they still pass).
+  - The unbindable set from task 115 (`Esc`, `Ctrl-C`, `:`, and the double-`Ctrl-C` quit)
+    is refused by `SetBinding`/file-parse with a **named reason**, not a generic parse
+    error — a user attempting to rebind `Ctrl-C Ctrl-C` sees why, not just that it failed.
+  - `c` in the help overlay opens the rebind flow, which calls
+    `ConfigService.GetKeymap`/`SetBinding` (already-existing RPCs, verified present in
+    `config.proto`) — the flow round-trips a rebind to the file and confirms the new
+    binding is live on the next `keys.toml` poll without a restart.
+  - Kitty keyboard protocol enhanced chords (`S-Enter`, `C-S-x`) are bonuses with legacy
+    equivalents; the protocol flags are pushed at startup and popped on **both** clean exit
+    and panic (a test installs a panic hook and asserts the pop runs — this is the one
+    terminal-state correctness property that, if missed, corrupts the user's shell after a
+    crash).
+- **verify:** `cargo nextest run -p rmail-core keymap::` (unbindable-set named refusals,
+  existing shadow-lint suite green against the expanded `Action` enum) · `cargo nextest
+  run -p rmail-cli tui::` (rebind-flow round-trip through `GetKeymap`/`SetBinding` against
+  the in-process daemon harness, kitty-protocol push/pop-on-panic)
+
+## 140. Search v2
+- [ ] status
+- **depends-on:** 119, 123, 128
+- **parallel-safe:** no
+- **acceptance:**
+  - `/` transforms the List card in place (no modal takeover) per §9's exact frame: prompt
+    row under the list title, hits streaming best-first below, Reader following the top hit
+    until the user moves, `w` flips rail to Why.
+  - Incremental: 25 ms debounce, cancel-prior-stream via generation + daemon single-query
+    slot, **old hits stay visible dimmed until the first new batch** (no strobe) — a test
+    types three fast keystrokes and asserts only the final query's stream survives and the
+    displayed rows never flash empty in between.
+  - Full operator/sigil grammar (§9.2) parses; `Tab` completes operators then values
+    through task 138's popup wired to the right source per operator (contacts/tags/
+    folders); unknown `key:value` degrades to free text, **never errors**.
+  - `C-n` compiles NL via `CompileQuery`; renders the confirm strip (raw → compiled DSL,
+    per-operator lines, `«model note»`, `cached` badge); `Enter` runs it, `e` edits the DSL
+    — never silently guessed (a test asserts an NL query with no `Enter` never issues the
+    underlying `Search` call).
+  - Why-ranked (`w`) rail content: feature-contribution block meters that **sum exactly to
+    the score** (a literal arithmetic assertion, not "looks close"), retriever sources,
+    matched span, `«claude_reason»` when L2-reranked; identical content to CLI `--explain`
+    (the three-parity rule — a shared test fixture run through both surfaces and diffed).
+    Explain failures latch visibly (`w!`), never silently.
+  - `Enter` pins the result set as the collection (breadcrumb `search ▸ "query"`) so `J/K`
+    walk hits and every verb works, through task 119's collection trait — search becomes
+    a first-class `Collection`, not a special-cased mode.
+  - Degradation badges render exactly per §9.7 (`semantic off`, `indexing… lexical
+    fallback`, `try ~semantic?`); `LogFeedback` fires when `query_id≠0` with the footer's
+    one-time `feedback logged` notice; Esc aborts the stream (ladder step 3, reusing task
+    115) and restores the previous collection from kept rows, not a fresh reload.
+  - `ot` toggles server-side `thread_collapse`; collapsed rows show `⧉N`, `za` expands
+    inline members from `thread_collapsed[]` — reusing the same `za` fold mechanism task
+    134 already wired, not a second fold key.
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (debounce/cancel/no-strobe,
+  operator grammar parse table, NL-compile confirm-before-run, why-ranked score-sums-
+  exactly, three-parity fixture diff against CLI `--explain`, Enter-pins-as-collection,
+  every degradation badge condition, Esc-restores-from-kept-rows, `ot`/`za` thread-collapse)
+
+## 141. Filter `f` wiring
+- [ ] status
+- **depends-on:** 110, 140
+- **parallel-safe:** no
+- **acceptance:**
+  - `f` is card-scoped exactly per §10: List card narrows rows (task 110's engine), Reader
+    card finds-in-message (distinct from `/`, per §7.1 — a test asserts `f` inside the
+    Reader never issues a `Search` RPC), Sidebar filters the tree (task 122's `f`, proven
+    to be the *same* call as this task's, not a coincidence of naming).
+  - An unsupported operator (task 110's `Unsupported` classification) renders red inline
+    with `use / for that`, exactly the copy §10 specifies — and the overlay/prompt stays
+    open rather than closing on the rejected keystroke (a test types an unsupported
+    operator and asserts the prompt is still focused and editable afterward).
+  - `C-Enter` escalates the current filter text into a real `/` search verbatim — the
+    exact string, not a re-derived approximation (a test with a filter containing a
+    negation and a quoted phrase asserts the escalated search query is byte-identical to
+    the filter's text).
+  - The `(partial)` chip + "`/` searches all" hint render together on a partially-loaded
+    folder per §10's honesty row.
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (card-scoped dispatch to three
+  different behaviors, unsupported-operator red-inline-and-stays-open, `C-Enter` verbatim
+  escalation, partial-folder honesty pairing)
+
+## 142. Finder v2 reconciliation
+- [ ] status
+- **depends-on:** 132
+- **parallel-safe:** no
+- **acceptance:**
+  - Existing finder (`C-p`, `FinderService.Find` streamed batches) keeps every proven v1
+    property — sigils (`> # @ / :`), scope cycling (`C-p`/`M-p`), `Tab` multi-select +
+    `C-a` select-all + `BatchAction`, kind glyphs, `indexing…`/superseded badges,
+    empty-query recents ranking — reconciled against the new card/overlay-stack model
+    (task 108) so it opens as a proper stack entry rather than the old single-slot overlay.
+  - `'?` (task 121) and `Space`-leader finder entries open the finder pre-scoped to the
+    right sigil rather than generic — a test drives `'?` and asserts the finder opens
+    already scoped to lenses/collections, not requiring the user to type the sigil.
+  - Snapshot-batch feel is preserved (batches replace, never strobe) — the exact property
+    §10's table claims, re-verified against the stack-based overlay rendering path since
+    that's what changed in this task, not the finder's own streaming logic.
+- **verify:** `cargo nextest run -p rmail-cli tui::overlays` (every listed v1 property
+  still holds against the overlay-stack integration, `'?` pre-scoping, batch-replace-no-
+  strobe re-verified post-migration)
+
+## 143. Sort chord + zoomed-table headers
+- [ ] status
+- **depends-on:** 119, 114
+- **parallel-safe:** no
+- **acceptance:**
+  - `o` chord's sub-keys (`od of os oz op ou or oo ot`) each apply the documented sort;
+    pressing the active mode's key again reverses — tested for every one of the nine,
+    including that `or` (relevance) is only reachable/meaningful on search collections
+    (inert with an honest status message elsewhere, not silently applying date-sort).
+  - List title always carries the active indicator (`↓date`/`↑from`, §11).
+  - **Zoomed List** (task 109's zoom mechanism) renders as the headed `Table` with real
+    column headers (`glyphs · from · to · subject · category(ai) · size · date` + account
+    chip in unified) and a sort arrow on the sorted column — the **only** header-click/
+    header-arrow surface in the whole design, confirmed by a test that no other card ever
+    renders a clickable/indicated column header.
+  - Folder sorts operate on loaded rows only; title appends `(sorts 1,204 loaded — G loads
+    more)` when the folder exceeds the loaded count; `o!` forces full pagination first with
+    a progress toast, refused above 5k with a named reason (not a silent cap). Search
+    results honor server-side sort where the plan allows (a test with a `QueryPlan`
+    declaring server sort asserts the client does not re-sort on top of it).
+  - Sort persists per collection-kind via task 114's prefs store, write-through.
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (all nine sort keys plus
+  reverse-on-repeat, relevance-sort collection-gating, zoomed-table headers+arrow as the
+  sole such surface, loaded-vs-total honesty string and `o!`'s 5k refusal, server-sort
+  deference, per-collection-kind persistence)
+
+## 144. Stale-while-revalidate + skeletons
+- [ ] status
+- **depends-on:** 123
+- **parallel-safe:** no
+- **acceptance:**
+  - Switching folders/collections keeps old rows visible, dimmed, with a `↻` title spinner
+    until page 1 of the new collection lands, then swaps in place — a test asserts the
+    frame immediately after a folder switch still renders the *previous* folder's rows
+    (dimmed), never a blank list (law 8).
+  - First-ever load (nothing was ever loaded for this collection) renders 8 shimmer
+    skeleton rows (`░░░` in `fg_faint`) at plausible column widths for the current
+    breakpoint — distinguished from the dimmed-old-rows case by a test that a collection
+    with zero prior state never shows dimmed rows (there's nothing to dim).
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (dimmed-old-rows-until-swap on a
+  collection switch with prior state, skeleton-rows-only on a never-loaded collection, no
+  blank frame in either transition)
+
+## 145. Ambient/detailed-tier Reports
+- [ ] status
+- **depends-on:** 120
+- **parallel-safe:** no
+- **acceptance:**
+  - Each header gauge's expanding verb (task 120's `SYNC`/`IDX`/`AI`/`OUT`/`NET`) opens its
+    detailed Report on Enter after focusing it via the finder `>` scope or the leader —
+    reusing the existing `Report`/`ReportPane` engine, not a new detail-view mechanism.
+  - Sync detail: per-folder table. Index detail: coverage `LineGauge` per kind from
+    `IndexKindStatus.coverage`, with lag + quarantine counts. AI detail: queue/spend. Cache
+    stats included where the underlying RPC already reports them — no new field invented
+    on the client to fill a gap the daemon doesn't report (that's a §19 gap if it's
+    missing, not something to fake here).
+- **verify:** `cargo nextest run -p rmail-cli tui::report` (each of the five gauges opens
+  the correct Report content via the finder `>`-scope path, index coverage gauge reads
+  `IndexKindStatus.coverage` per kind including lag/quarantine)
+
+## 146. Undo-send status chip
+- [ ] status
+- **depends-on:** 112, 129
+- **parallel-safe:** no
+- **acceptance:**
+  - The status-bar chip (not a toast) renders `⏱ sending to Sara in Ns — u cancels`,
+    counting down from `undo_deadline`; `u` calls `CancelScheduled` (absent id = most
+    recent cancelable, reusing task 112's stack) and reopens the composer with draft +
+    cursor position intact — a test asserts the reopened composer's cursor offset matches
+    where it was when send was triggered, not reset to 0 or end.
+  - The chip is driven by countdown `Cmd`s, never a free-running per-second tick unrelated
+    to an armed window (task 92's existing discipline, applied here).
+  - Confirmed never-evictable per task 129's acceptance — this task supplies the content,
+    129 already proved the slot can't be pushed off.
+- **verify:** `cargo nextest run -p rmail-cli tui::status` (countdown content and tick
+  source, `u`-cancels-and-reopens-with-intact-cursor, absent-id-picks-most-recent
+  semantics)
+
+## 147. WatchEvents cursor-stability + pulse tint
+- [ ] status
+- **depends-on:** 123
+- **parallel-safe:** no
+- **acceptance:**
+  - **The cursor never moves because of a network event** (§12.8, law-adjacent) — a test
+    delivers a `WatchEvents` insert-above-cursor event and asserts the cursor's *logical
+    row* (the message it was on) is unchanged, even though its *screen position* may shift
+    if rows above it changed count.
+  - Inserted rows land in place with a 2 s pulse tint, driven by a countdown `Cmd` (not a
+    free tick) that clears itself — a test asserts the tint is present immediately after
+    insert and absent after the countdown fires, with no lingering timer after that.
+  - `WatchEvents` resumes from stored `since_seq`; `OUT_OF_RANGE` triggers resync from
+    `resume_from` plus a toast `replayed N events` — a test simulates an `OUT_OF_RANGE`
+    response and asserts both the resync call and the toast, not just one.
+  - Events are a dirty flag → coalesced reload, never one reload per event (a burst of 50
+    events in one tick coalesces to one reload, tested with a counting fake executor).
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (cursor-stability under an
+  insert-above event, pulse-tint lifecycle exactly 2s via fake clock, `OUT_OF_RANGE`
+  resync+toast pairing, event-burst coalescing count)
+
+## 148. Frame discipline & perf instrumentation
+- [ ] status
+- **depends-on:** 120
+- **parallel-safe:** yes
+- **acceptance:**
+  - Event-driven redraw only: a dirty-flag mechanism gates `terminal.draw`, and spinner/
+    tick-driven redraws run **only** while something is actually animating (task 92's
+    existing rule, audited across every new gauge/spinner this part adds — a source-scan
+    test enumerating every `Cmd::Tick`-equivalent producer and asserting each is gated on a
+    live condition).
+  - Frame build+diff budget instrumented (debug-assert or a feature-gated timing harness)
+    against the 4 ms typical / 16 ms worst budget from §18 — not enforced as a hard test
+    failure (CI hardware varies) but logged via `tracing` when exceeded, so a regression is
+    discoverable without being a flaky gate.
+  - Synchronized-update (DEC 2026) wraps writes where the terminal advertises support,
+    falling back cleanly where it doesn't (a test with a fake terminal capability set
+    exercises both paths).
+  - `Table`/`List` visible-slice building (task 123's virtualization) and pre-wrap caching
+    (task 116) are both re-confirmed live on this pass — this task is the integration point
+    that would catch either regressing silently as more cards/collections landed on top of
+    them.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (every tick producer gated on a
+  live-animation condition via source scan, synchronized-update capability branching, a
+  smoke test confirming task 123/116's virtualization and caching still hold end-to-end)
+
+## 149. Compose v2
+- [ ] status
+- **depends-on:** 107, 112
+- **parallel-safe:** no
+- **acceptance:**
+  - Full-frame app per §14's exact layout: THIS DRAFT sidebar (reply target, revision
+    cycle, autosave tick) persists through the compose session; rail becomes the Guardian.
+    Entered via `c`, `r`/`R` (threading headers frozen at reply time by `CreateDraft`; a
+    Reader visual selection quotes only the selection), `F`, Enter on a draft row, or Enter
+    on a suggested-reply row (pre-streamed content already in the buffer on open).
+  - Fields: `Tab`/`S-Tab` move; To/Cc/Bcc autocomplete is frecency-ranked via task 138's
+    popup (fragment + initials matching, `jsm`→John Smith); `C-f` cycles From identities
+    (signature + sent-folder re-derive on switch); `C-a` attach via filesystem completion
+    (task 138's dir-first ranker).
+  - Body: inline editor for short replies (multi-line, kill ring, bracketed paste = one
+    undo unit); `C-e` suspends to `$EDITOR` with full repaint on return — a test drives
+    suspend/resume against a fake `$EDITOR` and asserts the terminal is fully repainted,
+    not left in a torn state. Autosave via `UpdateDraft` debounced 2 s; Esc = save + close,
+    never a silent discard.
+  - `C-g` AI menu streams generated text token-by-token into the **real editable buffer**
+    (Esc mid-stream keeps text so far); renders `«ai-tinted»` until first hand-edit; `C-o`
+    cycles revisions via `ListDraftRevisions` with hand-edits written back before
+    switching; `(local)` chip on local-model output.
+  - Guardian: `PreflightCheck` on field blur and always before send; BLOCK stops send
+    (`:send!` bypasses explicitly, never implicitly); WARN requires one extra Enter; NOTICE
+    lists informationally. Model findings never block (wire contract) and carry `«model»`.
+  - Send plan exactly per §14: `C-s` = schedule-now + undo window (chip counts down, `u`
+    cancels+reopens with draft+cursor intact — reusing task 146's exact mechanism, not a
+    parallel one); `C-l` Send Later (preset chips + NL with the daemon-resolved absolute
+    time echoing live via task 138's time-input mechanism); `C-t` Optimal
+    (`SuggestSendTime` + shown `«rationale»`); `C-u` cycles the undo window, lengthen-only;
+    `C-r` toggles `↩? remind in 3d if no reply` (`CreateFollowup`, cancel-on-reply).
+  - Narrow terminals keep the single column; Guardian folds to a one-line strip
+    (`GUARDIAN ⚠ 1 NOTICE — C-p details`) rather than disappearing.
+- **verify:** `cargo nextest run -p rmail-cli tui::commands` (layout and field behavior,
+  frecency/dir-first autocomplete via the shared popup, `$EDITOR` suspend/resume full
+  repaint, streamed AI text into the real buffer with ai-tint-until-edit, revision cycling
+  with write-back, Guardian BLOCK/WARN/NOTICE gating including the `:send!` bypass, full
+  send-plan including undo-window lengthen-only and cursor-intact reopen, narrow-terminal
+  Guardian fold)
+
+## 150. First-run screen
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - Full-frame welcome exactly per §15.1, shown when `AccountService.List` returns empty;
+    daemon connectivity shown inline. Four options (`a` add-from-email, `o` OAuth, `e` edit
+    `rmail.toml`, `t` trainer) each individually reachable and tested.
+  - `a` flow: email → `Autoconfigure` spinner with its exact copy → discovered servers +
+    source badge + warnings + ready-to-paste TOML (verbatim, **nothing stored until
+    confirmed** — a test asserts no `Account.Create` call occurs before the explicit
+    confirm step) → credential step (keychain/command/env/OAuth via `BeginOAuth` with a
+    cancel affordance while "waiting for browser consent…") → `TestConnection ✓` → budget
+    prompt (**`$0` is accepted as a valid, complete answer** — a test specifically submits
+    `$0` and asserts the flow proceeds rather than treating it as an empty/invalid field) →
+    the Mail frame with initial sync running.
+  - Status bar pins the hint line (`j/k move · e archive · ? help`) for the first 20
+    actions of the session, then stops — counted, not time-based (a test performs exactly
+    20 actions and asserts the hint is gone on the 21st).
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (empty-account-list triggers the
+  screen, all four entry options, the `a` flow's nothing-stored-before-confirm property,
+  `$0` budget accepted, 20-action hint countdown)
+
+## 151. Trainer v2
+- [ ] status
+- **depends-on:** 133
+- **parallel-safe:** no
+- **acceptance:**
+  - Full-frame app owned entirely by the TUI; renders its **own** practice rows inside its
+    **own** widget, banner `TRAINER — practice rows, not your mail` — a test asserts no
+    trainer row ever appears in `Model`'s real mailbox state (law-adjacent: "no
+    client-invented mail", §20.9) — practice rows live in trainer-local state that the real
+    List/Reader collections never read.
+  - Ten rows, each naming the key that dismisses it; performing the named action animates
+    the row out and advances; the sequence matches §15.2's exact key list (`j/k → Enter →
+    e → d/u → x x d → f → / → 'u → Z → ?`); clearing all rows renders the "first earned
+    zero state" (reusing whatever empty-state component task 156 establishes, not a
+    trainer-specific one).
+  - Reachable via `t` on first-run (task 150) and `Space h t` from anywhere, at any time,
+    not just once.
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (practice-row isolation from real
+  mailbox state, all ten steps individually advance on their named key and no other,
+  zero-state on completion reuses the shared empty-state component, reachable both from
+  first-run and `Space h t`)
+
+## 152. Initial sync screen honesty badges
+- [ ] status
+- **depends-on:** 120, 123
+- **parallel-safe:** no
+- **acceptance:**
+  - Rows appear as headers land via `WatchEvents` during initial sync, skeletons (task 144)
+    below the loaded rows, exactly matching §15.3's layout — the user can triage immediately
+    on what's loaded rather than waiting for sync to finish (a test asserts list-card verbs
+    work on the partially-synced rows with no special-casing).
+  - Sync/index progress gauges render honestly: `SYNC ⠧ 2.4k/min`, `IDX ⠋ 3%`, `AI – (no
+    budget)` when unset — each sourced from the real `Sync.Status`/`Index.Status`/
+    `Ai.GetUsage` fields, never a client-estimated percentage dressed up as the daemon's.
+  - `/` during initial sync shows the `indexing… lexical fallback` degradation badge
+    (reusing task 140's exact badge mechanism, not a sync-specific copy of it).
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (rows-plus-skeleton composition
+  during a simulated initial sync, gauge values traced to real proto fields with no
+  client-side estimation, search degradation badge fires during this state via the shared
+  mechanism)
+
+## 153. Offline banner
+- [ ] status
+- **depends-on:** 120
+- **parallel-safe:** no
+- **acceptance:**
+  - Populates the reserved banner row (task 120) amber with §15.5's exact content:
+    `▲ offline since HH:MM — retrying ⠙ Ns · queued: N sends · N flag changes (all
+    durable) · reading, search, tags, notes, local-AI all work`.
+  - Queued mutations carry a `⇡` glyph in the list until reconciled; late sends get a
+    `sent late` marker — both sourced from the outbox/mutation-queue state that already
+    exists (task 157 gives outbox its full collection; this task only needs the glyph
+    contract, which can be built against that task's minimal interface).
+  - `Space d s` forces a retry from anywhere while the banner is up (not only from a
+    dedicated screen).
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (banner content and amber tone
+  under a simulated IMAP-down/daemon-up state, `⇡` glyph and `sent late` marker on queued/
+  late rows, `Space d s` forces retry)
+
+## 154. Daemon-down screen
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** yes
+- **acceptance:**
+  - Full-frame screen exactly per §15.6, shown when the daemon socket is unreachable; last-
+    known data stays behind it, marked stale (not discarded — a test asserts `Model`'s
+    cached rows survive a disconnect and are still present, dimmed/stale-flagged, when the
+    screen is dismissed after reconnect).
+  - `!` **actually spawns `rmaild`** (the §1.2-mandated graft) and auto-reattaches on
+    success — a test with a fake process spawner asserts the exact command invoked and
+    that a successful spawn transitions the model out of this screen without a manual `r`.
+  - `r` retries now; `l` tails the last 50 lines of the daemon log; `y` copies the
+    launchctl start command (OSC 52 + arboard, matching the yank chord's copy mechanism);
+    `q` quits.
+  - Reconnect resumes `WatchEvents` from the stored seq — **no missed events** (reuses
+    task 147's exact resume mechanism; this screen is a consumer of it, not a second
+    implementation) — the screen's own text names the resume point honestly (the actual
+    stored `since_seq`, not a placeholder).
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (stale-not-discarded cached data,
+  `!` spawn command + auto-reattach via a fake spawner, `r`/`l`/`y`/`q` each individually,
+  reconnect resumes from the real stored seq with zero missed events in a fixture replay)
+
+## 155. Auth states at startup
+- [ ] status
+- **depends-on:** none
+- **parallel-safe:** yes
+- **acceptance:**
+  - `AuthStatus.local_login_required` shows a one-field password screen before the frame
+    (`LoginPassword`); the bearer token is held **only** in memory — a test asserts it is
+    never written to `tui.toml`, history, or any file this task's diff touches (a grep-
+    style test over the write paths, not just "we didn't add a write call").
+  - `RESOURCE_EXHAUSTED` lockout shows the same screen with a live countdown
+    (`locked — try again in Ns`) and the retry control genuinely disabled (not merely
+    visually greyed — a test attempts submit during the lockout window and asserts no
+    `LoginPassword` RPC is issued) until it elapses, at which point it re-enables itself
+    without requiring a keypress to notice.
+- **verify:** `cargo nextest run -p rmail-cli tui::model` (login-required gate precedes the
+  frame, bearer token never persisted to disk, lockout countdown blocks the RPC call
+  during its window and self-clears at zero)
+
+## 156. Empty/edge states
+- [ ] status
+- **depends-on:** 123, 129
+- **parallel-safe:** no
+- **acceptance:**
+  - One shared empty-state component (reused by trainer's zero-state, task 151, and every
+    collection's empty rendering) covers: empty folder (`∅ nothing here · < > other
+    lenses · C-p jump anywhere`); empty search (`0 hits for "…" · ⏎ try ~semantic · e
+    edit query · sources weak: …` with the live semantic-index-build percentage, not a
+    static claim).
+  - Huge-mailbox honesty: title is the tell (`Archive ↓date [500/812,440 ·⠿]`); `G` pages
+    on; filter/sort annotate `(partial)`/`loaded`; a one-time hint (not repeated every
+    frame) names search as the full-corpus path — tested that the hint appears once per
+    session, not on every render of a huge collection.
+  - Error rendering: failed RPC → status message zone shows the exact format
+    (`✗ Move failed: PERMISSION_DENIED (token lacks mail.write) — :token list`), sticky
+    until a keypress, **also** appended to the notification feed (re-confirms task 129's
+    dual-effect contract in this specific error-copy context); the optimistic change rolls
+    back visibly (re-confirms task 133's rollback contract). Parse errors in prompts render
+    red inline; the overlay stays open (re-confirms task 141's stays-open contract for
+    prompts generally, not just filter).
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (shared empty-state component
+  instantiated identically across trainer/folder/search, huge-mailbox title-tell and
+  one-time hint, error message exact format + dual-effect + visible rollback, prompt
+  parse-error stays-open)
+
+## 157. Outbox collection
+- [ ] status
+- **depends-on:** 119, 112
+- **parallel-safe:** yes
+- **acceptance:**
+  - `go` registry entry (task 119) backed by `ListOutbox` + live `WatchOutbox` — real data
+    replacing task 119's minimal stub.
+  - Rows render exactly per §16.1: state glyph (`◷ scheduled · ⧗ sending · ✓ sent · ✗
+    failed · · canceled · ? uncertain`), to, subject, when (+`optimal ✦` marker for
+    `SuggestSendTime`-sourced schedules), origin (`«ai»` rows always show an undo window —
+    a test asserts an AI-originated row's undo window is never absent, even if the general
+    undo policy would otherwise omit one for a short window), attempts, `last_error`
+    verbatim (not summarized/truncated).
+  - Verbs per the arbitration table (task 135): Enter inspect, `e` edit body (draft-
+    backed, reuses task 149's compose), `s` send-now, `u` cancel (task 112's stack), `R`
+    retry, `t` reschedule via task 138's time-input popup.
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (row rendering for every
+  state glyph, AI-origin undo-window guarantee, all six verbs dispatch correctly including
+  the compose/time-popup integrations)
+
+## 158. Follow-ups + Waiting-on collections
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - `gf` (Follow-ups): armed/fired state, remind-at, note-to-self banner on resurface; `d`
+    dismiss, `b` new (`CreateFollowup`).
+  - `gw` (Waiting-on): longest-wait-first ordering **taken verbatim from wire order**
+    (§16.2 — a test asserts the client does not re-sort what the server already ordered),
+    overdue rows red with age shown, `ask` column names "the one thing being waited on"
+    (not a generic subject line); `N` drafts a nudge via `DraftNudge` → composer (task 149)
+    pre-filled.
+  - Sidebar badges (task 122's QUEUES section) read `3` / `5·2!` matching these
+    collections' live counts exactly — a test changes the underlying data and asserts the
+    sidebar badge updates without a manual refresh.
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (Follow-ups armed/fired/
+  dismiss/new, Waiting-on wire-order-preserved + overdue styling + `ask` column + nudge
+  draft prefill, sidebar badge live-sync for both)
+
+## 159. Notifications collection
+- [ ] status
+- **depends-on:** 119, 131
+- **parallel-safe:** yes
+- **acceptance:**
+  - `gn` registry entry backed by the exact feed task 131 already built (durable,
+    `StreamAlerts since_id`, merged local history) — this task is the collection-façade
+    over that feed, not a second feed implementation.
+  - Tier-colored rows with `«reason»`; Enter opens the message; `w` explains via
+    `ScoreMessage` showing threshold/suppression/would-notify verdict — a test asserts all
+    three verdict fields render, not just a boolean fired/didn't-fire.
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (façade reuses task 131's
+  feed with no duplicated stream state, tier coloring, Enter-opens, `w` three-field verdict)
+
+## 160. Jobs collection
+- [ ] status
+- **depends-on:** 119, 131
+- **parallel-safe:** yes
+- **acceptance:**
+  - `gj` registry entry backed by the jobs feed already built in task 131 — same
+    façade-not-duplicate relationship as task 159.
+  - Cancel key reaches the real cancellation path for each job kind (export, attachment
+    save, reindex drain, bulk action) — a test per kind asserts the underlying stream
+    actually receives a cancellation, not just that the row's UI state changes locally.
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (façade reuse, per-kind
+  cancel reaches the real stream cancellation)
+
+## 161. Insights — Analytics
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - `gd` hub's Analytics surface: response-time p50/p90 you-vs-them, weekly trend
+    sparkline, attention-first group table with bottleneck/stalled chips, all from
+    `GetResponseTimes`.
+  - `q` NL analytics via `AskAnalytics`: answer renders as rows + `«narrative»` **with the
+    sandboxed SQL always shown** — a test asserts the SQL is present in every render of an
+    `AskAnalytics` result, not collapsible-to-absent (§16.5's checkability requirement is
+    non-negotiable, not a toggle).
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (response-time table and
+  sparkline from real field data, `AskAnalytics` narrative+rows+always-visible-SQL)
+
+## 162. Insights — Contact page
+- [ ] status
+- **depends-on:** 119, 128
+- **parallel-safe:** yes
+- **acceptance:**
+  - Full contact page (`gc` from any message, and the rail Contact tab's Enter from task
+    128) beyond the rail's metrics-only summary: volume, symmetry, cadence, decay, topics,
+    `«briefing»`, ≤5 next actions each Enter-able — a test asserts the action list is
+    capped at 5 even when the backend would return more (the cap is a client-side
+    presentation decision the acceptance fixes, not left to whatever the RPC returns).
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (full card content, 5-action
+  cap, each action Enter-able and dispatches correctly, rail-Contact-tab Enter reaches this
+  page)
+
+## 163. Insights — Subscriptions
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - `gv`: sender, class + source badge (`HEADER`/`HEURISTIC`/`«MODEL»` — the badge
+    literally names which of the three produced the classification, per §16.5), read-rate
+    meter, cadence, expandable signals.
+  - `U` shows the unsubscribe **proposal** (http/mailto/one-click) — **rmail never
+    unsubscribes itself**, enforced as a test that no code path in this task issues an
+    outbound unsubscribe request; `y` copies the link, Enter opens the browser. This is the
+    same "report, never repair" pattern as the deceptive-link handling in task 127 — worth
+    keeping consistent, not a separate design.
+  - `classify_unknown` is a labeled `$` action (costs money, says so before running).
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (source-badge accuracy per
+  classification origin, no self-unsubscribe code path exists, `y`/Enter on the proposal,
+  `$` label on classify_unknown)
+
+## 164. Insights — Invoices
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - `gi`: vendor/number/total/due/status columns, **every cell provenance-tagged**
+    (`parsed` plain vs. `«model»`) — a test asserts no cell in this collection is ever
+    rendered without one of the two provenance markers, closing off the "which numbers can
+    I trust" ambiguity by construction.
+  - `e` CSV export (`ExportInvoices`, jobs-feed progress via task 131/160's mechanism);
+    Enter opens the source message (task 119's detail-renderer contract).
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (provenance tag on every
+  cell — a fixture with mixed parsed/model cells specifically, `e` export reaches jobs
+  feed, Enter opens source)
+
+## 165. Insights — Digest renderer
+- [ ] status
+- **depends-on:** 127, 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - Markdown digest via the Reader's shared body renderer (task 127's measure-clamp
+    function, reused — not a fifth wrapping implementation); every line's `[msg:id]`
+    citation is Enter-able and opens the cited message.
+  - `]`/`[` walk sections; `r` regenerates (force, labeled `$` since it's a model call);
+    `cached` badge when serving `GenerateDigest`'s cached result rather than regenerating.
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (shared measure-clamp reuse
+  confirmed via the same test helper task 127 introduced, citation Enter-navigation,
+  section walk, `r`/`$`/`cached` badge states)
+
+## 166. Automation — Rules
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - `gr` Rules surface: table + TOML detail (task 119's detail-renderer contract, reusing
+    the existing `ConfigBlock`/report machinery rather than a new TOML viewer); `Space`
+    toggles enabled in place (optimistic, task 133's pattern).
+  - `n` NL synthesis: instruction → generated TOML + 30-day dry-run hits + stats → explicit
+    confirm to store — a test asserts nothing is persisted before the confirm step (same
+    "nothing stored until confirmed" property as task 150's account flow, now proven here
+    too since it's the same class of "model proposes, user confirms" interaction).
+  - `B` backtest: per-predicate outcome table, model-call/cache stats, `«explanation»` per
+    `claude_is` decision; corrections recorded from mis-fires feed back into the rule
+    (reusing whatever correction-recording mechanism v1's rule work already established —
+    verified present before assuming it, not reinvented).
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (table+TOML detail, `Space`
+  optimistic toggle, NL-synthesis nothing-stored-before-confirm, backtest table content and
+  correction feedback path)
+
+## 167. Automation — Agent
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - `RunInboxAgent` is **dry-run by default** — a test asserts the default invocation path
+    never mutates mail state, only produces the action table with `«reason»` and outcome.
+  - Mutating runs are gated behind explicit scopes **and** a typed confirmation (not a
+    `y/n`, matching §8.2's "type-the-name for nuclear ops" pattern extended here since an
+    agent acting autonomously on mail is at least as consequential as deleting an account).
+  - Run history is browsable as a collection (task 119) showing past runs' action tables.
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (dry-run-by-default proven
+  by zero mutating calls in the default path, scope-gate + typed-confirm required for a
+  mutating run, run history browsable)
+
+## 168. Automation — Hooks + Webhooks
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - Hooks: list + `t` test showing exit code and stdout/stderr (reusing the existing hook
+    test-run RPC, not a client-side re-implementation of hook execution).
+  - Webhooks: destinations with URLs **redacted to authority** by default (e.g.
+    `https://hooks.example.com/…` not the full path/query, which may carry a secret token)
+    — `reveal` is an explicit action, not the default rendering; deliveries sub-list with
+    `replay`.
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (hook test-run shows real
+  exit/stdout/stderr, webhook URL redacted-by-default with explicit reveal, delivery replay
+  reaches the real RPC)
+
+## 169. Settings v2
+- [ ] status
+- **depends-on:** 114, 117
+- **parallel-safe:** no
+- **acceptance:**
+  - Full-frame app, all 14 sections from the existing v1 settings screen (task 101) carried
+    forward, now with **current values inline** wherever a read RPC or local state exists:
+    spend via `GetSpend`, provider chain via `GetAiProvider` rendered as
+    configured→override→effective + policy mode, keymap, theme/density (task 114's prefs) —
+    a test enumerates all 14 sections and asserts every field that has a corresponding read
+    RPC or prefs value shows it, not a blank/placeholder.
+  - Config-file-only keys render via the existing `ConfigBlock` (path + effect timing +
+    open-to-copy) — reusing task 96/101's existing mechanism verbatim, not rebuilt.
+  - Keys section is the conflict-lint view (task 139's shadow lint) + `c` rebind (task
+    139's flow) — this task is the settings-screen *presentation* of machinery task 139
+    already built, proven by a test that no rebind logic is duplicated here.
+- **verify:** `cargo nextest run -p rmail-cli tui::settings` (all 14 sections present with
+  live values where a source exists, `ConfigBlock` reuse for file-only keys, Keys section
+  delegates to task 139's lint/rebind without duplication)
+
+## 170. Tokens/audit v2
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - Token table (scopes, last used, revoke) + mint flow where the secret is shown exactly
+    once and a re-run of the same mint request is refused (idempotency at the UI level
+    matching the RPC's own semantics — a test mints twice with the same client-generated
+    key and asserts the second call surfaces the "already minted, not shown again" refusal
+    rather than silently re-displaying the secret).
+  - Audit ledger: `QueryAiCalls` paginated (model, pass, tokens, cost, redaction level,
+    latency, status) with a filter row; `ExportLedger` streams to a file with jobs-feed
+    progress (task 131/160's mechanism).
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (token table+mint-once-only
+  semantics, audit ledger pagination+filter, export reaches jobs feed)
+
+## 171. Ask (RAG)
+- [ ] status
+- **depends-on:** 128
+- **parallel-safe:** no
+- **acceptance:**
+  - Rail Ask tab (`A`/`ga`; zoom or narrow width promotes to full-frame via task 109's zoom
+    mechanism) renders the **fixed frame order** honestly per §16.9: retrieval trace line
+    (`retrieved 24 · packed 9 · withheld 2 by policy`) → streamed tokens (64 KiB cap, marked
+    truncation when hit) → citations (`[n]` aligned with inline markers) → the daemon's
+    `grounded`/refusal verdict rendered as the **daemon's claim**, not the client's — a test
+    asserts the verdict text is sourced from the RPC response field, never inferred
+    client-side from the presence/absence of citations.
+  - **Citations are verbatim mailbox facts, never `«»`-marked** — the one deliberate
+    exception to law 9, and a test specifically asserts citation spans do NOT carry the
+    `ai` tint/guillemets that surrounding narrative text does, since marking a verbatim
+    quote as "model-generated" would be its own honesty violation.
+  - Ask-attachment (`?` in the attachment browser, task 127) reuses this exact surface with
+    page/span citations instead of message citations — proven by a shared rendering
+    function, not a parallel implementation.
+  - Truncation at the 64 KiB cap is visibly marked, never silent.
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (fixed frame order including
+  withheld-by-policy count, citation-text lacks ai-tint/guillemets while narrative text has
+  them, daemon-sourced verdict field, Ask-attachment shares the render function, truncation
+  marker at the cap boundary)
+
+## 172. Help & manual v2
+- [ ] status
+- **depends-on:** 136
+- **parallel-safe:** no
+- **acceptance:**
+  - `?` mode-aware searchable overlay (task 108's stack), grouped by verb path; Enter runs,
+    `c` rebinds (task 139's flow), `K` jumps to the manual page — all three reusing existing
+    mechanisms, this task's job is the mode-aware grouping and search over the v2 action set.
+  - `gh` Manual: full-frame reader using task 127's shared measure-clamp; in-page find; `g/`
+    grep-all-pages (reusing the existing `manual::grep` pure function from task 103/105,
+    extended to cover every new manual page this part's tasks add); jump list `C-o`/`C-i`
+    navigating manual history (a test walks forward/back through at least 3 visited pages
+    and asserts the jump list ordering matches a browser-history model, not a stack that
+    loses the forward direction after a new jump).
+  - Trainer reachable via `Space h t` (task 151's binding, confirmed wired from the help
+    surface too, not only first-run).
+- **verify:** `cargo nextest run -p rmail-cli tui::help` · `cargo nextest run -p rmail-cli
+  tui::manual` (mode-aware grouped search over the v2 action set, `c`/`K` delegation without
+  duplication, measure-clamp reuse, grep-all-pages coverage of new pages, jump-list
+  browser-history semantics)
+
+## 173. Multi-account & unified inbox
+- [ ] status
+- **depends-on:** 119, 122
+- **parallel-safe:** yes
+- **acceptance:**
+  - `g1`..`g9` switch the active account; `gu` opens Unified (`ListUnified` via task 119's
+    registry) with a 1-column account-accent gutter on every row, sourced from `acct1..6`
+    (task 117).
+  - Every action taken on a unified row routes via **that row's own** real account/mailbox
+    ids — a test constructs a unified view mixing two accounts and asserts an archive on a
+    row from account 2 issues the RPC against account 2's mailbox, not account 1's or a
+    default (the exact bug class this feature invites if the row's origin is lost anywhere
+    in the dispatch path).
+- **verify:** `cargo nextest run -p rmail-cli tui::collection` (g1..g9 switch, unified
+  gutter coloring matches `acct1..6`, per-row action routes to the row's own real
+  account/mailbox in a mixed-account fixture)
+
+## 174. Quick menu `.` v2
+- [ ] status
+- **depends-on:** 119
+- **parallel-safe:** yes
+- **acceptance:**
+  - For the cursored message: Summarize (cached, free — a test asserts zero model calls
+    since it's reading the same `<5ms` cache as task 126's AI capsule), Ask (pre-filled
+    into task 171's surface), Suggest reply/tags (labeled `$`), Extract
+    (events/tasks/invoice/links), each dispatching to its real existing RPC.
+  - Mute-rule proposal opens `:rule new` pre-filled — **honest**: there is no
+    `MuteService` (§19.5), and a test asserts no code path in this menu claims to mute
+    anything directly; the affordance's own label says "propose a rule", not "mute".
+- **verify:** `cargo nextest run -p rmail-cli tui::overlays` (each action dispatches to its
+  real RPC with Summarize proven cache-only, mute proposal opens rule-synthesis pre-filled
+  with no direct-mute code path anywhere)
+
+## 175. Daemon-gap degradation badges
+- [ ] status
+- **depends-on:** 111, 119, 140
+- **parallel-safe:** no
+- **acceptance:**
+  - All thirteen §19 gaps are checked, one by one, against the shipped surfaces from tasks
+    120–174, and each is confirmed to render its documented honest label rather than a
+    faked value: folder unread (`~`/`•`, task 111) · lens/search counts (task 113's honesty
+    machine) · thread-per-row folders (flat + `⧉N` + `pt`, task 124/134) · snooze-is-really-
+    a-followup (`b`'s copy, task 133) · mute-is-really-a-rule-proposal (task 174) · no NL
+    on `:` (the command line stays deterministic — a test asserts no free-text fallback
+    exists on `:`) · no screener storage (lenses stay client-side approximations, task 113)
+    · no redaction-preview RPC / no `:ai policy explain` (Settings, task 169, shows policy
+    from `GetAiProvider` only, nothing further claimed) · `AccountService.Update` is
+    delete+create (Settings says so explicitly) · archive-is-a-heuristic-Move (documented
+    at the point `e` is bound, task 133) · folder sort is loaded-rows-only (task 143's
+    `(sorts N loaded)` string) · the four services with no backend surface at all (Prompt
+    library/Conversation memory/bulk-undo/ghost-text) have **no UI entry point whatsoever**
+    — a test greps the whole `tui/` tree for any reference to these four and asserts none
+    exists, since a reserved-but-dead menu item would itself be the "invisible state" law
+    violation · encryption/signing glyph position reserved but not rendered until the wire
+    type carries the field (a test asserts the glyph cell renders empty, not a fake
+    "unencrypted" claim, when the field is absent).
+  - This task adds **zero** new RPCs — its only job is auditing that every gap is labeled
+    where §19 says it should be, and fixing any surface from 120–174 that was found to
+    silently paper over one instead.
+- **verify:** `cargo nextest run -p rmail-cli tui::` (one test per §19 gap asserting its
+  honest-label rendering at the specific surface that could otherwise fake it, plus the
+  two dead-feature absence greps)
+
+## 176. Re-homed keys migration
+- [ ] status
+- **depends-on:** 139, 172
+- **parallel-safe:** no
+- **acceptance:**
+  - Every re-homing §21 documents from the *current* (Part V) build to this design is
+    applied: `a` archive→`e`, `s` toggle-read→`U`, `f` flag→`s`, `c` copy-to→`M`, `M`
+    move-to→`m`, `o` open-html→`H`, `x` explain→`w`, `O` outbox→`go`; `gs` settings
+    unchanged. A test walks this exact old→new table and asserts every new binding is live
+    and — critically — that **no old binding silently still works with its old meaning**
+    (the specific failure mode a half-finished migration produces: two keys doing the same
+    thing, or one key doing something different than the manual now says).
+  - A new manual page (extending task 172's manual) documents the full old→new table for
+    anyone whose personal `keys.toml` still binds a pre-migration key — reusing task 139's
+    shadow-lint mechanism to detect exactly that case and point at this page by name in the
+    lint message, not just a generic "shadowed" warning.
+- **verify:** `cargo nextest run -p rmail-core keymap::` (every re-homed key resolves to
+  its documented new `Action` and the old meaning is unreachable) · `cargo nextest run -p
+  rmail-cli tui::manual` (migration page present and linked from the shadow-lint message)
+
+## 177. Appendix A width/height matrix golden-frame suite
+- [ ] status
+- **depends-on:** 107, 123, 126, 129, 130
+- **parallel-safe:** yes
+- **acceptance:**
+  - The view test suite renders every frame at the exact matrix Appendix A declares
+    normative — widths `{80, 100, 120, 160, 200}` × heights `{24, 30, 50}` — and asserts,
+    per §18's binding checklist: no `Rect` overflow anywhere in the tree, every column-
+    budget sum from task 123's per-breakpoint table ≤ inner width at that exact size, and
+    the drop orders from §4.3/§4.3's three named tables fire at exactly their documented
+    thresholds (not one column early or late).
+  - Appendix A.1–A.4's four reference frames (wide XL cozy, narrow S-stacked, zoomed
+    Reader, zoomed List triage table) are each reproduced as a golden test at their stated
+    dimensions and diffed structurally (card boundaries, zone presence/absence, title-line
+    content) — not a brittle byte-for-byte terminal-output comparison, which would break on
+    every cosmetic change, but a structural assertion of what §18 actually commits to.
+  - This suite is the **normative artifact** §18 names — a task anywhere in 120–176 whose
+    change breaks a case here is a regression in that task, not in this one; this task's
+    job is that the suite exists and is comprehensive, not that everything upstream already
+    passes it (upstream tasks are expected to keep it green as they land, per this part's
+    cross-cutting acceptance).
+- **verify:** `cargo nextest run -p rmail-cli tui::view` (the full 15-point width×height
+  matrix with zero overflow and correct budget sums at every point, all four Appendix A
+  reference frames structurally golden-tested, every documented drop-order threshold exact)
+
+## 178. Performance budget verification
+- [ ] status
+- **depends-on:** 177
+- **parallel-safe:** yes
+- **acceptance:**
+  - Each §18 budget gets an instrumented check: TUI attach < 200 ms (first frame before any
+    RPC returns — re-confirms the existing v1 invariant still holds with the v2 frame's
+    larger initial render), first search hit < 30 ms end-to-end, finder first batch < 16
+    ms, open message < 30 ms, AI panel read < 5 ms (the cache-only path from task 126),
+    frame build+diff < 4 ms typical / 16 ms worst (task 148's instrumentation, now checked
+    against a number), input-to-paint < 20 ms.
+  - Where CI hardware makes a hard latency assertion flaky, the check runs as a `tracing`-
+    logged measurement with a documented local-dev threshold rather than a hard failure —
+    consistent with task 148's approach — but every budget is at minimum *measured and
+    reported* on every run, so a regression is visible in the numbers even when it doesn't
+    fail the build.
+  - §18's 17-point craft-rules checklist is walked explicitly, one line per rule, each
+    either citing the task that proves it or filing a gap if one is found — this is the
+    closing audit, not new implementation.
+- **verify:** `cargo nextest run -p rmail-cli tui::` (instrumented measurement present for
+  all seven named budgets) · a written craft-rules audit (17 lines, one per §18 rule,
+  each resolved to a task or a filed gap) attached to the commit body
+
+## 179. Final cleanup and completion report
+- [ ] status
+- **depends-on:** 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120,
+  121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137,
+  138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154,
+  155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+  172, 173, 174, 175, 176, 177, 178
+- **parallel-safe:** no
+- **acceptance:**
+  - Every superseded v1 rendering path named in this part's preamble ("Supersedes, task by
+    task") is confirmed unreachable from any live keybinding — the old three-screen
+    `Screen::Viewer` path, the single-overlay-slot code, the headers-only preview, the
+    bespoke AI-panel column, the `O`-outbox-overlay — each either deleted outright or, if
+    the underlying function is still called by the new path, stripped of its own
+    now-dead entry points. No `#[allow(dead_code)]` left over from the migration.
+  - Full pipeline clean: `cargo fmt --all -- --check`, `cargo clippy --all-targets
+    --all-features -- -D warnings`, `scripts/docker-test.sh` (whole workspace), `cargo
+    build --release`, `cargo deny check`, `cargo audit`, `buf breaking` if `buf.yaml`
+    resolves. Zero `unwrap()/expect()/panic!/todo!` in non-test code anywhere under
+    `rmail-cli/src/tui/` (a workspace-wide grep gate, not a sample check).
+  - A completion report is produced (not committed as a new doc unless asked — printed in
+    the session and in the commit body): what shipped per phase, how to run it (`mail tui`
+    against a real or trainer-backed daemon), test count added by this part vs. Part I–V's
+    baseline, and an honest list of anything from `tui.md` that did **not** ship — if
+    anything remains, it stays unchecked here with a note why, rather than this task
+    checking itself off over a gap.
+- **verify:** `cargo fmt --all -- --check` · `cargo clippy --all-targets --all-features --
+  -D warnings` · `scripts/docker-test.sh` · `cargo build --release` · `cargo deny check` ·
+  `cargo audit` · `buf breaking --against proto/buf-baseline.binpb` (if resolvable) ·
+  `grep -rn "unwrap()\|expect(\|panic!\|todo!" rmail-cli/src/tui --include=*.rs | grep -v
+  /tests` (must be empty)
+
 ## Where this leaves the plan
 
-Every task in this file is checked off. The `:` vocabulary now covers every RPC the
-daemon exposes, each verb has exactly one documented home in the built-in manual,
-and the four reconciliation tests (`command::tests`, `commands::tests`,
-`manual::tests`, `parity::tests`) hold the three surfaces — CLI, TUI, MCP — to the
-same list.
+Parts I–V are checked off in full — the current build (tasks 1–106) is a complete,
+production TUI over a complete backend. Part VI is `tui.md`'s redesign of that same TUI's
+view and interaction layer, decomposed above into 73 dependency-ordered tasks (107–179)
+that a fresh `/loop` resumes from the first unchecked one. No task in Part VI adds an RPC
+— every wire call `tui.md` names was verified against `proto/` before this file was
+written — so Part VI is purely `rmail-cli/src/tui/**` plus the small `rmail-core::keymap`
+extensions the new chords/actions need. When 179 is checked, re-read this section: it
+should say all 179 are done, or name exactly what's left and why.
