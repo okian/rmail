@@ -122,7 +122,7 @@ fn loaded() -> Model {
 /// fixed rather than retyped, and a test reading the status line would be reading
 /// the "command — type a verb" the pane opened with.
 fn complaint(model: &Model) -> String {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => pane.error.clone().unwrap_or_default(),
         _ => model.status.clone(),
     }
@@ -457,7 +457,7 @@ fn the_block_outlives_the_report_it_was_shown_in() {
         ))),
     );
     update(&mut model, Msg::Key(Key::Esc));
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
     let cmds = run(&mut model, "toml");
     assert_eq!(
         cmds,

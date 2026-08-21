@@ -191,7 +191,7 @@ fn attach_list_reads_the_open_message_rather_than_the_daemon() {
     });
     let cmds = run(&mut model, "attach list");
     assert!(cmds.is_empty(), "it reaches no daemon: {cmds:?}");
-    let Some(Overlay::Report(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Report(pane)) = model.overlay_top() else {
         panic!("expected a report");
     };
     assert!(pane.complete, "nothing is outstanding");
@@ -220,7 +220,7 @@ fn attach_list_says_so_when_there_is_nothing_attached() {
     // showing an empty table.
     let mut model = loaded();
     run(&mut model, "attach list");
-    let why = match model.overlay.as_ref() {
+    let why = match model.overlay_top() {
         Some(Overlay::Command(pane)) => pane.error.clone().unwrap_or_default(),
         _ => model.status.clone(),
     };

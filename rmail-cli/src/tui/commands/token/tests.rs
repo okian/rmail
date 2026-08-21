@@ -267,7 +267,7 @@ fn mint(model: &mut Model) {
 fn the_secret_is_on_screen_and_in_nothing_else() {
     let mut model = loaded();
     mint(&mut model);
-    let Some(Overlay::Report(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Report(pane)) = model.overlay_top() else {
         panic!("expected a report");
     };
     assert!(
@@ -306,7 +306,7 @@ fn closing_the_pane_makes_the_secret_unrecoverable() {
     let mut model = loaded();
     mint(&mut model);
     update(&mut model, Msg::Key(Key::Esc));
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
     let everything = format!("{model:?}");
     assert!(
         !everything.contains(SECRET),
@@ -326,7 +326,7 @@ fn r_refuses_to_mint_a_second_token() {
     assert!(model.status.contains("ran once"), "{}", model.status);
     // The rows are left alone: they were true when they arrived, and they are
     // the only copy of the secret.
-    let Some(Overlay::Report(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Report(pane)) = model.overlay_top() else {
         panic!("the report stays up");
     };
     assert!(pane

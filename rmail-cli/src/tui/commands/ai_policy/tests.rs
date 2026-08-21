@@ -542,7 +542,7 @@ fn a_bare_budget_set_opens_a_form_and_a_banged_one_does_not() {
         matches!(cmds.first(), Some(Cmd::BudgetForm { .. })),
         "{cmds:?}"
     );
-    assert!(matches!(model.overlay, Some(Overlay::Form(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Form(_))));
 
     let mut model = loaded();
     let cmds = run(&mut model, "ai budget set --daily-hard-usd=5!");
@@ -550,7 +550,7 @@ fn a_bare_budget_set_opens_a_form_and_a_banged_one_does_not() {
         matches!(cmds.first(), Some(Cmd::BudgetSet { .. })),
         "{cmds:?}"
     );
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 }
 
 #[test]
@@ -566,7 +566,7 @@ fn an_unfilled_form_refuses_to_replace_what_it_could_not_read() {
     let cmds = update(&mut model, Msg::Key(Key::Enter));
     assert!(cmds.is_empty(), "nothing may be issued: {cmds:?}");
     assert!(
-        matches!(model.overlay, Some(Overlay::Form(_))),
+        matches!(model.overlay_top(), Some(Overlay::Form(_))),
         "the form stays up"
     );
     assert!(
@@ -622,7 +622,7 @@ fn a_bare_budget_set_applies_every_cap_the_daemon_reported() {
             ],
         }]
     );
-    assert!(model.overlay.is_none(), "applying closes the form");
+    assert!(!model.overlay_is_open(), "applying closes the form");
 }
 
 #[test]
@@ -650,7 +650,7 @@ fn a_value_the_verb_will_not_accept_is_refused_on_the_form() {
     walk_to(&mut model, apply);
     let cmds = update(&mut model, Msg::Key(Key::Enter));
     assert!(cmds.is_empty(), "{cmds:?}");
-    let Some(Overlay::Form(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Form(pane)) = model.overlay_top() else {
         panic!("the form stays up");
     };
     assert_eq!(pane.fields[0].value, "5abc", "and keeps what was typed");
@@ -680,7 +680,7 @@ fn a_failed_read_leaves_the_form_un_appliable() {
     walk_to(&mut model, apply);
     let cmds = update(&mut model, Msg::Key(Key::Enter));
     assert!(cmds.is_empty(), "{cmds:?}");
-    assert!(matches!(model.overlay, Some(Overlay::Form(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Form(_))));
 }
 
 #[test]
@@ -694,7 +694,7 @@ fn an_answer_to_a_superseded_read_is_dropped() {
             event: FormEvent::Fields(vec![("daily-hard-usd".to_owned(), "9".to_owned())]),
         },
     );
-    let Some(Overlay::Form(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Form(pane)) = model.overlay_top() else {
         panic!("expected a form");
     };
     assert!(!pane.ready, "a stale answer must not fill the form");
@@ -715,7 +715,7 @@ fn a_form_is_menu_until_a_field_is_open_and_insert_while_it_is() {
     }
     update(&mut model, Msg::Key(Key::Enter));
     assert_eq!(model.mode(), Mode::Menu);
-    let Some(Overlay::Form(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Form(pane)) = model.overlay_top() else {
         panic!("expected a form");
     };
     assert_eq!(
@@ -738,7 +738,7 @@ fn esc_cancels_the_field_before_it_cancels_the_form() {
     update(&mut model, Msg::Key(Key::Enter));
     update(&mut model, Msg::Key(Key::Char('9')));
     update(&mut model, Msg::Key(Key::Esc));
-    let Some(Overlay::Form(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Form(pane)) = model.overlay_top() else {
         panic!("the form stays up: one Esc is one layer");
     };
     assert_eq!(
@@ -747,7 +747,7 @@ fn esc_cancels_the_field_before_it_cancels_the_form() {
         "the value is put back"
     );
     update(&mut model, Msg::Key(Key::Esc));
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 }
 
 /// Type `line`, and return the generation the form's read was stamped with.
@@ -766,7 +766,7 @@ fn opened(model: &mut Model, line: &str) -> u64 {
 
 /// How many rows the open form has.
 fn rows_of(model: &Model) -> usize {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Form(pane)) => pane.rows(),
         other => panic!("expected a form: {other:?}"),
     }

@@ -417,7 +417,7 @@ fn a_library_listing_opens_a_report_and_a_store_does_not() {
         matches!(cmds.first(), Some(Cmd::SavedList { .. })),
         "{cmds:?}"
     );
-    assert!(matches!(model.overlay, Some(Overlay::Report(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Report(_))));
 
     let mut model = loaded();
     let cmds = run(&mut model, "saved save unpaid from:stripe");
@@ -425,5 +425,5 @@ fn a_library_listing_opens_a_report_and_a_store_does_not() {
         matches!(cmds.first(), Some(Cmd::SavedSet { .. })),
         "{cmds:?}"
     );
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 }

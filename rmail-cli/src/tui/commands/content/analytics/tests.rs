@@ -399,7 +399,7 @@ fn an_analytics_verb_opens_a_report() {
     let cmds = run(&mut model, "digest --since=7d");
     assert!(matches!(cmds.first(), Some(Cmd::Digest { .. })), "{cmds:?}");
     assert!(matches!(
-        model.overlay,
+        model.overlay_top(),
         Some(crate::tui::model::Overlay::Report(_))
     ));
 }

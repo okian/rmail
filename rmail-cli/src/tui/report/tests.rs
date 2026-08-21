@@ -22,6 +22,7 @@ use crate::tui::model::{
     update, Account, Cmd, Confirmed, Folder, Key, MessageRow, Model, Msg, Overlay, ReportEvent,
     Stream,
 };
+use crate::tui::overlays::QuickPane;
 use crate::tui::view;
 
 // ---------------------------------------------------------------------------
@@ -125,7 +126,7 @@ fn reporting() -> (Model, u64) {
 }
 
 fn open_pane(model: &Model) -> &ReportPane {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Report(pane)) => pane,
         other => panic!("expected the report overlay, found {other:?}"),
     }
@@ -550,7 +551,7 @@ fn a_report_derives_the_menu_mode_so_the_list_keys_come_back() {
 fn the_command_line_is_gone_once_the_report_is_up() {
     let (model, _) = reporting();
     assert!(
-        !matches!(model.overlay, Some(Overlay::Command(_))),
+        !matches!(model.overlay_top(), Some(Overlay::Command(_))),
         "every action reads `Model::mode`, and one run against a command line \
          that is still up asks the wrong layer what a key means"
     );
@@ -611,7 +612,7 @@ fn a_frame_for_a_report_nobody_has_open_is_ignored() {
     let mut model = loaded();
     frame(&mut model, 1, ReportFill::Append, rows(&["a"]), true);
     assert!(
-        model.overlay.is_none(),
+        !model.overlay_is_open(),
         "a late frame does not open a screen"
     );
 }
@@ -624,7 +625,7 @@ fn a_frame_for_a_report_nobody_has_open_is_ignored() {
 fn esc_closes_the_report_and_cancels_what_was_feeding_it() {
     let (mut model, _) = reporting();
     let cmds = press(&mut model, Key::Esc);
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
     assert_eq!(
         cmds,
         vec![Cmd::CancelStream {
@@ -639,7 +640,7 @@ fn esc_closes_the_report_and_cancels_what_was_feeding_it() {
 fn q_leaves_a_report_the_same_way_esc_does() {
     let (mut model, _) = reporting();
     let cmds = press(&mut model, Key::Char('q'));
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
     assert_eq!(
         cmds,
         vec![Cmd::CancelStream {
@@ -723,10 +724,10 @@ fn r_in_a_menu_that_is_not_a_report_does_nothing() {
     // than reaching past them.
     let mut model = loaded();
     press(&mut model, Key::Char('O'));
-    let overlay_before = model.overlay.clone();
+    let overlay_before = model.overlay_top().cloned();
     let cmds = press(&mut model, Key::Char('r'));
     assert!(cmds.is_empty());
-    assert_eq!(model.overlay, overlay_before);
+    assert_eq!(model.overlay_top().cloned(), overlay_before);
 }
 
 #[test]
@@ -735,7 +736,7 @@ fn colon_over_a_report_replaces_it_and_cancels_its_stream() {
     // opened over a report has to stop the stream that report was reading.
     let (mut model, _) = reporting();
     let cmds = press(&mut model, Key::Char(':'));
-    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Command(_))));
     assert_eq!(
         cmds,
         vec![Cmd::CancelStream {
@@ -763,7 +764,7 @@ fn enter_on_a_mutating_row_asks_first_and_y_runs_it() {
         cmds.is_empty(),
         "nothing is sent until the question is answered"
     );
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Confirm { prompt, then }) => {
             assert!(prompt.contains("auth clear"), "{prompt}");
             match then {
@@ -841,7 +842,7 @@ fn enter_on_a_read_only_row_runs_it_without_asking() {
         "a row that only reads is not a question, and asking about one \
          teaches people to answer yes without looking: {cmds:?}"
     );
-    assert!(matches!(model.overlay, Some(Overlay::Report(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Report(_))));
 }
 
 #[test]
@@ -905,7 +906,7 @@ fn a_row_carrying_a_verb_this_screen_cannot_run_says_so_on_the_status_line() {
         model.status
     );
     assert!(
-        matches!(model.overlay, Some(Overlay::Report(_))),
+        matches!(model.overlay_top(), Some(Overlay::Report(_))),
         "and the report the row was on is still there to read the complaint from"
     );
 }
@@ -923,7 +924,7 @@ fn enter_on_an_informational_row_does_nothing() {
     let cmds = press(&mut model, Key::Enter);
     assert!(cmds.is_empty());
     assert!(
-        matches!(model.overlay, Some(Overlay::Report(_))),
+        matches!(model.overlay_top(), Some(Overlay::Report(_))),
         "and it does not close the report either"
     );
 }
@@ -968,9 +969,9 @@ fn a_mutating_row_that_opens_its_own_confirmation_is_not_asked_about_twice() {
         "one question, then the work: {cmds:?}"
     );
     assert!(
-        matches!(model.overlay, Some(Overlay::Report(_))),
+        matches!(model.overlay_top(), Some(Overlay::Report(_))),
         "and the report is back rather than a second question: {:?}",
-        model.overlay
+        model.overlay_top()
     );
 }
 
@@ -985,7 +986,7 @@ fn the_delete_confirmation_still_carries_the_messages_it_captured() {
     // reload arriving while it is up cannot move the target.
     let mut model = loaded();
     press(&mut model, Key::Char('d'));
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Confirm {
             then: Confirmed::Delete(ids),
             ..
@@ -1194,4 +1195,75 @@ fn a_report_survives_a_terminal_too_small_to_draw_it() {
     // on a zero-width rectangle, and every overlay here is expected to clamp
     // rather than to be given a terminal that fits.
     assert_eq!(draw(&model, 8, 4).len(), 4);
+}
+
+// ---------------------------------------------------------------------------
+// the overlay stack, report half (task 108) — the confirm-carries-a-report
+// interaction this module already owns (see `enter_on_a_mutating_row_asks_
+// first_and_y_runs_it` above) is exactly where the stack's restore-on-Esc
+// primitive needed to be right, not merely convenient, once a stack deeper
+// than one is reachable.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn esc_on_a_confirm_restores_the_report_underneath_without_clobbering_a_deeper_layer() {
+    // Regression: `leave()` used to put the carried report back with
+    // `set_overlay` (replace-whatever-is-now-on-top), which only looked
+    // correct because every reachable pre-108 state was at most one overlay
+    // deep — the state every *existing* call site still produces (they all
+    // migrated to `set_overlay`, not `push_overlay`, to preserve exactly
+    // that). The moment a real `push_overlay` call site stacks a confirm
+    // over something else (tui.md §2.2.2's own "confirm over picker over
+    // collection"), replacing the top on the way back out would silently
+    // clobber whatever that something was instead of leaving it where
+    // popping the confirm already put it. `restore_overlay` (push back
+    // exactly what was popped) is the fix.
+    //
+    // Driven through the real `Esc` key (not a direct `pop_overlay` call),
+    // because the bug was in `leave()`'s own choice of primitive — a test
+    // that bypassed `leave()` could not have caught it, which is exactly
+    // what the first draft of this test did.
+    let mut model = loaded();
+    model.push_overlay(Overlay::Quick(QuickPane {
+        message_id: 10,
+        subject: "underneath".to_owned(),
+        cursor: 0,
+    }));
+    model.push_overlay(Overlay::Confirm {
+        prompt: "auth clear — run it? [y/N]".to_owned(),
+        then: Confirmed::Invoke {
+            invocation: Box::new(invocation("auth clear")),
+            over: Some(Box::new(ReportPane::new(
+                invocation("auth status"),
+                "auth status",
+                columns(),
+                0,
+            ))),
+        },
+    });
+    assert_eq!(model.overlays().len(), 2);
+
+    press(&mut model, Key::Esc);
+
+    assert_eq!(
+        model.overlays().len(),
+        2,
+        "the confirm pops and the report goes back on top — depth is \
+         restored to what it was, not left reduced to 1"
+    );
+    match model.overlay_top() {
+        Some(Overlay::Report(pane)) => {
+            assert_eq!(pane.invocation.verb, ["auth", "status"]);
+        }
+        other => panic!("expected the restored report on top, found {other:?}"),
+    }
+    match &model.overlays()[0] {
+        Overlay::Quick(pane) => {
+            assert_eq!(
+                pane.message_id, 10,
+                "the layer underneath survives untouched"
+            );
+        }
+        other => panic!("expected the quick menu still at the bottom, found {other:?}"),
+    }
 }

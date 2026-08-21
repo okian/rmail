@@ -141,7 +141,7 @@ fn with_arguments(verb: &rmail_core::command::Verb) -> String {
 }
 
 fn open_pane(model: &Model) -> &crate::tui::report::ReportPane {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Report(pane)) => pane,
         other => panic!("expected a report, found {other:?}"),
     }
@@ -812,7 +812,7 @@ fn a_fact_verb_says_so_on_the_status_line_and_counts_as_work() {
     let mut model = loaded();
     let cmds = issued(&run(&mut model, "ai retry"));
     assert_eq!(cmds, vec![Cmd::AiRetry]);
-    assert!(model.overlay.is_none(), "no report for a one-line answer");
+    assert!(!model.overlay_is_open(), "no report for a one-line answer");
     assert!(model.status.contains("retrying"), "{}", model.status);
     assert_eq!(
         model.inflight, 1,
@@ -865,7 +865,7 @@ fn a_flag_on_a_daemon_verb_reaches_it_through_the_real_dispatch_not_just_answer(
 fn a_verb_given_more_arguments_than_it_declares_is_refused() {
     let mut model = loaded();
     run(&mut model, "index entities email phone");
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => {
             let why = pane.error.clone().unwrap_or_default();
             assert!(why.contains("1 argument"), "{why}");
@@ -882,7 +882,7 @@ fn rebuild_asks_first_and_answering_yes_runs_it_once() {
         cmds.is_empty(),
         "nothing is sent until it is answered: {cmds:?}"
     );
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Confirm { prompt, then }) => {
             assert!(prompt.contains("rebuild"), "{prompt}");
             match then {
@@ -904,7 +904,7 @@ fn rebuild_asks_first_and_answering_yes_runs_it_once() {
         matches!(cmds.first(), Some(Cmd::IndexRebuild { .. })),
         "{cmds:?}"
     );
-    assert!(matches!(model.overlay, Some(Overlay::Report(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Report(_))));
 }
 
 #[test]
@@ -913,7 +913,7 @@ fn declining_rebuild_runs_nothing_and_leaves_no_report() {
     run(&mut model, "index rebuild");
     let cmds = update(&mut model, Msg::Key(Key::Char('n')));
     assert!(cmds.is_empty());
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 }
 
 #[test]
@@ -924,7 +924,7 @@ fn a_banged_rebuild_starts_without_asking() {
         matches!(cmds.first(), Some(Cmd::IndexRebuild { .. })),
         "{cmds:?}"
     );
-    assert!(matches!(model.overlay, Some(Overlay::Report(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Report(_))));
 }
 
 #[test]
@@ -938,7 +938,7 @@ fn re_running_a_report_that_asked_does_not_ask_again() {
         matches!(cmds.first(), Some(Cmd::IndexRebuild { .. })),
         "{cmds:?}"
     );
-    assert!(matches!(model.overlay, Some(Overlay::Report(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Report(_))));
 }
 
 #[test]
@@ -953,7 +953,7 @@ fn a_refusal_reaches_the_command_line_rather_than_being_swallowed() {
     // issued.
     let cmds = issued(&update(&mut model, Msg::Key(Key::Enter)));
     assert!(cmds.is_empty(), "{cmds:?}");
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => {
             let why = pane.error.clone().unwrap_or_default();
             assert!(why.contains("account"), "{why}");
@@ -1279,7 +1279,7 @@ fn a_banged_draft_delete_deletes_without_asking() {
     let mut model = loaded();
     let cmds = issued(&run(&mut model, "draft delete 5!"));
     assert_eq!(cmds, vec![Cmd::DraftDelete { draft_id: 5 }]);
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 }
 
 #[test]

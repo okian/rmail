@@ -630,7 +630,7 @@ fn a_block_opens_a_report_and_is_remembered_for_toml() {
     let mut model = loaded();
     let cmds = run(&mut model, "hook add on_move --name=x --command=/bin/y");
     assert!(cmds.is_empty(), "a block reaches no daemon: {cmds:?}");
-    let Some(Overlay::Report(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Report(pane)) = model.overlay_top() else {
         panic!("expected a report");
     };
     // Complete on arrival: nothing is outstanding, so a border reading "asking…"
@@ -745,7 +745,7 @@ fn the_live_feed_never_completes_and_a_closed_stream_is_a_failure() {
             },
         },
     );
-    let Some(Overlay::Report(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Report(pane)) = model.overlay_top() else {
         panic!("expected a report");
     };
     assert_eq!(pane.rows.len(), 1);

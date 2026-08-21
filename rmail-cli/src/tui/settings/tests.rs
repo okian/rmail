@@ -457,7 +457,7 @@ fn the_verb_opens_a_named_section_and_refuses_one_it_does_not_have() {
     press(&mut model, Key::Enter);
     // Left open with the offending word still there to fix, the way `:set`'s
     // complaint is.
-    let why = match model.overlay.as_ref() {
+    let why = match model.overlay_top() {
         Some(Overlay::Command(pane)) => pane.error.clone().unwrap_or_default(),
         other => panic!("expected the command line to stay open: {other:?}"),
     };
@@ -508,9 +508,9 @@ fn a_field_cannot_skip_a_confirmation_its_verb_asks_for() {
         "nothing runs until the question is answered"
     );
     assert!(
-        matches!(model.overlay, Some(Overlay::Confirm { .. })),
+        matches!(model.overlay_top(), Some(Overlay::Confirm { .. })),
         "{:?}",
-        model.overlay
+        model.overlay_top()
     );
 }
 
@@ -520,7 +520,7 @@ fn a_text_field_puts_the_verb_on_the_command_line() {
     open(&mut model);
     assert!(go_to(&mut model, "add an account"));
     press(&mut model, Key::Enter);
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => assert_eq!(pane.input, "account add "),
         other => panic!("expected a prefilled command line: {other:?}"),
     }
@@ -611,7 +611,7 @@ fn the_settings_layer_does_not_reach_the_list_behind_it() {
     );
     let cmds = press(&mut model, Key::Char('d'));
     assert!(cmds.is_empty(), "{cmds:?}");
-    assert!(model.overlay.is_none(), "no delete question was asked");
+    assert!(!model.overlay_is_open(), "no delete question was asked");
 }
 
 #[test]
@@ -625,9 +625,9 @@ fn s_from_a_report_opens_it_and_takes_the_report_down() {
         press(&mut model, Key::Char(c));
     }
     press(&mut model, Key::Enter);
-    assert!(matches!(model.overlay, Some(Overlay::Report(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Report(_))));
     let cmds = press(&mut model, Key::Char('s'));
-    assert!(model.overlay.is_none(), "the report went down");
+    assert!(!model.overlay_is_open(), "the report went down");
     assert_eq!(model.screen, Screen::Settings);
     assert!(
         cmds.iter()

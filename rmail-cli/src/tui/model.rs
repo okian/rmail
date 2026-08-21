@@ -115,6 +115,25 @@ pub const MAX_UNDO_TOAST: i64 = 120;
 /// there are several.
 const MAX_TOASTS: usize = 5;
 
+/// The most overlays [`Model::overlay_stack`] holds at once — tui.md
+/// §2.2.2's example is confirm-over-picker-over-collection, three deep.
+/// [`Model::push_overlay`] refuses a fourth outright rather than evicting
+/// the oldest: silently closing something the user still has open to make
+/// room for something new is a worse surprise than the new thing refusing
+/// to open.
+///
+/// Read only inside [`Model::push_overlay`], which no *existing* call site
+/// in this build reaches yet (every current "open an overlay" site goes
+/// through [`Model::set_overlay`], which preserves the pre-108 single-slot
+/// behavior exactly — see its own docs) — so both this constant and
+/// `push_overlay` are `#[allow(dead_code)]` in the non-test binary target,
+/// proven live instead by `push_overlay`'s own tests in
+/// `tui::overlays::tests`. The declared-shape-a-future-task-consumes
+/// pattern task 92 already established for `Toast::Completion`/
+/// `Toast::Priority`, not a stub.
+#[allow(dead_code)]
+pub const MAX_OVERLAY_DEPTH: usize = 3;
+
 /// `:set folder-width`/`:set preview-width`'s allowed range, each. Below 10
 /// a column cannot hold a folder name or a subject line; above 60 the pane
 /// declaring it stops being one of several and starts being the screen.
@@ -2405,8 +2424,22 @@ pub struct Model {
     /// Outside [`Model::settings`] because it outlives the screen — which is the
     /// same reason `rule_draft` and `block` are session state.
     last_settings_section: Option<settings::Section>,
-    /// The modal layer, if any.
-    pub overlay: Option<Overlay>,
+    /// The modal layer(s), innermost (topmost, the one receiving key input)
+    /// last — a stack rather than a single slot (tui.md §2.2.2), so a
+    /// confirm can be asked *over* a picker without discarding it. Capped at
+    /// [`MAX_OVERLAY_DEPTH`].
+    ///
+    /// Private rather than `pub`, unlike most of this struct: every other
+    /// field is data a view or a test reasonably wants to set up directly,
+    /// but this one has an invariant (the depth cap) that a bare `Vec`
+    /// cannot enforce on its own — a `model.overlay_stack.push(..)` reaching
+    /// in from outside this module would walk straight past
+    /// [`Model::push_overlay`]'s refusal. Read via [`Model::overlays`]/
+    /// [`Model::overlay_top`]/[`Model::overlay_top_mut`]; write via
+    /// [`Model::push_overlay`]/[`Model::pop_overlay`]/[`Model::set_overlay`]/
+    /// [`Model::restore_overlay`] — every one of those lives in this module
+    /// specifically so the cap has exactly one gate to reason about.
+    overlay_stack: Vec<Overlay>,
     /// Whether the collapsible AI panel is showing.
     pub ai_panel: bool,
     /// The analysis the AI panel is showing, if it has arrived.
@@ -2552,7 +2585,7 @@ impl Model {
             manual: None,
             settings: None,
             last_settings_section: None,
-            overlay: None,
+            overlay_stack: Vec::new(),
             ai_panel: false,
             summary: None,
             summary_for: None,
@@ -2638,7 +2671,7 @@ impl Model {
     /// of bug where a modal closes and the keyboard stays trapped in it.
     #[must_use]
     pub fn mode(&self) -> Mode {
-        match &self.overlay {
+        match self.overlay_top() {
             Some(Overlay::Pick { .. }) => Mode::Pick,
             Some(Overlay::Confirm { .. }) => Mode::Confirm,
             Some(Overlay::Input { .. }) => Mode::Insert,
@@ -2755,6 +2788,141 @@ impl Model {
     fn fail(&mut self, text: impl Into<String>) {
         self.status = text.into();
         self.level = Level::Error;
+    }
+
+    /// Push a new overlay on top of the stack — the only way one should be
+    /// opened outside this module (§2.2.2). Refused, with a status-line
+    /// explanation rather than a silent no-op or an eviction, once
+    /// [`MAX_OVERLAY_DEPTH`] is reached; the caller that asked for the new
+    /// overlay simply does not get it, exactly like [`bulk_targets`]'s
+    /// [`MAX_BULK`] refusal refuses rather than truncates.
+    ///
+    /// `#[allow(dead_code)]` for the same reason [`MAX_OVERLAY_DEPTH`]
+    /// carries it — see that constant's docs.
+    ///
+    /// # A known gap for whoever writes the first real call site
+    ///
+    /// `dispatch`'s `Msg::{Search,Finder,Ask,Reply,Report,Form,Explained,
+    /// Outbox}` arms all route their streamed events through
+    /// `overlay_top_mut()` — the *topmost* matching overlay only. Push a
+    /// second overlay over one that owns a live stream and every event for
+    /// the one underneath is silently dropped on the floor until it is
+    /// popped back to the top. Nothing reachable today does this (every
+    /// pre-108 call site still opens overlays via `set_overlay`, which never
+    /// leaves two stacked), so it has not needed fixing yet — but the first
+    /// call site that genuinely pushes over something with a stream open
+    /// will need those arms changed to search the whole stack
+    /// (`overlay_stack.iter_mut().rev().find_map(..)`) for the matching
+    /// variant, not just look at the top.
+    #[allow(dead_code)]
+    pub fn push_overlay(&mut self, overlay: Overlay) {
+        if self.overlay_stack.len() >= MAX_OVERLAY_DEPTH {
+            self.fail(format!(
+                "{MAX_OVERLAY_DEPTH} overlays already open — close one first"
+            ));
+            return;
+        }
+        self.overlay_stack.push(overlay);
+    }
+
+    /// Pop and return the topmost overlay, if any — the stack's half of
+    /// [`Model::push_overlay`], and the Esc ladder's step 2 (task 115).
+    pub fn pop_overlay(&mut self) -> Option<Overlay> {
+        self.overlay_stack.pop()
+    }
+
+    /// Close every open overlay, bottom to top, and return what was cleared
+    /// in that order — for the handful of call sites that are about to show
+    /// something (a different screen, a different mode's action) which *no*
+    /// overlay may be left covering, not "close the one thing that is
+    /// currently on top." `pop_overlay` is the wrong primitive for those:
+    /// it only reaches the topmost layer, and every one of these call sites
+    /// predates this task's stack entirely — their own doc comments (e.g.
+    /// [`open_manual_at`]'s "the manual is a screen, so an overlay left up
+    /// would cover the thing the caller just asked to show") state the
+    /// invariant as "no overlay," not "one fewer overlay."
+    ///
+    /// Returns the cleared overlays so a caller that needs to cancel their
+    /// streams can do so for all of them — `over.iter().flat_map(cancels)`
+    /// — rather than only the one `pop_overlay` would have reached.
+    pub(crate) fn clear_overlays(&mut self) -> Vec<Overlay> {
+        std::mem::take(&mut self.overlay_stack)
+    }
+
+    /// Push `overlay` back exactly where [`Model::pop_overlay`] took it
+    /// from — for the "pop, inspect, and put back if it wasn't a match"
+    /// idiom several call sites use (e.g. answering a `Pick`/`Confirm`/
+    /// `Input` overlay when the popped value turns out to be a different
+    /// variant). A no-op on `None` so callers can pass a `pop_overlay()`
+    /// result straight through without an extra `if let`.
+    pub(crate) fn restore_overlay(&mut self, overlay: Option<Overlay>) {
+        if let Some(overlay) = overlay {
+            // Deliberately *not* `push_overlay`: this is undoing a pop that
+            // already happened, not opening something new, so it must
+            // never trip the depth refusal — the stack was never over
+            // capacity a moment ago and restoring what was just removed
+            // from it cannot make it so. Asserted, not just claimed: every
+            // real caller passes through a value `pop_overlay` (or a
+            // decrement of one) just handed back, so this can only fire if
+            // a future caller starts using `restore_overlay` to push
+            // something that was never popped from a stack this size.
+            debug_assert!(
+                self.overlay_stack.len() < MAX_OVERLAY_DEPTH,
+                "restore_overlay should only ever put back what pop_overlay just removed"
+            );
+            self.overlay_stack.push(overlay);
+        }
+    }
+
+    /// Replace the topmost overlay with `overlay`, or open it fresh if
+    /// nothing is open — every call site this migrates from the old
+    /// `Model.overlay: Option<Overlay>` field's `= Some(x)` assignment,
+    /// which always unconditionally replaced whatever was there. This is
+    /// the compatibility shim that makes that translation exact rather than
+    /// a behavior change: none of those call sites decided to *stack* a new
+    /// overlay over an existing one (the type could not express that), so
+    /// none of them should start doing so just because the storage
+    /// underneath became a `Vec`.
+    ///
+    /// A call site that *does* want real stacking (opening a genuinely new
+    /// layer over what is already showing — tui.md §2.2.2's confirm-over-
+    /// picker) should call [`Model::push_overlay`] directly instead; this
+    /// method exists for the sites that were always "the current one",
+    /// never "one more".
+    pub(crate) fn set_overlay(&mut self, overlay: Overlay) {
+        match self.overlay_stack.last_mut() {
+            Some(top) => *top = overlay,
+            None => self.overlay_stack.push(overlay),
+        }
+    }
+
+    /// Every open overlay, outermost (bottom) first — [`view::render`]'s own
+    /// read of the stack for back-to-front drawing (§2.2.2), and the general
+    /// escape hatch for anything else that needs to look at more than the
+    /// top without gaining write access.
+    #[must_use]
+    pub fn overlays(&self) -> &[Overlay] {
+        &self.overlay_stack
+    }
+
+    /// The topmost overlay — the only one that receives key input. Lower
+    /// ones (if any) are visually present but inert; nothing in this module
+    /// dispatches a keypress to them.
+    #[must_use]
+    pub fn overlay_top(&self) -> Option<&Overlay> {
+        self.overlay_stack.last()
+    }
+
+    /// Mutable access to the topmost overlay — the write half of
+    /// [`Model::overlay_top`].
+    pub fn overlay_top_mut(&mut self) -> Option<&mut Overlay> {
+        self.overlay_stack.last_mut()
+    }
+
+    /// Whether any overlay is open at all.
+    #[must_use]
+    pub fn overlay_is_open(&self) -> bool {
+        !self.overlay_stack.is_empty()
     }
 
     /// Keep both cursors — and a visual selection's anchor — inside their
@@ -3073,7 +3241,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Search { generation, event } => {
             let mut note = None;
-            if let Some(Overlay::Search(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Search(pane)) = model.overlay_top_mut() {
                 match event {
                     SearchEvent::Hit(hit) => pane.push_hit(generation, *hit),
                     SearchEvent::Done(result) if generation == pane.generation => {
@@ -3097,7 +3265,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Finder { generation, event } => {
             let mut note = None;
-            if let Some(Overlay::Finder(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Finder(pane)) = model.overlay_top_mut() {
                 match event {
                     FinderEvent::Batch {
                         items,
@@ -3125,7 +3293,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Ask { generation, event } => {
             let mut note = None;
-            if let Some(Overlay::Ask(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Ask(pane)) = model.overlay_top_mut() {
                 if generation == pane.generation {
                     match event {
                         AskEvent::Trace(trace) => pane.trace = Some(trace),
@@ -3181,7 +3349,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Reply { generation, event } => {
             let mut note = None;
-            if let Some(Overlay::Reply(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Reply(pane)) = model.overlay_top_mut() {
                 if generation == pane.generation {
                     match event {
                         ReplyEvent::Context(context) => pane.context = Some(context),
@@ -3228,7 +3396,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Report { generation, event } => {
             let mut note = None;
-            if let Some(Overlay::Report(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Report(pane)) = model.overlay_top_mut() {
                 match event {
                     ReportEvent::Frame {
                         fill,
@@ -3253,7 +3421,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Form { generation, event } => {
             let mut note = None;
-            if let Some(Overlay::Form(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Form(pane)) = model.overlay_top_mut() {
                 match event {
                     FormEvent::Fields(values) => {
                         if pane.fill(generation, &values) {
@@ -3276,7 +3444,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Explained { message_id, result } => {
             let mut note = None;
-            if let Some(Overlay::Search(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Search(pane)) = model.overlay_top_mut() {
                 if pane.explaining == Some(message_id) {
                     pane.explaining = None;
                     match result {
@@ -3331,7 +3499,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             let rows = match result {
                 Ok(rows) => rows,
                 Err(error) => {
-                    if let Some(Overlay::Outbox(pane)) = model.overlay.as_mut() {
+                    if let Some(Overlay::Outbox(pane)) = model.overlay_top_mut() {
                         pane.loading = false;
                         // The rows already listed stay. A cancel reports
                         // through this message too, and a refused cancel
@@ -3343,7 +3511,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                     return Vec::new();
                 }
             };
-            if let Some(Overlay::Outbox(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Outbox(pane)) = model.overlay_top_mut() {
                 pane.loading = false;
                 pane.error = None;
                 pane.rows.clone_from(&rows);
@@ -3380,7 +3548,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
 /// overlay. `Ok` is [`Model::info`], `Err` is [`Model::fail`].
 ///
 /// The indirection exists because those two take the whole model and the arms
-/// above are inside `model.overlay.as_mut()`; deciding the text there and
+/// above are inside `model.overlay_top_mut()`; deciding the text there and
 /// applying it here is the difference between one borrow and a fight with the
 /// borrow checker in every arm.
 type Note = Option<Result<String, String>>;
@@ -3497,7 +3665,7 @@ fn follow_cursor(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn explain_current(model: &mut Model) -> Vec<Cmd> {
-    let Some(Overlay::Search(pane)) = model.overlay.as_mut() else {
+    let Some(Overlay::Search(pane)) = model.overlay_top_mut() else {
         return Vec::new();
     };
     if !pane.explain {
@@ -3535,7 +3703,7 @@ fn summarize_current(model: &mut Model) -> Vec<Cmd> {
     // Only what the overlays leave alone: a panel that chased the highlighted
     // *search hit* as well would be a second cursor to reason about, and the
     // why-panel already covers "tell me about this hit".
-    if model.overlay.is_some() {
+    if model.overlay_is_open() {
         return Vec::new();
     }
     let Some(message_id) = target_message(model) else {
@@ -3686,7 +3854,7 @@ fn edit_prompt(model: &mut Model, edit: TextEdit) -> Vec<Cmd> {
         apply_edit(&mut prompt.pattern, edit);
         return Vec::new();
     }
-    let typed = match model.overlay.as_mut() {
+    let typed = match model.overlay_top_mut() {
         Some(Overlay::Input { buffer, .. }) => {
             apply_edit(buffer, edit);
             Typed::Nothing
@@ -3917,7 +4085,7 @@ enum Cursor {
 }
 
 fn active_cursor(model: &Model) -> Option<Cursor> {
-    match &model.overlay {
+    match model.overlay_top() {
         Some(Overlay::Pick { .. }) => Some(Cursor::Pick),
         Some(overlay) if overlay.list_cursor().is_some() => Some(Cursor::Overlay),
         // A confirm or a prompt has nothing to scroll, and must not scroll
@@ -3941,11 +4109,11 @@ fn active_cursor(model: &Model) -> Option<Cursor> {
 /// sit on at all.
 fn cursor_span(model: &Model, cursor: Cursor) -> Option<(usize, usize)> {
     let (idx, len) = match cursor {
-        Cursor::Pick => match &model.overlay {
+        Cursor::Pick => match model.overlay_top() {
             Some(Overlay::Pick { idx, .. }) => (*idx, model.folders.len()),
             _ => return None,
         },
-        Cursor::Overlay => model.overlay.as_ref()?.list_cursor()?,
+        Cursor::Overlay => model.overlay_top()?.list_cursor()?,
         Cursor::Scroll => (
             model.scroll,
             model.open.as_ref().map_or(0, |open| open.body.len()),
@@ -3980,12 +4148,12 @@ fn manual_doc(model: &Model) -> Option<manual::Doc> {
 fn set_cursor(model: &mut Model, cursor: Cursor, at: usize) {
     match cursor {
         Cursor::Pick => {
-            if let Some(Overlay::Pick { idx, .. }) = model.overlay.as_mut() {
+            if let Some(Overlay::Pick { idx, .. }) = model.overlay_top_mut() {
                 *idx = at;
             }
         }
         Cursor::Overlay => {
-            if let Some(overlay) = model.overlay.as_mut() {
+            if let Some(overlay) = model.overlay_top_mut() {
                 overlay.set_list_cursor(at);
             }
         }
@@ -4150,13 +4318,13 @@ fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
     // is inside the manual: `<esc>` puts the value back and leaves the form up.
     // Ahead of the take below, because taking the overlay first would close the
     // whole form to cancel one field.
-    if let Some(Overlay::Form(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Form(pane)) = model.overlay_top_mut() {
         if pane.cancel_edit() {
             model.info("cancelled");
             return Vec::new();
         }
     }
-    if let Some(overlay) = model.overlay.take() {
+    if let Some(overlay) = model.pop_overlay() {
         // The help screen was not collecting anything, so "cancelled" would
         // be a lie; the others were. Half true since task 102: browsing it
         // still collects nothing, but a half-typed filter is exactly the
@@ -4173,6 +4341,14 @@ fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
         // dropping two layers for one `n`: declining the question is not
         // asking to leave the screen it was asked on, and the report's own
         // stream is still the one running.
+        //
+        // `restore_overlay`, not `set_overlay`: this is putting back what
+        // was just popped, not opening something new. The distinction is
+        // not academic — `set_overlay` replaces whatever is *now* on top,
+        // so if the confirm had itself been pushed over a third layer
+        // (§2.2.2's own "confirm over picker over collection"), `set_overlay`
+        // would silently clobber that third layer with the restored report
+        // instead of leaving it where popping the confirm already put it.
         if let Overlay::Confirm {
             then: Confirmed::Invoke {
                 over: Some(over), ..
@@ -4180,7 +4356,7 @@ fn leave(model: &mut Model, then: Leave) -> Vec<Cmd> {
             ..
         } = overlay
         {
-            model.overlay = Some(Overlay::Report(over));
+            model.restore_overlay(Some(Overlay::Report(over)));
         }
         return stop;
     }
@@ -4377,14 +4553,14 @@ fn accept_pick(model: &mut Model) -> Vec<Cmd> {
     // actions are bindable in any mode, and `pick.accept` bound somewhere it
     // does not belong should do nothing, not silently close the overlay that
     // happens to be up.
-    let (what, message_ids, idx) = match model.overlay.take() {
+    let (what, message_ids, idx) = match model.pop_overlay() {
         Some(Overlay::Pick {
             what,
             message_ids,
             idx,
         }) => (what, message_ids, idx),
         other => {
-            model.overlay = other;
+            model.restore_overlay(other);
             return Vec::new();
         }
     };
@@ -4410,10 +4586,10 @@ fn accept_pick(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn accept_confirm(model: &mut Model) -> Vec<Cmd> {
-    let then = match model.overlay.take() {
+    let then = match model.pop_overlay() {
         Some(Overlay::Confirm { then, .. }) => then,
         other => {
-            model.overlay = other;
+            model.restore_overlay(other);
             return Vec::new();
         }
     };
@@ -4436,13 +4612,13 @@ fn submit(model: &mut Model) -> Vec<Cmd> {
     // `<enter>` closes the field it opened and leaves the form up. Not an
     // apply: the form is several fields and committing on the first `<enter>`
     // would make filling in the second one impossible.
-    if let Some(Overlay::Form(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Form(pane)) = model.overlay_top_mut() {
         if pane.editing.is_some() {
             pane.commit();
             return Vec::new();
         }
     }
-    let (buffer, what, message_id) = match model.overlay.take() {
+    let (buffer, what, message_id) = match model.pop_overlay() {
         Some(Overlay::Input {
             buffer,
             what,
@@ -4450,7 +4626,7 @@ fn submit(model: &mut Model) -> Vec<Cmd> {
             ..
         }) => (buffer, what, message_id),
         other => {
-            model.overlay = other;
+            model.restore_overlay(other);
             return Vec::new();
         }
     };
@@ -4565,7 +4741,7 @@ fn confirm_delete(model: &mut Model) -> Vec<Cmd> {
         )
     };
     model.visual = None;
-    model.overlay = Some(Overlay::Confirm {
+    model.set_overlay(Overlay::Confirm {
         prompt,
         then: Confirmed::Delete(ids),
     });
@@ -4620,7 +4796,7 @@ fn pick(model: &mut Model, what: PickFor) -> Vec<Cmd> {
         return Vec::new();
     };
     model.visual = None;
-    model.overlay = Some(Overlay::Pick {
+    model.set_overlay(Overlay::Pick {
         what,
         message_ids: ids,
         idx: 0,
@@ -4647,7 +4823,7 @@ fn start_ai_reply(model: &mut Model, intent: String, reply_all: bool) -> Vec<Cmd
     };
     model.generation += 1;
     let generation = model.generation;
-    model.overlay = Some(Overlay::Reply(Box::new(ReplyPane {
+    model.set_overlay(Overlay::Reply(Box::new(ReplyPane {
         message_id,
         generation,
         ..ReplyPane::default()
@@ -4680,7 +4856,7 @@ fn forward(model: &mut Model) -> Vec<Cmd> {
     let Some(message_id) = single_target(model) else {
         return Vec::new();
     };
-    model.overlay = Some(Overlay::Input {
+    model.set_overlay(Overlay::Input {
         prompt: "forward to".to_owned(),
         buffer: String::new(),
         what: InputFor::ForwardTo,
@@ -4735,7 +4911,7 @@ fn open_html(model: &mut Model) -> Vec<Cmd> {
 /// `?` — the key reference, at whichever mode is current.
 fn open_help(model: &mut Model) -> Vec<Cmd> {
     let mode = model.mode();
-    model.overlay = Some(Overlay::Help(Box::new(HelpPane::new(mode, &model.keymap))));
+    model.set_overlay(Overlay::Help(Box::new(HelpPane::new(mode, &model.keymap))));
     Vec::new()
 }
 
@@ -4744,14 +4920,14 @@ fn open_help(model: &mut Model) -> Vec<Cmd> {
 ///
 /// The two-step borrow `refresh_command` also uses: [`help::rows`] wants
 /// `&Keymap` and the pane's own `mode`/`filter` at once, which a single
-/// `model.overlay.as_mut()` cannot offer alongside `&model.keymap` borrowed
+/// `model.overlay_top_mut()` cannot offer alongside `&model.keymap` borrowed
 /// at the same time.
 fn refresh_help(model: &mut Model) {
-    let Some(Overlay::Help(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Help(pane)) = model.overlay_top() else {
         return;
     };
     let rows = help::rows(pane.mode, &pane.filter, &model.keymap);
-    if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Help(pane)) = model.overlay_top_mut() {
         pane.rows = rows;
         // Reset rather than clamped: a mode switch or a filter edit changes
         // *what* is at every index, not just how many, so whatever survived
@@ -4778,11 +4954,11 @@ fn refresh_help(model: &mut Model) {
 /// underneath, the same trade every other list here makes — and if the
 /// list shrank past the old index, it clamps to the new last row.
 fn reload_help(model: &mut Model) {
-    let Some(Overlay::Help(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Help(pane)) = model.overlay_top() else {
         return;
     };
     let rows = help::rows(pane.mode, &pane.filter, &model.keymap);
-    if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Help(pane)) = model.overlay_top_mut() {
         pane.rows = rows;
         let count = help::binding_count(pane);
         pane.cursor = pane.cursor.min(count.saturating_sub(1));
@@ -4797,7 +4973,7 @@ fn reload_help(model: &mut Model) {
 /// own — the collision `keymap::mod`'s defaults document, and the same
 /// answer `open_search` already gives the sibling collision on `/`.
 fn cycle_help_mode(model: &mut Model, jump: Jump) -> Vec<Cmd> {
-    let Some(Overlay::Help(pane)) = model.overlay.as_mut() else {
+    let Some(Overlay::Help(pane)) = model.overlay_top_mut() else {
         return Vec::new();
     };
     let modes = Mode::CONFIGURABLE;
@@ -4819,7 +4995,7 @@ fn cycle_help_mode(model: &mut Model, jump: Jump) -> Vec<Cmd> {
 /// set`'s own default is `normal`, so a row from that mode's own chain does
 /// not need `--mode normal` to say what is already true.
 fn open_help_rebind(model: &mut Model) -> Vec<Cmd> {
-    let Some(Overlay::Help(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Help(pane)) = model.overlay_top() else {
         return Vec::new();
     };
     let Some(action) = help::selected(pane) else {
@@ -4864,7 +5040,7 @@ fn open_help_rebind(model: &mut Model) -> Vec<Cmd> {
         format!(" --mode={}", owner.id())
     };
     let input = format!("keys set {chord} {}{mode_flag}", action.id());
-    model.overlay = Some(Overlay::Command(Box::new(CommandPane {
+    model.set_overlay(Overlay::Command(Box::new(CommandPane {
         input,
         ..CommandPane::default()
     })));
@@ -4896,7 +5072,7 @@ fn owning_mode(keymap: &Keymap, browsing: Mode, action: Action, chord: &Chord) -
 /// `K` — the manual, at its front page, or — from the key reference (task
 /// 102) — at the page documenting the highlighted row.
 fn open_manual(model: &mut Model) -> Vec<Cmd> {
-    if let Some(Overlay::Help(pane)) = model.overlay.as_ref() {
+    if let Some(Overlay::Help(pane)) = model.overlay_top() {
         if let Some(action) = help::selected(pane) {
             return open_manual_at(model, action.id());
         }
@@ -4936,12 +5112,13 @@ pub fn open_manual_at(model: &mut Model, name: &str) -> Vec<Cmd> {
         model.fail(format!("this build has no manual page called {name:?}"));
         return Vec::new();
     };
-    // The manual is a *screen*, so an overlay left up would cover the thing
-    // the caller just asked to show. Taking it also stops whatever it was
-    // streaming, which is `leave`'s rule for closing one.
-    let stop = model.overlay.take().map(|overlay| cancels(&overlay));
+    // The manual is a *screen*, so any overlay left up would cover the thing
+    // the caller just asked to show — every one of them, not just the top,
+    // so this clears the whole stack rather than popping one. Clearing also
+    // stops whatever each was streaming.
+    let stop: Vec<Cmd> = model.clear_overlays().iter().flat_map(cancels).collect();
     let mut cmds = enter_manual(model, manual::Location::Page(anchor.to_owned()));
-    cmds.extend(stop.unwrap_or_default());
+    cmds.extend(stop);
     cmds
 }
 
@@ -4998,7 +5175,7 @@ fn manual_jump(model: &mut Model, jump: Jump) -> Vec<Cmd> {
     // `<c-o>` are this layer's manual-jump bindings, made context-sensitive
     // here rather than given a binding of their own — the same collision
     // `open_search` already resolves for the sibling `/`.
-    if matches!(model.overlay, Some(Overlay::Help(_))) {
+    if matches!(model.overlay_top(), Some(Overlay::Help(_))) {
         return cycle_help_mode(model, jump);
     }
     let Some(manual) = model.manual.as_mut() else {
@@ -5024,7 +5201,7 @@ fn open_manual_grep(model: &mut Model) -> Vec<Cmd> {
     // path takes the modal down first instead — it was dispatched *by* one
     // (task 89's command line), which is a modal
     // asking to be replaced rather than one being talked over.
-    if model.overlay.is_some() {
+    if model.overlay_is_open() {
         return Vec::new();
     }
     open_manual_grep_for(model, "")
@@ -5039,7 +5216,7 @@ fn open_manual_grep(model: &mut Model) -> Vec<Cmd> {
 /// action path and task 89 calls it directly. A blank pattern raises the
 /// prompt rather than listing nothing, which is what a bare `:helpgrep` means.
 pub fn open_manual_grep_for(model: &mut Model, pattern: &str) -> Vec<Cmd> {
-    let stop = model.overlay.take().map(|overlay| cancels(&overlay));
+    let stop: Vec<Cmd> = model.clear_overlays().iter().flat_map(cancels).collect();
     // The front page first, so `<c-o>` from the hit list has somewhere to go
     // rather than the list being a dead end.
     if model.screen != Screen::Manual {
@@ -5051,7 +5228,7 @@ pub fn open_manual_grep_for(model: &mut Model, pattern: &str) -> Vec<Cmd> {
     } else {
         enter_manual(model, manual::Location::Grep(pattern.to_owned()))
     };
-    cmds.extend(stop.unwrap_or_default());
+    cmds.extend(stop);
     cmds
 }
 
@@ -5238,7 +5415,7 @@ fn follow_manual_link(model: &mut Model) -> Vec<Cmd> {
 /// back to its query line), and a stray press must never replace a pane that
 /// is holding a streamed answer or a half-typed question.
 fn screen_is_clear(model: &Model) -> bool {
-    model.overlay.is_none()
+    !model.overlay_is_open()
 }
 
 /// `/` — open the search overlay, or take an open one back to its query line.
@@ -5246,7 +5423,7 @@ fn open_search(model: &mut Model) -> Vec<Cmd> {
     // `/` means "search what is in front of me" in every layer that binds it.
     // On the manual that is this page: opening the mailbox search overlay
     // there would cover the text it was pressed to search.
-    if model.screen == Screen::Manual && model.overlay.is_none() {
+    if model.screen == Screen::Manual && !model.overlay_is_open() {
         return prompt_manual(model, Scope::Page);
     }
     // The key reference's own rows, task 102: `/` starts a live filter over
@@ -5254,18 +5431,18 @@ fn open_search(model: &mut Model) -> Vec<Cmd> {
     // line like every other key this overlay's own cursor and mode-cycling
     // already answer — a hint on every press of `/`, `<tab>` or `j` would be
     // noise none of Help's other in-place moves write either.
-    if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Help(pane)) = model.overlay_top_mut() {
         pane.editing = true;
         return Vec::new();
     }
-    if let Some(Overlay::Search(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Search(pane)) = model.overlay_top_mut() {
         pane.focus = SearchFocus::Query;
         return Vec::new();
     }
     if !screen_is_clear(model) {
         return Vec::new();
     }
-    model.overlay = Some(Overlay::Search(Box::default()));
+    model.set_overlay(Overlay::Search(Box::default()));
     model.info("search — ~ semantic · = lexical · Tab completes an operator · Enter walks results");
     Vec::new()
 }
@@ -5280,7 +5457,7 @@ fn search_now(model: &mut Model) -> Vec<Cmd> {
     model.generation += 1;
     let generation = model.generation;
     let account_id = model.current_account().map_or(0, |account| account.id);
-    let Some(Overlay::Search(pane)) = model.overlay.as_mut() else {
+    let Some(Overlay::Search(pane)) = model.overlay_top_mut() else {
         return Vec::new();
     };
     pane.restart(generation);
@@ -5310,7 +5487,7 @@ fn search_now(model: &mut Model) -> Vec<Cmd> {
 /// `Enter` on the query line: hand the keyboard to the results.
 fn focus_results(model: &mut Model) -> Vec<Cmd> {
     let mut note = None;
-    if let Some(Overlay::Search(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Search(pane)) = model.overlay_top_mut() {
         if pane.hits.is_empty() {
             note = Some(Err("no results to walk yet".to_owned()));
         } else {
@@ -5326,7 +5503,7 @@ fn focus_results(model: &mut Model) -> Vec<Cmd> {
 
 /// `x` — the why-panel.
 fn toggle_explain(model: &mut Model) -> Vec<Cmd> {
-    let Some(Overlay::Search(pane)) = model.overlay.as_mut() else {
+    let Some(Overlay::Search(pane)) = model.overlay_top_mut() else {
         return Vec::new();
     };
     pane.explain = !pane.explain;
@@ -5347,7 +5524,7 @@ fn toggle_explain(model: &mut Model) -> Vec<Cmd> {
 /// Replace whatever is on screen with a search for `query` and run it. The
 /// finder's jump targets that are not a message or a folder land here.
 fn search_for(model: &mut Model, query: String) -> Vec<Cmd> {
-    model.overlay = Some(Overlay::Search(Box::new(SearchPane {
+    model.set_overlay(Overlay::Search(Box::new(SearchPane {
         query,
         ..SearchPane::default()
     })));
@@ -5359,7 +5536,7 @@ fn open_finder(model: &mut Model) -> Vec<Cmd> {
     if !screen_is_clear(model) {
         return Vec::new();
     }
-    model.overlay = Some(Overlay::Finder(Box::default()));
+    model.set_overlay(Overlay::Finder(Box::default()));
     model.info("find — > commands · # tags · @ people · / saved searches · : folders");
     // Opened with an empty prompt on purpose: an empty finder query means
     // "rank by signals alone", which is the recents-and-frequents list a
@@ -5372,7 +5549,7 @@ fn find_now(model: &mut Model) -> Vec<Cmd> {
     model.generation += 1;
     let generation = model.generation;
     let account_id = model.current_account().map_or(0, |account| account.id);
-    let Some(Overlay::Finder(pane)) = model.overlay.as_mut() else {
+    let Some(Overlay::Finder(pane)) = model.overlay_top_mut() else {
         return Vec::new();
     };
     pane.restart(generation);
@@ -5391,7 +5568,7 @@ fn find_now(model: &mut Model) -> Vec<Cmd> {
 /// because `ref_id` is a row id in whichever table the kind names and those
 /// id spaces overlap (tag 7, mailbox 7 and message 7 all exist).
 fn activate_finder(model: &mut Model) -> Vec<Cmd> {
-    let item = match model.overlay.as_ref() {
+    let item = match model.overlay_top() {
         Some(Overlay::Finder(pane)) => pane.item().cloned(),
         _ => return Vec::new(),
     };
@@ -5402,7 +5579,7 @@ fn activate_finder(model: &mut Model) -> Vec<Cmd> {
     match item.kind {
         FinderKind::Message => open_message_by_id(model, item.ref_id),
         FinderKind::Mailbox => {
-            model.overlay = None;
+            model.clear_overlays();
             open_folder_by_id(model, item.ref_id)
         }
         // A saved search's second line *is* its query text; a tag and a
@@ -5430,19 +5607,18 @@ fn activate_finder(model: &mut Model) -> Vec<Cmd> {
 /// `:` — the command line. `Ctrl-K` opens the same overlay.
 fn open_command(model: &mut Model) -> Vec<Cmd> {
     // `:` is bound in `Menu` as well as `Normal`, so a list overlay is the
-    // one thing it may open *over* — and it replaces that overlay rather
-    // than stacking on it, taking whatever it was streaming down with it.
-    // The alternative reading, "refuse while anything is up", makes the
-    // binding dead in the layer it was deliberately added to; the reading
-    // after that, "restore the menu on Esc", is an overlay stack this model
-    // does not have and would leave a restored search pane holding results
-    // whose stream was cancelled. A modal that answers `:` is a modal asking
-    // to be replaced — the same call `open_manual_grep_for` makes when it is
-    // dispatched from one.
-    let stop = if model.mode() == Mode::Menu {
-        model.overlay.take().map(|overlay| cancels(&overlay))
+    // one thing it may open *over* — and it clears whatever is open rather
+    // than stacking on it (`clear_overlays`, not `push_overlay`), taking
+    // whatever any of it was streaming down too. The alternative, "restore
+    // the menu on Esc" (real now that task 108 gave `Model` an actual
+    // overlay stack), would leave a restored search pane holding results
+    // whose stream was already cancelled — worse than the pane just being
+    // gone. A modal that answers `:` is a modal asking to be replaced — the
+    // same call `open_manual_grep_for` makes when it is dispatched from one.
+    let stop: Vec<Cmd> = if model.mode() == Mode::Menu {
+        model.clear_overlays().iter().flat_map(cancels).collect()
     } else if screen_is_clear(model) {
-        None
+        Vec::new()
     } else {
         return Vec::new();
     };
@@ -5460,24 +5636,24 @@ fn open_command(model: &mut Model) -> Vec<Cmd> {
     } else {
         String::new()
     };
-    model.overlay = Some(Overlay::Command(Box::new(CommandPane {
+    model.set_overlay(Overlay::Command(Box::new(CommandPane {
         input,
         ..CommandPane::default()
     })));
     refresh_command(model);
     model.info("command — type a verb, Enter runs it, Tab completes");
-    stop.unwrap_or_default()
+    stop
 }
 
 /// The range prefix a `:` opened over a visual selection starts with.
 const SELECTION_RANGE: &str = "'<,'>";
 
 fn refresh_command(model: &mut Model) {
-    let Some(Overlay::Command(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Command(pane)) = model.overlay_top() else {
         return;
     };
     let matches = command_matches(&pane.input.clone(), &model.keymap);
-    if let Some(Overlay::Command(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Command(pane)) = model.overlay_top_mut() {
         pane.matches = matches;
     }
 }
@@ -5498,7 +5674,7 @@ fn refresh_command(model: &mut Model) {
 /// the verb inside it happened to rank first would be a keystroke doing what
 /// nobody asked.
 fn submit_command(model: &mut Model) -> Vec<Cmd> {
-    let Some(Overlay::Command(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Command(pane)) = model.overlay_top() else {
         return Vec::new();
     };
     let line = pane.input.trim().to_owned();
@@ -5553,7 +5729,7 @@ fn carries_a_flag(line: &str) -> bool {
 /// a refusal written only into an overlay that is not there is a keystroke that
 /// silently did nothing.
 fn complain(model: &mut Model, why: String) -> Vec<Cmd> {
-    if let Some(Overlay::Command(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Command(pane)) = model.overlay_top_mut() {
         pane.error = Some(why);
         return Vec::new();
     }
@@ -5563,7 +5739,7 @@ fn complain(model: &mut Model, why: String) -> Vec<Cmd> {
 
 /// The best-ranked match's verb path, if the pane has one.
 fn best_match(model: &Model) -> Option<String> {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => pane.best().map(|entry| entry.verb.clone()),
         _ => None,
     }
@@ -5578,7 +5754,7 @@ fn best_match(model: &Model) -> Option<String> {
 /// a fallback with its own dispatch would be a second place for `'<,'>` and
 /// `!` to be honoured, free to drift from the first.
 fn run_best(model: &mut Model, verb: &str) -> Vec<Cmd> {
-    let (prefix, bang) = match model.overlay.as_ref() {
+    let (prefix, bang) = match model.overlay_top() {
         Some(Overlay::Command(pane)) => (
             range_prefix(&pane.input),
             pane.input.trim_end().ends_with('!'),
@@ -5736,7 +5912,7 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         // Complete on arrival: the answer is in this process, so a border
         // reading "asking…" would describe a request that was never made.
         pane.apply(generation, ReportFill::Replace, rows, true);
-        model.overlay = Some(Overlay::Report(Box::new(pane)));
+        model.set_overlay(Overlay::Report(Box::new(pane)));
         model.info(match found {
             0 => "every binding can be typed".to_owned(),
             1 => "1 binding can never be typed — unbind the shorter one".to_owned(),
@@ -5814,7 +5990,7 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
         // that was never made.
         pane.apply(generation, ReportFill::Replace, rows, true);
         let count = pane.rows.len();
-        model.overlay = Some(Overlay::Report(Box::new(pane)));
+        model.set_overlay(Overlay::Report(Box::new(pane)));
         model.info(match count {
             0 => "nothing attached to this message".to_owned(),
             1 => "1 attachment · :attach tables, :attach invoice, :attach ask".to_owned(),
@@ -5953,7 +6129,7 @@ fn run_invocation(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
     // than inside each action for the same reason the range is: an action
     // that opened a `Confirm` is the *only* thing a bang changes, and one
     // implementation of that is one place it can be wrong.
-    if invocation.bang && matches!(model.overlay, Some(Overlay::Confirm { .. })) {
+    if invocation.bang && matches!(model.overlay_top(), Some(Overlay::Confirm { .. })) {
         cmds.extend(accept_confirm(model));
     }
     cmds
@@ -6212,7 +6388,7 @@ fn acts_on_mail(verb: &str) -> bool {
 /// overlay that is still up would ask the *command line* what `cursor.down`
 /// means rather than the screen it is about to reveal.
 fn close_command(model: &mut Model) {
-    model.overlay = None;
+    model.clear_overlays();
 }
 
 /// Walk the history, filtered by whatever was typed before the walk began.
@@ -6225,9 +6401,11 @@ fn browse_history(model: &mut Model, direction: Direction) -> bool {
     // `<up>`, and cloning five hundred strings to read a prefix off them is
     // work proportional to the history for a keystroke that is not.
     let Model {
-        history, overlay, ..
+        history,
+        overlay_stack,
+        ..
     } = model;
-    let Some(Overlay::Command(pane)) = overlay.as_mut() else {
+    let Some(Overlay::Command(pane)) = overlay_stack.last_mut() else {
         return false;
     };
     let seed = match &pane.browse {
@@ -6304,7 +6482,7 @@ fn run_answered_command(model: &mut Model, invocation: command::Invocation) -> V
             close_command(model);
             let mut pane = FormPane::new(invocation, request.title, request.fields, generation);
             pane.prefill(&pane.invocation.flags.clone());
-            model.overlay = Some(Overlay::Form(Box::new(pane)));
+            model.set_overlay(Overlay::Form(Box::new(pane)));
             model.info(format!("{verb} — reading what is in force…"));
             return vec![request.cmd];
         }
@@ -6331,7 +6509,7 @@ fn run_answered_command(model: &mut Model, invocation: command::Invocation) -> V
             pane.apply(generation, ReportFill::Replace, block.rows(), true);
             let label = block.label.clone();
             model.block = Some(block);
-            model.overlay = Some(Overlay::Report(Box::new(pane)));
+            model.set_overlay(Overlay::Report(Box::new(pane)));
             model.info(format!("{label} — <enter> on a row, or :toml to open it"));
             return Vec::new();
         }
@@ -6343,7 +6521,7 @@ fn run_answered_command(model: &mut Model, invocation: command::Invocation) -> V
     // could drift from it.
     if let Some(prompt) = request.confirm.clone() {
         close_command(model);
-        model.overlay = Some(Overlay::Confirm {
+        model.set_overlay(Overlay::Confirm {
             prompt,
             then: Confirmed::Invoke {
                 invocation: Box::new(command::Invocation {
@@ -6368,7 +6546,7 @@ fn run_answered_command(model: &mut Model, invocation: command::Invocation) -> V
     if request.once {
         pane = pane.only_once();
     }
-    model.overlay = Some(Overlay::Report(Box::new(pane)));
+    model.set_overlay(Overlay::Report(Box::new(pane)));
     model.info(format!("{verb} — r re-runs · Esc closes"));
     vec![request.cmd]
 }
@@ -6458,13 +6636,14 @@ fn use_account(model: &mut Model, id: i64) -> Vec<Cmd> {
 /// where the last `<enter>` left it and carrying that across a close would be
 /// remembering a value nothing has read back.
 fn open_settings(model: &mut Model, section: Option<settings::Section>) -> Vec<Cmd> {
-    // The one overlay it may open over is a list overlay, the same rule `:` and
-    // the manual follow: a Report answering `s` is a Report asking to be
-    // replaced, and it takes its stream down with it.
-    let stop = if model.mode() == Mode::Menu {
-        model.overlay.take().map(|overlay| cancels(&overlay))
+    // Any overlay open is the same rule `:` and the manual follow: a Report
+    // answering `s` is a Report asking to be replaced (the whole stack, not
+    // just its top), and clearing takes every one of their streams down
+    // with it.
+    let stop: Vec<Cmd> = if model.mode() == Mode::Menu {
+        model.clear_overlays().iter().flat_map(cancels).collect()
     } else if screen_is_clear(model) {
-        None
+        Vec::new()
     } else {
         return Vec::new();
     };
@@ -6475,7 +6654,7 @@ fn open_settings(model: &mut Model, section: Option<settings::Section>) -> Vec<C
     set_screen(model, Screen::Settings);
     model.settings = Some(settings::SettingsState::new(section));
     announce_settings(model);
-    stop.unwrap_or_default()
+    stop
 }
 
 /// `<tab>` — the next section.
@@ -6542,7 +6721,7 @@ fn accept_setting(model: &mut Model) -> Vec<Cmd> {
         // write for the screen to express.
         settings::Accepted::Type { line } => {
             let mut cmds = open_command(model);
-            if let Some(Overlay::Command(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Command(pane)) = model.overlay_top_mut() {
                 pane.input = if line.ends_with('=') {
                     line.to_owned()
                 } else {
@@ -6596,7 +6775,7 @@ fn target_of(model: &Model) -> Target {
 /// question was answered to open this report, and asking it on every `r` would
 /// make `r` the wrong key to press.
 fn rerun_report(model: &mut Model) -> Vec<Cmd> {
-    let Some(Overlay::Report(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Report(pane)) = model.overlay_top() else {
         return Vec::new();
     };
     let verb = pane.invocation.verb.join(" ");
@@ -6645,7 +6824,7 @@ fn rerun_report(model: &mut Model) -> Vec<Cmd> {
         }
     };
     model.generation = generation;
-    if let Some(Overlay::Report(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Report(pane)) = model.overlay_top_mut() {
         pane.restart(generation);
     }
     model.info(format!("{verb} — re-running…"));
@@ -6661,14 +6840,14 @@ fn rerun_report(model: &mut Model) -> Vec<Cmd> {
 /// invocation and the report itself, so `y` runs it without asking twice and
 /// either answer leaves the reader on the screen they were reading.
 fn run_report_row(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd> {
-    let Some(Overlay::Report(over)) = model.overlay.take() else {
+    let Some(Overlay::Report(over)) = model.pop_overlay() else {
         return Vec::new();
     };
     if !report::mutates(&invocation) || invocation.bang {
         return run_row(model, invocation, Some(over));
     }
     let prompt = format!(":{} — run it? [y/N]", invocation.verb.join(" "));
-    model.overlay = Some(Overlay::Confirm {
+    model.set_overlay(Overlay::Confirm {
         prompt,
         then: Confirmed::Invoke {
             invocation: Box::new(command::Invocation {
@@ -6689,7 +6868,7 @@ fn run_report_row(model: &mut Model, invocation: command::Invocation) -> Vec<Cmd
 /// a complaint: `n` is bound in the whole `Menu` layer, and most rows there have
 /// nothing to say no to.
 fn reject_report_row(model: &mut Model) -> Vec<Cmd> {
-    let rejection = match model.overlay.as_ref() {
+    let rejection = match model.overlay_top() {
         Some(Overlay::Report(pane)) => pane.row().and_then(|row| row.on_reject.clone()),
         _ => None,
     };
@@ -6712,6 +6891,21 @@ fn reject_report_row(model: &mut Model) -> Vec<Cmd> {
 /// could redraw the state from *before* the change — which is worse than saying
 /// plainly that the rows are from before it. `r` is what re-reads, and the
 /// title says so.
+///
+/// "Unless the command put something else in its place" is checked against
+/// the *top* of the stack, not the whole thing — correct today, because
+/// `over` was popped by [`run_report_row`] from a stack that was at most one
+/// deep before it (every pre-108 call site still opens overlays via
+/// `set_overlay`). If a future overlay this report was stacked *under* is
+/// still there when this returns, this restores on top of it via
+/// `set_overlay`, which is safe specifically because the `None` guard has
+/// already established the stack is empty at that point — but it means the
+/// report is silently dropped rather than restored whenever the guard is
+/// `Some` (something else *is* on top), even if that something is unrelated
+/// to where the report itself belongs. Not fixed here: doing so requires
+/// deciding where in a multi-layer stack a report reappears, which nothing
+/// reachable today needs an answer for, and tui.md does not specify at this
+/// level of detail.
 fn run_row(
     model: &mut Model,
     invocation: command::Invocation,
@@ -6719,9 +6913,9 @@ fn run_row(
 ) -> Vec<Cmd> {
     let stale = report::mutates(&invocation);
     let cmds = run_invocation(model, invocation);
-    if let (None, Some(mut over)) = (model.overlay.as_ref(), over) {
+    if let (None, Some(mut over)) = (model.overlay_top(), over) {
         over.stale = over.stale || stale;
-        model.overlay = Some(Overlay::Report(over));
+        model.set_overlay(Overlay::Report(over));
     }
     cmds
 }
@@ -6776,7 +6970,7 @@ fn run_command_id(model: &mut Model, id: &str) -> Vec<Cmd> {
 /// run against an overlay that is still up would ask the *overlay* what
 /// `cursor.down` means rather than the screen it is about to reveal.
 fn run_named(model: &mut Model, action: Action) -> Vec<Cmd> {
-    model.overlay = None;
+    model.clear_overlays();
     run_action(model, action, None)
 }
 
@@ -6784,10 +6978,10 @@ fn run_named(model: &mut Model, action: Action) -> Vec<Cmd> {
 fn open_ask(model: &mut Model, question: String) -> Vec<Cmd> {
     // Reachable from a bare screen and from the `.` menu, which is the one
     // overlay that exists to launch others.
-    if !matches!(model.overlay, None | Some(Overlay::Quick(_))) {
+    if !matches!(model.overlay_top(), None | Some(Overlay::Quick(_))) {
         return Vec::new();
     }
-    model.overlay = Some(Overlay::Ask(Box::new(AskPane {
+    model.set_overlay(Overlay::Ask(Box::new(AskPane {
         question,
         ..AskPane::default()
     })));
@@ -6797,7 +6991,7 @@ fn open_ask(model: &mut Model, question: String) -> Vec<Cmd> {
 
 /// `Enter` on the question line: send it.
 fn ask_now(model: &mut Model) -> Vec<Cmd> {
-    let question = match model.overlay.as_ref() {
+    let question = match model.overlay_top() {
         Some(Overlay::Ask(pane)) => pane.question.trim().to_owned(),
         _ => return Vec::new(),
     };
@@ -6808,7 +7002,7 @@ fn ask_now(model: &mut Model) -> Vec<Cmd> {
     model.generation += 1;
     let generation = model.generation;
     let account_id = model.current_account().map_or(0, |account| account.id);
-    let Some(Overlay::Ask(pane)) = model.overlay.as_mut() else {
+    let Some(Overlay::Ask(pane)) = model.overlay_top_mut() else {
         return Vec::new();
     };
     // Reset wholesale rather than field by field: a re-ask that carried over
@@ -6854,7 +7048,7 @@ fn open_quick(model: &mut Model) -> Vec<Cmd> {
         model.fail("no message selected");
         return Vec::new();
     };
-    model.overlay = Some(Overlay::Quick(QuickPane {
+    model.set_overlay(Overlay::Quick(QuickPane {
         message_id,
         subject,
         cursor: 0,
@@ -6863,7 +7057,7 @@ fn open_quick(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn run_quick(model: &mut Model, action: QuickAction) -> Vec<Cmd> {
-    let (message_id, subject) = match model.overlay.as_ref() {
+    let (message_id, subject) = match model.overlay_top() {
         Some(Overlay::Quick(pane)) => (pane.message_id, pane.subject.clone()),
         _ => return Vec::new(),
     };
@@ -6876,7 +7070,7 @@ fn run_quick(model: &mut Model, action: QuickAction) -> Vec<Cmd> {
 
 /// Open the AI panel on one specific message.
 fn ai_panel_for(model: &mut Model, message_id: i64, suggest_reply: bool) -> Vec<Cmd> {
-    model.overlay = None;
+    model.clear_overlays();
     model.ai_panel = true;
     model.summary = None;
     model.summary_for = Some(message_id);
@@ -6908,7 +7102,7 @@ fn open_outbox(model: &mut Model) -> Vec<Cmd> {
         model.fail("no account");
         return Vec::new();
     };
-    model.overlay = Some(Overlay::Outbox(Box::new(OutboxPane {
+    model.set_overlay(Overlay::Outbox(Box::new(OutboxPane {
         loading: true,
         ..OutboxPane::default()
     })));
@@ -6922,7 +7116,7 @@ fn open_outbox(model: &mut Model) -> Vec<Cmd> {
 /// In the outbox pane that is the highlighted row; anywhere else it is the
 /// toast, which is the only send the user can see from the message list.
 fn undo_send(model: &mut Model) -> Vec<Cmd> {
-    let target = match model.overlay.as_ref() {
+    let target = match model.overlay_top() {
         Some(Overlay::Outbox(pane)) => pane
             .row()
             .map(|row| (row.id, row.to.clone(), row.state.clone())),
@@ -6971,7 +7165,7 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
         Close,
         Nothing,
     }
-    let chosen = match model.overlay.as_ref() {
+    let chosen = match model.overlay_top() {
         Some(Overlay::Search(pane)) => pane
             .hit()
             .map_or(Chosen::Nothing, |hit| Chosen::Message(hit.message_id)),
@@ -7022,7 +7216,7 @@ fn menu_accept(model: &mut Model) -> Vec<Cmd> {
 /// whose commit answered to different keys would be a second vocabulary to
 /// learn for one overlay.
 fn edit_or_apply_form(model: &mut Model) -> Vec<Cmd> {
-    let Some(Overlay::Form(pane)) = model.overlay.as_mut() else {
+    let Some(Overlay::Form(pane)) = model.overlay_top_mut() else {
         return Vec::new();
     };
     if !pane.on_apply() {
@@ -7054,7 +7248,7 @@ fn edit_or_apply_form(model: &mut Model) -> Vec<Cmd> {
     // Down before the invocation runs, for the reason `run_row` takes the
     // report down: every action reads `Model::mode`, and one dispatched with the
     // form still up would be answered by the form's own `Menu` layer.
-    model.overlay = None;
+    model.clear_overlays();
     record_command(model, &line);
     run_invocation(model, applied)
 }
@@ -7065,7 +7259,7 @@ fn edit_or_apply_form(model: &mut Model) -> Vec<Cmd> {
 /// which is the whole point of refusing at the form rather than a round trip
 /// later — and of not closing it first.
 fn refuse_form(model: &mut Model, why: String) -> Vec<Cmd> {
-    let Some(Overlay::Form(pane)) = model.overlay.as_mut() else {
+    let Some(Overlay::Form(pane)) = model.overlay_top_mut() else {
         return Vec::new();
     };
     let verb = pane.invocation.verb.join(" ");
@@ -7078,7 +7272,7 @@ fn refuse_form(model: &mut Model, why: String) -> Vec<Cmd> {
 /// folder yet — so `Enter` says what the highlighted row's state means
 /// instead, which is the only thing anyone reads an outbox for.
 fn describe_outbox_row(model: &mut Model) -> Vec<Cmd> {
-    let note = match model.overlay.as_ref() {
+    let note = match model.overlay_top() {
         Some(Overlay::Outbox(pane)) => pane.row().map(|row| match &row.last_error {
             Some(error) => Err(format!("{}: {error}", row.state)),
             None => Ok(format!("{} — to {}", row.state, row.to)),
@@ -7091,7 +7285,7 @@ fn describe_outbox_row(model: &mut Model) -> Vec<Cmd> {
 
 /// Open a message by id, from wherever the overlay found it.
 fn open_message_by_id(model: &mut Model, message_id: i64) -> Vec<Cmd> {
-    model.overlay = None;
+    model.clear_overlays();
     model.opening = Some(message_id);
     model.info("opening…");
     model.inflight += 1;
@@ -7127,11 +7321,11 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
     if model
         .manual
         .as_ref()
-        .is_some_and(|manual| manual.typing() && model.overlay.is_none())
+        .is_some_and(|manual| manual.typing() && !model.overlay_is_open())
     {
         return submit_manual_search(model);
     }
-    let which = match model.overlay.as_ref() {
+    let which = match model.overlay_top() {
         Some(Overlay::Search(pane)) if pane.typing() => Which::SearchQuery,
         Some(Overlay::Finder(_)) => Which::Finder,
         Some(Overlay::Command(_)) => Which::Command,
@@ -7146,7 +7340,7 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
         Which::Command => submit_command(model),
         Which::AskQuestion => ask_now(model),
         Which::HelpFilterDone => {
-            if let Some(Overlay::Help(pane)) = model.overlay.as_mut() {
+            if let Some(Overlay::Help(pane)) = model.overlay_top_mut() {
                 pane.editing = false;
             }
             Vec::new()
@@ -7160,17 +7354,17 @@ fn prompt_accept(model: &mut Model) -> Vec<Cmd> {
 /// completing an operator into it would type text the finder matches
 /// literally.
 fn prompt_complete(model: &mut Model) -> Vec<Cmd> {
-    if matches!(model.overlay, Some(Overlay::Command(_))) {
+    if matches!(model.overlay_top(), Some(Overlay::Command(_))) {
         return complete_command(model);
     }
-    let completed = match model.overlay.as_ref() {
+    let completed = match model.overlay_top() {
         Some(Overlay::Search(pane)) if pane.typing() => complete_operator(&pane.query),
         _ => None,
     };
     let Some(completed) = completed else {
         return Vec::new();
     };
-    if let Some(Overlay::Search(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Search(pane)) = model.overlay_top_mut() {
         pane.query = completed;
     }
     search_now(model)
@@ -7187,7 +7381,7 @@ fn prompt_complete(model: &mut Model) -> Vec<Cmd> {
 /// prefix must not have one of them silently chosen, which would be a
 /// keystroke that did the wrong thing rather than one that did nothing.
 fn complete_command(model: &mut Model) -> Vec<Cmd> {
-    let Some(Overlay::Command(pane)) = model.overlay.as_ref() else {
+    let Some(Overlay::Command(pane)) = model.overlay_top() else {
         return Vec::new();
     };
     let input = pane.input.clone();
@@ -7243,7 +7437,7 @@ fn complete_command(model: &mut Model) -> Vec<Cmd> {
 /// line is only bounded by the whole file's size, and a pane holding an
 /// unbounded string is re-sanitized and re-wrapped on every frame.
 fn set_command_line(model: &mut Model, line: String) {
-    if let Some(Overlay::Command(pane)) = model.overlay.as_mut() {
+    if let Some(Overlay::Command(pane)) = model.overlay_top_mut() {
         pane.input = truncated(line);
         pane.browse = None;
         pane.error = None;

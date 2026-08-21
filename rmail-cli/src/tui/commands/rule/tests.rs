@@ -207,7 +207,7 @@ fn a_synthesis_leaves_a_draft_the_next_rule_add_stores() {
     // The draft outlives the report it was shown in, which is the reason it is
     // session state rather than a field on the pane.
     update(&mut model, Msg::Key(Key::Esc));
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
     let cmds = run(&mut model, "rule add");
     assert_eq!(
         cmds,
@@ -343,7 +343,7 @@ fn a_rule_table_opens_a_report_and_a_rule_fact_does_not() {
         matches!(cmds.first(), Some(Cmd::RuleList { .. })),
         "{cmds:?}"
     );
-    assert!(matches!(model.overlay, Some(Overlay::Report(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Report(_))));
 
     let mut model = loaded();
     update(&mut model, Msg::RuleDrafted("x".to_owned()));
@@ -352,7 +352,7 @@ fn a_rule_table_opens_a_report_and_a_rule_fact_does_not() {
         matches!(cmds.first(), Some(Cmd::RuleCreate { .. })),
         "{cmds:?}"
     );
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 }
 
 #[test]

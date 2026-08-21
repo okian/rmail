@@ -13,9 +13,10 @@
 
 use super::*;
 use crate::tui::model::{
-    update, Account, AskEvent, Cmd, FinderEvent, Folder, Key, MessageRow, Model, Msg, Overlay,
-    ReplyEvent, SearchEvent, Stream,
+    update, Account, AskEvent, Cmd, Confirmed, FinderEvent, Folder, Key, Level, MessageRow, Model,
+    Msg, Overlay, ReplyEvent, SearchEvent, Stream, MAX_OVERLAY_DEPTH,
 };
+use crate::tui::whichkey;
 
 // ---------------------------------------------------------------------------
 // fixtures
@@ -160,28 +161,28 @@ fn outbox_row(id: i64, state: &str, undo_deadline: Option<i64>) -> OutboxRow {
 }
 
 fn search_pane(model: &Model) -> &SearchPane {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Search(pane)) => pane,
         other => panic!("expected the search overlay, found {other:?}"),
     }
 }
 
 fn finder_pane(model: &Model) -> &FinderPane {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Finder(pane)) => pane,
         other => panic!("expected the finder overlay, found {other:?}"),
     }
 }
 
 fn command_pane(model: &Model) -> &CommandPane {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => pane,
         other => panic!("expected the command overlay, found {other:?}"),
     }
 }
 
 fn ask_pane(model: &Model) -> &AskPane {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Ask(pane)) => pane,
         other => panic!("expected the ask overlay, found {other:?}"),
     }
@@ -401,7 +402,7 @@ fn enter_on_a_result_opens_that_message() {
     let cmds = press(&mut model, Key::Enter);
     assert_eq!(cmds, vec![Cmd::Open { message_id: 44 }]);
     assert!(
-        model.overlay.is_none(),
+        !model.overlay_is_open(),
         "opening a result leaves the overlay behind"
     );
 }
@@ -528,7 +529,7 @@ fn the_finder_jumps_by_kind() {
         press(&mut model, Key::Enter),
         vec![Cmd::LoadMessages { mailbox_id: 2 }]
     );
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 
     let mut model = loaded();
     let generation = stream_generation(&press(&mut model, Key::ctrl('p')));
@@ -554,7 +555,7 @@ fn a_finder_command_row_runs_the_action_it_names() {
     batch(&mut model, generation, vec![command], true);
 
     press(&mut model, Key::Enter);
-    assert!(matches!(model.overlay, Some(Overlay::Help(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Help(_))));
 }
 
 #[test]
@@ -587,7 +588,7 @@ fn a_finder_kind_this_build_does_not_know_is_never_acted_on() {
         true,
     );
     assert!(press(&mut model, Key::Enter).is_empty());
-    assert!(model.overlay.is_some(), "and the overlay stays put");
+    assert!(model.overlay_is_open(), "and the overlay stays put");
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +688,7 @@ fn the_command_line_runs_the_best_match_when_the_line_names_no_verb() {
     keys(&mut model, "hel");
     press(&mut model, Key::Enter);
     assert!(
-        matches!(model.overlay, Some(Overlay::Help(_))),
+        matches!(model.overlay_top(), Some(Overlay::Help(_))),
         "the command line closes and the command runs against the screen \
          behind it"
     );
@@ -708,7 +709,7 @@ fn the_command_line_says_so_when_nothing_matches() {
         "{:?}",
         pane.error
     );
-    assert!(model.overlay.is_some(), "and the overlay stays open");
+    assert!(model.overlay_is_open(), "and the overlay stays open");
 }
 
 #[test]
@@ -870,7 +871,7 @@ fn an_ask_that_fails_leaves_the_pane_usable() {
     assert!(model.status.contains("the provider is down"));
     // And Esc still works, which is the property that matters.
     press(&mut model, Key::Esc);
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 }
 
 #[test]
@@ -918,7 +919,7 @@ fn issued(cmds: &[Cmd]) -> Vec<Cmd> {
 }
 
 fn reply_pane(model: &Model) -> &ReplyPane {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Reply(pane)) => pane,
         other => panic!("expected the reply overlay, found {other:?}"),
     }
@@ -995,7 +996,7 @@ fn a_reply_that_fails_leaves_the_pane_usable() {
     assert!(reply_pane(&model).done);
     assert!(model.status.contains("the provider is down"));
     press(&mut model, Key::Esc);
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 }
 
 #[test]
@@ -1039,7 +1040,7 @@ fn bare_reply_drafts_the_same_way_r_does() {
         "`:reply` and `r` are the same request to the daemon"
     );
     assert!(
-        !matches!(typed_model.overlay, Some(Overlay::Reply(_))),
+        !matches!(typed_model.overlay_top(), Some(Overlay::Reply(_))),
         "no --ai, no streaming pane"
     );
 }
@@ -1072,7 +1073,7 @@ fn reply_ai_with_no_message_selected_is_refused() {
     model.messages.clear();
     let cmds = issued(&typed(&mut model, "reply --ai anything"));
     assert!(cmds.is_empty(), "{cmds:?}");
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
     assert!(model.status.contains("message"), "{}", model.status);
 }
 
@@ -1294,7 +1295,7 @@ fn hiding_the_ai_panel_drops_what_it_was_showing() {
 fn the_quick_menu_captures_its_message_when_it_opens() {
     let mut model = loaded();
     press(&mut model, Key::Char('.'));
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Quick(pane)) => {
             assert_eq!(pane.message_id, 10);
             assert_eq!(pane.subject, "subject 10");
@@ -1358,7 +1359,7 @@ fn each_overlay(mut check: impl FnMut(&str, Model)) {
     ] {
         let mut model = loaded();
         press(&mut model, key);
-        assert!(model.overlay.is_some(), "{name} did not open");
+        assert!(model.overlay_is_open(), "{name} did not open");
         check(name, model);
     }
 }
@@ -1367,7 +1368,7 @@ fn each_overlay(mut check: impl FnMut(&str, Model)) {
 fn esc_leaves_every_overlay() {
     each_overlay(|name, mut model| {
         press(&mut model, Key::Esc);
-        assert!(model.overlay.is_none(), "Esc did not leave {name}");
+        assert!(!model.overlay_is_open(), "Esc did not leave {name}");
         assert!(!model.quit, "Esc must not quit from {name}");
     });
 }
@@ -1395,7 +1396,7 @@ fn esc_leaves_an_overlay_even_mid_stream_and_mid_word() {
         },
     );
     press(&mut model, Key::Esc);
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
 }
 
 #[test]
@@ -1421,7 +1422,7 @@ fn a_half_typed_chord_in_a_menu_does_not_swallow_the_next_key() {
     // because a chord half-matched is a bug, not a feature.
     press(&mut model, Key::Char('g'));
     press(&mut model, Key::Char('k'));
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Outbox(pane)) => assert_eq!(pane.cursor, 1),
         other => panic!("expected the outbox, found {other:?}"),
     }
@@ -1447,7 +1448,7 @@ fn keys_do_not_reach_the_list_behind_an_overlay() {
     // `d` deletes mail in the message list. In a Menu-mode overlay it must be
     // nothing at all — the chain stops at Global by construction.
     assert!(press(&mut model, Key::Char('d')).is_empty());
-    assert!(matches!(model.overlay, Some(Overlay::Outbox(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Outbox(_))));
 }
 
 #[test]
@@ -1492,7 +1493,7 @@ fn an_overlay_key_pressed_over_another_overlay_does_not_discard_it() {
     // query line. Over the ask pane it must do nothing rather than throw an
     // answer away.
     press(&mut model, Key::Char('/'));
-    assert!(matches!(model.overlay, Some(Overlay::Ask(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Ask(_))));
     assert_eq!(ask_pane(&model).answer, "Acme owes you [1].");
 }
 
@@ -1886,7 +1887,7 @@ fn a_refused_cancel_does_not_blank_the_outbox() {
             result: Err("already claimed by a worker".to_owned()),
         },
     );
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Outbox(pane)) => assert_eq!(
             pane.rows.len(),
             1,
@@ -1895,4 +1896,232 @@ fn a_refused_cancel_does_not_blank_the_outbox() {
         other => panic!("expected the outbox, found {other:?}"),
     }
     assert!(model.status.contains("already claimed"), "{}", model.status);
+}
+
+// ---------------------------------------------------------------------------
+// the overlay stack (task 108: `Model::overlay_stack`, replacing the single
+// `Option<Overlay>` slot — tui.md §2.2.2, §3.1)
+// ---------------------------------------------------------------------------
+
+fn quick(n: i64) -> Overlay {
+    Overlay::Quick(QuickPane {
+        message_id: n,
+        subject: n.to_string(),
+        cursor: 0,
+    })
+}
+
+#[test]
+fn push_overlay_accumulates_in_order_and_the_last_pushed_is_the_top() {
+    let mut model = Model::default();
+    model.push_overlay(quick(1));
+    model.push_overlay(quick(2));
+    model.push_overlay(quick(3));
+    assert_eq!(model.overlays().len(), 3);
+    assert!(
+        matches!(model.overlay_top(), Some(Overlay::Quick(pane)) if pane.message_id == 3),
+        "the most recently pushed overlay is the top"
+    );
+    assert_eq!(
+        model.overlays().to_vec(),
+        vec![quick(1), quick(2), quick(3)]
+    );
+}
+
+#[test]
+fn push_overlay_refuses_a_fourth_rather_than_evicting_the_oldest() {
+    let mut model = Model::default();
+    for n in 0..i64::try_from(MAX_OVERLAY_DEPTH).unwrap() {
+        model.push_overlay(quick(n));
+    }
+    assert_eq!(model.overlays().len(), MAX_OVERLAY_DEPTH);
+    let stack_before = model.overlays().to_vec();
+
+    model.push_overlay(quick(999));
+
+    assert_eq!(
+        model.overlays().to_vec(),
+        stack_before,
+        "a refused push must not grow the stack, reorder it, or evict anything \
+         already open — closing something the user still has open to make \
+         room would be worse than refusing the new one"
+    );
+    assert!(
+        model.status.contains("3 overlays already open"),
+        "the refusal names the cap: {}",
+        model.status
+    );
+    assert_eq!(model.level, Level::Error);
+}
+
+#[test]
+fn pop_overlay_is_last_in_first_out() {
+    let mut model = Model::default();
+    model.push_overlay(quick(1)); // bottom
+    model.push_overlay(quick(2)); // top
+
+    assert_eq!(
+        model.pop_overlay(),
+        Some(quick(2)),
+        "the most recently pushed overlay pops first"
+    );
+    assert!(
+        matches!(model.overlay_top(), Some(Overlay::Quick(pane)) if pane.message_id == 1),
+        "the one underneath is now the top"
+    );
+
+    assert_eq!(model.pop_overlay(), Some(quick(1)));
+    assert!(model.overlay_top().is_none());
+    assert_eq!(
+        model.pop_overlay(),
+        None,
+        "popping an empty stack is a no-op, not a panic"
+    );
+}
+
+#[test]
+fn overlay_top_mut_reaches_only_the_top_never_what_is_underneath() {
+    let mut model = Model::default();
+    model.push_overlay(quick(1));
+    model.push_overlay(quick(2));
+
+    if let Some(Overlay::Quick(pane)) = model.overlay_top_mut() {
+        pane.cursor = 7;
+    } else {
+        panic!("expected the top to be a Quick overlay");
+    }
+
+    assert!(matches!(
+        model.overlay_top(),
+        Some(Overlay::Quick(pane)) if pane.message_id == 2 && pane.cursor == 7
+    ));
+    // The mutation reached only the top — the one underneath is untouched.
+    assert_eq!(model.overlays()[0], quick(1));
+}
+
+#[test]
+fn overlay_is_open_reflects_emptiness_exactly() {
+    let mut model = Model::default();
+    assert!(!model.overlay_is_open());
+    model.push_overlay(quick(1));
+    assert!(model.overlay_is_open());
+    model.pop_overlay();
+    assert!(!model.overlay_is_open());
+}
+
+#[test]
+fn set_overlay_replaces_the_top_in_place_rather_than_growing_the_stack() {
+    // The compatibility shim every pre-108 "open an overlay" call site now
+    // goes through: it must reproduce `Option::= Some(x)`'s old behavior
+    // exactly (always ends up as "the current one"), or every one of those
+    // call sites would silently start stacking instead of replacing.
+    let mut model = Model::default();
+    model.set_overlay(quick(1));
+    assert_eq!(model.overlays().len(), 1, "empty stack: acts like a push");
+
+    model.set_overlay(quick(2));
+    assert_eq!(
+        model.overlays().len(),
+        1,
+        "non-empty stack: replaces the top, does not grow"
+    );
+    assert_eq!(model.overlays().to_vec(), vec![quick(2)]);
+}
+
+#[test]
+fn restore_overlay_pushes_back_exactly_what_was_popped_and_is_a_no_op_on_none() {
+    let mut model = Model::default();
+    model.push_overlay(quick(1));
+    let taken = model.pop_overlay();
+    assert!(model.overlay_top().is_none());
+
+    model.restore_overlay(taken);
+    assert_eq!(model.overlays().to_vec(), vec![quick(1)]);
+
+    // A no-op on `None`: callers pass a `pop_overlay()` result straight
+    // through without an extra `if let`, and a mismatched-variant restore
+    // (the "pop, inspect, put back if it wasn't a match" idiom) must not
+    // silently invent an overlay from nothing.
+    model.restore_overlay(None);
+    assert_eq!(model.overlays().to_vec(), vec![quick(1)]);
+}
+
+#[test]
+fn confirm_can_stack_over_an_already_open_overlay_and_esc_reveals_it_again() {
+    // tui.md §2.2.2's own example: "confirm over picker over collection".
+    // The *setup* is the primitive operations rather than a real keybinding,
+    // because no existing call site in this build pushes a second layer yet
+    // (they all replace, via `set_overlay`, preserving pre-108 behavior —
+    // see `set_overlay`'s own docs) — this proves the mechanism a later
+    // task's call site can now build on. The *teardown* is a real `Esc`
+    // press, though, so this exercises the actual `leave()` code path
+    // rather than bypassing it by calling `pop_overlay` directly — see
+    // `esc_on_a_confirm_restores_the_report_underneath_without_clobbering_a_deeper_layer`
+    // in `tui::report::tests` for the report-carrying variant of this same
+    // property, which is where the bug this guards against actually was.
+    let mut model = loaded();
+    model.push_overlay(quick(1));
+    model.push_overlay(Overlay::Confirm {
+        prompt: "really? [y/N]".to_owned(),
+        then: Confirmed::Delete(vec![1]),
+    });
+    assert_eq!(model.overlays().len(), 2);
+    assert!(matches!(model.overlay_top(), Some(Overlay::Confirm { .. })));
+
+    // Declining (or answering) the confirm pops it — the ladder's step 2
+    // (task 115 owns the full ladder; this is the stack half of it).
+    press(&mut model, Key::Esc);
+    assert_eq!(model.overlays().len(), 1);
+    assert!(
+        matches!(model.overlay_top(), Some(Overlay::Quick(pane)) if pane.message_id == 1),
+        "popping the confirm reveals the picker still underneath — nothing \
+         had to carry a copy of it to get it back"
+    );
+}
+
+#[test]
+fn a_pending_chord_and_an_open_overlay_coexist_without_the_band_taking_a_stack_slot() {
+    // §3.1: "the which-key band is not an overlay." If it were secretly
+    // modeled as one, a pending chord would either fail to show (something
+    // already occupies the "overlay" slot) or silently bump whatever was
+    // open off the stack. Neither happens: pending-chord state
+    // (`Model::pending`) and the overlay stack are separate fields.
+    let mut model = loaded();
+    press(&mut model, Key::Char('.'));
+    assert!(
+        matches!(model.overlay_top(), Some(Overlay::Quick(_))),
+        "the quick menu opened"
+    );
+    assert!(
+        whichkey::band(&model).is_none(),
+        "no pending chord yet, so no band"
+    );
+    let stack_before = model.overlays().to_vec();
+
+    // `gg` is bound directly in `Mode::Menu` (cursor-top) — a real two-key
+    // chord in the quick menu's own layer, not borrowed from Normal (`Menu`
+    // chains only to `Global`, which binds no chords at all) — so this is a
+    // genuine pending chord in the mode the open overlay is actually in, not
+    // a contrived one.
+    press(&mut model, Key::Char('g'));
+    assert!(
+        !model.pending.keys().is_empty(),
+        "g is a pending chord prefix in Menu mode (the first half of gg)"
+    );
+    assert!(
+        whichkey::band(&model).is_some(),
+        "the band itself renders while the overlay is up — proving the two \
+         genuinely coexist, not just that the stack survives unread"
+    );
+    assert_eq!(
+        model.overlays().to_vec(),
+        stack_before,
+        "a pending chord must not push, pop, or otherwise touch the overlay stack"
+    );
+
+    // Completing the chord resolves it and clears pending — still without
+    // touching the stack depth (cursor-top on a 1-row menu is a no-op move).
+    press(&mut model, Key::Char('g'));
+    assert!(model.pending.keys().is_empty());
+    assert_eq!(model.overlays().len(), stack_before.len());
 }

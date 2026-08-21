@@ -84,25 +84,38 @@ pub fn render(model: &Model, frame: &mut Frame) {
     }
     render_status(model, frame, rows[3]);
 
-    match &model.overlay {
-        Some(Overlay::Help(pane)) => render_help(&model.theme, pane, frame, area),
-        Some(Overlay::Pick { what, idx, .. }) => render_pick(model, frame, area, *what, *idx),
-        Some(Overlay::Confirm { prompt, .. }) => {
-            render_modal(&model.theme, frame, area, "confirm", prompt);
+    // Back-to-front by stack index (task 108, tui.md §2.2.2): index 0 is the
+    // outermost/oldest overlay, the last is the innermost/topmost — forward
+    // iteration draws each in turn, so a later one visually overpaints an
+    // earlier one only where the two actually overlap (every `render_*`
+    // function below clears and paints just its own centered/clamped
+    // sub-area, never the full `area` it is handed — see e.g.
+    // `render_modal`'s own `Clear` on `centered(area, ..)`), which is what
+    // makes "confirm over picker" a small dialog floating over a still-
+    // visible list rather than a full-screen replacement of it. Only the
+    // topmost overlay ever receives key input — that is `Model::mode()`'s
+    // rule (it reads `overlay_top()`, the last element), not something this
+    // render pass enforces or needs to.
+    for overlay in model.overlays() {
+        match overlay {
+            Overlay::Help(pane) => render_help(&model.theme, pane, frame, area),
+            Overlay::Pick { what, idx, .. } => render_pick(model, frame, area, *what, *idx),
+            Overlay::Confirm { prompt, .. } => {
+                render_modal(&model.theme, frame, area, "confirm", prompt);
+            }
+            Overlay::Input { prompt, buffer, .. } => {
+                render_modal(&model.theme, frame, area, prompt, &format!("{buffer}▏"));
+            }
+            Overlay::Search(pane) => render_search(&model.theme, pane, frame, area),
+            Overlay::Finder(pane) => render_finder(&model.theme, pane, frame, area),
+            Overlay::Command(pane) => render_command(&model.theme, pane, frame, area),
+            Overlay::Ask(pane) => render_ask(&model.theme, pane, frame, area),
+            Overlay::Reply(pane) => render_reply(&model.theme, pane, frame, area),
+            Overlay::Outbox(pane) => render_outbox(&model.theme, pane, frame, area),
+            Overlay::Quick(pane) => render_quick(&model.theme, pane, frame, area),
+            Overlay::Report(pane) => render_report(&model.theme, pane, frame, area),
+            Overlay::Form(pane) => render_form(&model.theme, pane, frame, area),
         }
-        Some(Overlay::Input { prompt, buffer, .. }) => {
-            render_modal(&model.theme, frame, area, prompt, &format!("{buffer}▏"));
-        }
-        Some(Overlay::Search(pane)) => render_search(&model.theme, pane, frame, area),
-        Some(Overlay::Finder(pane)) => render_finder(&model.theme, pane, frame, area),
-        Some(Overlay::Command(pane)) => render_command(&model.theme, pane, frame, area),
-        Some(Overlay::Ask(pane)) => render_ask(&model.theme, pane, frame, area),
-        Some(Overlay::Reply(pane)) => render_reply(&model.theme, pane, frame, area),
-        Some(Overlay::Outbox(pane)) => render_outbox(&model.theme, pane, frame, area),
-        Some(Overlay::Quick(pane)) => render_quick(&model.theme, pane, frame, area),
-        Some(Overlay::Report(pane)) => render_report(&model.theme, pane, frame, area),
-        Some(Overlay::Form(pane)) => render_form(&model.theme, pane, frame, area),
-        None => {}
     }
 }
 

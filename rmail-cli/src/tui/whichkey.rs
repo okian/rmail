@@ -114,7 +114,7 @@ pub struct Band {
 ///   registry instead.
 #[must_use]
 pub fn band(model: &Model) -> Option<Band> {
-    if let Some(Overlay::Command(pane)) = model.overlay.as_ref() {
+    if let Some(Overlay::Command(pane)) = model.overlay_top() {
         return Some(command_band(&model.keymap, model.mode(), &pane.input));
     }
     let pending = model.pending.keys();

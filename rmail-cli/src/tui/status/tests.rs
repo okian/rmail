@@ -127,7 +127,7 @@ fn every_reachable_mode() -> Vec<(Mode, Model)> {
     out.push((Mode::Visual, visual));
 
     let mut insert = loaded();
-    insert.overlay = Some(Overlay::Input {
+    insert.set_overlay(Overlay::Input {
         prompt: "forward to".to_owned(),
         buffer: String::new(),
         what: InputFor::ForwardTo,

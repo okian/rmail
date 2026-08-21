@@ -655,7 +655,7 @@ fn a_list_overlay_pages_with_the_same_key() {
     assert_eq!(model.mode(), Mode::Pick);
 
     press(&mut model, Key::ctrl('d'));
-    match &model.overlay {
+    match model.overlay_top() {
         Some(Overlay::Pick { idx, .. }) => assert_eq!(
             *idx,
             model.folders.len() - 1,
@@ -664,7 +664,7 @@ fn a_list_overlay_pages_with_the_same_key() {
         other => panic!("expected the folder picker, found {other:?}"),
     }
     press(&mut model, Key::ctrl('u'));
-    match &model.overlay {
+    match model.overlay_top() {
         Some(Overlay::Pick { idx, .. }) => assert_eq!(*idx, 0),
         other => panic!("expected the folder picker, found {other:?}"),
     }
@@ -707,10 +707,10 @@ fn question_mark_opens_help_and_it_closes_on_q_esc_or_another_question_mark() {
     for closer in [Key::Char('q'), Key::Esc, Key::Char('?')] {
         let mut model = loaded();
         press(&mut model, Key::Char('?'));
-        assert!(matches!(model.overlay, Some(Overlay::Help(_))));
+        assert!(matches!(model.overlay_top(), Some(Overlay::Help(_))));
 
         press(&mut model, closer);
-        assert_eq!(model.overlay, None, "{closer:?} closed the help");
+        assert_eq!(model.overlay_top(), None, "{closer:?} closed the help");
         assert!(!model.quit, "{closer:?} must not also quit");
     }
 }
@@ -725,7 +725,7 @@ fn esc_on_the_key_reference_is_silent_while_browsing_but_says_cancelled_while_fi
     press(&mut model, Key::Char('?'));
     let status_before = model.status.clone();
     press(&mut model, Key::Esc);
-    assert_eq!(model.overlay, None);
+    assert_eq!(model.overlay_top(), None);
     assert_eq!(
         model.status, status_before,
         "browsing and backing out must not touch the status line"
@@ -735,7 +735,7 @@ fn esc_on_the_key_reference_is_silent_while_browsing_but_says_cancelled_while_fi
     press(&mut model, Key::Char('?'));
     press(&mut model, Key::Char('/'));
     press(&mut model, Key::Esc);
-    assert_eq!(model.overlay, None);
+    assert_eq!(model.overlay_top(), None);
     assert_eq!(model.status, "cancelled");
 }
 
@@ -836,11 +836,11 @@ fn delete_asks_first_and_only_deletes_on_y() {
     let mut model = loaded();
     let cmds = press(&mut model, Key::Char('d'));
     assert!(cmds.is_empty(), "nothing is sent before the answer");
-    assert!(matches!(model.overlay, Some(Overlay::Confirm { .. })));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Confirm { .. })));
 
     let cmds = press(&mut model, Key::Char('y'));
     assert_eq!(cmds, vec![Cmd::Delete { message_id: 10 }]);
-    assert_eq!(model.overlay, None);
+    assert_eq!(model.overlay_top(), None);
 }
 
 #[test]
@@ -850,7 +850,7 @@ fn declining_the_delete_confirmation_sends_nothing() {
         press(&mut model, Key::Char('d'));
         let cmds = press(&mut model, decline);
         assert!(cmds.is_empty(), "{decline:?} sent a command");
-        assert_eq!(model.overlay, None);
+        assert_eq!(model.overlay_top(), None);
         assert!(!model.quit, "{decline:?} must not quit the TUI");
     }
 }
@@ -938,7 +938,7 @@ fn copy_and_move_pick_a_destination_folder_first() {
     let cmds = press(&mut model, Key::Char('c'));
     assert!(cmds.is_empty());
     assert_eq!(
-        model.overlay,
+        model.overlay_top().cloned(),
         Some(Overlay::Pick {
             what: PickFor::Copy,
             message_ids: vec![10],
@@ -1047,7 +1047,7 @@ fn escaping_the_folder_picker_sends_nothing() {
     press(&mut model, Key::Char('M'));
     let cmds = press(&mut model, Key::Esc);
     assert!(cmds.is_empty());
-    assert_eq!(model.overlay, None);
+    assert_eq!(model.overlay_top(), None);
 }
 
 #[test]
@@ -1100,7 +1100,7 @@ fn forward_asks_for_a_recipient_and_drafts_to_it() {
     let cmds = press(&mut model, Key::Char('F'));
     assert!(cmds.is_empty());
     assert!(matches!(
-        model.overlay,
+        model.overlay_top(),
         Some(Overlay::Input {
             what: InputFor::ForwardTo,
             ..
@@ -1126,7 +1126,7 @@ fn forward_asks_for_a_recipient_and_drafts_to_it() {
             message_id: 10,
         }]
     );
-    assert_eq!(model.overlay, None);
+    assert_eq!(model.overlay_top(), None);
 }
 
 #[test]
@@ -1135,7 +1135,7 @@ fn an_empty_forward_recipient_drafts_nothing() {
     press(&mut model, Key::Char('F'));
     let cmds = press(&mut model, Key::Enter);
     assert!(cmds.is_empty());
-    assert_eq!(model.overlay, None);
+    assert_eq!(model.overlay_top(), None);
 }
 
 #[test]
@@ -1148,7 +1148,7 @@ fn typing_into_the_forward_prompt_does_not_trigger_action_keys() {
         press(&mut model, Key::Char(c));
     }
     assert!(!model.quit);
-    let typed = match &model.overlay {
+    let typed = match model.overlay_top() {
         Some(Overlay::Input { buffer, .. }) => buffer.clone(),
         other => format!("the prompt closed: {other:?}"),
     };
@@ -1510,7 +1510,7 @@ fn a_text_prompt_stops_accepting_characters_at_its_limit() {
     for _ in 0..(MAX_INPUT * 2) {
         press(&mut model, Key::Char('a'));
     }
-    let typed = match &model.overlay {
+    let typed = match model.overlay_top() {
         Some(Overlay::Input { buffer, .. }) => buffer.clone(),
         other => panic!("the prompt closed: {other:?}"),
     };
@@ -1643,7 +1643,7 @@ fn a_keymap_reload_updates_the_open_key_references_rows_without_resetting_its_cu
         "a background reload must not reset where the cursor was, unlike a \
          mode switch or a filter edit"
     );
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Help(pane)) => {
             let cursor_down = pane.rows.iter().find_map(|row| match row {
                 help::Row::Binding {
@@ -1820,7 +1820,7 @@ fn a_visual_delete_asks_once_and_names_the_count() {
     keys(&mut model, "vjj");
     let cmds = press(&mut model, Key::Char('d'));
     assert!(cmds.is_empty());
-    let prompt = match &model.overlay {
+    let prompt = match model.overlay_top() {
         Some(Overlay::Confirm { prompt, .. }) => prompt.clone(),
         other => panic!("no confirmation: {other:?}"),
     };
@@ -2263,7 +2263,7 @@ fn slash_searches_the_page_rather_than_the_mailbox() {
     let mut model = manual_open();
     press(&mut model, Key::Char('/'));
     assert!(
-        model.overlay.is_none(),
+        !model.overlay_is_open(),
         "the mailbox search overlay would cover the text it was opened to \
          search"
     );
@@ -2406,9 +2406,9 @@ fn g_slash_from_the_message_list_is_the_mailbox_search_not_helpgrep() {
     keys(&mut model, "g/");
     assert_eq!(model.screen, Screen::List);
     assert!(
-        matches!(model.overlay, Some(Overlay::Search(_))),
+        matches!(model.overlay_top(), Some(Overlay::Search(_))),
         "{:?}",
-        model.overlay
+        model.overlay_top()
     );
 }
 
@@ -2429,7 +2429,7 @@ fn helpgrep_reached_from_outside_the_manual_opens_the_manual_first() {
         Screen::Manual,
         "somebody who ran it still meant to search the manual"
     );
-    assert!(model.overlay.is_none(), "the palette closed behind it");
+    assert!(!model.overlay_is_open(), "the palette closed behind it");
     assert!(manual(&model).typing());
     assert_eq!(
         manual(&model).prompt.as_ref().map(|prompt| prompt.scope),
@@ -2470,7 +2470,7 @@ fn enter_on_the_key_reference_runs_the_highlighted_action() {
     let mut model = loaded();
     press(&mut model, Key::Char('?'));
     for _ in 0..Mode::CONFIGURABLE.len() {
-        if matches!(model.overlay.as_ref(), Some(Overlay::Help(pane)) if pane.mode == Mode::Help) {
+        if matches!(model.overlay_top(), Some(Overlay::Help(pane)) if pane.mode == Mode::Help) {
             break;
         }
         press(&mut model, Key::ctrl('o'));
@@ -2479,12 +2479,12 @@ fn enter_on_the_key_reference_runs_the_highlighted_action() {
     keys(&mut model, "rebind");
     press(&mut model, Key::Enter);
     assert!(
-        matches!(model.overlay, Some(Overlay::Help(_))),
+        matches!(model.overlay_top(), Some(Overlay::Help(_))),
         "typing and submitting a filter must not by itself close the overlay"
     );
 
     press(&mut model, Key::Enter);
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => {
             assert_eq!(pane.input, "keys set c help.rebind --mode=help")
         }
@@ -2503,7 +2503,7 @@ fn enter_on_an_empty_key_reference_filter_result_still_closes_it() {
     keys(&mut model, "no such binding exists anywhere in this build");
     press(&mut model, Key::Enter);
     press(&mut model, Key::Enter);
-    assert_eq!(model.overlay, None);
+    assert_eq!(model.overlay_top(), None);
     assert!(!model.quit);
 }
 
@@ -2773,7 +2773,7 @@ fn opening_the_manual_over_a_streaming_overlay_stops_the_stream() {
     model.keymap = keymap_from("[menu]\nK = \"manual\"\n");
     let cmds = press(&mut model, Key::Char('K'));
     assert_eq!(model.screen, Screen::Manual);
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
     assert!(
         cmds.contains(&Cmd::CancelStream { which: Stream::Ask }),
         "{cmds:?}"
@@ -2832,7 +2832,7 @@ fn n_and_capital_n_are_silent_when_the_manual_is_not_open() {
         let cmds = press(&mut model, key);
         assert!(cmds.is_empty(), "{key:?} issued work: {cmds:?}");
         assert!(
-            matches!(model.overlay, Some(Overlay::Help(_))),
+            matches!(model.overlay_top(), Some(Overlay::Help(_))),
             "{key:?} closed it"
         );
         assert_eq!(
@@ -2845,14 +2845,14 @@ fn n_and_capital_n_are_silent_when_the_manual_is_not_open() {
 }
 
 fn help_pane_mode(model: &Model) -> Mode {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Help(pane)) => pane.mode,
         other => panic!("expected the key reference to be open: {other:?}"),
     }
 }
 
 fn help_pane_cursor(model: &Model) -> usize {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Help(pane)) => pane.cursor,
         other => panic!("expected the key reference to be open: {other:?}"),
     }
@@ -2939,7 +2939,7 @@ fn slash_starts_filtering_the_key_reference_instead_of_opening_a_second_overlay(
     press(&mut model, Key::Char('?'));
     model.info("2 message(s)");
     press(&mut model, Key::Char('/'));
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Help(pane)) => assert!(pane.editing, "/ should start editing the filter"),
         other => panic!("/ must not open a second overlay: {other:?}"),
     }
@@ -2953,14 +2953,14 @@ fn slash_starts_filtering_the_key_reference_instead_of_opening_a_second_overlay(
 fn typing_into_the_key_references_filter_narrows_its_rows_live() {
     let mut model = loaded();
     press(&mut model, Key::Char('?'));
-    let before = match model.overlay.as_ref() {
+    let before = match model.overlay_top() {
         Some(Overlay::Help(pane)) => pane.rows.len(),
         other => panic!("expected the key reference to be open: {other:?}"),
     };
 
     press(&mut model, Key::Char('/'));
     keys(&mut model, "rebind");
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Help(pane)) => {
             assert_eq!(pane.filter, "rebind");
             assert!(
@@ -3014,7 +3014,7 @@ fn helpgrep_with_a_pattern_closes_an_overlay_it_was_dispatched_from() {
     press(&mut model, Key::Enter);
 
     let cmds = open_manual_grep_for(&mut model, "Key reference");
-    assert!(model.overlay.is_none());
+    assert!(!model.overlay_is_open());
     assert!(cmds.contains(&Cmd::CancelStream { which: Stream::Ask }));
     assert_eq!(
         manual(&model).at,
@@ -3027,7 +3027,7 @@ fn helpgrep_with_a_pattern_closes_an_overlay_it_was_dispatched_from() {
 // ---------------------------------------------------------------------------
 
 fn command_pane(model: &Model) -> &CommandPane {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => pane,
         other => panic!("expected the command overlay, found {other:?}"),
     }
@@ -3043,7 +3043,7 @@ fn command(model: &mut Model, line: &str) -> Vec<Cmd> {
 fn colon_opens_the_command_line_in_prompt_mode() {
     let mut model = loaded();
     press(&mut model, Key::Char(':'));
-    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Command(_))));
     assert_eq!(
         model.mode(),
         Mode::Prompt,
@@ -3060,7 +3060,7 @@ fn ctrl_k_opens_the_same_overlay_as_colon() {
     // action id breaks a `keys.toml` somebody has already written.
     let mut model = loaded();
     press(&mut model, Key::ctrl('k'));
-    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Command(_))));
 }
 
 #[test]
@@ -3075,8 +3075,8 @@ fn a_verb_with_no_arguments_delegates_straight_to_run_action() {
     command(&mut by_line, "help");
     press(&mut by_line, Key::Enter);
 
-    assert!(matches!(by_key.overlay, Some(Overlay::Help(_))));
-    assert_eq!(by_line.overlay, by_key.overlay);
+    assert!(matches!(by_key.overlay_top(), Some(Overlay::Help(_))));
+    assert_eq!(by_line.overlay_top(), by_key.overlay_top());
     assert_eq!(by_line.screen, by_key.screen);
 }
 
@@ -3221,14 +3221,14 @@ fn a_bang_skips_the_confirmation_and_only_that() {
     command(&mut without, "message delete");
     press(&mut without, Key::Enter);
     assert!(
-        matches!(without.overlay, Some(Overlay::Confirm { .. })),
+        matches!(without.overlay_top(), Some(Overlay::Confirm { .. })),
         "delete asks first"
     );
 
     let mut with = loaded();
     command(&mut with, "message delete!");
     let cmds = press(&mut with, Key::Enter);
-    assert!(with.overlay.is_none(), "no question was asked");
+    assert!(!with.overlay_is_open(), "no question was asked");
     assert!(
         cmds.iter().any(|cmd| matches!(cmd, Cmd::Delete { .. })),
         "and the delete went out: {cmds:?}"
@@ -3529,7 +3529,7 @@ fn the_fallback_carries_the_range_and_the_bang_the_line_had() {
     let mut banged = loaded();
     command(&mut banged, "message del!");
     let cmds = press(&mut banged, Key::Enter);
-    assert!(banged.overlay.is_none(), "the bang survived the fallback");
+    assert!(!banged.overlay_is_open(), "the bang survived the fallback");
     assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Delete { .. })));
 }
 
@@ -3599,7 +3599,7 @@ fn colon_from_a_list_overlay_replaces_it_and_stops_what_it_was_streaming() {
     assert_eq!(model.mode(), Mode::Menu, "the results are up");
 
     let cmds = press(&mut model, Key::Char(':'));
-    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Command(_))));
     assert!(
         cmds.iter().any(|cmd| matches!(
             cmd,
@@ -3625,19 +3625,19 @@ fn opening_the_command_line_over_a_modal_that_is_not_a_list_is_refused() {
     for opener in [Action::CommandOpen, Action::PaletteOpen] {
         let mut model = loaded();
         press(&mut model, Key::Char('d'));
-        assert!(matches!(model.overlay, Some(Overlay::Confirm { .. })));
+        assert!(matches!(model.overlay_top(), Some(Overlay::Confirm { .. })));
         assert!(run_action(&mut model, opener, None).is_empty());
         assert!(
-            matches!(model.overlay, Some(Overlay::Confirm { .. })),
+            matches!(model.overlay_top(), Some(Overlay::Confirm { .. })),
             "{opener:?} replaced the question"
         );
 
         let mut model = loaded();
         press(&mut model, Key::Char('c'));
-        assert!(matches!(model.overlay, Some(Overlay::Pick { .. })));
+        assert!(matches!(model.overlay_top(), Some(Overlay::Pick { .. })));
         run_action(&mut model, opener, None);
         assert!(
-            matches!(model.overlay, Some(Overlay::Pick { .. })),
+            matches!(model.overlay_top(), Some(Overlay::Pick { .. })),
             "{opener:?} replaced the picker"
         );
     }
@@ -3711,7 +3711,7 @@ fn a_range_on_a_verb_that_acts_on_no_message_is_refused() {
     press(&mut model, Key::Char(':'));
     keys(&mut model, "help");
     press(&mut model, Key::Enter);
-    assert!(model.overlay.is_some(), "the command line is still up");
+    assert!(model.overlay_is_open(), "the command line is still up");
     let why = command_pane(&model).error.clone().unwrap_or_default();
     assert!(why.contains("does not act on one"), "{why}");
 
@@ -3754,7 +3754,10 @@ fn set_updates_a_pane_width_and_closes_the_overlay() {
     command(&mut model, "set folder-width 25");
     press(&mut model, Key::Enter);
     assert_eq!(model.folder_width_pct, 25);
-    assert!(model.overlay.is_none(), "a successful :set closes the line");
+    assert!(
+        !model.overlay_is_open(),
+        "a successful :set closes the line"
+    );
     assert_eq!(model.status, "folder-width set to 25");
 }
 
@@ -3776,7 +3779,7 @@ fn set_rejects_a_non_numeric_value_and_leaves_the_line_open() {
     let mut model = loaded();
     command(&mut model, "set folder-width abc");
     press(&mut model, Key::Enter);
-    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Command(_))));
     let why = command_pane(&model).error.clone().unwrap_or_default();
     assert!(why.contains("not a whole number"), "{why}");
     assert_eq!(model.folder_width_pct, 20, "the bad value never lands");
@@ -3874,7 +3877,7 @@ fn set_with_a_missing_value_is_refused_cleanly_not_a_panic() {
     let mut model = loaded();
     command(&mut model, "set folder-width");
     press(&mut model, Key::Enter);
-    assert!(matches!(model.overlay, Some(Overlay::Command(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Command(_))));
     assert!(
         command_pane(&model).error.is_some(),
         "a half-given set must surface as an error, not silently no-op"
@@ -4194,7 +4197,7 @@ fn c_on_a_key_reference_row_opens_the_same_prefilled_rebind_enter_does() {
     // it — and a test that pressed a fixed number of times was really asserting
     // where `Help` happened to sit in that list.
     for _ in 0..Mode::CONFIGURABLE.len() {
-        if matches!(model.overlay.as_ref(), Some(Overlay::Help(pane)) if pane.mode == Mode::Help) {
+        if matches!(model.overlay_top(), Some(Overlay::Help(pane)) if pane.mode == Mode::Help) {
             break;
         }
         press(&mut model, Key::ctrl('o'));
@@ -4204,7 +4207,7 @@ fn c_on_a_key_reference_row_opens_the_same_prefilled_rebind_enter_does() {
     press(&mut model, Key::Enter);
 
     press(&mut model, Key::Char('c'));
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => {
             assert_eq!(pane.input, "keys set c help.rebind --mode=help")
         }
@@ -4250,7 +4253,7 @@ fn rebind_targets_the_mode_that_actually_owns_the_binding_not_the_one_being_brow
     press(&mut model, Key::Enter);
 
     press(&mut model, Key::Char('c'));
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Command(pane)) => {
             assert_eq!(pane.input, "keys set a message.archive")
         }
@@ -4274,7 +4277,7 @@ fn rebind_refuses_an_action_whose_only_binding_is_global() {
 
     press(&mut model, Key::Char('c'));
     assert!(
-        matches!(model.overlay, Some(Overlay::Help(_))),
+        matches!(model.overlay_top(), Some(Overlay::Help(_))),
         "a refused rebind must not open a command line to edit"
     );
     // Not just `Level::Error`: `open_help_rebind`'s other failure path
@@ -4525,7 +4528,7 @@ fn command_and_run(model: &mut Model, line: &str) -> Vec<Cmd> {
 
 /// The report that is up.
 fn open_pane(model: &Model) -> &crate::tui::report::ReportPane {
-    match model.overlay.as_ref() {
+    match model.overlay_top() {
         Some(Overlay::Report(pane)) => pane,
         other => panic!("expected a report, found {other:?}"),
     }

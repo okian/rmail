@@ -267,7 +267,7 @@ fn a_rebound_key_shows_up_in_the_help() {
     let mut model = loaded();
     model.keymap =
         crate::keymap::file::parse("[normal]\n\"<c-d>\" = \"cursor.down\"\n", "keys.toml").unwrap();
-    model.overlay = Some(Overlay::Help(Box::new(HelpPane::new(
+    model.set_overlay(Overlay::Help(Box::new(HelpPane::new(
         Mode::Normal,
         &model.keymap,
     ))));
@@ -351,7 +351,7 @@ fn a_selected_row_the_cursor_is_not_on_is_still_marked() {
 #[test]
 fn the_folder_picker_overlay_lists_the_folders() {
     let mut model = loaded();
-    model.overlay = Some(Overlay::Pick {
+    model.set_overlay(Overlay::Pick {
         what: PickFor::Move,
         message_ids: vec![10],
         idx: 1,
@@ -364,13 +364,13 @@ fn the_folder_picker_overlay_lists_the_folders() {
 #[test]
 fn the_confirm_and_input_overlays_show_their_prompts() {
     let mut model = loaded();
-    model.overlay = Some(Overlay::Confirm {
+    model.set_overlay(Overlay::Confirm {
         prompt: "delete permanently (expunges on the server)? [y/N]".to_owned(),
         then: Confirmed::Delete(vec![10]),
     });
     assert!(screen(&model).contains("expunges on the server"));
 
-    model.overlay = Some(Overlay::Input {
+    model.set_overlay(Overlay::Input {
         prompt: "forward to".to_owned(),
         buffer: "bob@example.com".to_owned(),
         what: InputFor::ForwardTo,
@@ -386,14 +386,14 @@ fn a_terminal_smaller_than_the_overlays_still_renders() {
     // `centered` clamps rather than subtracting into an underflow; ratatui's
     // own layout would panic on a `Rect` that does not fit its parent.
     let mut model = loaded();
-    model.overlay = Some(Overlay::Help(Box::new(HelpPane::new(
+    model.set_overlay(Overlay::Help(Box::new(HelpPane::new(
         Mode::Normal,
         &model.keymap,
     ))));
     let rendered = draw(&model, 20, 5);
     assert_eq!(rendered.len(), 5);
 
-    model.overlay = Some(Overlay::Pick {
+    model.set_overlay(Overlay::Pick {
         what: PickFor::Copy,
         message_ids: vec![10],
         idx: 0,
@@ -717,7 +717,7 @@ fn a_parse_error_is_shown_in_the_command_line_in_red() {
         !chars_matching(&model, 120, 30, dark.err).is_empty(),
         "the complaint is in the error style: {screen}"
     );
-    assert!(model.overlay.is_some(), "and the overlay stays open");
+    assert!(model.overlay_is_open(), "and the overlay stays open");
 }
 
 #[test]
@@ -984,7 +984,7 @@ fn dark_theme_status_line_matches_the_historical_colors_for_each_level() {
 fn dark_theme_help_overlay_matches_the_historical_colors() {
     let dark = Theme::dark();
     let mut model = loaded();
-    model.overlay = Some(Overlay::Help(Box::new(HelpPane::new(
+    model.set_overlay(Overlay::Help(Box::new(HelpPane::new(
         Mode::Normal,
         &model.keymap,
     ))));
@@ -1030,7 +1030,7 @@ fn dark_theme_pick_confirm_and_input_overlays_border_matches_the_historical_colo
             "forward to",
         ),
     ] {
-        model.overlay = Some(overlay);
+        model.set_overlay(overlay);
         // Every overlay border is drawn `focused` — an overlay is definitionally
         // the thing with the keyboard's attention.
         let border = chars_matching(&model, 120, 30, dark.border_focus);
@@ -1049,7 +1049,7 @@ fn dark_theme_finder_kind_label_matches_the_historical_color() {
     // Two items, cursor left on the first (default `cursor: 0`) — the
     // *second* row's kind label is what this checks, so `List::highlight_style`
     // patching the first row is beside the point.
-    model.overlay = Some(Overlay::Finder(Box::new(FinderPane {
+    model.set_overlay(Overlay::Finder(Box::new(FinderPane {
         query: ">arch".to_owned(),
         items: vec![
             overlays::FinderItem {
@@ -1249,7 +1249,7 @@ fn mono_theme_still_renders_without_panicking_for_every_overlay() {
             then: Confirmed::Delete(vec![10]),
         },
     ] {
-        model.overlay = Some(overlay);
+        model.set_overlay(overlay);
         draw(&model, 120, 30);
     }
 }
@@ -1801,5 +1801,72 @@ fn set_ai_panel_width_actually_moves_the_panels_left_edge() {
     assert!(
         wide_x < narrow_x,
         "a wider AI panel should push its own left edge left: {narrow_x} vs {wide_x}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// overlay stack z-order (task 108: rendering half — the mechanism itself is
+// `tui::overlays::tests`; this is the one module allowed to call `render`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_stacked_overlay_renders_over_the_one_underneath_without_erasing_it() {
+    // tui.md §2.2.2's own example, drawn: confirm over the quick menu. Both
+    // must be visible at once — the confirm as a small floating dialog, the
+    // quick menu still readable around it — which is what "painted over, not
+    // replaced" (§4.4) means for something the eye can check directly.
+    let mut model = loaded();
+    model.push_overlay(Overlay::Quick(QuickPane {
+        message_id: 10,
+        subject: "Q3 invoice".to_owned(),
+        cursor: 0,
+    }));
+    model.push_overlay(Overlay::Confirm {
+        prompt: "really? [y/N]".to_owned(),
+        then: Confirmed::Delete(vec![10]),
+    });
+
+    let rendered = screen(&model);
+    assert!(
+        rendered.contains("really?"),
+        "the topmost overlay (confirm) must be visible:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Summarize") || rendered.contains("Q3 invoice"),
+        "the overlay underneath must still be visible around the confirm's \
+         small dialog box, not erased by it:\n{rendered}"
+    );
+}
+
+#[test]
+fn overlay_stack_render_order_is_back_to_front_by_index() {
+    // Help clamps to 84%×80% of a 120×30 area — roughly (10,3) to (100,24) —
+    // and Finder to 76%×70% — roughly (14,4) to (91,21) — so Finder's whole
+    // footprint sits inside Help's. Pushing Finder last must make its title
+    // the one actually on screen in that overlap, proving the render loop
+    // walks the stack forward (index 0 first, the top drawn last, so it
+    // wins any overlap) rather than in reverse or some other order. A
+    // weaker assertion here (e.g. matching a glyph Help's own chrome also
+    // contains) would pass whether or not the order is right — this one
+    // does not: `render_help`'s footer contains no "find —" substring at
+    // all, so its presence is real signal, not a coincidence of a shared
+    // character.
+    let mut model = loaded();
+    model.push_overlay(Overlay::Help(Box::new(HelpPane::new(
+        Mode::Normal,
+        &model.keymap,
+    ))));
+    let with_help_only = screen(&model);
+    assert!(with_help_only.contains("keys —"), "{with_help_only}");
+    assert!(
+        !with_help_only.contains("find —"),
+        "sanity: Help alone must not already contain the finder's title"
+    );
+
+    model.push_overlay(Overlay::Finder(Box::default()));
+    let with_finder_on_top = screen(&model);
+    assert!(
+        with_finder_on_top.contains("find —"),
+        "the finder, pushed last, must be what actually renders on top:\n{with_finder_on_top}"
     );
 }

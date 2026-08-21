@@ -362,7 +362,7 @@ fn n_runs_the_highlighted_rows_rejection() {
         }]
     );
     assert!(
-        matches!(model.overlay, Some(Overlay::Report(_))),
+        matches!(model.overlay_top(), Some(Overlay::Report(_))),
         "and the list stays up, because the next row is answered next"
     );
 }
@@ -389,7 +389,7 @@ fn n_on_a_row_with_nothing_to_reject_does_nothing() {
     );
     let cmds = update(&mut model, Msg::Key(Key::Char('n')));
     assert!(cmds.is_empty());
-    assert!(matches!(model.overlay, Some(Overlay::Report(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Report(_))));
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +490,7 @@ fn a_tag_table_opens_a_report_and_a_tag_fact_does_not() {
         matches!(cmds.first(), Some(Cmd::TagList { .. })),
         "{cmds:?}"
     );
-    assert!(matches!(model.overlay, Some(Overlay::Report(_))));
+    assert!(matches!(model.overlay_top(), Some(Overlay::Report(_))));
 
     let mut model = loaded();
     let cmds = run(&mut model, "tag new invoices");
@@ -498,6 +498,9 @@ fn a_tag_table_opens_a_report_and_a_tag_fact_does_not() {
         matches!(cmds.first(), Some(Cmd::TagCreate { .. })),
         "{cmds:?}"
     );
-    assert!(model.overlay.is_none(), "a one-line answer needs no screen");
+    assert!(
+        !model.overlay_is_open(),
+        "a one-line answer needs no screen"
+    );
     assert_eq!(model.inflight, 1, "somebody asked for it");
 }
