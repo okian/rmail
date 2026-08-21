@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use futures::StreamExt as _;
 
 use super::*;
 use crate::ai::provider::{ChatResponse, ProviderStream};

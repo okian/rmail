@@ -12,7 +12,16 @@
 //! computed, a fresh request actually cutting an older scan short (not
 //! merely discarding its output), and `Explain`'s contributions reconciling
 //! with the score the ranker actually produced.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// `result_large_err`: `next_result` below returns `Result<_, tonic::Status>`
+// directly (unlike this file's other stream helpers, which unwrap
+// internally) — see `client_auth_service.rs`'s identical `#![allow(...)]`
+// for why boxing `Status` isn't the fix.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::result_large_err
+)]
 
 use std::cell::Cell;
 use std::path::PathBuf;

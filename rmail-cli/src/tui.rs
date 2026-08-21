@@ -69,6 +69,7 @@ pub mod grpc;
 pub mod help;
 pub mod history;
 pub mod html;
+pub mod layout;
 pub mod manual;
 pub mod model;
 pub mod overlays;

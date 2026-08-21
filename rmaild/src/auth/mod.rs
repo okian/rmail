@@ -184,6 +184,15 @@ where
 /// Decide whether a call to `method` may proceed, given the caller's
 /// principal: implicit admin (`peer_admin`, unless `require_login_for_peer`
 /// disables that shortcut) or a `bearer` token.
+// `Status` is the correct error type at this boundary (this function *is*
+// the interceptor's authorization check, not a domain call a `Status` gets
+// mapped onto later) — clippy's complaint is purely about its stack size on
+// the `Err` path, and boxing it would mean every caller here and in
+// `principal_scopes` matches on `Box<Status>` instead of the type tonic's
+// own generated code (and every RPC handler in this crate) already uses.
+// `result_large_err` is a recent addition to clippy's default warn set; see
+// `rmail-proto/src/lib.rs`'s identical note for the same lint.
+#[allow(clippy::result_large_err)]
 async fn authorize(
     db: &Database,
     method: &str,
@@ -238,6 +247,7 @@ async fn authorize(
 ///
 /// [`Status`] (mapped from [`rmail_core::Error::Unauthenticated`]) if there is
 /// neither an applicable Unix-peer trust nor a valid bearer token.
+#[allow(clippy::result_large_err)] // see `authorize`'s identical note, above
 async fn principal_scopes(
     db: &Database,
     peer_admin: bool,

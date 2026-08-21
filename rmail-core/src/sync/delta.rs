@@ -1236,6 +1236,10 @@ mod tests {
     }
 
     #[test]
+    // The single-element `Vec` is the point of the test (see the comment on
+    // `vanished` below) — clippy's suggested `.collect()` rewrite is exactly
+    // the four-billion-element allocation this fixture exists to avoid.
+    #[allow(clippy::single_range_in_vec_init)]
     fn vanished_ranges_are_tested_not_expanded() {
         let changes = Changes {
             // What a server answers for a folder it emptied. Expanding this
