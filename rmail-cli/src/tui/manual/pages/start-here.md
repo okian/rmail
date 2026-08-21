@@ -19,6 +19,7 @@ no files on disk, so it still works on the day the daemon will not start.
 
 ## Concepts
 
+- [[cards-and-zoom]]
 - [[search-vs-finder]]
 - [[saved-vs-smart]]
 - [[archive]]

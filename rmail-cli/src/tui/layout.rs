@@ -68,7 +68,14 @@
 //! say again.
 #![allow(dead_code)]
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
+// Re-exported (not just used internally) so `tui::model` — which otherwise
+// imports no ratatui type, per this crate's "one ratatui-aware module"
+// invariant — can name `layout::Rect` in `Model::deck_plan`'s signature
+// without reaching past this module into `ratatui` itself. `Rect` is bare
+// geometry (four integers), not rendering; `Constraint`/`Layout` stay
+// private since nothing outside this module needs to run the solver.
+pub use ratatui::layout::Rect;
 
 #[cfg(test)]
 mod tests;
@@ -86,6 +93,23 @@ impl Card {
     /// Left-to-right deck order, matching the order tui.md's frame diagrams
     /// draw them in (§3.1's `[1] SIDEBAR [2] LIST [3] READER [4] RAIL`).
     pub const ALL: [Card; 4] = [Card::Sidebar, Card::List, Card::Reader, Card::Rail];
+
+    /// The lowercase name this card is called by in status text and pane
+    /// titles — this crate's convention for both (see e.g. `pane_block`'s
+    /// callers in `view.rs`: `"preview"`, `"message"`, `"manual"`). A method
+    /// rather than a derived `Debug` string, so a rename of the variant
+    /// cannot silently rewrite what a user reads — the same reason
+    /// `Action::describe` and `Mode::id` are hand-written rather than
+    /// derived.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Card::Sidebar => "sidebar",
+            Card::List => "list",
+            Card::Reader => "reader",
+            Card::Rail => "rail",
+        }
+    }
 }
 
 /// Width breakpoint, named for tui.md §4.2's own vocabulary so a reader can

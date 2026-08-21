@@ -1224,7 +1224,9 @@ fn u_with_nothing_to_undo_says_so() {
 #[test]
 fn the_ai_panel_loads_the_message_under_the_cursor_and_follows_it() {
     let mut model = loaded();
-    let cmds = press(&mut model, Key::Char('\\'));
+    press(&mut model, Key::Char(' '));
+    press(&mut model, Key::Char('a'));
+    let cmds = press(&mut model, Key::Char('p'));
     assert!(model.ai_panel);
     assert_eq!(
         cmds,
@@ -1265,7 +1267,9 @@ fn the_ai_panel_loads_the_message_under_the_cursor_and_follows_it() {
 #[test]
 fn the_ai_panel_does_not_re_request_while_a_load_is_in_flight() {
     let mut model = loaded();
-    press(&mut model, Key::Char('\\'));
+    press(&mut model, Key::Char(' '));
+    press(&mut model, Key::Char('a'));
+    press(&mut model, Key::Char('p'));
     // Any message at all, without a response landing first.
     assert!(update(&mut model, Msg::Changed)
         .iter()
@@ -1275,7 +1279,9 @@ fn the_ai_panel_does_not_re_request_while_a_load_is_in_flight() {
 #[test]
 fn hiding_the_ai_panel_drops_what_it_was_showing() {
     let mut model = loaded();
-    press(&mut model, Key::Char('\\'));
+    press(&mut model, Key::Char(' '));
+    press(&mut model, Key::Char('a'));
+    press(&mut model, Key::Char('p'));
     update(
         &mut model,
         Msg::Summarized {
@@ -1286,7 +1292,9 @@ fn hiding_the_ai_panel_drops_what_it_was_showing() {
             }),
         },
     );
-    press(&mut model, Key::Char('\\'));
+    press(&mut model, Key::Char(' '));
+    press(&mut model, Key::Char('a'));
+    press(&mut model, Key::Char('p'));
     assert!(!model.ai_panel);
     assert!(model.summary.is_none());
 }
@@ -1688,7 +1696,9 @@ fn an_explanation_that_failed_is_not_asked_for_again() {
 #[test]
 fn a_summary_that_failed_is_not_asked_for_again() {
     let mut model = loaded();
-    press(&mut model, Key::Char('\\'));
+    press(&mut model, Key::Char(' '));
+    press(&mut model, Key::Char('a'));
+    press(&mut model, Key::Char('p'));
     let cmds = update(
         &mut model,
         Msg::Summarized {

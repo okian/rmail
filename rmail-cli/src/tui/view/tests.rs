@@ -120,6 +120,56 @@ fn the_three_panes_show_folders_the_list_and_a_preview() {
 }
 
 #[test]
+fn a_zoomed_card_replaces_the_panes_with_a_named_placeholder() {
+    let mut model = loaded();
+    let before = screen(&model);
+    assert!(before.contains("Quarterly invoice"), "{before}");
+
+    press(&mut model, Key::Char('Z'));
+    let after = screen(&model);
+    // The pane title's em-dash form, not a bare "list"/"zoomed" — both of
+    // those also appear in the status line's own "list zoomed" message, so
+    // a looser assertion would pass even if the placeholder's title itself
+    // were deleted.
+    assert!(after.contains("list — zoomed"), "{after}");
+    assert!(
+        !after.contains("Quarterly invoice"),
+        "the placeholder replaces the panes rather than sharing the frame with them: {after}"
+    );
+}
+
+#[test]
+fn the_zoomed_placeholder_names_whichever_card_was_just_zoomed() {
+    // `Z` always targets `card_focus` (`toggle_zoom`'s own doc), so this is
+    // indirectly a test of `card_focus` too — but what the placeholder
+    // itself reads off is `model.zoom`, and that is what this asserts.
+    let mut model = loaded();
+    model.card_focus = Card::Reader;
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::Reader));
+    let rendered = screen(&model);
+    // Not a bare "reader" — the status line's own "reader zoomed" message
+    // would satisfy that without the placeholder's title doing anything.
+    assert!(rendered.contains("reader — zoomed"), "{rendered}");
+}
+
+#[test]
+fn the_status_line_still_renders_while_a_card_is_zoomed() {
+    // Not "2 message(s)" — `toggle_zoom` writes its own status message, so
+    // that one is legitimately gone the moment `Z` is pressed. What must
+    // survive is the chrome that has nothing to do with zoom at all: the
+    // mode indicator and the account/folder scope.
+    let mut model = loaded();
+    press(&mut model, Key::Char('Z'));
+    let rendered = screen(&model);
+    assert!(rendered.contains("NORMAL"), "{rendered}");
+    assert!(
+        rendered.contains("personal/INBOX"),
+        "chrome around the deck must survive a zoomed card, only the deck itself changes: {rendered}"
+    );
+}
+
+#[test]
 fn each_row_carries_a_date_and_an_undated_row_does_not_shear_the_column() {
     // 1_700_000_000 is 2023-11-14T22:13:20Z. Which calendar day that lands on
     // depends on the reader's zone, so the assertion is on the month — true
@@ -646,7 +696,9 @@ fn the_ai_panel_takes_a_column_and_leaves_the_list_visible() {
     let before = screen(&model);
     assert!(before.contains("Quarterly invoice"));
 
-    press(&mut model, Key::Char('\\'));
+    press(&mut model, Key::Char(' '));
+    press(&mut model, Key::Char('a'));
+    press(&mut model, Key::Char('p'));
     update(
         &mut model,
         Msg::Summarized {
@@ -1563,13 +1615,15 @@ fn the_status_line_names_focus_only_when_folders_are_off_screen_and_focused() {
 
 #[test]
 fn the_focus_hint_survives_a_long_status_line() {
-    // `\` both opens the AI panel and installs a 63-column status
+    // ` ap` both opens the AI panel and installs a 63-column status
     // ("AI panel — cached analysis only; `.` offers the calls that cost").
     // At 59 columns that status alone overruns the row; the hint must still
     // reach the screen rather than being truncated off the right edge of an
     // unbounded, unwrapped status span.
     let mut model = loaded();
-    press(&mut model, Key::Char('\\'));
+    press(&mut model, Key::Char(' '));
+    press(&mut model, Key::Char('a'));
+    press(&mut model, Key::Char('p'));
     press(&mut model, Key::Char('h'));
     assert_eq!(model.focus, Focus::Folders);
     assert!(model.ai_panel);
@@ -1610,6 +1664,29 @@ fn the_focus_hint_accounts_for_the_open_ai_panel_when_measuring_width() {
         narrowed_by_panel.contains("focus: folders"),
         "56 columns for the panes should read as narrow, even though the \
          terminal itself is 80: {narrowed_by_panel}"
+    );
+}
+
+#[test]
+fn the_focus_hint_is_eligible_while_a_card_is_zoomed_even_at_a_width_that_would_show_folders() {
+    // 120 columns is wide enough that folders are normally drawn (see
+    // `the_status_line_names_focus_only_when_folders_are_off_screen_and_focused`)
+    // — but a zoomed card covers the whole deck regardless of width, so the
+    // folder pane is exactly as invisible as it is at a narrow terminal, and
+    // the hint that exists for that case must fire here too.
+    let mut model = loaded();
+    press(&mut model, Key::Char('h'));
+    assert_eq!(model.focus, Focus::Folders);
+    assert!(
+        !draw(&model, 120, 30).join("\n").contains("focus: folders"),
+        "sanity: folders are drawn and the hint is quiet before any zoom"
+    );
+
+    press(&mut model, Key::Char('Z'));
+    let rendered = draw(&model, 120, 30).join("\n");
+    assert!(
+        rendered.contains("focus: folders"),
+        "the zoomed card hides folders exactly as a narrow terminal would: {rendered}"
     );
 }
 
@@ -1704,9 +1781,11 @@ fn the_ai_panel_header_shows_when_the_summary_is_pinned() {
     let mut model = loaded();
     assert!(!screen(&model).contains("AI ·"), "not open yet");
 
-    // Opened by \, following the cursor: not pinned, and the header must
+    // Opened by ` ap`, following the cursor: not pinned, and the header must
     // not claim otherwise.
-    press(&mut model, Key::Char('\\'));
+    press(&mut model, Key::Char(' '));
+    press(&mut model, Key::Char('a'));
+    press(&mut model, Key::Char('p'));
     let unpinned = screen(&model);
     assert!(unpinned.contains("AI ·"), "the panel is open: {unpinned}");
     assert!(

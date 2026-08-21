@@ -1,6 +1,6 @@
 # What the AI costs
 
-Two AI keys sit next to each other on the message list and only one of them
+Two AI keys answer for whatever the cursor is on, and only one of them
 spends anything. Knowing which is which is most of what you need.
 
 - {{keys:ai.panel}} shows the cached analysis for whatever the cursor is on:

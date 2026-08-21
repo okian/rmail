@@ -582,13 +582,19 @@ fn ctrl_d_and_ctrl_u_page_the_message_list_and_clamp_at_the_ends() {
 fn a_page_is_as_tall_as_the_terminal_says_it_is() {
     let mut model = with_messages(200);
 
-    update(&mut model, Msg::Resize { rows: 50 });
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: 120,
+            rows: 50,
+        },
+    );
     press(&mut model, Key::ctrl('d'));
     assert_eq!(model.message_idx, 46, "50 rows, less chrome, less overlap");
 
     // A terminal shorter than its own chrome still has to move by something,
     // and one row is the correct degenerate answer.
-    update(&mut model, Msg::Resize { rows: 2 });
+    update(&mut model, Msg::Resize { cols: 120, rows: 2 });
     let before = model.message_idx;
     press(&mut model, Key::ctrl('d'));
     assert_eq!(model.message_idx, before + 1);
@@ -598,7 +604,13 @@ fn a_page_is_as_tall_as_the_terminal_says_it_is() {
 fn a_resize_says_nothing_on_the_status_line() {
     let mut model = loaded();
     model.info("something worth reading");
-    let cmds = update(&mut model, Msg::Resize { rows: 40 });
+    let cmds = update(
+        &mut model,
+        Msg::Resize {
+            cols: 120,
+            rows: 40,
+        },
+    );
     assert!(cmds.is_empty(), "a resize asks the daemon for nothing");
     assert_eq!(
         model.status, "something worth reading",
@@ -4540,4 +4552,497 @@ fn issued(cmds: &[Cmd]) -> Vec<Cmd> {
         .filter(|cmd| !matches!(cmd, Cmd::SaveHistory { .. }))
         .cloned()
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// zoom + drawer state (task 109) — tui.md §4.4/§4.5
+// ---------------------------------------------------------------------------
+
+/// A representative width per breakpoint that *affords* the sidebar/rail
+/// split (M/L/XL — see `affords_split`'s own docs for why S is not among
+/// these even though it is wider than XS).
+const AFFORDING_WIDTH: u16 = 140; // M
+/// A representative width narrow enough that neither card's visibility
+/// preference has any effect — `\`/`C-b` can only focus-summon here.
+const NARROW_WIDTH: u16 = 100; // S
+/// A representative L-breakpoint width — wide enough that the rail joins
+/// the split as a `Shown` column rather than M's drawer-only treatment.
+const WIDE_WIDTH: u16 = 180; // L
+/// So narrow that only one card fits on screen at all (§4.2's XS row).
+const XS_WIDTH: u16 = 60; // Xs
+
+#[test]
+fn zoom_toggles_on_and_off_for_the_focused_card() {
+    let mut model = loaded();
+    assert_eq!(model.card_focus, Card::List, "the default focus");
+    assert_eq!(model.zoom, None);
+
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::List));
+
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, None, "Z again unzooms the same card");
+}
+
+#[test]
+fn z_outside_the_list_screen_explains_itself_rather_than_zooming_the_wrong_card() {
+    // `Z` is bound in every layer `Mode::Viewer` falls through to, so it is
+    // reachable with a message open — where `render_panes`, the only place
+    // that draws the placeholder, never runs at all.
+    let mut model = loaded();
+    model.screen = Screen::Viewer;
+    let zoom_before = model.zoom;
+
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(
+        model.zoom, zoom_before,
+        "must not zoom the card deck from a screen that cannot show it"
+    );
+    assert!(
+        model.status.contains("screen"),
+        "the refusal must say why, not silently drop the key: {}",
+        model.status
+    );
+}
+
+#[test]
+fn zoom_persists_across_a_resize() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::List));
+
+    update(&mut model, Msg::Resize { cols: 80, rows: 24 });
+    assert_eq!(
+        model.zoom,
+        Some(Card::List),
+        "a resize must not clear a sticky zoom"
+    );
+}
+
+#[test]
+fn zoom_is_not_implicitly_coupled_to_card_focus() {
+    // Not named "persists across a focus change": the one real
+    // `update`-driven way to move focus today, `C-b`/`\`'s focus-summon
+    // branch, deliberately clears zoom on purpose (see
+    // `c_b_focus_summon_clears_a_zoom_on_a_different_card` below), so zoom
+    // does *not* survive that focus change and a name claiming it does
+    // would answer the wrong question for anyone who came here looking.
+    //
+    // `h`/`l`/`Tab` do not move `card_focus` at all yet (task 132) — set it
+    // directly here, which is deliberately not routed through the summon
+    // branch. What this narrower test proves is still real: nothing *else*
+    // reaches into `zoom` when `card_focus` changes — a plain field write
+    // is the whole story, not a mutator quietly watching for one.
+    let mut model = loaded();
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::List));
+
+    model.card_focus = Card::Reader;
+    assert_eq!(
+        model.zoom,
+        Some(Card::List),
+        "zoom is not implicitly coupled to whatever card_focus happens to hold"
+    );
+}
+
+#[test]
+fn z_pressed_again_after_focus_moved_away_zooms_the_new_focus_not_the_old_zoom() {
+    // `Z` always targets `card_focus`, never "whatever is currently zoomed"
+    // — pressing it again after focus moved elsewhere replaces the zoom
+    // rather than clearing an unrelated one.
+    let mut model = loaded();
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::List));
+
+    model.card_focus = Card::Reader;
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::Reader));
+}
+
+#[test]
+fn z_on_the_focused_sidebar_neither_panics_nor_dead_ends_focus() {
+    let mut model = loaded();
+    model.card_focus = Card::Sidebar;
+
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::Sidebar));
+    // "Allowed for rule-consistency" (§4.5) — it need not render specially,
+    // but computing the plan for it must not panic, and focus must still be
+    // a real, movable value afterward (not, say, silently reset).
+    let _ = model.deck_plan();
+    assert_eq!(model.card_focus, Card::Sidebar);
+
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, None);
+    let _ = model.deck_plan();
+}
+
+#[test]
+fn c_b_flips_sidebar_visible_at_an_affording_width() {
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: AFFORDING_WIDTH,
+            rows: 40,
+        },
+    );
+    assert!(model.sidebar_visible, "the documented default");
+
+    press(&mut model, Key::ctrl('b'));
+    assert!(!model.sidebar_visible);
+    assert_eq!(
+        model.card_focus,
+        Card::List,
+        "flipping the preference does not itself move focus"
+    );
+
+    press(&mut model, Key::ctrl('b'));
+    assert!(model.sidebar_visible, "C-b toggles both ways");
+}
+
+#[test]
+fn c_b_at_an_affording_width_does_not_override_an_active_zoom() {
+    // Deliberate, not a gap: the affording branch is a preference flip, and
+    // `layout_mode`'s zoom branch outranks every preference (§4.5, "zoom
+    // wins over every other rule"). Flipping `sidebar_visible` while some
+    // other card is zoomed must not un-zoom it or draw a sidebar — that
+    // would make `C-b` a second, accidental way to clear zoom, on top of
+    // `Z` and the narrow branch's own summon.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: AFFORDING_WIDTH,
+            rows: 40,
+        },
+    );
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::List));
+
+    press(&mut model, Key::ctrl('b'));
+    assert!(!model.sidebar_visible, "the preference still flips");
+    assert_eq!(model.zoom, Some(Card::List), "but the zoom is untouched");
+    assert!(
+        model.deck_plan().placement(Card::Sidebar).is_hidden(),
+        "zoom still owns the whole frame — the sidebar is not drawn just \
+         because its preference turned on"
+    );
+}
+
+#[test]
+fn c_b_focus_summons_the_sidebar_at_a_narrow_width() {
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: NARROW_WIDTH,
+            rows: 40,
+        },
+    );
+    let visible_before = model.sidebar_visible;
+
+    press(&mut model, Key::ctrl('b'));
+    assert_eq!(
+        model.card_focus,
+        Card::Sidebar,
+        "no separate 'open sidebar' key — the only lever at a width the \
+         preference cannot affect is focus, the same mechanism h/l/Tab use"
+    );
+    assert_eq!(
+        model.sidebar_visible, visible_before,
+        "and the preference itself is untouched, since it has no effect here"
+    );
+}
+
+#[test]
+fn backslash_flips_rail_visible_at_an_affording_width() {
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: AFFORDING_WIDTH,
+            rows: 40,
+        },
+    );
+    assert!(!model.rail_visible, "the documented default");
+
+    press(&mut model, Key::Char('\\'));
+    assert!(model.rail_visible);
+
+    press(&mut model, Key::Char('\\'));
+    assert!(!model.rail_visible);
+}
+
+#[test]
+fn backslash_at_an_affording_width_does_not_override_an_active_zoom() {
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: AFFORDING_WIDTH,
+            rows: 40,
+        },
+    );
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::List));
+
+    press(&mut model, Key::Char('\\'));
+    assert!(model.rail_visible, "the preference still flips");
+    assert_eq!(model.zoom, Some(Card::List), "but the zoom is untouched");
+    assert!(
+        model.deck_plan().placement(Card::Rail).is_hidden(),
+        "zoom still owns the whole frame"
+    );
+}
+
+#[test]
+fn backslash_focus_summons_the_rail_at_a_narrow_width() {
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: NARROW_WIDTH,
+            rows: 40,
+        },
+    );
+    let visible_before = model.rail_visible;
+
+    press(&mut model, Key::Char('\\'));
+    assert_eq!(model.card_focus, Card::Rail);
+    assert_eq!(model.rail_visible, visible_before);
+}
+
+#[test]
+fn the_focus_summoned_drawer_actually_shows_up_in_the_deck_plan() {
+    // End to end: the key press changes `card_focus`, and `deck_plan` (the
+    // same function a real frame will eventually call, task 120) turns that
+    // into a drawer placement — proving the summon is not just a field
+    // flip nobody reads.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: NARROW_WIDTH,
+            rows: 40,
+        },
+    );
+    assert!(model.deck_plan().placement(Card::Sidebar).is_hidden());
+
+    press(&mut model, Key::ctrl('b'));
+    assert!(model.deck_plan().placement(Card::Sidebar).is_drawer());
+}
+
+#[test]
+fn the_rail_focus_summoned_drawer_also_shows_up_in_the_deck_plan() {
+    // `toggle_rail`'s exact counterpart to the sidebar test above — the two
+    // functions are structurally identical, and so is their coverage.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: NARROW_WIDTH,
+            rows: 40,
+        },
+    );
+    assert!(model.deck_plan().placement(Card::Rail).is_hidden());
+
+    press(&mut model, Key::Char('\\'));
+    assert!(model.deck_plan().placement(Card::Rail).is_drawer());
+}
+
+#[test]
+fn c_b_focus_summon_clears_a_zoom_on_a_different_card() {
+    // The promise behind a focus-summon is "show me this" — a zoom left
+    // stale on some other card would break that promise, since
+    // `layout_mode`'s zoom branch answers only `ctx.zoom`, never
+    // `ctx.focus`: the summoned card would stay off screen with the
+    // keyboard focus pointed at it.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: NARROW_WIDTH,
+            rows: 40,
+        },
+    );
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::List));
+
+    press(&mut model, Key::ctrl('b'));
+    assert_eq!(model.card_focus, Card::Sidebar);
+    assert_eq!(
+        model.zoom, None,
+        "the summon must not leave the sidebar hidden behind a stale zoom"
+    );
+    assert!(model.deck_plan().placement(Card::Sidebar).is_drawer());
+}
+
+#[test]
+fn backslash_focus_summon_clears_a_zoom_on_a_different_card() {
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: NARROW_WIDTH,
+            rows: 40,
+        },
+    );
+    press(&mut model, Key::Char('Z'));
+    assert_eq!(model.zoom, Some(Card::List));
+
+    press(&mut model, Key::Char('\\'));
+    assert_eq!(model.card_focus, Card::Rail);
+    assert_eq!(model.zoom, None);
+    assert!(model.deck_plan().placement(Card::Rail).is_drawer());
+}
+
+#[test]
+fn focus_summoning_a_different_drawer_dismisses_the_one_open_before_it() {
+    // "moving focus away closes it, with no separate open-overlay key"
+    // (§4.4): drawer state is derived from focus alone, so summoning a
+    // second drawer at the same narrow width is what dismissing the first
+    // one looks like — there is no dedicated dismiss key to test instead.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: NARROW_WIDTH,
+            rows: 40,
+        },
+    );
+
+    press(&mut model, Key::ctrl('b'));
+    assert!(model.deck_plan().placement(Card::Sidebar).is_drawer());
+
+    press(&mut model, Key::Char('\\'));
+    assert_eq!(model.card_focus, Card::Rail);
+    assert!(
+        model.deck_plan().placement(Card::Sidebar).is_hidden(),
+        "focus moved away — the sidebar drawer must close, not stack"
+    );
+    assert!(model.deck_plan().placement(Card::Rail).is_drawer());
+}
+
+#[test]
+fn rail_visible_at_m_is_a_drawer_never_a_split_column() {
+    // `layout_m` never gives the rail a `Shown` slot at all — only `Drawer`
+    // or `Hidden` — even though `affords_split` treats M as wide enough to
+    // flip the same `rail_visible` preference the sidebar gets a real
+    // column from at this width.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: AFFORDING_WIDTH,
+            rows: 40,
+        },
+    );
+    press(&mut model, Key::Char('\\'));
+    assert!(model.rail_visible);
+    assert!(model.deck_plan().placement(Card::Rail).is_drawer());
+}
+
+#[test]
+fn rail_visible_at_l_joins_the_split_as_shown() {
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: WIDE_WIDTH,
+            rows: 40,
+        },
+    );
+    press(&mut model, Key::Char('\\'));
+    assert!(model.rail_visible);
+    let placement = model.deck_plan().placement(Card::Rail);
+    assert!(
+        !placement.is_hidden() && !placement.is_drawer(),
+        "rail must be part of the normal split at L, not hidden or drawn as a drawer: {placement:?}"
+    );
+}
+
+#[test]
+fn xs_focus_summon_replaces_the_card_that_was_showing_rather_than_overlaying_it() {
+    // At XS only one card fits at all (§4.2) — `single_card` makes a
+    // summoned drawer occupy the whole area with everything else `Hidden`,
+    // never painted over a split the way S/M/L/XL's drawers are, because
+    // there is no split underneath left to preserve.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: XS_WIDTH,
+            rows: 40,
+        },
+    );
+    assert!(
+        !model.deck_plan().placement(Card::List).is_hidden(),
+        "the default focus is what XS shows before anything is pressed"
+    );
+
+    press(&mut model, Key::ctrl('b'));
+    assert_eq!(model.card_focus, Card::Sidebar);
+    assert!(model.deck_plan().placement(Card::Sidebar).is_drawer());
+    assert!(
+        model.deck_plan().placement(Card::List).is_hidden(),
+        "XS has no split underneath to preserve — the drawer replaces List, it does not overlay it"
+    );
+}
+
+#[test]
+fn a_sidebar_hidden_by_preference_still_drawers_once_focus_returns_at_an_affording_width() {
+    // Reachable today by shrinking the terminal mid-session, summoning the
+    // sidebar there, and widening back out without touching `C-b` again —
+    // the `(None, true) => Drawer` arm in `layout_m`/`layout_l_xl`, which
+    // only fires when focus names the sidebar *and* its preference is off
+    // at a width that would otherwise afford it a real column.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: AFFORDING_WIDTH,
+            rows: 40,
+        },
+    );
+    press(&mut model, Key::ctrl('b'));
+    assert!(!model.sidebar_visible, "the preference is now off");
+
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: NARROW_WIDTH,
+            rows: 40,
+        },
+    );
+    press(&mut model, Key::ctrl('b'));
+    assert_eq!(model.card_focus, Card::Sidebar);
+
+    update(
+        &mut model,
+        Msg::Resize {
+            cols: AFFORDING_WIDTH,
+            rows: 40,
+        },
+    );
+    let placement = model.deck_plan().placement(Card::Sidebar);
+    assert!(
+        placement.is_drawer(),
+        "focus still names the sidebar and the preference is still off — \
+         it must be painted as a drawer rather than lost: {placement:?}"
+    );
+}
+
+#[test]
+fn sidebar_toggle_and_rail_toggle_each_have_exactly_one_default_binding() {
+    // The architectural half of "no separate open-sidebar-overlay key"
+    // (§4.4): confirmed against the live keymap rather than asserted in
+    // prose, so a future binding added elsewhere for either action would
+    // fail this test rather than silently create a second door to the same
+    // drawer.
+    let model = loaded();
+    let sidebar_chords = model.keymap.chords_for(Mode::Normal, Action::SidebarToggle);
+    assert_eq!(sidebar_chords.len(), 1, "{sidebar_chords:?}");
+    let rail_chords = model.keymap.chords_for(Mode::Normal, Action::RailToggle);
+    assert_eq!(rail_chords.len(), 1, "{rail_chords:?}");
 }

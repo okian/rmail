@@ -650,3 +650,14 @@ fn card_all_lists_every_variant_exactly_once() {
     }
     assert!(seen.iter().all(|&s| s), "Card::ALL is missing a variant");
 }
+
+#[test]
+fn every_card_label_is_unique_lowercase_and_non_empty() {
+    let labels: Vec<&str> = Card::ALL.iter().map(|c| c.label()).collect();
+    for label in &labels {
+        assert!(!label.is_empty());
+        assert_eq!(*label, label.to_lowercase(), "{label} is not lowercase");
+    }
+    let unique: std::collections::BTreeSet<&&str> = labels.iter().collect();
+    assert_eq!(unique.len(), labels.len(), "{labels:?} has a duplicate");
+}

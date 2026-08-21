@@ -1342,7 +1342,7 @@ sequenced first and everything else depends on them transitively.
 - **note (ten more call sites needed a third primitive, `clear_overlays`):** six sites doing `model.overlay = None` and four more doing `.take()`-then-cancel-its-stream all predate this task and each already carries a doc comment stating the invariant as "no overlay may be left open" (e.g. `open_manual_at`: "the manual is a screen, so an overlay left up would cover the thing the caller just asked to show") — never "one fewer overlay." Migrating them to `pop_overlay` (which only reaches the top) would have silently regressed that invariant the moment any stack ever got two deep. Added `Model::clear_overlays` (drains the whole stack, returns what was cleared so the four stream-owning sites can `.iter().flat_map(cancels)` across all of them instead of only the topmost) and moved all ten sites onto it. Also made `overlay_stack` a private field (was `pub`, which made the depth cap purely advisory — any code, including a future call site, could `push` straight past it) behind a new read-only `Model::overlays() -> &[Overlay]`; every write path was already exclusively the five methods this task added, so no behavior changed, only what could bypass them.
 
 ## 109. Zoom + drawer state
-- [ ] status
+- [x] status
 - **depends-on:** 107
 - **parallel-safe:** no
 - **acceptance:**
@@ -1364,6 +1364,48 @@ sequenced first and everything else depends on them transitively.
 - **verify:** `cargo nextest run -p rmail-cli tui::model` (zoom toggle per card persists
   across a resize and a focus change, drawer summon/dismiss at each breakpoint via
   `layout_mode`, `\`/`C-b` dual behavior at wide vs. narrow widths)
+- **closed at merge — the reviewer found the same state-machine hole in both halves of the
+  sidebar/rail toggle, one round apart:** `toggle_sidebar`/`toggle_rail`'s narrow-width branch
+  (focus-summoning a drawer) left `model.zoom` untouched when the zoom was on a *different*
+  card, so summoning e.g. the sidebar with `C-b` while the reader was zoomed left the zoomed
+  reader on screen while focus silently moved to a sidebar nothing was rendering — round 1
+  caught this and it was fixed by clearing `model.zoom` in that branch. Round 2 found the
+  *affording*-width branch (the preference flip at ≥120 columns) carried an equivalent bug: it
+  flipped `sidebar_visible`/`rail_visible` without touching an active zoom, plus emitted a
+  status message claiming "sidebar on" even when zoom meant nothing changed on screen. Here the
+  fix diverged from the reviewer's own first suggestion: the affording branch sets a
+  *preference* for the eventual renderer to consult on a later frame, not an immediate visual
+  promise the way narrow-width focus-summon is, so clearing zoom there would break the
+  pre-existing (task 107) "zoom always wins" invariant for no reason — the reviewer's second
+  pass retracted its own suggestion and agreed. `affords_split`'s two branches now carry doc
+  comments spelling out which is a promise and which is a preference, and why only one clears
+  zoom.
+- **closed at merge — `Z` had no observable effect and was reachable from the wrong screen:**
+  the first draft toggled `Model::zoom` with no corresponding render, so the acceptance's own
+  "the toggle is observable and tested" requirement was unmet outside unit assertions on the
+  field itself — fixed by `render_zoomed_placeholder` in `view.rs`, a full-bleed block naming
+  the zoomed card, gated on `Screen::List`. Round 2 caught that the gate was missing at the
+  `update` layer too: `Mode::Viewer`'s keymap chain inherits `Mode::Normal`
+  (`keymap/mod.rs:539`), so `Z` was live while a message was open in the old `Screen::Viewer`
+  even though nothing there ever renders a zoom placeholder — pressing it silently changed
+  `model.zoom` with zero visible effect and no way back short of guessing. `toggle_zoom` now
+  refuses outside `Screen::List` with a status-line explanation instead.
+- **note (round 3, a loose assertion that could pass for the wrong reason):** two
+  placeholder-naming tests (`a_zoomed_card_replaces_the_panes_with_a_named_placeholder`,
+  `the_zoomed_placeholder_names_whichever_card_was_just_zoomed`) asserted only that the
+  rendered frame contained a loose substring like `"list"` or `"reader"`, which the status
+  line's own `"list zoomed"`/`"reader zoomed"` message could satisfy independently of whether
+  `render_zoomed_placeholder`'s title was ever drawn. Tightened to the placeholder's actual
+  em-dash title form (`"list — zoomed"`), which only the placeholder itself can produce.
+- **note (manual page and task 132's undecided rule):** the manual-coverage gate required a
+  documenting page for `card.zoom`/`sidebar.toggle`/`rail.toggle` before this task's own diff
+  could land; added `cards-and-zoom.md`, careful to describe only what's actually observable
+  today (state changes plus the zoom placeholder), not the four-card deck this task's state is
+  built for but doesn't render yet. Also added an acceptance bullet to task 132 (the future
+  zoom/focus rule) pinning the one interaction this task's own tests establish: moving focus
+  onto a *hidden* card clears zoom, moving between two already-*visible* cards does not — §4.5's
+  "survives focus changes" language covers only the second case, which task 132 will need to
+  know explicitly rather than re-deriving.
 
 ## 110. Filter engine (client-side predicate grammar subset)
 - [ ] status
@@ -1457,6 +1499,13 @@ sequenced first and everything else depends on them transitively.
     visibility + active tab, sidebar visibility, panel width overrides, hints on/off, mouse
     capture, undo-advance direction — with documented defaults for every field (no field is
     ever genuinely absent; unset means "use the shipped default", never "unknown").
+  - Resolves `Model::rail_visible`'s width-dependent default: task 109 hardcoded it `false`
+    at construction rather than consulting `layout::default_rail_visible` (`>= 176`), by
+    this task's own design (there was nowhere to persist an override against it yet, and no
+    live path to keep it in step as the terminal resizes). This task both computes the
+    documented default from the *current* width when no stored preference exists, and
+    decides — and tests — what a live `Msg::Resize` crossing 176 does to a value the user
+    has never explicitly toggled versus one they have.
   - Write-through, debounced 1 s (matches `keys.toml`'s existing hot-reload cadence in
     spirit, but this direction is writes, not reads) — a burst of ten preference changes in
     one second produces one disk write, proven with a fake clock rather than a real sleep.
@@ -1972,6 +2021,17 @@ sequenced first and everything else depends on them transitively.
   - `C-w h/j/k/l` gives explicit directional focus as an alternative to `h`/`l`/`Tab`,
     resolving to the same focus-change code path (proven by a test that both produce
     identical `Model` deltas for the same starting state).
+  - Decides and implements the zoom/focus interaction rule task 109 left narrow: task 109's
+    `toggle_sidebar`/`toggle_rail` clear `Model::zoom` whenever their focus-summon branch
+    moves focus onto a card the current layout would otherwise hide, specifically so the
+    summoned card is never left invisible behind an unrelated zoom (`layout_mode`'s zoom
+    branch answers only `ctx.zoom`, never `ctx.focus`). This task is what gives `h`/`l`/`Tab`
+    a *general* way to move focus onto a hidden card, so the same question recurs for every
+    one of them, not just the two `\`/`C-b` already answer. Resolve it as one rule, not
+    per-key: moving focus onto a card the layout would otherwise hide always clears zoom;
+    moving focus between two cards that are already both visible in the current layout does
+    not. §4.5's "survives focus changes and resizes" governs the second case only — a bullet
+    and a test say so explicitly, so this is decided once rather than re-derived per key.
 - **verify:** `cargo nextest run -p rmail-cli tui::model` (h/l/Tab focus-only semantics
   under every card and zoom state, digits-are-always-counts even with a card named by a
   digit-adjacent chord, the h-in-Reader regression test, Enter's promote-rightward for at

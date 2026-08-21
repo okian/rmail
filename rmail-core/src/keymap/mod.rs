@@ -426,6 +426,14 @@ actions! {
     ConfirmAccept => "confirm.accept",      "confirm";
     InputSubmit   => "input.submit",        "submit what has been typed";
     InputBackspace => "input.backspace",    "delete the character before the cursor";
+    // Part VI (Cockpit redesign, task 109): the card deck's own bindings —
+    // tui.md §4.4/§4.5. `RailToggle` re-homes `\` from `AiPanel`, which the
+    // rail's own AI tab supersedes once task 128 renders it; `AiPanel` stays
+    // bound (on `<space>ap` alone now) since nothing yet replaces what it
+    // does.
+    Zoom          => "card.zoom",           "zoom the focused card full-bleed";
+    SidebarToggle => "sidebar.toggle",      "toggle the sidebar, or focus-summon it";
+    RailToggle    => "rail.toggle",         "toggle the rail, or focus-summon it";
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +733,12 @@ const DEFAULTS: &[(Mode, &str, Action)] = &[
     (Mode::Normal, "<c-k>", Action::PaletteOpen),
     (Mode::Normal, "A", Action::AskOpen),
     (Mode::Normal, ".", Action::AiQuick),
-    (Mode::Normal, "\\", Action::AiPanel),
+    // Re-homed from `Action::AiPanel` (task 109, tui.md §4.4) — the rail's
+    // own `✦ AI` tab supersedes the bespoke AI panel column once task 128
+    // renders it; `AiPanel` keeps its `<space>ap` binding until then.
+    (Mode::Normal, "\\", Action::RailToggle),
+    (Mode::Normal, "<c-b>", Action::SidebarToggle),
+    (Mode::Normal, "Z", Action::Zoom),
     (Mode::Normal, "O", Action::OutboxOpen),
     // `u` is "undo the send that is still inside its window" — the toast's
     // key. Bound in Normal as well as Menu because the toast is visible from

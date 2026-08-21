@@ -213,6 +213,12 @@ pub const PAGES: &[Page] = &[
         ],
     },
     Page {
+        anchor: "cards-and-zoom",
+        title: "Cards, focus and zoom",
+        body: Body::Authored(include_str!("manual/pages/cards-and-zoom.md")),
+        documents: &["card.zoom", "sidebar.toggle", "rail.toggle"],
+    },
+    Page {
         anchor: "typing",
         title: "Typing, choosing and confirming",
         body: Body::Authored(include_str!("manual/pages/typing.md")),

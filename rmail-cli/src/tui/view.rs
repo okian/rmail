@@ -26,6 +26,7 @@ use ratatui::Frame;
 
 use super::form::FormPane;
 use super::help::{self, HelpPane};
+use super::layout::Card;
 use super::manual;
 use super::model::{Focus, Model, Overlay, Scope, Screen, FLAGGED, SEEN};
 use super::overlays::{
@@ -153,6 +154,10 @@ const MIN_MESSAGE: u16 = 24;
 /// is what tells a person that rather than leaving them to wonder why `j`
 /// stopped moving the message cursor.
 fn render_panes(model: &Model, frame: &mut Frame, area: Rect) {
+    if let Some(card) = model.zoom {
+        render_zoomed_placeholder(model, frame, area, card);
+        return;
+    }
     render_main_with_panel(model, frame, area, |model, frame, area| {
         if area.width < FOLDER_BREAKPOINT {
             render_messages(model, frame, area);
@@ -193,6 +198,34 @@ fn render_panes(model: &Model, frame: &mut Frame, area: Rect) {
         render_messages(model, frame, columns[1]);
         render_preview(model, frame, columns[2]);
     });
+}
+
+/// `Z`'s placeholder (task 109, tui.md §4.5): the whole card area, naming
+/// which card is zoomed, standing in for that card's own zoomed render until
+/// it exists (List's headed sortable table is task 143). Its entire job is
+/// to make the toggle observable now rather than a keystroke with no effect
+/// — [`Model::zoom`] and everything that flips it is real, tested state
+/// regardless of what draws here.
+///
+/// Scoped to [`Screen::List`] — the only caller, [`render_panes`], only runs
+/// there, and `toggle_zoom` (`tui::model`) refuses to set [`Model::zoom`]
+/// outside it for exactly that reason. `card_focus`/`Model::zoom` describe
+/// the four-card Cockpit deck, which [`Screen::Viewer`]/[`Screen::Manual`]/
+/// [`Screen::Settings`] have no single agreed meaning for yet; reconciling
+/// the old screen enum with the card model is task 120's job, not this
+/// placeholder's.
+fn render_zoomed_placeholder(model: &Model, frame: &mut Frame, area: Rect, card: Card) {
+    frame.render_widget(Clear, area);
+    let title = format!("{} — zoomed", card.label());
+    frame.render_widget(
+        Paragraph::new(
+            "This card's own zoomed view has not been built yet; this \
+             placeholder only proves the toggle works. Z unzooms.",
+        )
+        .wrap(Wrap { trim: true })
+        .block(pane_block(&model.theme, &title, true)),
+        area,
+    );
 }
 
 /// Draw `main` in `area`, giving the collapsible AI panel a column of its own
@@ -543,8 +576,15 @@ fn render_status(model: &Model, frame: &mut Frame, area: Rect) {
     let pending_width = u16::try_from(bar.pending.chars().count() + 1).unwrap_or(u16::MAX);
     // `status::bar` answers "the folder pane has focus"; whether that pane is
     // being drawn is this module's question, because it is the only one that
-    // knows the width. A hint about a pane the reader can see is noise.
-    let eligible = !bar.focus_hint.is_empty() && panes_width(model, area.width) < FOLDER_BREAKPOINT;
+    // knows the width — and, since task 109, whether a zoomed card is
+    // covering it regardless of width. `focus_hint` is already empty unless
+    // `model.focus == Focus::Folders`, so a zoomed card cannot raise a hint
+    // that would otherwise have nothing to say; it can only stop this from
+    // wrongly withholding one. A hint about a pane the reader can see is
+    // noise, but folders under a zoomed List are exactly as invisible as
+    // folders dropped for width.
+    let eligible = !bar.focus_hint.is_empty()
+        && (panes_width(model, area.width) < FOLDER_BREAKPOINT || model.zoom.is_some());
     let hint_width = if eligible {
         u16::try_from(bar.focus_hint.chars().count() + 1).unwrap_or(u16::MAX)
     } else {

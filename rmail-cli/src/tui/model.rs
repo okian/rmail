@@ -62,6 +62,7 @@ use super::config_block::ConfigBlock;
 use super::form::FormPane;
 use super::help::{self, HelpPane};
 use super::history::History;
+use super::layout::{self, Card};
 use super::manual;
 use super::overlays;
 use super::overlays::{
@@ -166,6 +167,10 @@ const DEFAULT_AI_PANEL_WIDTH_PCT: u16 = 30;
 /// sensible answer before the first frame and a `None` would have to be
 /// answered with a number here anyway.
 const DEFAULT_VIEWPORT_ROWS: u16 = 24;
+/// [`DEFAULT_VIEWPORT_ROWS`]'s width half — the classic 80x24 — added in
+/// task 109 alongside [`Model::viewport_cols`]; see that field's own docs
+/// for why the model did not need to know its width before now.
+const DEFAULT_VIEWPORT_COLS: u16 = 80;
 
 /// Rows of a frame that are never the scrolling pane: the status line, and the
 /// two border rows of the pane itself.
@@ -881,15 +886,18 @@ pub enum Msg {
         /// What arrived.
         event: FormEvent,
     },
-    /// The terminal is this many rows tall — sent once at startup and again on
-    /// every resize.
+    /// The terminal is this size — sent once at startup and again on every
+    /// resize.
     ///
     /// A message rather than something read from the terminal where it is
-    /// needed, because [`update`] is pure: the window's height is an input
+    /// needed, because [`update`] is pure: the window's size is an input
     /// event that arrives on the same channel as a key press (crossterm
-    /// delivers it on the same event stream), not a thing the model may go and
-    /// ask for. Only the height, for the reason [`Model::viewport_rows`] gives.
+    /// delivers it on the same event stream), not a thing the model may go
+    /// and ask for. Carries both dimensions since task 109 gave the width
+    /// half a reason to exist — see [`Model::viewport_cols`]'s own docs.
     Resize {
+        /// The new column count.
+        cols: u16,
         /// The new row count.
         rows: u16,
     },
@@ -2539,11 +2547,39 @@ pub struct Model {
     /// property of the terminal, not of the mailbox. Everything else about
     /// geometry stays in `view`, which is handed a `Rect` per frame — see
     /// [`page_rows`] for what this is and is not used for.
-    ///
-    /// Width is deliberately absent: nothing in the model's arithmetic needs
-    /// it, and a field the model only stores is a field that can go stale
-    /// without anything noticing.
     pub viewport_rows: u16,
+    /// The terminal's width, as of the last [`Msg::Resize`] — [`viewport_rows`](Model::viewport_rows)'s
+    /// sibling, added in task 109 once [`layout::breakpoint`] gave the model
+    /// its first real reason to know it: `\`/`C-b`'s "flip a preference at
+    /// affording widths, focus-summon a drawer at narrower ones" behavior
+    /// (§4.4) reads the current breakpoint, and that needs the real column
+    /// count, not a guess. `viewport_rows`'s own former doc note ("width is
+    /// deliberately absent") is why this field did not exist until now — the
+    /// model genuinely had nothing to do with it before this task.
+    pub viewport_cols: u16,
+    /// The card zoomed full-bleed (`Z`), if any — sticky across resizes and
+    /// focus changes (tui.md §4.5); cleared only by `Z` again or the Esc
+    /// ladder (task 115).
+    pub zoom: Option<Card>,
+    /// Which of the four cards has keyboard focus. Defaults to
+    /// [`Card::List`] and, until task 132 wires `h`/`l`/`Tab`, is changed
+    /// only by [`Card::Sidebar`]/[`Card::Rail`]'s own focus-summon toggles
+    /// (`C-b`/`\` at breakpoints too narrow to show them as part of the
+    /// normal split — §4.4).
+    pub card_focus: Card,
+    /// Whether the sidebar is shown by default at breakpoints that can
+    /// afford it (M/L/XL) — `C-b`'s toggle target at those widths. A plain
+    /// session field for now; task 114's `tui.toml` is what will persist it
+    /// across sessions and let a user's own default override this one.
+    pub sidebar_visible: bool,
+    /// The rail's equivalent of [`sidebar_visible`](Model::sidebar_visible)
+    /// — `\`'s toggle target at the widths that consult it (M/L/XL; see
+    /// [`layout::layout_mode`]'s own per-breakpoint docs for exactly which).
+    /// Defaults `false` rather than [`layout::default_rail_visible`]'s
+    /// width-dependent answer: computing that default properly (and keeping
+    /// it in step as the terminal resizes) is task 114's job once there is
+    /// somewhere to persist an override against it, not this one's.
+    pub rail_visible: bool,
 }
 
 impl Default for Model {
@@ -2610,6 +2646,11 @@ impl Model {
             preview_width_pct: DEFAULT_PREVIEW_WIDTH_PCT,
             ai_panel_width_pct: DEFAULT_AI_PANEL_WIDTH_PCT,
             viewport_rows: DEFAULT_VIEWPORT_ROWS,
+            viewport_cols: DEFAULT_VIEWPORT_COLS,
+            zoom: None,
+            card_focus: Card::List,
+            sidebar_visible: true,
+            rail_visible: false,
         }
     }
 
@@ -2726,6 +2767,39 @@ impl Model {
                 Screen::Viewer => Mode::Viewer,
             },
         }
+    }
+
+    /// Where the four cards go right now — tui.md §2.2's single source of
+    /// truth (task 107's [`layout::layout_mode`]), fed from the facts this
+    /// module holds about them. Computed fresh on every call rather than
+    /// cached: `layout_mode` is pure and cheap, and caching it here would be
+    /// one more place model and view state could quietly disagree.
+    ///
+    /// `reader_open` reads [`Model::open`] — whether a message is currently
+    /// open is exactly what tui.md means by it (§4.2's S-breakpoint row),
+    /// and it is state this model already has, not something task 109 needed
+    /// to invent. `height_tier` reads [`Model::viewport_rows`], the same
+    /// field [`page_rows`] already trusts for the window's real size.
+    ///
+    /// `#[allow(dead_code)]`: `view.rs` still renders the v1 three-pane
+    /// frame — wiring this into a real draw is task 120's outer grid. Proven
+    /// live by this module's own tests instead, the same "declared shape a
+    /// named future task consumes" pattern task 107's `layout_mode` itself
+    /// carries until the same task wires it in.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn deck_plan(&self) -> layout::DeckPlan {
+        layout::layout_mode(
+            layout::Rect::new(0, 0, self.viewport_cols, self.viewport_rows),
+            layout::DeckContext {
+                focus: self.card_focus,
+                zoom: self.zoom,
+                sidebar_visible: self.sidebar_visible,
+                rail_visible: self.rail_visible,
+                reader_open: self.open.is_some(),
+                height_tier: layout::height_tier(self.viewport_rows),
+            },
+        )
     }
 
     /// The rows a visual selection covers, low index first, or `None` when
@@ -3183,10 +3257,11 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             ));
             Vec::new()
         }
-        Msg::Resize { rows } => {
+        Msg::Resize { cols, rows } => {
             // Silent: a resize is something the user did to their own window
             // and can see the result of, and a status line about it would push
             // off whatever the last thing that happened was.
+            model.viewport_cols = cols;
             model.viewport_rows = rows;
             Vec::new()
         }
@@ -4018,6 +4093,9 @@ fn run_action(model: &mut Model, action: Action, count: Option<u32>) -> Vec<Cmd>
         Action::CommandOpen | Action::PaletteOpen => open_command(model),
         Action::AskOpen => open_ask(model, String::new()),
         Action::AiPanel => toggle_ai_panel(model),
+        Action::Zoom => toggle_zoom(model),
+        Action::SidebarToggle => toggle_sidebar(model),
+        Action::RailToggle => toggle_rail(model),
         Action::AiQuick => open_quick(model),
         Action::OutboxOpen => open_outbox(model),
         Action::OutboxCancel => undo_send(model),
@@ -7022,7 +7100,123 @@ fn ask_now(model: &mut Model) -> Vec<Cmd> {
     }]
 }
 
-/// `\` — the collapsible AI panel.
+/// `Z` — zoom the focused card full-bleed inside the card area, or unzoom it
+/// (tui.md §4.5). [`super::view`] draws a named placeholder while a zoom is
+/// active — each card's own zoomed render (List's headed sortable table is
+/// task 143) lands later; this task only proves the toggle is real and
+/// observable.
+///
+/// Refuses outside [`Screen::List`]: `card_focus`/`zoom` describe the card
+/// deck, and only [`super::view::render_panes`] (List's own render path)
+/// ever draws the placeholder. Reachable without this guard — `Z` is bound
+/// in [`Mode::Viewer`]'s chain too — and without it the viewer would zoom
+/// whatever `card_focus` was last left at, announce success, and change
+/// nothing on screen until the user backs out to the list and finds a
+/// placeholder they do not remember causing.
+///
+/// Always targets [`Model::card_focus`], never whatever
+/// [`Model::zoom`] currently names: pressing `Z` is "zoom *this*", not
+/// "toggle whatever was last zoomed" — so if a different card were zoomed
+/// already, `Z` would replace it with the focused one rather than clearing
+/// an unrelated zoom. That divergence is not reachable today: every path
+/// that can change `card_focus` — only [`toggle_sidebar`]/[`toggle_rail`]'s
+/// focus-summon branch, until task 132 — clears `zoom` itself, so the two
+/// never disagree here. `zoom == Some(card_focus)` is therefore a safe
+/// simplifying assumption for callers *today*, not a permanent one; task
+/// 132 is what reopens the question and it must not assume this comment
+/// still holds by then.
+fn toggle_zoom(model: &mut Model) -> Vec<Cmd> {
+    if model.screen != Screen::List {
+        model.info("zoom applies to the card deck, not this screen");
+        return Vec::new();
+    }
+    model.zoom = if model.zoom == Some(model.card_focus) {
+        model.info(format!("{} unzoomed", model.card_focus.label()));
+        None
+    } else {
+        model.info(format!("{} zoomed", model.card_focus.label()));
+        Some(model.card_focus)
+    };
+    Vec::new()
+}
+
+/// Whether `bp` is a breakpoint at which [`layout::layout_mode`] actually
+/// consults a card's visibility preference (`sidebar_visible`/
+/// `rail_visible`) rather than deciding purely from focus — M/L/XL for
+/// both cards (see `layout_m`'s/`layout_l_xl`'s own `ctx.sidebar_visible`/
+/// `ctx.rail_visible` reads; `layout_s`/`layout_xs` never read either
+/// field). The shared half of [`toggle_sidebar`]/[`toggle_rail`]'s "flip a
+/// preference where that has any effect, focus-summon where it would not"
+/// split (§4.4).
+fn affords_split(bp: layout::Breakpoint) -> bool {
+    matches!(
+        bp,
+        layout::Breakpoint::M | layout::Breakpoint::L | layout::Breakpoint::Xl
+    )
+}
+
+/// `C-b` — the sidebar (tui.md §4.4).
+///
+/// Flips [`Model::sidebar_visible`] at a breakpoint that affords showing it
+/// as part of the normal split; at a narrower one, `sidebar_visible` has no
+/// effect on anything `layout::layout_mode` draws, so this instead
+/// focus-summons it as a drawer — "same key, same meaning: show me it."
+///
+/// The affording branch is a *preference* flip, not a promise about this
+/// exact frame — deliberately: `layout_mode`'s zoom branch outranks it (zoom
+/// wins over every other rule, §4.5), so flipping the preference while some
+/// other card is zoomed changes nothing on screen until the zoom clears,
+/// same as it would once this build actually draws the deck. The status
+/// message says "on"/"off" rather than "shown"/"hidden" for exactly that
+/// reason — it must never claim an immediate visual effect this build
+/// cannot deliver.
+///
+/// The narrow branch's summon is a different kind of thing — a focus
+/// change, not a preference — and it *does* clear [`Model::zoom`], because
+/// "show me it" there is a promise about this exact frame: `layout_mode`'s
+/// zoom branch answers only `ctx.zoom`, never `ctx.focus`, so a stale zoom
+/// would leave the summoned card hidden behind it, a focus that points at a
+/// card the frame does not draw. Clearing it here is what keeps that
+/// promise regardless of what was zoomed before.
+fn toggle_sidebar(model: &mut Model) -> Vec<Cmd> {
+    if affords_split(layout::breakpoint(model.viewport_cols)) {
+        model.sidebar_visible = !model.sidebar_visible;
+        model.info(if model.sidebar_visible {
+            "sidebar on"
+        } else {
+            "sidebar off"
+        });
+    } else {
+        model.zoom = None;
+        model.card_focus = Card::Sidebar;
+        model.info("sidebar focused");
+    }
+    Vec::new()
+}
+
+/// `\` — the rail (tui.md §4.4). [`toggle_sidebar`]'s exact counterpart;
+/// see that function's docs, including why the affording branch says
+/// "on"/"off" rather than "shown"/"hidden", and why only the focus-summon
+/// branch clears [`Model::zoom`].
+fn toggle_rail(model: &mut Model) -> Vec<Cmd> {
+    if affords_split(layout::breakpoint(model.viewport_cols)) {
+        model.rail_visible = !model.rail_visible;
+        model.info(if model.rail_visible {
+            "rail on"
+        } else {
+            "rail off"
+        });
+    } else {
+        model.zoom = None;
+        model.card_focus = Card::Rail;
+        model.info("rail focused");
+    }
+    Vec::new()
+}
+
+/// `<space>ap` — the collapsible AI panel. No longer bound to `\`, which the
+/// rail's own `✦ AI` tab takes over once task 128 renders it — see
+/// [`toggle_rail`].
 fn toggle_ai_panel(model: &mut Model) -> Vec<Cmd> {
     model.ai_panel = !model.ai_panel;
     if model.ai_panel {

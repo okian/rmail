@@ -2051,4 +2051,10 @@ pub const LOCAL_ACTIONS: &[Action] = &[
     // Task 95's `n`, local for exactly the same reason: it runs whatever the
     // highlighted row's own verb reaches.
     Action::ReportReject,
+    // Task 109's zoom and drawer toggles. Local because there is nothing to
+    // ask the daemon: which card is zoomed and which are visible is layout
+    // state the client keeps for itself, the same way `focus.toggle` is.
+    Action::Zoom,
+    Action::SidebarToggle,
+    Action::RailToggle,
 ];

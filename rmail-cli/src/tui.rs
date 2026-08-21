@@ -158,15 +158,20 @@ pub async fn run(socket: &Path, args: TuiArgs) -> Result<()> {
         Arc::clone(&stop),
     );
 
-    // The window's height, before anything else: the model assumes 24 rows
-    // until it is told otherwise, and a `<c-d>` pressed on the first frame of
-    // a tall terminal should move a whole screen rather than the default's.
-    // Sent as a message for the same reason the resizes that follow it are —
+    // The window's size, before anything else: the model assumes 80x24 until
+    // it is told otherwise, and a `<c-d>` pressed on the first frame of a
+    // tall terminal should move a whole screen rather than the default's —
+    // and, since task 109, `\`/`C-b` on the first frame of a narrow one
+    // should already know it can't afford the card it is toggling. Sent as a
+    // message for the same reason the resizes that follow it are —
     // `model::update` is pure and reads no terminal. An unreadable size is not
     // a startup failure: the default stands, and the first real resize
     // corrects it.
     if let Ok(size) = terminal.size() {
-        let _ = tx.send(Msg::Resize { rows: size.height });
+        let _ = tx.send(Msg::Resize {
+            cols: size.width,
+            rows: size.height,
+        });
     }
 
     // Boot is a message like any other, so the first loads follow exactly the
@@ -331,10 +336,8 @@ fn to_msg(event: Event) -> Option<Msg> {
             }
             to_key(key.code, key.modifiers).map(Msg::Key)
         }
-        // Only the height, which is what a page is measured in; `view` is
-        // handed the width as part of its `Rect` on every frame and needs no
-        // copy of it in the model. See `Msg::Resize`.
-        Event::Resize(_, rows) => Some(Msg::Resize { rows }),
+        // Both dimensions since task 109 — see `Msg::Resize`'s own docs.
+        Event::Resize(cols, rows) => Some(Msg::Resize { cols, rows }),
         _ => None,
     }
 }
@@ -483,10 +486,13 @@ mod tests {
             to_msg(Event::Key(press(KeyCode::Char('j')))),
             Some(Msg::Key(Key::Char('j')))
         ));
-        // A resize carries the height only; the width is `view`'s business.
+        // A resize carries both dimensions (task 109).
         assert!(matches!(
             to_msg(Event::Resize(120, 44)),
-            Some(Msg::Resize { rows: 44 })
+            Some(Msg::Resize {
+                cols: 120,
+                rows: 44
+            })
         ));
         // A release is not a keystroke, and a mouse event is not modelled at
         // all — both stop here rather than reaching `update`.
