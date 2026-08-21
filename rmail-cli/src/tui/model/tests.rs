@@ -778,6 +778,8 @@ fn archive_moves_the_message_into_the_archive_folder() {
             message_id: 10,
             dest_mailbox_id: 2,
             label: "archived".to_owned(),
+            undo_from: Some(1),
+            idempotency_key: String::new(),
         }]
     );
 
@@ -785,7 +787,10 @@ fn archive_moves_the_message_into_the_archive_folder() {
         &mut model,
         Msg::Done {
             label: "archived".to_owned(),
-            result: Ok(Effect::Removed(10)),
+            result: Ok(Effect::Removed {
+                message_id: 10,
+                undo_from: Some(1),
+            }),
         },
     );
     assert_eq!(
@@ -793,6 +798,20 @@ fn archive_moves_the_message_into_the_archive_folder() {
         vec![11, 12],
         "the row leaves the list once the daemon confirms, not before"
     );
+    // The confirmed move pushed its own inverse — see
+    // `archiving_a_message_then_undoing_it_moves_it_back` for the full
+    // undo round trip; this just pins that the push itself happened.
+    match model.undo.pop() {
+        Some(undo::Entry::Move {
+            message_id,
+            dest_mailbox_id,
+            ..
+        }) => {
+            assert_eq!(message_id, 10);
+            assert_eq!(dest_mailbox_id, 1, "moves back to the folder it left");
+        }
+        other => unreachable!("expected a Move undo entry, got {other:?}"),
+    }
 }
 
 #[test]
@@ -830,6 +849,8 @@ fn archive_finds_a_nested_archive_folder_by_its_leaf_name() {
                 message_id: 10,
                 dest_mailbox_id: id,
                 label: "archived".to_owned(),
+                undo_from: Some(1),
+                idempotency_key: String::new(),
             }],
             "{name} was not recognised as an archive folder"
         );
@@ -907,6 +928,8 @@ fn s_toggles_seen_by_sending_the_whole_intended_flag_set() {
             // or toggling read would silently unflag the message.
             flags: vec![FLAGGED.to_owned(), SEEN.to_owned()],
             label: "marked read".to_owned(),
+            undo_flags: Some(vec![FLAGGED.to_owned()]),
+            idempotency_key: String::new(),
         }]
     );
 
@@ -917,6 +940,7 @@ fn s_toggles_seen_by_sending_the_whole_intended_flag_set() {
             result: Ok(Effect::Flags {
                 message_id: 10,
                 flags: vec![FLAGGED.to_owned(), SEEN.to_owned()],
+                undo_flags: None,
             }),
         },
     );
@@ -929,6 +953,8 @@ fn s_toggles_seen_by_sending_the_whole_intended_flag_set() {
             message_id: 10,
             flags: vec![FLAGGED.to_owned()],
             label: "marked not read".to_owned(),
+            undo_flags: Some(vec![FLAGGED.to_owned(), SEEN.to_owned()]),
+            idempotency_key: String::new(),
         }]
     );
 }
@@ -943,6 +969,8 @@ fn f_toggles_flagged() {
             message_id: 10,
             flags: vec![FLAGGED.to_owned()],
             label: "marked flagged".to_owned(),
+            undo_flags: Some(Vec::new()),
+            idempotency_key: String::new(),
         }]
     );
 }
@@ -983,6 +1011,8 @@ fn copy_and_move_pick_a_destination_folder_first() {
             message_id: 10,
             dest_mailbox_id: 2,
             label: "moved to Archive".to_owned(),
+            undo_from: Some(1),
+            idempotency_key: String::new(),
         }]
     );
 }
@@ -1009,6 +1039,8 @@ fn the_picker_acts_on_the_open_message_when_the_viewer_is_up() {
             message_id: 12,
             dest_mailbox_id: 2,
             label: "moved to Archive".to_owned(),
+            undo_from: Some(1),
+            idempotency_key: String::new(),
         }]
     );
 }
@@ -1039,6 +1071,16 @@ fn new_mail_arriving_under_an_open_picker_does_not_change_what_it_moves() {
             message_id: 12,
             dest_mailbox_id: 1,
             label: "moved to INBOX".to_owned(),
+            // Not `Some(1)`: the reload above replaced `model.messages`
+            // with `[row(99)]`, so message 12 is no longer verifiably a
+            // row from the open folder by the time this fires — the same
+            // guard that protects a search-hit-in-the-viewer move applies
+            // here too, and for the same reason (`archive`'s own comment).
+            // Still moves the *message*, correctly — just not credited as
+            // undoable, since this ledger cannot vouch for where it came
+            // from.
+            undo_from: None,
+            idempotency_key: String::new(),
         }],
         "the picker still targets the message it was opened on"
     );
@@ -1215,6 +1257,8 @@ fn actions_in_the_viewer_apply_to_the_open_message_not_the_list_cursor() {
             message_id: 12,
             dest_mailbox_id: 2,
             label: "archived".to_owned(),
+            undo_from: Some(1),
+            idempotency_key: String::new(),
         }]
     );
 }
@@ -1232,7 +1276,10 @@ fn removing_the_open_message_closes_the_viewer() {
         &mut model,
         Msg::Done {
             label: "deleted".to_owned(),
-            result: Ok(Effect::Removed(11)),
+            result: Ok(Effect::Removed {
+                message_id: 11,
+                undo_from: None,
+            }),
         },
     );
     assert_eq!(model.screen, Screen::List);
@@ -1264,7 +1311,10 @@ fn the_cursor_stays_inside_the_list_when_the_last_row_is_removed() {
         &mut model,
         Msg::Done {
             label: "archived".to_owned(),
-            result: Ok(Effect::Removed(12)),
+            result: Ok(Effect::Removed {
+                message_id: 12,
+                undo_from: None,
+            }),
         },
     );
     assert_eq!(model.message_idx, 1);
@@ -1676,6 +1726,8 @@ fn a_reloaded_keymap_changes_what_a_key_does() {
             message_id: 10,
             dest_mailbox_id: 2,
             label: "archived".to_owned(),
+            undo_from: Some(1),
+            idempotency_key: String::new(),
         }],
         "the new binding took effect without a restart"
     );
@@ -1828,11 +1880,15 @@ fn a_visual_selection_archives_every_message_in_it() {
                 message_id: 10,
                 dest_mailbox_id: 2,
                 label: "archived".to_owned(),
+                undo_from: Some(1),
+                idempotency_key: String::new(),
             },
             Cmd::Move {
                 message_id: 11,
                 dest_mailbox_id: 2,
                 label: "archived".to_owned(),
+                undo_from: Some(1),
+                idempotency_key: String::new(),
             }
         ]
     );
@@ -1858,15 +1914,67 @@ fn a_bulk_flag_toggle_picks_one_intent_for_the_whole_selection() {
                 message_id: 10,
                 flags: vec![SEEN.to_owned()],
                 label: "marked read".to_owned(),
+                // Message 10 already had SEEN — this dispatch does not
+                // actually change it, so there is nothing real for an
+                // undo to reverse.
+                undo_flags: None,
+                idempotency_key: String::new(),
             },
             Cmd::SetFlags {
                 message_id: 11,
                 flags: vec![SEEN.to_owned()],
                 label: "marked read".to_owned(),
+                undo_flags: Some(Vec::new()),
+                idempotency_key: String::new(),
             }
         ],
         "a mixed selection is marked read, not toggled row by row"
     );
+
+    // The two `undo_flags` shapes above are only half the claim — confirm
+    // `apply_effect` actually treats them differently at the stack, not
+    // just in the dispatched `Cmd`. Message 10 (no-op: already SEEN) must
+    // push nothing; message 11 (real: newly SEEN) must push its inverse.
+    update(
+        &mut model,
+        Msg::Done {
+            label: "marked read".to_owned(),
+            result: Ok(Effect::Flags {
+                message_id: 10,
+                flags: vec![SEEN.to_owned()],
+                undo_flags: None,
+            }),
+        },
+    );
+    assert_eq!(
+        model.undo.pop(),
+        None,
+        "message 10 already had SEEN — no real change, nothing to undo"
+    );
+    update(
+        &mut model,
+        Msg::Done {
+            label: "marked read".to_owned(),
+            result: Ok(Effect::Flags {
+                message_id: 11,
+                flags: vec![SEEN.to_owned()],
+                undo_flags: Some(Vec::new()),
+            }),
+        },
+    );
+    match model.undo.pop() {
+        Some(undo::Entry::Flags {
+            message_id, flags, ..
+        }) => {
+            assert_eq!(message_id, 11);
+            assert_eq!(
+                flags,
+                Vec::<String>::new(),
+                "restores to its pre-toggle empty set"
+            );
+        }
+        other => unreachable!("expected a Flags undo entry, got {other:?}"),
+    }
 
     // Now that every message in the selection has it, the same key clears it.
     let mut model = loaded();
@@ -1880,6 +1988,8 @@ fn a_bulk_flag_toggle_picks_one_intent_for_the_whole_selection() {
             message_id: 10,
             flags: Vec::new(),
             label: "marked not read".to_owned(),
+            undo_flags: Some(vec![SEEN.to_owned()]),
+            idempotency_key: String::new(),
         })
     );
 }
@@ -2029,6 +2139,419 @@ fn an_overlays_own_action_bound_elsewhere_does_not_close_the_wrong_overlay() {
 }
 
 // ---------------------------------------------------------------------------
+// undo (task 112)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn archiving_a_message_the_open_folder_never_actually_listed_is_not_undoable() {
+    // The regression this pins: a message opened in the viewer is not
+    // necessarily a row in `model.messages` — a search hit reached via
+    // `open_message_by_id` never sets `open_folder` to the folder the
+    // message actually lives in, so `model.open_folder` can still name
+    // whatever folder was last *listed*, a different one entirely.
+    // Crediting that folder as "where to undo back to" would file the
+    // message somewhere it never was, silently. Honest is to record no
+    // undo at all for a move this ledger cannot vouch for the source of.
+    let mut model = loaded();
+    model.screen = Screen::Viewer;
+    model.open = Some(OpenMessage {
+        id: 99, // not one of loaded()'s own rows (10, 11, 12)
+        ..OpenMessage::default()
+    });
+    assert!(
+        !model.messages.iter().any(|m| m.id == 99),
+        "the fixture's own premise"
+    );
+
+    let cmds = press(&mut model, Key::Char('a'));
+    match cmds.as_slice() {
+        [Cmd::Move {
+            message_id,
+            undo_from,
+            ..
+        }] => {
+            assert_eq!(*message_id, 99);
+            assert_eq!(
+                *undo_from, None,
+                "not verifiably in the open folder, so not undoable"
+            );
+        }
+        other => unreachable!("expected one Move, got {other:?}"),
+    }
+
+    // The `Cmd` carrying `undo_from: None` is only half the claim — confirm
+    // `apply_effect` actually honors it and pushes nothing, rather than
+    // relying on a shape nobody drives to confirmation.
+    update(
+        &mut model,
+        Msg::Done {
+            label: "archived".to_owned(),
+            result: Ok(Effect::Removed {
+                message_id: 99,
+                undo_from: None,
+            }),
+        },
+    );
+    assert_eq!(
+        model.undo.pop(),
+        None,
+        "an unvouched move must push nothing to undo back to"
+    );
+}
+
+#[test]
+fn archiving_a_message_then_undoing_it_moves_it_back() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('a'));
+    update(
+        &mut model,
+        Msg::Done {
+            label: "archived".to_owned(),
+            result: Ok(Effect::Removed {
+                message_id: 10,
+                undo_from: Some(1),
+            }),
+        },
+    );
+    assert_eq!(model.messages.len(), 2, "confirmed, so actually gone");
+
+    let cmds = undo(&mut model);
+    match cmds.as_slice() {
+        [Cmd::Move {
+            message_id,
+            dest_mailbox_id,
+            idempotency_key,
+            undo_from,
+            ..
+        }] => {
+            assert_eq!(*message_id, 10);
+            assert_eq!(*dest_mailbox_id, 1, "back to the folder it left");
+            assert!(!idempotency_key.is_empty(), "a real key, not an empty one");
+            assert_eq!(
+                *undo_from, None,
+                "undoing an undo is not itself undoable — no redo"
+            );
+        }
+        other => unreachable!("expected one Move back, got {other:?}"),
+    }
+}
+
+#[test]
+fn undo_reissues_the_exact_key_its_entry_was_minted_with() {
+    // `!idempotency_key.is_empty()` (the assertion the round-trip tests
+    // above make) would still pass for an implementation that discarded
+    // the entry's own key and minted a fresh one at pop time — which
+    // would make "so a retried undo cannot double-apply" (`undo.rs`'s own
+    // stated purpose for minting one at all) false: two pops of the same
+    // logical retry would carry two different keys, and the daemon's
+    // replay fence would never recognize the second as a repeat. Built
+    // directly from `undo::Entry::mv` rather than driven through a real
+    // forward dispatch, since the claim under test belongs to `undo`'s
+    // pop-and-reissue path specifically, not to how an entry gets pushed
+    // in the first place (covered elsewhere).
+    let mut model = loaded();
+    let entry = undo::Entry::mv(10, 1);
+    let undo::Entry::Move {
+        idempotency_key: minted,
+        ..
+    } = entry.clone()
+    else {
+        unreachable!()
+    };
+    model.undo.push(entry);
+
+    match undo(&mut model).as_slice() {
+        [Cmd::Move {
+            idempotency_key, ..
+        }] => {
+            assert_eq!(
+                *idempotency_key, minted,
+                "the reissued Cmd carries the entry's own key, not a fresh one"
+            );
+        }
+        other => unreachable!("expected one Move, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_failed_undo_does_not_claim_it_happened() {
+    // The regression this pins: `Msg::Done`'s error arm reuses the same
+    // `label` a success would have used as the prefix on the error
+    // message. A label that asserts completion ("undone — …") would make
+    // a *failed* undo render as `undone — moved back to INBOX: <error>` —
+    // a success claim glued to the error that contradicts it.
+    let mut model = loaded();
+    press(&mut model, Key::Char('a'));
+    update(
+        &mut model,
+        Msg::Done {
+            label: "archived".to_owned(),
+            result: Ok(Effect::Removed {
+                message_id: 10,
+                undo_from: Some(1),
+            }),
+        },
+    );
+    let cmds = undo(&mut model);
+    let Cmd::Move { label, .. } = cmds.into_iter().next().expect("one Move") else {
+        unreachable!("expected a Move");
+    };
+
+    update(
+        &mut model,
+        Msg::Done {
+            label,
+            result: Err("connection reset".to_owned()),
+        },
+    );
+    assert_eq!(model.level, Level::Error);
+    assert!(
+        !model.status.contains("undone"),
+        "must not claim the undo happened when it failed: {}",
+        model.status
+    );
+    assert!(
+        model.status.contains("connection reset"),
+        "{}",
+        model.status
+    );
+}
+
+#[test]
+fn toggling_a_flag_then_undoing_it_restores_the_exact_prior_set() {
+    let mut model = loaded();
+    model.messages[0].flags = vec![FLAGGED.to_owned()];
+
+    press(&mut model, Key::Char('s')); // mark read: adds SEEN, keeps FLAGGED
+    update(
+        &mut model,
+        Msg::Done {
+            label: "marked read".to_owned(),
+            result: Ok(Effect::Flags {
+                message_id: 10,
+                flags: vec![FLAGGED.to_owned(), SEEN.to_owned()],
+                undo_flags: Some(vec![FLAGGED.to_owned()]),
+            }),
+        },
+    );
+    assert!(model.messages[0].has_flag(SEEN));
+
+    let cmds = undo(&mut model);
+    match cmds.as_slice() {
+        [Cmd::SetFlags {
+            message_id,
+            flags,
+            idempotency_key,
+            undo_flags,
+            ..
+        }] => {
+            assert_eq!(*message_id, 10);
+            assert_eq!(
+                flags,
+                &vec![FLAGGED.to_owned()],
+                "exactly what it held before"
+            );
+            assert!(!idempotency_key.is_empty());
+            assert_eq!(*undo_flags, None, "no redo");
+        }
+        other => unreachable!("expected one SetFlags restore, got {other:?}"),
+    }
+}
+
+#[test]
+fn undo_reissues_the_exact_key_a_flags_entry_was_minted_with() {
+    // Same claim as `undo_reissues_the_exact_key_its_entry_was_minted_with`,
+    // for `Entry::Flags` — the two entry kinds convert to their inverse
+    // `Cmd` in separate match arms, so one passing is not evidence for
+    // the other.
+    let mut model = loaded();
+    let entry = undo::Entry::flags(10, vec![FLAGGED.to_owned()]);
+    let undo::Entry::Flags {
+        idempotency_key: minted,
+        ..
+    } = entry.clone()
+    else {
+        unreachable!()
+    };
+    model.undo.push(entry);
+
+    match undo(&mut model).as_slice() {
+        [Cmd::SetFlags {
+            idempotency_key, ..
+        }] => {
+            assert_eq!(
+                *idempotency_key, minted,
+                "the reissued Cmd carries the entry's own key, not a fresh one"
+            );
+        }
+        other => unreachable!("expected one SetFlags, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_confirmed_tag_application_pushes_an_undo_entry_that_reverses_direction() {
+    let mut model = loaded();
+    let cmds = update(
+        &mut model,
+        Msg::TagApplied {
+            message_id: 10,
+            name: "invoices".to_owned(),
+            remove: false, // a forward `tag add`
+        },
+    );
+    assert!(cmds.is_empty(), "a pure local bookkeeping push, no RPC");
+
+    let cmds = undo(&mut model);
+    match cmds.as_slice() {
+        [Cmd::UndoTag {
+            message_id,
+            name,
+            remove,
+        }] => {
+            assert_eq!(*message_id, 10);
+            assert_eq!(name, "invoices");
+            assert!(*remove, "undoing an add removes it");
+        }
+        other => unreachable!("expected one UndoTag reversal, got {other:?}"),
+    }
+
+    // And the reverse direction, symmetrically — at the unit level only:
+    // `apply_tags` (`grpc.rs`) never actually sends `Msg::TagApplied{remove:
+    // true, ..}` in production (its own `remove` branch never sets
+    // `changed`, so it never pushes at all — see its own comment, and
+    // `manual/pages/undo.md`'s "removing a tag" caveat). This proves
+    // `undo`'s own match arm inverts correctly for both directions
+    // regardless of which one production can currently reach — see
+    // `undo`'s own comment on its `Tag` arm for why that is still worth
+    // keeping correct rather than assumed.
+    update(
+        &mut model,
+        Msg::TagApplied {
+            message_id: 11,
+            name: "invoices".to_owned(),
+            remove: true, // a forward `tag rm` — hypothetical, see above
+        },
+    );
+    match undo(&mut model).as_slice() {
+        [Cmd::UndoTag { remove, .. }] => assert!(!remove, "undoing a removal re-adds it"),
+        other => unreachable!("expected one UndoTag reversal, got {other:?}"),
+    }
+}
+
+#[test]
+fn undo_on_an_empty_stack_says_so_and_issues_nothing() {
+    let mut model = loaded();
+    let cmds = undo(&mut model);
+    assert!(cmds.is_empty());
+    assert_eq!(model.level, Level::Error);
+    assert!(model.status.contains("nothing to undo"), "{}", model.status);
+}
+
+#[test]
+fn popping_an_entry_removes_it_so_a_second_undo_reaches_the_next_one_down() {
+    let mut model = loaded();
+    press(&mut model, Key::Char('a')); // archives message 10
+    update(
+        &mut model,
+        Msg::Done {
+            label: "archived".to_owned(),
+            result: Ok(Effect::Removed {
+                message_id: 10,
+                undo_from: Some(1),
+            }),
+        },
+    );
+    model.messages[0].flags = vec![FLAGGED.to_owned()];
+    press(&mut model, Key::Char('f')); // flags message 11 (now the cursor row)
+    update(
+        &mut model,
+        Msg::Done {
+            label: "marked flagged".to_owned(),
+            result: Ok(Effect::Flags {
+                message_id: 11,
+                flags: vec![FLAGGED.to_owned()],
+                undo_flags: Some(Vec::new()),
+            }),
+        },
+    );
+
+    match undo(&mut model).as_slice() {
+        [Cmd::SetFlags { message_id, .. }] => assert_eq!(*message_id, 11, "most recent first"),
+        other => unreachable!("expected the flags undo first, got {other:?}"),
+    }
+    match undo(&mut model).as_slice() {
+        [Cmd::Move { message_id, .. }] => assert_eq!(*message_id, 10, "then the archive"),
+        other => unreachable!("expected the move undo second, got {other:?}"),
+    }
+    assert!(undo(&mut model).is_empty(), "and then nothing is left");
+}
+
+#[test]
+fn u_falls_through_to_the_generic_stack_once_nothing_outbox_specific_is_pending() {
+    // `undo_send` is `u`'s existing handler (outbox-cancel/toast). It
+    // checks that first — see `overlays::tests::
+    // a_pending_send_still_wins_u_over_an_archive_undo_pushed_after_it`
+    // for why the order matters — and only once there is no outbox row
+    // and no live toast does it fall through to the generic stack (task
+    // 112). This fixture has neither, so the fallthrough is what fires.
+    let mut model = loaded();
+    model.undo.push(undo::Entry::mv(10, 1));
+    let cmds = run_action(&mut model, Action::OutboxCancel, None);
+    match cmds.as_slice() {
+        [Cmd::Move { message_id, .. }] => assert_eq!(*message_id, 10),
+        other => unreachable!("expected the stack's own Move, got {other:?}"),
+    }
+}
+
+#[test]
+fn u_puts_a_cancel_scheduled_entry_back_rather_than_consuming_it() {
+    // Nothing pushes one of these yet (task 146's job), but `undo_send`
+    // must not silently swallow it if it somehow got here — it belongs to
+    // the outbox-cancel logic just below, not the generic reissue path.
+    let mut model = loaded();
+    model.undo.push(undo::Entry::cancel_scheduled(42));
+
+    let cmds = run_action(&mut model, Action::OutboxCancel, None);
+    assert!(
+        cmds.is_empty(),
+        "no outbox pane and no toast in this fixture"
+    );
+    assert!(model.status.contains("nothing to undo"), "{}", model.status);
+
+    // Put back, not dropped: still there for a later `u`.
+    match model.undo.pop() {
+        Some(undo::Entry::CancelScheduled { outbox_id, .. }) => assert_eq!(outbox_id, 42),
+        other => unreachable!("expected the entry back on top, got {other:?}"),
+    }
+    assert!(model.undo.pop().is_none(), "only one entry was ever pushed");
+}
+
+#[test]
+fn undo_skips_past_a_cancel_scheduled_entry_to_reach_a_real_one_beneath_it() {
+    // The regression this pins: putting back only the *first*
+    // `CancelScheduled` found would permanently wedge on it — every later
+    // `undo` would re-find that same entry, report "nothing to undo" while
+    // the stack plainly is not empty, and never reach the real `Move`
+    // beneath it. Nothing pushes a `CancelScheduled` entry in production
+    // today, but this must still hold once task 146 does.
+    let mut model = loaded();
+    model.undo.push(undo::Entry::mv(10, 1));
+    model.undo.push(undo::Entry::cancel_scheduled(42));
+
+    let cmds = undo(&mut model);
+    match cmds.as_slice() {
+        [Cmd::Move { message_id, .. }] => assert_eq!(*message_id, 10),
+        other => unreachable!("expected the Move beneath it, got {other:?}"),
+    }
+    // And the skipped-past entry is still there, on top, for later.
+    match model.undo.pop() {
+        Some(undo::Entry::CancelScheduled { outbox_id, .. }) => assert_eq!(outbox_id, 42),
+        other => unreachable!("expected the entry put back on top, got {other:?}"),
+    }
+    assert!(model.undo.pop().is_none(), "and nothing else is left");
+}
+
+// ---------------------------------------------------------------------------
 // the manual (task 103)
 // ---------------------------------------------------------------------------
 
@@ -2123,7 +2646,10 @@ fn the_manual_falls_back_to_the_list_when_the_message_it_covered_is_gone() {
         &mut model,
         Msg::Done {
             label: "archived".to_owned(),
-            result: Ok(Effect::Removed(10)),
+            result: Ok(Effect::Removed {
+                message_id: 10,
+                undo_from: None,
+            }),
         },
     );
     assert_eq!(
@@ -2158,7 +2684,10 @@ fn the_manual_state_and_the_screen_never_disagree() {
         Msg::Key(Key::Char('K')),
         Msg::Done {
             label: "archived".to_owned(),
-            result: Ok(Effect::Removed(10)),
+            result: Ok(Effect::Removed {
+                message_id: 10,
+                undo_from: None,
+            }),
         },
         Msg::Key(Key::Esc),
         Msg::Folders(Ok(folders())),
@@ -2664,6 +3193,8 @@ fn a_selection_made_on_the_list_does_not_act_from_the_viewer_either() {
             message_id: 12,
             dest_mailbox_id: 2,
             label: "archived".to_owned(),
+            undo_from: Some(1),
+            idempotency_key: String::new(),
         }],
         "it archives what the viewer is showing, not the rows behind it"
     );

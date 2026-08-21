@@ -416,7 +416,7 @@ actions! {
     AiPanel       => "ai.panel",            "show or hide the AI panel";
     AiQuick       => "ai.quick",            "AI actions for this message";
     OutboxOpen    => "outbox",              "the outbox: scheduled, failed and undoable sends";
-    OutboxCancel  => "outbox.cancel",       "cancel the highlighted send (undo)";
+    OutboxCancel  => "outbox.cancel",       "cancel a pending send, or undo the last move/flag/tag";
     ReportRerun   => "report.rerun",        "run this report's own : line again";
     ReportReject  => "report.reject",       "the no half of a report row that offers both";
     PromptAccept  => "prompt.accept",       "accept what has been typed";

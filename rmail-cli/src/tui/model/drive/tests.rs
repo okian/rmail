@@ -41,7 +41,10 @@ impl CmdExec for Stalled {
             release.notified().await;
             let _ = out.send(Msg::Done {
                 label: "archived".to_owned(),
-                result: Ok(Effect::Removed(10)),
+                result: Ok(Effect::Removed {
+                    message_id: 10,
+                    undo_from: None,
+                }),
             });
         });
     }
@@ -144,6 +147,8 @@ async fn commands_returned_by_update_reach_the_executor() {
             message_id: 10,
             dest_mailbox_id: 2,
             label: "archived".to_owned(),
+            undo_from: Some(1),
+            idempotency_key: String::new(),
         }]
     );
 }

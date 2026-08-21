@@ -439,17 +439,29 @@ async fn set_flags_reaches_the_daemon_and_reports_the_set_it_applied() {
             message_id: daemon.message_id,
             flags: vec![crate::tui::model::SEEN.to_owned()],
             label: "marked read".to_owned(),
+            // Neither travels to the server — proving the RPC still
+            // succeeds with a real key, and that `undo_flags` survives the
+            // trip through `grpc.rs` into the `Effect` unchanged, is the
+            // one thing a model-level test structurally cannot reach.
+            undo_flags: Some(Vec::new()),
+            idempotency_key: "grpc-tests-set-flags".to_owned(),
         },
         tx.clone(),
     );
     match next(&mut rx, "the flag update").await {
         Msg::Done {
             label,
-            result: Ok(Effect::Flags { message_id, flags }),
+            result:
+                Ok(Effect::Flags {
+                    message_id,
+                    flags,
+                    undo_flags,
+                }),
         } => {
             assert_eq!(label, "marked read");
             assert_eq!(message_id, daemon.message_id);
             assert_eq!(flags, vec![crate::tui::model::SEEN.to_owned()]);
+            assert_eq!(undo_flags, Some(Vec::new()), "echoed through unchanged");
         }
         other => unreachable!("expected a flag effect, got {other:?}"),
     }
@@ -540,16 +552,27 @@ async fn a_move_removes_the_row_and_the_listing_agrees() {
             message_id: daemon.message_id,
             dest_mailbox_id: daemon.archive_id,
             label: "archived".to_owned(),
+            // Neither travels to the server — proving the RPC still
+            // succeeds with a real key, and that `undo_from` survives the
+            // trip through `grpc.rs` into the `Effect` unchanged, is the
+            // one thing a model-level test structurally cannot reach.
+            undo_from: Some(daemon.inbox_id),
+            idempotency_key: "grpc-tests-move".to_owned(),
         },
         tx.clone(),
     );
     match next(&mut rx, "the move").await {
         Msg::Done {
             label,
-            result: Ok(Effect::Removed(id)),
+            result:
+                Ok(Effect::Removed {
+                    message_id,
+                    undo_from,
+                }),
         } => {
             assert_eq!(label, "archived");
-            assert_eq!(id, daemon.message_id);
+            assert_eq!(message_id, daemon.message_id);
+            assert_eq!(undo_from, Some(daemon.inbox_id), "echoed through unchanged");
         }
         other => unreachable!("expected a move result, got {other:?}"),
     }
@@ -1519,6 +1542,8 @@ async fn a_real_flag_change_reaches_the_ledger_as_a_delta_not_just_a_coalesced_r
             message_id: daemon.message_id,
             flags: vec![crate::tui::model::SEEN.to_owned()],
             label: "marked read".to_owned(),
+            undo_flags: None,
+            idempotency_key: String::new(),
         },
         tx.clone(),
     );
@@ -1603,6 +1628,279 @@ async fn cmd_write_keybinding_runs_through_the_real_executor_and_reports_back() 
     let written = std::fs::read_to_string(&path).expect("the write actually landed on disk");
     assert!(written.contains("cursor.down"), "{written}");
     let _ = std::fs::remove_file(&path);
+
+    daemon.stop().await;
+}
+
+/// Drain `Msg::Report` frames for `generation` until the completing one,
+/// collecting every `Msg::TagApplied` seen along the way. The layer a
+/// model-level test structurally cannot reach: whether `apply_tags`
+/// (`grpc.rs`) actually gates its own `sink.tag_applied(...)` call the way
+/// the AddTag no-op check claims to.
+async fn drain_tag_apply(
+    rx: &mut UnboundedReceiver<Msg>,
+    generation: u64,
+) -> Vec<(i64, String, bool)> {
+    let mut applied = Vec::new();
+    loop {
+        match next(rx, "a tag-apply frame or report").await {
+            Msg::TagApplied {
+                message_id,
+                name,
+                remove,
+            } => applied.push((message_id, name, remove)),
+            Msg::Report {
+                generation: got,
+                event: ReportEvent::Frame { complete: true, .. },
+            } if got == generation => return applied,
+            Msg::Report { .. } => {}
+            other => unreachable!("expected TagApplied or a report frame, got {other:?}"),
+        }
+    }
+}
+
+/// task 112's P1: a redundant `AddTag` (the tag was already there) must
+/// not push an undo entry, since there is nothing for the entry it would
+/// push to actually reverse — `apply_tags`'s own no-op check, proven
+/// against a real daemon rather than trusted from reading the code, since
+/// the signal it reads (`AddTagResponse.applications` empty vs not) only
+/// means what it's supposed to if the daemon really does skip emitting an
+/// application for a redundant one.
+#[tokio::test]
+async fn a_redundant_tag_apply_pushes_no_undo_entry_but_a_genuine_one_does() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    // A genuine forward apply: a real change. Exactly one `TagApplied`.
+    exec.exec(
+        Cmd::TagApply {
+            generation: 1,
+            message_ids: vec![daemon.message_id],
+            name: "invoices".to_owned(),
+            remove: false,
+        },
+        tx.clone(),
+    );
+    assert_eq!(
+        drain_tag_apply(&mut rx, 1).await,
+        vec![(daemon.message_id, "invoices".to_owned(), false)],
+        "a genuine forward apply is the one case that should push"
+    );
+
+    // The same apply again — now a no-op, since the tag is already there.
+    // Must push nothing.
+    exec.exec(
+        Cmd::TagApply {
+            generation: 2,
+            message_ids: vec![daemon.message_id],
+            name: "invoices".to_owned(),
+            remove: false,
+        },
+        tx.clone(),
+    );
+    assert_eq!(
+        drain_tag_apply(&mut rx, 2).await,
+        Vec::new(),
+        "a redundant apply changed nothing, so there is nothing to undo"
+    );
+
+    daemon.stop().await;
+}
+
+/// task 112's P1: `RemoveTag` never pushes an undo entry at all, forward
+/// or otherwise — `RemoveTagResponse` is `google.protobuf.Empty`, so
+/// there is no signal distinguishing a genuine removal from a no-op, and
+/// guessing "yes it changed" risks *adding* a tag the message never
+/// carried the moment `u` is pressed. Proven against a real daemon: a
+/// removal that genuinely happens (the tag really is gone afterwards)
+/// still pushes nothing.
+#[tokio::test]
+async fn removing_a_tag_never_pushes_an_undo_entry_even_when_it_genuinely_changes_something() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::TagApply {
+            generation: 1,
+            message_ids: vec![daemon.message_id],
+            name: "invoices".to_owned(),
+            remove: false,
+        },
+        tx.clone(),
+    );
+    drain_tag_apply(&mut rx, 1).await;
+
+    exec.exec(
+        Cmd::TagApply {
+            generation: 2,
+            message_ids: vec![daemon.message_id],
+            name: "invoices".to_owned(),
+            remove: true,
+        },
+        tx.clone(),
+    );
+    assert_eq!(
+        drain_tag_apply(&mut rx, 2).await,
+        Vec::new(),
+        "a genuine removal still pushes nothing — there is no signal to trust"
+    );
+
+    daemon.stop().await;
+}
+
+/// A row that fails outright — not merely a no-op — must also push
+/// nothing. `outcome.is_ok()` gates the push already; this is what proves
+/// it against a real failure rather than trusting the `Result` plumbing
+/// by inspection.
+#[tokio::test]
+async fn a_failed_tag_apply_pushes_no_undo_entry() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::TagApply {
+            generation: 1,
+            message_ids: vec![999_999], // no such message
+            name: "invoices".to_owned(),
+            remove: false,
+        },
+        tx.clone(),
+    );
+    assert_eq!(
+        drain_tag_apply(&mut rx, 1).await,
+        Vec::new(),
+        "a failed apply changed nothing, so there is nothing to undo"
+    );
+
+    daemon.stop().await;
+}
+
+/// `Cmd::UndoTag` — the undo stack's own reissue path (task 112) —
+/// actually reaches `TagService` and reports back through `Msg::Done`,
+/// the layer a model-level test (which only ever hand-builds `Msg`s)
+/// cannot prove. Also proves it does *not* route through the same
+/// superseding report slot `Cmd::TagApply` does: both are dispatched
+/// back to back and both are expected to complete, which a shared
+/// slot would not allow (the second would abort the first).
+#[tokio::test]
+async fn undo_tag_reaches_the_daemon_and_does_not_share_the_report_streams_slot() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::TagApply {
+            generation: 1,
+            message_ids: vec![daemon.message_id],
+            name: "invoices".to_owned(),
+            remove: false,
+        },
+        tx.clone(),
+    );
+    drain_tag_apply(&mut rx, 1).await;
+
+    // Two `UndoTag`s back to back, exactly as two rapid `u` presses would
+    // dispatch them — if this shared `Cmd::TagApply`'s superseding slot,
+    // the first would be aborted and never answer.
+    exec.exec(
+        Cmd::UndoTag {
+            message_id: daemon.message_id,
+            name: "invoices".to_owned(),
+            remove: true,
+        },
+        tx.clone(),
+    );
+    exec.exec(
+        Cmd::UndoTag {
+            message_id: daemon.message_id,
+            name: "another".to_owned(),
+            remove: false,
+        },
+        tx.clone(),
+    );
+
+    let mut labels = Vec::new();
+    for _ in 0..2 {
+        match next(&mut rx, "an UndoTag completion").await {
+            Msg::Done { label, result } => {
+                assert!(result.is_ok(), "{result:?}");
+                labels.push(label);
+            }
+            other => unreachable!("expected Msg::Done, got {other:?}"),
+        }
+    }
+    assert!(labels.iter().any(|l| l.contains("removed")), "{labels:?}");
+    assert!(labels.iter().any(|l| l.contains("restored")), "{labels:?}");
+
+    daemon.stop().await;
+}
+
+/// The other half of the previous test's own claim, and the direction the
+/// bug actually described in user terms: pressing `u` while a `:tag add`'s
+/// own streamed report is still on screen must not silently kill that
+/// report. `Cmd::TagApply` still uses the shared superseding "reporting"
+/// slot (`stream_report`) — only `Cmd::UndoTag` moved off it — so a
+/// `TagApply` dispatched first must complete in full even when an
+/// `UndoTag` is dispatched immediately behind it, with no await in
+/// between to let one finish before the other starts.
+#[tokio::test]
+async fn a_tag_apply_report_completes_even_when_an_undo_tag_follows_it_immediately() {
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    // Seed a second, unrelated tag first (awaited — this one has to exist
+    // before the race so `UndoTag` below has something real to reverse).
+    exec.exec(
+        Cmd::TagApply {
+            generation: 1,
+            message_ids: vec![daemon.message_id],
+            name: "already-there".to_owned(),
+            remove: false,
+        },
+        tx.clone(),
+    );
+    drain_tag_apply(&mut rx, 1).await;
+
+    // The race: a forward apply, then an undo reissue, back to back —
+    // exactly a `:tag add` report still streaming when `u` is pressed.
+    exec.exec(
+        Cmd::TagApply {
+            generation: 2,
+            message_ids: vec![daemon.message_id],
+            name: "invoices".to_owned(),
+            remove: false,
+        },
+        tx.clone(),
+    );
+    exec.exec(
+        Cmd::UndoTag {
+            message_id: daemon.message_id,
+            name: "already-there".to_owned(),
+            remove: true,
+        },
+        tx.clone(),
+    );
+
+    let (mut tag_apply_completed, mut tag_applied_seen, mut undo_tag_completed) =
+        (false, false, false);
+    while !(tag_apply_completed && tag_applied_seen && undo_tag_completed) {
+        match next(&mut rx, "the race to settle").await {
+            Msg::TagApplied { name, .. } if name == "invoices" => tag_applied_seen = true,
+            Msg::Report {
+                generation: 2,
+                event: ReportEvent::Frame { complete: true, .. },
+            } => tag_apply_completed = true,
+            Msg::Done { label, result } if label.starts_with("tag already-there") => {
+                assert!(result.is_ok(), "{result:?}");
+                undo_tag_completed = true;
+            }
+            other => unreachable!("unexpected message while waiting: {other:?}"),
+        }
+    }
 
     daemon.stop().await;
 }

@@ -75,6 +75,7 @@ use super::report::{self, ReportColumn, ReportFill, ReportPane, ReportRow};
 use super::settings::{self, SettingsState};
 use super::status::{Daemon, Health, Subsystem};
 use super::theme::Theme;
+use super::undo;
 use crate::keymap::file::{self as keys_file, keys_path_from_env};
 pub use crate::keymap::Key;
 use crate::keymap::{Action, Chord, Keymap, Mode, Pending, Resolution};
@@ -775,13 +776,25 @@ pub enum Level {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// The message is gone from this folder (moved, archived or deleted).
-    Removed(i64),
+    Removed {
+        /// Which message.
+        message_id: i64,
+        /// Where to move it back to if this is undone — the folder it
+        /// left, echoed straight through from `Cmd::Move`'s own
+        /// `undo_from`. Always `None` for a hard delete: `MailService.Delete`
+        /// expunges on the server, and there is nowhere for an inverse to
+        /// send it back to.
+        undo_from: Option<i64>,
+    },
     /// The message's flag set is now this.
     Flags {
         /// Which message.
         message_id: i64,
         /// Its complete new flag set.
         flags: Vec<String>,
+        /// The flag set to restore if this is undone, echoed straight
+        /// through from `Cmd::SetFlags`'s own `undo_flags`.
+        undo_flags: Option<Vec<String>>,
     },
     /// A draft was created.
     Drafted(i64),
@@ -849,6 +862,22 @@ pub enum Msg {
     /// folders that are not the one currently open, which `Msg::Changed`
     /// never touches.
     LedgerDelta(Vec<ledger::SeqDelta>),
+    /// `Cmd::TagApply` applied to one message, successfully. Sent per row
+    /// from `apply_tags`'s own streaming loop, alongside (not instead of)
+    /// the `Msg::Report` frame that row also produces — `TagApply`'s
+    /// outcome never reaches `Msg::Done`/`Effect` at all (it streams a
+    /// `ReportRow` per id, some of which can fail while others succeed in
+    /// the same batch), so this is the undo stack's own hook onto a
+    /// confirmed tag change. See `tui::undo`'s own module doc.
+    TagApplied {
+        /// Which message.
+        message_id: i64,
+        /// Which tag.
+        name: String,
+        /// Whether this application removed it — `Entry::tag`'s own
+        /// `remove` is the *inverse* of this.
+        remove: bool,
+    },
     /// The `WatchEvents` subscription ended, with the reason.
     ///
     /// Deliberately not a [`Msg::Done`]: nobody asked for the stream and
@@ -1132,6 +1161,17 @@ pub enum Cmd {
         flags: Vec<String>,
         /// Status-line text on success.
         label: String,
+        /// The flag set to restore if this change is later undone — the
+        /// complete set the message held before this dispatch. `None`
+        /// means this dispatch is itself an undo's own reissue, so
+        /// `apply_effect` must not push a further undo entry for it (see
+        /// `tui::undo`'s own module doc: no redo).
+        undo_flags: Option<Vec<String>>,
+        /// Real only when this dispatch is itself an undo's reissue —
+        /// every forward dispatch passes the empty string. See `grpc.rs`'s
+        /// own comment at the `SetFlags` handler for why an empty key has
+        /// been safe for every other caller.
+        idempotency_key: String,
     },
     /// `MailService.Move`.
     Move {
@@ -1141,6 +1181,17 @@ pub enum Cmd {
         dest_mailbox_id: i64,
         /// Status-line text on success.
         label: String,
+        /// Where to move this message *back* to if this move is later
+        /// undone — the folder it was in before this dispatch. `None`
+        /// means this dispatch is itself an undo's own reissue, so
+        /// `apply_effect` must not push a further undo entry for it (see
+        /// `tui::undo`'s own module doc: no redo).
+        undo_from: Option<i64>,
+        /// Real only when this dispatch is itself an undo's reissue —
+        /// every forward dispatch passes the empty string. See `grpc.rs`'s
+        /// own comment at the `Move` handler for why an empty key has been
+        /// safe for every other caller.
+        idempotency_key: String,
     },
     /// `MailService.Copy`.
     Copy {
@@ -1395,13 +1446,38 @@ pub enum Cmd {
         /// Whose tags.
         account_id: i64,
     },
-    /// `TagService.AddTag`/`RemoveTag` over the selection.
+    /// `TagService.AddTag`/`RemoveTag` over the selection. Always a
+    /// forward dispatch — an undo's own reversal goes through
+    /// [`Cmd::UndoTag`] instead, on a separate, non-superseding path (see
+    /// its own doc for why the two cannot share one).
     TagApply {
         /// Which report this is.
         generation: u64,
         /// The messages, as `Target::selection` gave them.
         message_ids: Vec<i64>,
         /// The tag.
+        name: String,
+        /// Whether to remove it rather than add it.
+        remove: bool,
+    },
+    /// The undo stack's own reversal of a single tag application (task
+    /// 112) — `TagService.AddTag`/`RemoveTag` against exactly one message,
+    /// dispatched and completed like `Move`/`SetFlags` (`Msg::Done`) rather
+    /// than through the streamed-report machinery `Cmd::TagApply` uses.
+    /// Two reasons it needs its own variant rather than reusing that one
+    /// with a flag: `GrpcExec::stream_report` runs every `Cmd::TagApply`
+    /// through one shared superseding slot (`self.reporting`), so a second
+    /// one — including a second `u` press reissuing a *different* entry —
+    /// would silently abort the first mid-flight, which is exactly the
+    /// "does nothing and says nothing" failure law 6/9 forbids; and a
+    /// dedicated `Msg::Done` completion needs no `ReportPane` opened for it
+    /// to land in, so undoing a tag cannot displace whatever overlay (a
+    /// search, a running report, an AI-drafted reply) happened to be on
+    /// screen when `u` was pressed.
+    UndoTag {
+        /// Which message.
+        message_id: i64,
+        /// Which tag.
         name: String,
         /// Whether to remove it rather than add it.
         remove: bool,
@@ -2581,6 +2657,9 @@ pub struct Model {
     /// module doc for the full lifecycle. Seeded from a loaded page,
     /// adjusted from `WatchEvents` deltas, never trusted as exact.
     pub ledger: Ledger,
+    /// Session-local inverse operations — task 112, `tui::undo`'s own
+    /// module doc for the full lifecycle and its no-redo guarantee.
+    pub undo: undo::Stack,
     /// The bindings in force. Replaced wholesale when `keys.toml` changes;
     /// never patched, so a half-applied reload cannot exist.
     pub keymap: Keymap,
@@ -2707,6 +2786,7 @@ impl Model {
             visual: None,
             daemon: Daemon::default(),
             ledger: Ledger::default(),
+            undo: undo::Stack::default(),
             block: None,
             rule_draft: None,
             keymap: Keymap::defaults(),
@@ -3700,6 +3780,17 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
             Vec::new()
         }
+        // No `inflight` arithmetic, same reasoning as `Msg::LedgerDelta`
+        // just above: `Msg::Report`, not this, is what the row's own
+        // completion already counts.
+        Msg::TagApplied {
+            message_id,
+            name,
+            remove,
+        } => {
+            model.undo.push(undo::Entry::tag(message_id, name, !remove));
+            Vec::new()
+        }
     }
 }
 
@@ -3896,12 +3987,33 @@ fn summarize_current(model: &mut Model) -> Vec<Cmd> {
     }]
 }
 
-/// Fold a completed action's effect into the local view.
+/// Fold a completed action's effect into the local view — and, for a
+/// `Move`/`SetFlags` whose forward dispatch named an inverse, push it onto
+/// `model.undo`. Pushing here rather than at dispatch time is deliberate:
+/// this crate's mutations are confirm-then-apply, not optimistic (nothing
+/// touches `model.messages` until the daemon has agreed), so this is the
+/// one place per `Cmd` that both knows the action truly happened and still
+/// has the inverse data in hand — see `tui::undo`'s own module doc.
 fn apply_effect(model: &mut Model, effect: &Effect) {
     match effect {
-        Effect::Removed(id) => {
-            model.messages.retain(|m| m.id != *id);
-            if model.open.as_ref().is_some_and(|o| o.id == *id) {
+        Effect::Removed {
+            message_id,
+            undo_from,
+        } => {
+            // Correct for an undo's own reissue too, despite the name: the
+            // row this un-moves *back into* the open folder was never
+            // optimistically re-added here (this crate confirms before it
+            // applies), so `retain` removing an id that is not present is
+            // simply a no-op — the row reappears for real only once
+            // `Msg::Changed`'s own reseed notices the daemon-side move.
+            // One narrow, self-correcting exception: if that reseed wins
+            // the race and lands *before* this exact `Msg::Done` does, its
+            // fresher `model.messages` already contains the restored row,
+            // and this `retain` would remove it again until the next
+            // reseed. Not worth a staleness check for a one-tick glitch on
+            // an already-completed action.
+            model.messages.retain(|m| m.id != *message_id);
+            if model.open.as_ref().is_some_and(|o| o.id == *message_id) {
                 model.open = None;
                 // Only when the viewer is actually what is on screen. The
                 // manual may have been opened over it, and a message being
@@ -3912,14 +4024,28 @@ fn apply_effect(model: &mut Model, effect: &Effect) {
                     set_screen(model, Screen::List);
                 }
             }
-            if model.opening == Some(*id) {
+            if model.opening == Some(*message_id) {
                 model.opening = None;
             }
             model.clamp();
+            if let Some(dest_mailbox_id) = undo_from {
+                model
+                    .undo
+                    .push(undo::Entry::mv(*message_id, *dest_mailbox_id));
+            }
         }
-        Effect::Flags { message_id, flags } => {
+        Effect::Flags {
+            message_id,
+            flags,
+            undo_flags,
+        } => {
             if let Some(row) = model.messages.iter_mut().find(|m| m.id == *message_id) {
                 row.flags.clone_from(flags);
+            }
+            if let Some(previous) = undo_flags {
+                model
+                    .undo
+                    .push(undo::Entry::flags(*message_id, previous.clone()));
             }
         }
         Effect::Drafted(_) | Effect::None => {}
@@ -4742,6 +4868,17 @@ fn accept_pick(model: &mut Model) -> Vec<Cmd> {
                 message_id,
                 dest_mailbox_id: dest.id,
                 label: format!("moved to {}", dest.name),
+                // See `archive`'s own comment on why this is not simply
+                // `model.open_folder`: the picker's own target can be the
+                // open message (`Screen::Viewer`), which a search hit can
+                // leave pointed at a folder other than the one currently
+                // listed.
+                undo_from: if model.messages.iter().any(|m| m.id == message_id) {
+                    model.open_folder
+                } else {
+                    None
+                },
+                idempotency_key: String::new(),
             },
         })
         .collect()
@@ -4855,6 +4992,20 @@ fn archive(model: &mut Model) -> Vec<Cmd> {
             message_id,
             dest_mailbox_id: dest,
             label: "archived".to_owned(),
+            // Only when the target is verifiably a row from the open
+            // folder, not merely equal to whatever `model.open_folder`
+            // happens to name right now: `bulk_targets` can resolve to the
+            // open *message* (`Screen::Viewer`'s own target), which a
+            // search hit can leave open while `open_folder` still names
+            // the list behind it — a different folder than the message
+            // actually lives in. Crediting that as "where to undo back to"
+            // would file the message somewhere it never was.
+            undo_from: if model.messages.iter().any(|m| m.id == message_id) {
+                model.open_folder
+            } else {
+                None
+            },
+            idempotency_key: String::new(),
         })
         .collect()
 }
@@ -4935,10 +5086,26 @@ fn toggle_flag(model: &mut Model, flag: &str, noun: &str) -> Vec<Cmd> {
     model.visual = None;
     model.inflight += rows.len();
     rows.into_iter()
-        .map(|row| Cmd::SetFlags {
-            message_id: row.id,
-            flags: row.flags_with(flag, present),
-            label: label.clone(),
+        .map(|row| {
+            // A mixed selection has one intent for all of it (`present`,
+            // above), but not every row necessarily changes to reach
+            // it — marking a selection read where some rows are already
+            // read is exactly that. `undo_flags` is `None` for a row this
+            // dispatch does not actually change, so its confirmation does
+            // not push an undo entry with nothing real to reverse — the
+            // same standard `apply_tags` already applies to a redundant
+            // tag apply, made possible here (unlike there) because the
+            // prior state is already in hand locally, not something only
+            // the daemon's response could reveal.
+            let already = row.has_flag(flag) == present;
+            let previous = row.flags.clone();
+            Cmd::SetFlags {
+                message_id: row.id,
+                flags: row.flags_with(flag, present),
+                label: label.clone(),
+                undo_flags: if already { None } else { Some(previous) },
+                idempotency_key: String::new(),
+            }
         })
         .collect()
 }
@@ -6785,6 +6952,27 @@ fn use_account(model: &mut Model, id: i64) -> Vec<Cmd> {
     // The undo toast counts down a send from the account being left, and `u`
     // would cancel an outbox entry that is no longer on screen.
     remove_undo_toast(model);
+    // Same argument, for the same reason, applied to the generic stack
+    // (task 112): `mailbox_id`/`message_id` are global daemon row ids, so
+    // a stale entry reissued after a switch would still land on the
+    // *correct* row in the account being left — not on the wrong message,
+    // and not a no-op. That is exactly the problem: reversing something in
+    // an account nobody is looking at any more, with no folder or message
+    // list on screen able to show what just happened, is an undo the
+    // screen cannot account for — the same "no longer on screen" argument
+    // `remove_undo_toast` just made, not a different one.
+    // Known, narrow gap this reset does not close: a `Cmd::Move`/
+    // `Cmd::SetFlags`/`Cmd::TagApply` already in flight when the switch
+    // happens still completes afterward, and `apply_effect`/`Msg::TagApplied`
+    // push unconditionally on confirmation — so a mutation whose *request*
+    // predates this clear can still refill the stack with an entry from
+    // the account just left, one `Msg::Done` later. Closing it properly
+    // needs an account generation stamped onto those `Cmd`s and checked
+    // at push, real plumbing across three dispatch paths for a window
+    // that needs a mutation in flight at the exact moment of a switch —
+    // narrow enough that documenting it honestly here is the proportionate
+    // fix for now rather than adding that plumbing pre-emptively.
+    model.undo = undo::Stack::default();
     let account_id = id;
     model.info(format!("{name} — loading folders…"));
     // Two counted requests, and two that are not, for exactly the reasons
@@ -7400,25 +7588,232 @@ fn open_outbox(model: &mut Model) -> Vec<Cmd> {
     vec![Cmd::LoadOutbox { account_id }]
 }
 
+/// Pop the most recent entry off `model.undo` and reissue its inverse
+/// `Cmd`, or report "nothing to undo" on an empty stack — task 112's own
+/// acceptance, verbatim. `undo_send` (`u`'s existing handler, just below)
+/// falls through to this once it has ruled out something more urgent —
+/// see its own comment for why that check has to come first.
+fn undo(model: &mut Model) -> Vec<Cmd> {
+    // `CancelScheduled` entries are not this function's to act on — task
+    // 146 owns the whole scheduled-send-undo lifecycle (the chip, "absent
+    // id = most recent cancelable", reopening the composer) and will
+    // replace this whole function. Skip past any and put them back
+    // afterwards, in their original relative order, rather than stopping
+    // at the first one: nothing pushes one today, so this loop runs once
+    // in practice, but stopping there would mean the *first* one ever
+    // pushed permanently wedges every entry beneath it — every later `u`
+    // would re-find that same entry, report "nothing to undo" while the
+    // stack plainly is not empty, and never reach anything real again.
+    let mut deferred = Vec::new();
+    let found = loop {
+        match model.undo.pop() {
+            Some(entry @ undo::Entry::CancelScheduled { .. }) => deferred.push(entry),
+            other => break other,
+        }
+    };
+    for entry in deferred.into_iter().rev() {
+        model.undo.push(entry);
+    }
+    let Some(entry) = found else {
+        model.fail("nothing to undo");
+        return Vec::new();
+    };
+    // Turn the popped entry into its inverse `Cmd`, plus whatever local
+    // state that reissue needs.
+    match entry {
+        undo::Entry::Move {
+            message_id,
+            dest_mailbox_id,
+            idempotency_key,
+        } => {
+            let name = model
+                .folders
+                .iter()
+                .find(|f| f.id == dest_mailbox_id)
+                .map(|f| f.name.clone());
+            model.inflight += 1;
+            model.info(name.as_ref().map_or_else(
+                || "undoing — moving back…".to_owned(),
+                |name| format!("undoing — moving back to {name}…"),
+            ));
+            // Not "undone — …": `Msg::Done`'s error arm reuses this same
+            // string as the prefix on a failure (`format!("{label}: {error}")`,
+            // same as every forward label), and a label asserting
+            // completion would print `undone — moved back to INBOX:
+            // connection reset` — a success claim glued to the error that
+            // contradicts it. "moved back to …" reads correctly attached
+            // to either outcome, the same way "archived" already does for
+            // the forward action this reverses.
+            let label = name.map_or_else(
+                || "moved back".to_owned(),
+                |name| format!("moved back to {name}"),
+            );
+            vec![Cmd::Move {
+                message_id,
+                dest_mailbox_id,
+                label,
+                // `None`: this dispatch is itself an undo, so its own
+                // completion must not push a further entry — no redo.
+                undo_from: None,
+                idempotency_key,
+            }]
+        }
+        undo::Entry::Flags {
+            message_id,
+            flags,
+            idempotency_key,
+        } => {
+            model.inflight += 1;
+            model.info("undoing — restoring flags…");
+            vec![Cmd::SetFlags {
+                message_id,
+                flags,
+                // See the `Move` arm's own comment on why this is not
+                // "undone — …".
+                label: "flags restored".to_owned(),
+                undo_flags: None,
+                idempotency_key,
+            }]
+        }
+        undo::Entry::Tag {
+            message_id,
+            name,
+            remove,
+            idempotency_key,
+        } => {
+            // No wire field to carry this onto — see `undo::Entry::Tag`'s
+            // own doc. `Cmd::UndoTag`, not `Cmd::TagApply` — see the
+            // former's own doc for why the two cannot share a dispatch
+            // path.
+            let _ = idempotency_key;
+            // `remove: false` (undoing a removal, by re-adding) cannot
+            // happen in production today: `Msg::TagApplied` only ever
+            // fires with `remove: false` (the forward `add` path;
+            // `apply_tags`'s `remove` branch never sets `changed`, so it
+            // never sends one — see its own comment), and the
+            // `Msg::TagApplied` handler just above inverts that into
+            // `Entry::Tag{remove: true}` every time. Kept implemented
+            // rather than assumed, the same reasoning `Entry::cancel_scheduled`
+            // documents for itself: correct now that this path is
+            // symmetric at the type level, even though only one direction
+            // is currently reachable.
+            let verb = if remove { "tag rm" } else { "tag add" };
+            model.inflight += 1;
+            model.info(format!("undoing — {verb} {name}…"));
+            vec![Cmd::UndoTag {
+                message_id,
+                name,
+                remove,
+            }]
+        }
+        undo::Entry::CancelScheduled {
+            outbox_id,
+            idempotency_key,
+        } => {
+            // Dead in practice, not just today: the skip-loop above this
+            // match already routes every `CancelScheduled` entry back
+            // onto the stack before `entry` is ever bound, and nothing
+            // constructs one outside `undo::tests` in the first place
+            // (task 146's own job). No test exercises this arm's body —
+            // both `u_puts_a_cancel_scheduled_entry_back_rather_than_consuming_it`
+            // and `undo_skips_past_a_cancel_scheduled_entry_to_reach_a_real_one_beneath_it`
+            // assert the opposite, that it is never reached. Kept
+            // implemented rather than `unreachable!`d regardless — the
+            // match has to be exhaustive either way, and a correct
+            // fallback costs nothing extra if the skip-loop's own
+            // invariant is ever broken by a later change.
+            let _ = idempotency_key;
+            model.inflight += 1;
+            model.info("cancelling…");
+            vec![Cmd::CancelSend { outbox_id }]
+        }
+    }
+}
+
 /// `u` — cancel a send.
 ///
 /// In the outbox pane that is the highlighted row; anywhere else it is the
 /// toast, which is the only send the user can see from the message list.
+///
+/// Bound in `Mode::Normal` (and, chained through it, `Viewer`/`Visual`) and
+/// in `Mode::Menu` (`keymap/mod.rs`) — the latter covering every overlay
+/// that mode groups: Search, Ask, Reply, Outbox, Quick, Report, a
+/// non-editing Form. Task 112's fallthrough to the generic stack inherits
+/// that whole reach deliberately, **except the outbox pane itself** — see
+/// the `Some(Overlay::Outbox(pane))` arm below, which never reaches
+/// `undo()` no matter what `pane`/the toast resolve to, so "the pane
+/// currently on screen" is the one overlay this paragraph's "whole reach"
+/// does not include. Everywhere else: "universal undo" (tui.md's own
+/// words) reads as a promise that `u` behaves the same regardless of what
+/// happens to be on screen, and carving out further exceptions would make
+/// it un-universal in a way nothing has asked for. A stray `u` while
+/// composing a reply now reverses an unrelated archive where it used to be
+/// inert — a real, deliberate consequence of that reading, not a bug.
 fn undo_send(model: &mut Model) -> Vec<Cmd> {
-    let target = match model.overlay_top() {
-        Some(Overlay::Outbox(pane)) => pane
-            .row()
-            .map(|row| (row.id, row.to.clone(), row.state.clone())),
-        _ => undo_toast(model)
-            .map(|toast| (toast.outbox_id, toast.to.clone(), "scheduled".to_owned())),
-    };
-    let Some((outbox_id, to, state)) = target else {
-        model.fail("nothing to undo");
-        return Vec::new();
-    };
+    // This check comes first, ahead of the generic stack (task 112): a
+    // send still inside its cancel window is urgent and has irreversible
+    // consequences the moment the window closes (the mail actually goes
+    // out), while the stack's own entries (an archive, a flag toggle, a
+    // tag) are not time-critical the same way — reversing whichever one
+    // is more recent instead of the send the UI is that moment advertising
+    // "u cancels" for would be the worse mistake in both directions: a
+    // send nobody meant to let through, and a keypress that silently did
+    // something other than what was on screen.
+    match model.overlay_top() {
+        Some(Overlay::Outbox(pane)) => match pane.row() {
+            Some(row) => cancel_outbox_entry(model, row.id, row.to.clone(), row.state.clone()),
+            // Still `loading`, failed, or genuinely empty: no row to
+            // highlight, but the toast can still be live — `open_outbox`
+            // does not clear it, and a listing that is slow or has failed
+            // must not make an urgent, already-armed countdown
+            // uncancellable just because this pane happens to be the one
+            // on screen. Only once *neither* exists does `u` here mean
+            // "nothing to cancel" — and even then, never the generic
+            // stack: this pane's own status line promises "u cancels the
+            // highlighted send", and falling through to reverse an
+            // unrelated action instead would answer a different question
+            // than the one on screen.
+            None => cancel_toast(model).unwrap_or_else(|| {
+                model.fail("nothing to cancel here");
+                Vec::new()
+            }),
+        },
+        // Nothing outbox-specific pending — `u` falls through to the
+        // generic stack, which is where task 112's own acceptance lives.
+        _ => cancel_toast(model).unwrap_or_else(|| undo(model)),
+    }
+}
+
+/// Cancel the live undo toast, if there is one — the one piece of
+/// `undo_send`'s own logic two different states (a row-less outbox pane,
+/// and no outbox overlay at all) both need, factored out specifically so
+/// that shape cannot go missing from one of them without going missing
+/// from its own single definition. `None` means exactly "no toast", not
+/// "cancel it and there was nothing to do" — the two callers each decide
+/// what "nothing to cancel" means for themselves (a message vs. a
+/// fallthrough), which is why this returns `Option<Vec<Cmd>>` rather than
+/// bare `Vec<Cmd>`.
+fn cancel_toast(model: &mut Model) -> Option<Vec<Cmd>> {
+    let toast = undo_toast(model)?;
+    Some(cancel_outbox_entry(
+        model,
+        toast.outbox_id,
+        toast.to.clone(),
+        "scheduled".to_owned(),
+    ))
+}
+
+/// Cancel the outbox entry `undo_send` resolved a target down to, whether
+/// that came from a highlighted row or the toast.
+fn cancel_outbox_entry(model: &mut Model, outbox_id: i64, to: String, state: String) -> Vec<Cmd> {
     // The daemon refuses these too — `CancelScheduled` is the authority — but
     // saying so here costs a round trip nobody needs and reads better than
-    // FAILED_PRECONDITION does.
+    // FAILED_PRECONDITION does. Refuses even when a *different* send has a
+    // live toast right now — a stale cursor parked on an already-`sent` row
+    // while the outbox pane is up refuses rather than falling back to the
+    // toast. Consistent with the pane's own promise ("u cancels the
+    // *highlighted* send") rather than a gap: the pane is what is on
+    // screen, and the toast is not what the highlighted row is offering.
     if matches!(state.as_str(), "sent" | "canceled" | "sending") {
         model.fail(format!("that one is already {state}"));
         return Vec::new();

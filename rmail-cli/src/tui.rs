@@ -80,6 +80,7 @@ pub mod settings;
 pub mod status;
 pub mod term;
 pub mod theme;
+pub mod undo;
 pub mod view;
 pub mod whichkey;
 

@@ -1541,7 +1541,7 @@ sequenced first and everything else depends on them transitively.
   softened to the property that actually holds) and a self-contradictory closing line.
 
 ## 112. Undo stack (session-local inverse operations)
-- [ ] status
+- [x] status
 - **depends-on:** none
 - **parallel-safe:** yes
 - **acceptance:**
@@ -1561,6 +1561,100 @@ sequenced first and everything else depends on them transitively.
 - **verify:** `cargo nextest run -p rmail-cli tui::undo` (push/pop ordering, idempotency
   key carried through to the reissued `Cmd`, empty-stack message, no public redo method —
   a compile-fail test via `trybuild` or a doc-comment-checked absence is acceptable)
+- **closed at merge — round 1 found two P0s, five P1s and four P2s:** `undo_send` originally
+  checked the generic stack before the outbox/toast, so archiving a message right after
+  scheduling a send let `u` reverse the archive instead of cancelling the time-critical send —
+  fixed by reordering (outbox/toast first, generic stack only once neither applies).
+  `Msg::TagApplied` fired unconditionally, including for an undo's own reissue, creating an
+  infinite redo loop (`u` on a tag entry re-pushing its own reversal forever) — fixed with a
+  separate `Cmd::UndoTag` dispatch path whose completion never re-fires `Msg::TagApplied`.
+  `inflight` leaked on every tag undo (fixed: only `Move`/`Flags`/`CancelScheduled` increment
+  it); tag undo was completely silent on success or failure (fixed via `Cmd::UndoTag`'s own
+  `Msg::Done`-based completion); `undo_from` credited the wrong folder for a search-hit message
+  opened in the viewer (fixed: only set when the message is verifiably a row in
+  `model.messages`); tag undo could reverse a no-op forward apply (fixed via
+  `AddTagResponse.applications.is_empty()` no-op detection, researched directly against
+  `rmail-core::tags::TagStore::add_tag`). `use_account` did not clear the stack (fixed); the
+  stack was unbounded (fixed: `MAX_ENTRIES = 200`, evicting the oldest entry); empty-stack
+  acceptance was untested against real code; bulk granularity documented as a deliberate
+  one-entry-per-message decision.
+- **closed at merge — round 2 found two P1s and two P2s:** the outbox pane's row-less states
+  (loading/failed/empty) still fell through to the generic stack even with a live send-cancel
+  toast (first fix: an `.or_else()` toast fallback — later found insufficient in round 4). A
+  no-op `tag rm` still pushed a wrong-direction undo entry — fixed by making `apply_tags`'s
+  `changed` permanently `false` for the whole `remove` branch (tag removal is never undoable,
+  by design, documented in the manual). Tag undo shared `Cmd::TagApply`'s superseding
+  `stream_report` slot, so rapid `u` presses silently aborted in-flight tag-report streams —
+  fixed via the `Cmd::UndoTag`/plain-`spawn` split. Widening the parity table's `actions:`
+  lists for `OutboxCancel` broke a separate, stricter invariant
+  (`command::tests::no_action_maps_to_more_than_one_capability`, since `Capability` is
+  `parity::Command`) — root-caused to `command::registry()`'s auto-derivation picking an
+  arbitrary capability via `.next()`; fixed with an explicit hand-written `Verb` entry in
+  `explicit()`.
+- **closed at merge — round 3 found one P1 and three P2s:** the outbox pane still fell through
+  to the generic stack when there was no row *and* no toast (round 2's fix only covered
+  row-absent-but-toast-present) — fixed with a full restructure so the `Overlay::Outbox` arm
+  never reaches `undo()` under any sub-state. A failed undo's status line reused the same
+  "undone — X" prefix a success would, reading as a false completion claim glued to the error —
+  labels reworded to bare action descriptions. The manual page directly contradicted the
+  shipped feature — rewritten. The parity-table justification comment was inaccurate and its
+  test only asserted `count > 1` without pinning which capability actually won — both fixed.
+- **closed at merge — round 4 found two P1s (one a genuine regression) and three P2s:** round
+  3's own restructure regressed round 2's already-fixed bug — nesting the outbox-pane logic
+  dropped the toast fallback entirely, making a live, armed send-cancel countdown uncancellable
+  whenever the outbox pane merely happened to be on screen mid-load — fixed by nesting *both*
+  the row-check and the toast fallback inside the `Overlay::Outbox` arm, with `undo()` reachable
+  only from the sibling arm. This exact path had zero test coverage across two breakages —
+  fixed with two dedicated tests. `explicit()`'s justifying comment falsely claimed
+  `:outbox cancel` was narrower than `u` (traced `commands::compose.rs` and confirmed it is
+  not); the capability test exemption asserted only `count > 1`, not the actual capability
+  chosen (fixed with a `verb_at`-based assertion pinning it exactly); the manual overclaimed
+  "every move pushes an entry" (softened to "usually"), omitted the 200-cap, and needed the
+  `undo_from: None` case documented as a "what cannot be taken back" bullet.
+- **closed at merge — round 5 found six new P2/P3s:** `undo_send`'s own doc paragraph
+  self-contradicted its body (claimed the fallthrough reaches the outbox overlay, which it
+  explicitly does not) — same overclaim duplicated in the manual — both corrected. A bulk flag
+  toggle pushed a no-op undo entry for every row in the selection, including rows whose flag
+  state did not actually change, risking flushing genuinely useful entries out of the 200-cap
+  stack — fixed using free local state (`row.has_flag(flag) == present`). The idempotency-key
+  round-trip tests only asserted non-emptiness, which a mint-fresh-at-pop-time bug would still
+  pass — fixed with two tests proving the *same* key survives `undo()`'s pop-and-reissue. An
+  in-flight `Move`/`SetFlags`/`TagApply` completing after an account switch can still refill the
+  just-cleared stack with a stale cross-account entry — judged the real fix (an account
+  generation stamped into three `Cmd` variants) disproportionate to the narrow window; documented
+  instead. `Msg::TagApplied{remove: true}` (undoing a removal) is unreachable in production but
+  was tested as if live and contradicts the manual's own "removing a tag is not undoable" claim —
+  fixed with clarifying comments in both the code and the test. The toast-cancel expression was
+  duplicated across two call sites — identified as the structural reason the same omission bug
+  recurred twice — fixed by extracting a shared `cancel_toast` helper.
+- **closed at merge — round 6 found a P2 and two P3s; round 7 independently re-traced the same
+  surface from scratch and approved outright:** the tests proved a dispatched `Cmd` carried
+  `undo_from: None`/`undo_flags: None` on a no-op, but nothing proved `apply_effect` actually
+  honored that by skipping the push — fixed by extending two existing tests with a real
+  `Msg::Done` round trip and a stack assertion; round 7 confirmed this genuinely catches a
+  reverted guard, including a subtler `undo_from.or(model.open_folder)` fallback variant, not
+  just a literal-default one. The "one entry per message"/"40 entries" claims in `undo.rs`'s
+  module doc and the manual had gone stale the moment the no-op suppression above shipped —
+  both corrected to "one entry per message it actually changes" (flags/tags can now push fewer
+  than the selection's size; round 7 independently traced `model.messages`'s three assignment
+  sites and confirmed a plain archive genuinely has no analogous local no-op case). A manual
+  clause explaining why a slow or failed outbox listing cannot block a live countdown's cancel
+  was attached to the wrong sentence (described inside-the-pane behavior, appended to the
+  outside-the-pane one) — moved to the sentence it actually describes. Round 7 flagged two
+  further doc nits and explicitly judged both not worth fixing.
+- **note — two deliberate deviations from this task's own acceptance text:** "each carrying the
+  idempotency key its forward action used" describes reuse; what shipped is a key freshly minted
+  by the `Entry` constructor itself (`Entry::mv`/`flags`/`tag`/`cancel_scheduled`), because no
+  forward `Cmd::Move`/`Cmd::SetFlags` dispatch mints a real key today either (forward dispatch
+  sends `idempotency_key: String::new()`) — there is nothing yet to reuse. Minting fresh costs
+  nothing and delivers the acceptance's actual goal (a retried undo cannot double-apply) the
+  moment a real per-request key scheme lands on the forward path too; `rmail-core`'s
+  `IdempotencyStore` also documents keys as globally single-use across methods, so literal reuse
+  would have made a move's own undo fail as `ALREADY_EXISTS` rather than protect it. Separately,
+  tui.md's enumeration names "restore-from-trash" as a fifth inverse-operation kind; this
+  codebase has no distinct trash mechanism to hook (`Action::Delete` is a hard IMAP expunge, not
+  a move to a special folder), so "restore" and "move-back" are the same `Entry::Move` here, not
+  two types. Both documented in `undo.rs`'s own module doc.
 
 ## 113. Lens engine (pinned queries, honest counts)
 - [ ] status

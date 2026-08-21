@@ -1818,6 +1818,42 @@ fn explicit() -> Vec<Verb> {
             description: None,
         },
         Verb {
+            path: vec!["outbox", "cancel"],
+            // Explicit rather than left to the auto-generation loop below
+            // (which would otherwise derive this same path from
+            // `Action::OutboxCancel::id()`): task 112 widened `u`'s own
+            // *keymap* meaning to also pop the generic undo stack when no
+            // send is pending, so `Capability::for_action(OutboxCancel)`
+            // now genuinely returns more than one row — correct for that
+            // keymap-reachability question (`parity`'s own doc), wrong for
+            // this one, where `registry()`'s `.next()` would otherwise pick
+            // an arbitrary one of the four by enum declaration order.
+            //
+            // This is *not* because typing `:outbox cancel` is somehow
+            // narrower than pressing `u` — it is not: this `Verb` has no
+            // `positionals`, so it resolves through the exact same
+            // `run_action(model, Action::OutboxCancel, None)` path (no
+            // `commands::answer` arm claims this verb — see
+            // `commands.rs`), which means `:outbox cancel` reaches
+            // `undo_send` and can fall through to the generic stack
+            // exactly as `u` can. `SendSchedulerCancelScheduled` is picked
+            // here because it is what the auto-derivation *would* have
+            // produced before task 112 (this verb's own name and its
+            // one purpose for existing at all is the send-cancel case),
+            // not because the polymorphism stops here — it does not.
+            // `Capability::for_cli("outbox cancel")` (a different lookup,
+            // over `SendSchedulerCancelScheduled`'s own `cli:` list) is
+            // the unrelated, genuinely single-purpose `mail outbox cancel
+            // <id>` CLI form — that one really does take an explicit id
+            // and really can only mean this.
+            capability: Some(Capability::SendSchedulerCancelScheduled),
+            action: Some(Action::OutboxCancel),
+            positionals: &[],
+            flags: &[],
+            cli_alias: None,
+            description: None,
+        },
+        Verb {
             path: vec!["outbox", "retry"],
             capability: Some(Capability::SendSchedulerRetryFailed),
             action: None,

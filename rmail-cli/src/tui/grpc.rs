@@ -495,6 +495,8 @@ impl CmdExec for GrpcExec {
                 message_id,
                 flags,
                 label,
+                undo_flags,
+                idempotency_key,
             } => {
                 let mut client = self.mail.clone();
                 let applied = flags.clone();
@@ -502,16 +504,20 @@ impl CmdExec for GrpcExec {
                     let result = call(client.set_flags(SetFlagsRequest {
                         message_id,
                         flags,
-                        // Empty: a keystroke in the TUI is issued once and
-                        // never auto-retried, so there is nothing for a replay
-                        // fence to protect against. Minting keys is a client
+                        // Empty for every forward dispatch: a keystroke in
+                        // the TUI is issued once and never auto-retried, so
+                        // there is nothing for a replay fence to protect
+                        // against there. Real only when `model::undo` built
+                        // this `Cmd` itself — see `tui::undo`'s own module
+                        // doc. Minting keys for anything else is a client
                         // policy the CLI's gRPC layer owns (task 42).
-                        idempotency_key: String::new(),
+                        idempotency_key,
                     }))
                     .await
                     .map(|_| Effect::Flags {
                         message_id,
                         flags: applied,
+                        undo_flags,
                     });
                     Msg::Done { label, result }
                 });
@@ -520,16 +526,23 @@ impl CmdExec for GrpcExec {
                 message_id,
                 dest_mailbox_id,
                 label,
+                undo_from,
+                idempotency_key,
             } => {
                 let mut client = self.mail.clone();
                 self.spawn(out, async move {
                     let result = call(client.r#move(MoveRequest {
                         message_id,
                         dest_mailbox_id,
-                        idempotency_key: String::new(),
+                        // See `SetFlags`'s own comment just above — the same
+                        // reasoning applies here.
+                        idempotency_key,
                     }))
                     .await
-                    .map(|_| Effect::Removed(message_id));
+                    .map(|_| Effect::Removed {
+                        message_id,
+                        undo_from,
+                    });
                     Msg::Done { label, result }
                 });
             }
@@ -563,7 +576,13 @@ impl CmdExec for GrpcExec {
                         idempotency_key: String::new(),
                     }))
                     .await
-                    .map(|_| Effect::Removed(message_id));
+                    // `MailService.Delete` expunges on the server —
+                    // `undo_from: None` always, since there is nowhere for
+                    // an inverse to send the message back to.
+                    .map(|_| Effect::Removed {
+                        message_id,
+                        undo_from: None,
+                    });
                     Msg::Done {
                         label: "deleted".to_owned(),
                         result,
@@ -1012,6 +1031,39 @@ impl CmdExec for GrpcExec {
                 let mut client = self.tags.clone();
                 self.stream_report(generation, out, move |sink| async move {
                     apply_tags(&mut client, &message_ids, &name, remove, &sink).await;
+                });
+            }
+            Cmd::UndoTag {
+                message_id,
+                name,
+                remove,
+            } => {
+                let mut client = self.tags.clone();
+                self.spawn(out, async move {
+                    let target = Some(Target {
+                        of: Some(target::Of::MessageId(message_id)),
+                    });
+                    let names = vec![name.clone()];
+                    let result = if remove {
+                        call(client.remove_tag(RemoveTagRequest { target, names }))
+                            .await
+                            .map(|_| Effect::None)
+                    } else {
+                        call(client.add_tag(AddTagRequest { target, names }))
+                            .await
+                            .map(|_| Effect::None)
+                    };
+                    let verb = if remove { "removed" } else { "restored" };
+                    // Not "undone — …": `Msg::Done`'s error arm reuses this
+                    // same string as the failure prefix, and a label
+                    // asserting completion would read as a success claim
+                    // glued to the error that contradicts it — see `undo`'s
+                    // own `Move` arm in `model.rs` for the fuller version of
+                    // this reasoning.
+                    Msg::Done {
+                        label: format!("tag {name} {verb}"),
+                        result,
+                    }
                 });
             }
             Cmd::TagCreate {
@@ -3399,6 +3451,20 @@ impl ReportSink {
             event: ReportEvent::Failed(error),
         });
     }
+
+    /// A side-channel alongside [`ReportSink::rows`]/[`ReportSink::append`],
+    /// not a replacement for either — `apply_tags` still reports every
+    /// outcome as a row the pane shows either way. This is what lets the
+    /// undo stack (task 112) learn about a *confirmed* tag change from a
+    /// streaming RPC whose per-row outcome otherwise never reaches
+    /// `Msg::Done`/`Effect`. See `tui::undo`'s own module doc.
+    fn tag_applied(&self, message_id: i64, name: String, remove: bool) {
+        let _ = self.out.send(Msg::TagApplied {
+            message_id,
+            name,
+            remove,
+        });
+    }
 }
 
 /// Drain an `IndexProgress` stream into a Report.
@@ -3542,6 +3608,22 @@ async fn apply_tags(
             of: Some(target::Of::MessageId(*message_id)),
         });
         let names = vec![name.to_owned()];
+        // Whether this specific call is known to have genuinely changed
+        // something — only ever knowable for `add_tag` (see below).
+        // Defaults to, and for `remove_tag` stays, `false`: a no-op
+        // `remove_tag` (nothing to remove) and a real one look identical
+        // on the wire (`RemoveTagResponse` is `google.protobuf.Empty`, and
+        // `TagStore::remove_tag`'s own `removed` count is discarded before
+        // it reaches the gRPC boundary — `rmaild/src/tag_service.rs`), so
+        // there is no way to tell them apart here. Silence (never pushing
+        // an undo for a removal) is the honest answer, the same call
+        // `archive`/`accept_pick` make for a move whose source cannot be
+        // verified (`model.rs`, `undo_from`) — guessing "yes it changed"
+        // risks *adding* a tag the message never carried the moment `u` is
+        // pressed, which is worse than losing the undo. Fixing this for
+        // real needs a daemon change (a `RemoveTagResponse` field), not a
+        // client one.
+        let mut changed = false;
         let outcome = if remove {
             call(client.remove_tag(RemoveTagRequest { target, names }))
                 .await
@@ -3550,13 +3632,25 @@ async fn apply_tags(
             call(client.add_tag(AddTagRequest { target, names }))
                 .await
                 .map(|response| {
-                    response
-                        .into_inner()
-                        .applications
+                    let applications = response.into_inner().applications;
+                    // A single name per call (`names` above), so an empty
+                    // response is unambiguous: the server only omits a
+                    // `TagApplication` when the tag was already there
+                    // (`TagStore::add_tag`'s own `Option<i64>`-returning
+                    // insert — `None` on a redundant apply). No multi-name
+                    // ambiguity applies at this granularity.
+                    changed = !applications.is_empty();
+                    applications
                         .first()
                         .map_or_else(|| "applied".to_owned(), |a| wire::tag_source(a.source))
                 })
         };
+        // Only a confirmed, *genuine* change is undoable — a row that
+        // failed, or an apply/removal this call cannot verify actually did
+        // anything, has nothing for `undo::Entry::tag` to reverse.
+        if changed && outcome.is_ok() {
+            sink.tag_applied(*message_id, name.to_owned(), remove);
+        }
         rows.push(match outcome {
             Ok(what) => wire::tag_applied_row(*message_id, name, &what),
             // Kept going rather than abandoned: a tag that failed on one message

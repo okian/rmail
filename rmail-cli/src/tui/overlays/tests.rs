@@ -13,8 +13,8 @@
 
 use super::*;
 use crate::tui::model::{
-    update, Account, AskEvent, Cmd, Confirmed, FinderEvent, Folder, Key, Level, MessageRow, Model,
-    Msg, Overlay, ReplyEvent, SearchEvent, Stream, MAX_OVERLAY_DEPTH,
+    update, Account, AskEvent, Cmd, Confirmed, Effect, FinderEvent, Folder, Key, Level, MessageRow,
+    Model, Msg, Overlay, ReplyEvent, SearchEvent, Stream, MAX_OVERLAY_DEPTH,
 };
 use crate::tui::whichkey;
 
@@ -1179,6 +1179,56 @@ fn u_cancels_the_send_the_toast_names_from_the_message_list() {
 }
 
 #[test]
+fn a_pending_send_still_wins_u_over_an_archive_undo_pushed_after_it() {
+    // The regression this pins: `u` must check the outbox/toast first and
+    // fall through to the generic stack (task 112) only when neither has
+    // anything pending — not the other way around. A stale generic-stack
+    // entry sitting on top must never eat the keypress that is, at that
+    // exact moment, the toast's own advertised way to stop a send that is
+    // seconds from actually going out.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Outbox {
+            now: 1_000,
+            result: Ok(vec![outbox_row(9, "scheduled", Some(1_010))]),
+        },
+    );
+    // An archive happens *after* the send was scheduled — the more recent
+    // event, and exactly the case a naive "most recent wins" reading of
+    // "universal undo" would get wrong.
+    press(&mut model, Key::Char('a'));
+    update(
+        &mut model,
+        Msg::Done {
+            label: "archived".to_owned(),
+            result: Ok(Effect::Removed {
+                message_id: 10,
+                undo_from: Some(1),
+            }),
+        },
+    );
+
+    let cmds = press(&mut model, Key::Char('u'));
+    assert_eq!(
+        cmds,
+        vec![Cmd::CancelSend { outbox_id: 9 }],
+        "the pending send is cancelled, not the archive reversed"
+    );
+    assert!(
+        model.toasts.is_empty(),
+        "the offer was taken, so it stops being offered"
+    );
+    // Not merely "the wrong Cmd wasn't returned" — the archive's own undo
+    // entry is still sitting on the stack, untouched, ready for a later
+    // `u` once the send has actually been dealt with.
+    match model.undo.pop() {
+        Some(crate::tui::undo::Entry::Move { message_id, .. }) => assert_eq!(message_id, 10),
+        other => unreachable!("expected the archive's own entry, still there: {other:?}"),
+    }
+}
+
+#[test]
 fn u_in_the_outbox_cancels_the_highlighted_row() {
     let mut model = loaded();
     press(&mut model, Key::Char('O'));
@@ -1197,6 +1247,55 @@ fn u_in_the_outbox_cancels_the_highlighted_row() {
         press(&mut model, Key::Char('u')),
         vec![Cmd::CancelSend { outbox_id: 2 }]
     );
+}
+
+#[test]
+fn u_in_a_still_loading_outbox_pane_does_not_fall_through_to_the_generic_stack() {
+    // The pane is up (`O`) but `Msg::Outbox` has not answered yet, so
+    // `pane.row()` is `None` — with no toast either, `u` must dead-end
+    // right there, not reach for `model.undo`'s own entry. A stray `u`
+    // during that round trip must never silently reverse an unrelated
+    // archive while the outbox is what is on screen.
+    let mut model = loaded();
+    model.undo.push(crate::tui::undo::Entry::mv(10, 1));
+    press(&mut model, Key::Char('O'));
+
+    let cmds = press(&mut model, Key::Char('u'));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(
+        model.status.contains("nothing to cancel here"),
+        "{}",
+        model.status
+    );
+    match model.undo.pop() {
+        Some(crate::tui::undo::Entry::Move { message_id, .. }) => assert_eq!(message_id, 10),
+        other => unreachable!("the stack entry must survive untouched: {other:?}"),
+    }
+}
+
+#[test]
+fn u_in_a_still_loading_outbox_pane_still_reaches_a_live_toast() {
+    // The regression this pins: a listing that is slow (or failed) must
+    // not make an already-armed, urgent countdown uncancellable just
+    // because the outbox pane happens to be the thing on screen.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Outbox {
+            now: 1_000,
+            result: Ok(vec![outbox_row(9, "scheduled", Some(1_010))]),
+        },
+    );
+    press(&mut model, Key::Char('O')); // opens with rows: [] until Msg::Outbox answers again
+    assert!(
+        model
+            .overlay_top()
+            .is_some_and(|o| matches!(o, Overlay::Outbox(_))),
+        "the fixture's own premise"
+    );
+
+    let cmds = press(&mut model, Key::Char('u'));
+    assert_eq!(cmds, vec![Cmd::CancelSend { outbox_id: 9 }]);
 }
 
 #[test]

@@ -652,6 +652,23 @@ fn switching_accounts_preserves_last_seq_so_the_floor_still_defends_the_new_acco
 }
 
 #[test]
+fn switching_accounts_clears_the_undo_stack_too() {
+    // `mailbox_id`/`message_id` are global daemon row ids, so a stale
+    // entry would still land on the correct row in the account being left
+    // — the problem is reversing something there with no folder or
+    // message list on screen able to show what happened, the same
+    // "no longer on screen" argument `remove_undo_toast`'s own comment in
+    // `use_account` already makes for the send-cancel toast.
+    let mut model = loaded();
+    model.undo.push(crate::tui::undo::Entry::mv(10, 1));
+    run(&mut model, "account use 8");
+    assert!(
+        model.undo.pop().is_none(),
+        "the old account's undo entries do not survive a switch"
+    );
+}
+
+#[test]
 fn switching_to_the_account_already_open_does_nothing_at_all() {
     // Somebody asking for the account they are on wants nothing to happen, and
     // throwing away their cursor and their open message to fetch the same rows

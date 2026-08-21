@@ -1,7 +1,16 @@
 # Undo, and what cannot be undone
 
-There is no general undo stack. What exists is narrower and more reliable: a
-window during which a send has not happened yet.
+{{keys:outbox.cancel}} does two different things depending on what it finds,
+checked in this order: cancel a send still inside its window, or — if there is
+none *and the outbox pane is not what is currently on screen* — pop the last
+reversible action (a move, a flag, a tag) off a session-local stack and
+reverse it. Inside the outbox pane itself the key stays scoped to sends only,
+even with nothing there yet to cancel — its own status line already promises
+"u cancels the highlighted send", and answering a different question than the
+one on screen would be worse than saying there is nothing to do. The window
+exists because a send is time-critical in a way nothing else here is: past
+it, mail has actually left, and there is nothing left to catch up with. See
+"The stack" below for the second half.
 
 ## Every send is scheduled
 
@@ -59,17 +68,52 @@ asking for a zero window, or for a send at exactly now, is the same bypass in
 different clothes: an agent's send is pushed back out to the floor either
 way.
 
+## The stack
+
+A move (including an archive), a flag toggle, or a tag *addition* usually
+pushes an entry onto a session-local stack, capped at 200 — past that the
+oldest is dropped to make room, not the newest. Outside the outbox pane,
+{{keys:outbox.cancel}} pops the most recent one and reverses it once there is
+no send left to cancel first — including a send the toast is still offering.
+From *inside* the outbox pane the key stays scoped to sends only and never
+reaches the stack — see the opening section above — but that scope still
+favors a live toast over an empty or broken listing: a highlighted row wins
+when there is one, otherwise the toast does, and only with neither does the
+key say there is nothing to cancel. That is what keeps a slow or failed
+outbox listing from making an armed countdown uncancellable just because
+that pane happens to be up. A bulk action on several messages at once pushes
+one entry per message it actually changes, not per message touched — a
+mixed selection where some rows already match the target pushes fewer
+entries than rows selected, so undoing all of it can take fewer presses than
+the selection's size. There is no single "undo the whole batch" entry.
+
+**No redo.** Undoing an undo does not put the original action back — a popped
+entry is gone, reversed, done. This is deliberate: replaying a forward action
+against a mailbox that has since changed underneath it (a message moved again,
+deleted, its flags touched from another client) would be a guess dressed up as
+a fact. The same caution means a reversal that itself fails is not retried
+automatically or put back on the stack — the status line says so plainly
+rather than claiming it happened, but the specific entry is gone either way.
+
+Switching accounts clears the stack — an entry left over from the account you
+just left has nowhere on screen to show what undoing it did.
+
 ## What cannot be taken back
 
 - Delete, which expunges on the server. See [[archive]].
+- A move whose source folder this client cannot vouch for — a message opened
+  from a search result or a similar cross-folder view, rather than from the
+  list of the folder it is actually in. Moving it still works; there is
+  simply nothing honest to record as "where it came from" to undo back to.
+- Removing a tag. The daemon's own answer to "remove this tag" carries no way
+  to tell "it was there and now is not" apart from "it was never there" —
+  guessing the former and undoing wrong would *add* a tag the message never
+  carried, silently, which is worse than not offering the undo at all. Adding
+  a tag has no such gap and is undoable normally.
 - A message whose window has closed. The toast disappears when it does,
   because an undo offer that no longer works is worse than no offer.
 - Anything that already left the machine: a webhook delivery, a model call,
   an IMAP keyword that has already round-tripped.
-
-Reversible actions — a move, a flag, a tag — are undone by doing the opposite,
-which is not an undo stack but is available forever rather than for ten
-seconds.
 
 ## Where these numbers come from
 

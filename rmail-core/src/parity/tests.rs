@@ -377,4 +377,19 @@ fn the_verbs_that_reach_two_rpcs_still_do() {
     let list: BTreeSet<&str> = Command::for_cli("list").map(Command::rpc).collect();
     assert!(list.contains("/rmail.v1.MailService/List"));
     assert!(list.contains("/rmail.v1.MailService/ListUnified"));
+
+    // `u` (task 112's undo stack) reaches three RPCs beyond the one its own
+    // name suggests (`SendSchedulerService/CancelScheduled`): reversing an
+    // archive or a picked-folder move calls `Move`, reversing a flag toggle
+    // calls `SetFlags`, and reversing a confirmed tag addition calls
+    // `RemoveTag` — but never `AddTag`, since removing a tag pushes no undo
+    // entry at all (`TagRemoveTag`'s own `actions:` doc explains why).
+    let undo: BTreeSet<&str> = Command::for_action(Action::OutboxCancel)
+        .map(Command::rpc)
+        .collect();
+    assert!(undo.contains("/rmail.v1.SendSchedulerService/CancelScheduled"));
+    assert!(undo.contains("/rmail.v1.MailService/Move"));
+    assert!(undo.contains("/rmail.v1.MailService/SetFlags"));
+    assert!(undo.contains("/rmail.v1.TagService/RemoveTag"));
+    assert!(!undo.contains("/rmail.v1.TagService/AddTag"));
 }

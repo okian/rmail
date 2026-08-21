@@ -471,8 +471,11 @@ commands! {
         effect: Mutate,
         cli: [],
         // Archiving *is* a move, to the account's archive folder — one
-        // capability, two ways to ask for it.
-        actions: [Archive, MoveTo],
+        // capability, two ways to ask for it. `OutboxCancel` (task 112's
+        // undo stack, `u`) reaches this too: reversing an archive or a
+        // picked-folder move reissues it with the source and destination
+        // swapped.
+        actions: [Archive, MoveTo, OutboxCancel],
         summary: "Move messages to another mailbox, reflecting the move to IMAP.",
     }
     MailCopy {
@@ -488,7 +491,10 @@ commands! {
         tool: "set_flags",
         effect: Mutate,
         cli: [],
-        actions: [ToggleRead, ToggleFlag],
+        // `OutboxCancel` (task 112's undo stack, `u`) reaches this too:
+        // reversing a flag toggle reissues it with the message's prior
+        // complete flag set.
+        actions: [ToggleRead, ToggleFlag, OutboxCancel],
         summary: "Add or remove IMAP flags (\\Seen, \\Flagged, ...) on a message.",
     }
     MailDelete {
@@ -995,7 +1001,14 @@ commands! {
         tool: "remove_tag",
         effect: Mutate,
         cli: ["untag"],
-        actions: [],
+        // `OutboxCancel` (task 112's undo stack, `u`) reaches this in one
+        // direction only: reversing a confirmed tag *addition* calls
+        // `RemoveTag`. The reverse never happens — removing a tag pushes
+        // no undo entry at all (`RemoveTagResponse` carries no signal
+        // telling a genuine removal apart from a no-op, so `AddTag` is
+        // never reachable from here — `TagAddTag`'s own `actions:` stays
+        // empty).
+        actions: [OutboxCancel],
         summary: "Remove tags from a message or thread.",
     }
     TagListTags {

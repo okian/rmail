@@ -911,22 +911,52 @@ fn every_capability_reachable_by_an_action_has_a_verb() {
     }
 }
 
-/// `registry` builds each auto-derived verb's capability from
+/// `registry` builds each *auto-derived* verb's capability from
 /// `Capability::for_action(*action).next()` — silently keeping only the
-/// first when an action maps to more than one. Nothing today does (checked
-/// here across all of `Capability::ALL`, not assumed), but nothing pins
-/// that fact against a later capability's `actions()` growing to include an
-/// action another capability already claims.
+/// first when an action maps to more than one. Nothing but the one
+/// documented exception below does that (checked here across all of
+/// `Capability::ALL`, not assumed), but nothing pins that fact against a
+/// later capability's `actions()` growing to include an action another
+/// capability already claims.
+///
+/// `Action::OutboxCancel` is the exception, deliberately: task 112 made `u`
+/// pop the generic undo stack when no send is pending, so it now reaches
+/// `MailMove`/`MailSetFlags`/`TagRemoveTag` alongside its original
+/// `SendSchedulerCancelScheduled` — a real, intended fact `parity`'s own
+/// `actions:` lists are right to record (see
+/// `the_verbs_that_reach_two_rpcs_still_do` in `parity::tests`). What stops
+/// `registry`'s auto-derivation from picking one of those four
+/// arbitrarily is that it never runs for this action in the first place:
+/// `explicit()` gives `outbox.cancel` its own hand-written `Verb` with
+/// `capability: Some(Capability::SendSchedulerCancelScheduled)` fixed, so
+/// the ambiguity this test exists to catch for every *other* action simply
+/// does not reach `registry` for this one.
 #[test]
 fn no_action_maps_to_more_than_one_capability() {
     for action in Action::ALL {
         let count = Capability::for_action(*action).count();
+        if *action == Action::OutboxCancel {
+            assert!(count > 1, "the documented exception stopped being one");
+            continue;
+        }
         assert!(
             count <= 1,
             "{} maps to {count} capabilities; `registry` only keeps the first",
             action.id()
         );
     }
+    // The claim above — that `explicit()`'s own hand-written `Verb` is what
+    // keeps this exception safe — asserted directly, not just implied by
+    // the count check: without it, `registry()`'s auto-derivation would
+    // still run and `.next()` would pick whichever of the four capabilities
+    // sorts first by declaration order (`MailMove`, not
+    // `SendSchedulerCancelScheduled`) — silently annotating `:outbox
+    // cancel` with the wrong RPC.
+    assert_eq!(
+        verb_at(&["outbox", "cancel"]).and_then(|verb| verb.capability),
+        Some(Capability::SendSchedulerCancelScheduled),
+        "explicit() must be the one pinning this, not registry()'s auto-derivation"
+    );
 }
 
 // ---------------------------------------------------------------------------
