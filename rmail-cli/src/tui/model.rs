@@ -82,6 +82,8 @@ use crate::keymap::{Action, Chord, Keymap, Mode, Pending, Resolution};
 pub const SEEN: &str = "\\Seen";
 /// The IMAP flag marking a message flagged/starred.
 pub const FLAGGED: &str = "\\Flagged";
+/// The IMAP flag marking a message replied-to.
+pub const ANSWERED: &str = "\\Answered";
 
 /// Folder names, in preference order, that a message is archived *into*.
 ///
@@ -239,6 +241,63 @@ pub struct MessageRow {
     pub flags: Vec<String>,
     /// Whether the message carries attachments.
     pub has_attachments: bool,
+    /// Whether the message (or its thread) has a note. Declared shape a
+    /// future task populates — same deferral as [`tags`](Self::tags): notes
+    /// are their own table (`NoteService`), not part of `ListMessages`.
+    pub has_note: bool,
+    /// The `To` recipients, as the server reports them (comma-joined
+    /// addr-specs, not parsed into a list) — already on the wire response
+    /// (`Message.to_addrs`), so carrying it here costs nothing extra.
+    pub to: Option<String>,
+    /// Applied tag names. Declared shape a future task populates: no RPC in
+    /// today's `ListMessages` response carries tag data (`TagService` is
+    /// per-message/per-query, not part of a mailbox listing), so
+    /// [`wire::message_row`](crate::tui::model::wire::message_row) always
+    /// leaves this empty. [`filter`](crate::tui::filter)'s `tag:`/`has:tag`
+    /// evaluation is written and tested against this field regardless, so it
+    /// starts working the moment something populates it — but
+    /// [`filter::Predicate::unloaded_data`](crate::tui::filter::Predicate::unloaded_data)
+    /// is what a caller must check to avoid presenting an always-empty
+    /// `tag:` result as an authoritative one before that happens.
+    ///
+    /// Task 123 (List card row anatomy) is the earliest task that plausibly
+    /// needs real per-row tag data at all, for chip rendering — but its own
+    /// requirement (tui.md:536, "chip text auto-contrasts on wire
+    /// `Tag.color`") needs more than a bare name, so whatever populates this
+    /// field for real will likely need to widen it (a `Tag`-shaped element
+    /// carrying color, not `String`) rather than fill this exact shape as
+    /// written. `filter`'s own matching only ever needs the name half of
+    /// that, whatever the eventual element type turns out to be — effective
+    /// tags too (own or inherited from the thread, applied state only),
+    /// matching `has:tag`'s server definition
+    /// (`retrieve::filtermask::has_tag_predicate_sql`), not just a message's
+    /// own row in `message_tags`.
+    pub tags: Vec<String>,
+    /// The subset of AI enrichment [`filter`](crate::tui::filter) can match
+    /// against. Same deferral as [`tags`](Self::tags), including which task
+    /// owns populating it being unpinned — no task in tasks.md's 107–179
+    /// range yet names threading triage data onto list rows specifically;
+    /// whichever one does should also fold multiple `ai_summaries` passes
+    /// (triage, deep) into one [`AiFacts`], since `retrieve::filtermask`
+    /// treats each as its own `EXISTS` and a single record here can only
+    /// ever answer for whichever pass the populator chose.
+    pub ai: Option<AiFacts>,
+}
+
+/// The matchable slice of a message's AI triage/deep-pass results — not the
+/// full [`AiSummary`](super::overlays::AiSummary) shown in the rail panel,
+/// which also carries prose (`tl_dr`, `summary`, `key_points`) that no filter
+/// predicate ever compares against.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AiFacts {
+    /// Triage priority, e.g. `"high"`.
+    pub priority: Option<String>,
+    /// Triage category, e.g. `"invoice"`.
+    pub category: Option<String>,
+    /// Triage sentiment, e.g. `"negative"`.
+    pub sentiment: Option<String>,
+    /// Whether triage thought a reply was needed.
+    pub needs_reply: Option<bool>,
 }
 
 impl MessageRow {

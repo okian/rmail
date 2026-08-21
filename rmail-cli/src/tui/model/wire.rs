@@ -121,6 +121,12 @@ pub fn message_row(proto: ProtoMessage) -> MessageRow {
         date: proto.date.or(proto.internaldate),
         flags: proto.flags,
         has_attachments: proto.has_attachments,
+        to: proto.to_addrs,
+        // None of these three are carried by `Message` — see the doc
+        // comments on `MessageRow::has_note`/`tags`/`ai` for why.
+        has_note: false,
+        tags: Vec::new(),
+        ai: None,
     }
 }
 

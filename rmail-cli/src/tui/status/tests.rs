@@ -41,6 +41,10 @@ fn row(id: i64, seen: bool) -> MessageRow {
             Vec::new()
         },
         has_attachments: false,
+        has_note: false,
+        to: None,
+        tags: Vec::new(),
+        ai: None,
     }
 }
 

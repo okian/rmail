@@ -76,6 +76,10 @@ fn loaded() -> Model {
             date: Some(1_700_000_000),
             flags: Vec::new(),
             has_attachments: true,
+            has_note: false,
+            to: None,
+            tags: Vec::new(),
+            ai: None,
         },
         MessageRow {
             id: 11,
@@ -85,6 +89,10 @@ fn loaded() -> Model {
             date: Some(1_700_000_100),
             flags: vec![SEEN.to_owned(), FLAGGED.to_owned()],
             has_attachments: false,
+            has_note: false,
+            to: None,
+            tags: Vec::new(),
+            ai: None,
         },
     ];
     model.status = "2 message(s)".to_owned();

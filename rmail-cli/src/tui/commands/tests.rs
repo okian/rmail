@@ -93,6 +93,10 @@ fn loaded() -> Model {
             date: Some(1_700_000_000 + id),
             flags: Vec::new(),
             has_attachments: false,
+            has_note: false,
+            to: None,
+            tags: Vec::new(),
+            ai: None,
         })
         .collect();
     model

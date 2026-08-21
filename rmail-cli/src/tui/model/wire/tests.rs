@@ -213,6 +213,21 @@ fn a_list_row_prefers_the_display_name_and_keeps_the_address_for_replying() {
     );
 }
 
+#[test]
+fn a_list_row_carries_to_addrs_and_not_cc_addrs() {
+    // Pinned as its own test rather than folded into a neighbor: `to` and
+    // `cc` are both `Option<String>` on the wire type, so swapping which one
+    // `message_row` reads from would type-check silently and only a value
+    // assertion catches it.
+    let row = message_row(ProtoMessage {
+        id: 5,
+        to_addrs: Some("team@example.com".to_owned()),
+        cc_addrs: Some("watcher@example.com".to_owned()),
+        ..ProtoMessage::default()
+    });
+    assert_eq!(row.to.as_deref(), Some("team@example.com"));
+}
+
 // ---------------------------------------------------------------------------
 // drafts
 // ---------------------------------------------------------------------------

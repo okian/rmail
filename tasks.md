@@ -1408,7 +1408,7 @@ sequenced first and everything else depends on them transitively.
   know explicitly rather than re-deriving.
 
 ## 110. Filter engine (client-side predicate grammar subset)
-- [ ] status
+- [x] status
 - **depends-on:** none
 - **parallel-safe:** yes
 - **acceptance:**
@@ -1426,6 +1426,49 @@ sequenced first and everything else depends on them transitively.
 - **verify:** `cargo nextest run -p rmail-cli tui::filter` (every safe operator matches/
   excludes correctly, every unsafe operator classifies as `Unsupported` by name, negation
   and free-text-over-loaded-fields both work, empty filter is a no-op identity)
+- **closed at merge — round 1 found three P1s in the server-mirroring logic:** `tag_matches`
+  had the `tag:project/*` hierarchy backwards relative to
+  `retrieve::filtermask::tag_predicate_sql` (fixed to exact-only without the glob suffix,
+  tag-and-descendants with it); a shape-invalid-but-registered operator value
+  (`date:not-a-date`) silently degraded to a free-text search for the literal typed string
+  instead of reporting `Unsupported`, hiding a constraint the user typed and expected to
+  narrow by; and `Predicate::matches` gave no way to tell "genuinely no match" from "the
+  operator's backing `MessageRow` field isn't populated yet" — fixed by adding
+  `Predicate::unloaded_data() -> Vec<UnloadedData>` for `tag:`/`has:tag`/`has:note`/`ai:`,
+  the four operators this task's own acceptance names as safe-but-currently-unpopulated.
+- **closed at merge — round 2 found round 1's own operator-value fix had overcorrected:**
+  reporting *every* registered key's malformed value as `Unsupported` was right for operators
+  outside the safe subset (`date:`, `larger:`, ...) but wrong for the safe seven — `subject:"`,
+  one keystroke into typing a quoted value, flashed "use `/` for that" on an operator this
+  filter fully supports. Fixed with `is_safe_operator_key`: a safe key's malformed value now
+  degrades to free text (matching what `/` search already does with the identical half-typed
+  input) exactly as a value that parsed would have been evaluated as a real constraint; only a
+  genuinely unsafe key's malformed value still reports `Unsupported`, since free-texting that
+  one would silently drop a constraint the filter has no other way to express. A round-1 test
+  had encoded the wrong premise for `ai:priority>`/`ai:category:` specifically (asserting they
+  should stay `Unsupported`) — corrected once the fix made it visibly inconsistent with every
+  other safe operator.
+- **note (round 3, four small non-blocking findings, all fixed):** a free-text-degrade test
+  asserted only the positive match, which an empty predicate would have satisfied too — added
+  the negative-match half every sibling test already had. The offender-reporting-order example
+  in `Classification::Unsupported`'s own doc comment (`~x before:2024` reports `"before"` even
+  though `~` reads first) had no test pinning it — added one. The `is_safe_operator_key` drift
+  guard built its probe strings unquoted, which happened to still work only because one of
+  `OPERATORS`' twenty example values (`note`'s `"follow up"`) has no space-sensitivity in this
+  particular case — quoted them so the test exercises the actual documented example rather
+  than a lucky truncation of it. `Predicate::unloaded_data`'s doc explained why `is:pinned`/
+  `is:muted` are legitimately absent from a non-empty result but missed that
+  `has:<unrecognized>` is the identical case for the identical reason — added.
+- **note (two findings recorded to memory, not fixed here — out of scope for this file):**
+  `todo:`/`summary:` degrading to free text instead of `Unsupported` is a gap in
+  `rmail_core::query::parse` (no such operator variant exists at all), not something
+  `filter.rs` can close without adding operators to the shared grammar `/` search would then
+  also need to consume. Separately, `rmail-core`'s own `OPERATORS` table advertises `ai:`'s
+  example as `"priority>=high"`, which parses to a threshold of literally `"=high"` — a value
+  neither this filter nor server-side search can ever match, so the UI's own suggested
+  completion syntax is currently dead on arrival on both engines. Both are `rmail-core` parser
+  issues outside a new `rmail-cli/src/tui/filter.rs`'s stated scope; full detail in this
+  session's memory (`ai-operator-example-hint-never-matches`) for whoever picks either one up.
 
 ## 111. Client unread ledger
 - [ ] status

@@ -64,6 +64,7 @@
 
 pub mod commands;
 pub mod config_block;
+pub mod filter;
 pub mod form;
 pub mod grpc;
 pub mod help;
