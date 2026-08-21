@@ -35,11 +35,11 @@ use rmail_proto::v1::{
     Attachment, AuditEntry, AuthStatusResponse, AutoconfigureResponse, BeginOAuthResponse,
     BudgetClass, BulkTagResponse, CallStatus, CellType, Citation as ProtoCitation,
     CompleteOAuthResponse, CreateDraftRequest, DayUsage, Draft, DraftAddress, DraftNudgeResponse,
-    DraftReplyContext, DraftRevision, EvalMetrics, EvalReport, EvaluationStats, ExportDone,
-    ExportInvoicesResponse, ExtractEventsResponse, ExtractInvoiceResponse, ExtractLinksResponse,
-    ExtractStructuredResponse, ExtractTablesResponse, ExtractTasksResponse, ExtractionSource,
-    FieldOrigin, FieldProvenance, FindResult, FinderStatusResponse, FolderStatus, Followup,
-    FollowupState, ForwardMessageResponse, FullMessage, GenerateDigestResponse,
+    DraftReplyContext, DraftRevision, EvalMetrics, EvalReport, EvaluationStats, Event, EventKind,
+    ExportDone, ExportInvoicesResponse, ExtractEventsResponse, ExtractInvoiceResponse,
+    ExtractLinksResponse, ExtractStructuredResponse, ExtractTablesResponse, ExtractTasksResponse,
+    ExtractionSource, FieldOrigin, FieldProvenance, FindResult, FinderStatusResponse, FolderStatus,
+    Followup, FollowupState, ForwardMessageResponse, FullMessage, GenerateDigestResponse,
     GetAiProviderResponse, GetContactInsightResponse, GetResponseTimesResponse, GetSpendResponse,
     HookEvent, IndexDrift, IndexGcReport, IndexKind, IndexProgress, IndexStatusResponse,
     InjectionSeverity, InvoiceMoney, InvoicePaymentStatus, InvoiceText, ItemKind, LinkKind,
@@ -60,7 +60,9 @@ use rmail_proto::v1::{
 };
 
 use rmail_core::command;
+use serde::Deserialize;
 
+use crate::tui::ledger::Delta;
 use crate::tui::overlays::{
     valid_byte_ranges, AiSummary, Citation, Explanation, FinderItem, FinderKind, Hit, OutboxRow,
 };
@@ -102,6 +104,68 @@ pub fn folder(proto: FolderStatus) -> Folder {
         id: proto.mailbox_id,
         name: proto.name,
         message_count: proto.message_count,
+    }
+}
+
+/// The `flags` this daemon actually puts on a `FlagChanged` event's
+/// payload (`rmail-core`'s `NewEvent::payload` call sites all write
+/// `serde_json::json!({ "uid": ..., "flags": flags, .. })`). The extra
+/// `uid` key is ignored by `serde`'s default behavior rather than needing
+/// to be named.
+#[derive(Deserialize)]
+struct FlagChangedPayload {
+    flags: Vec<String>,
+}
+
+/// Decode one `WatchEvents` frame into a [`Delta`] the unread ledger can
+/// apply, or `None` for anything it has no use for: an event kind outside
+/// the four `grpc.rs`'s `watch()` actually subscribes to (`SyncState`,
+/// `SendResult`, `RuleFired`, `AiSummary`, or the zero-value
+/// `EventKind::Unspecified` a decode failure would fall back to), a frame
+/// missing the `mailbox_id`/`message_id` every real event of these four
+/// kinds carries in practice, or (for `FlagChanged` only — `Moved` needs
+/// no payload at all, see [`Delta::Moved`]'s own doc) a `payload` that
+/// fails to parse as its expected shape.
+///
+/// Takes `&Event` rather than owning it because `grpc.rs`'s caller also
+/// needs `event.seq` for [`ledger::SeqDelta`], from the same value.
+///
+/// A `None` here is a slightly-stale estimate somewhere, not a correctness
+/// problem — [`super::ledger`]'s own module doc explains why a missed
+/// delta is safe to just drop rather than treated as an error the way a
+/// dead stream itself is (`grpc.rs`'s `Msg::LiveUpdatesStopped`).
+#[must_use]
+pub fn ledger_delta(event: &Event) -> Option<Delta> {
+    match event.kind() {
+        EventKind::NewMail => Some(Delta::Arrived {
+            mailbox_id: event.mailbox_id?,
+            message_id: event.message_id?,
+        }),
+        EventKind::FlagChanged => {
+            let payload: FlagChangedPayload = serde_json::from_str(&event.payload).ok()?;
+            Some(Delta::Flags {
+                mailbox_id: event.mailbox_id?,
+                message_id: event.message_id?,
+                flags: payload.flags,
+            })
+        }
+        // No payload needed: the top-level `mailbox_id` on a real `Moved`
+        // event is the *source* mailbox (`rmail-core/src/mail/mod.rs`'s
+        // `move_message`), which is all `Delta::Moved` carries now that it
+        // no longer credits a destination — see its own doc comment.
+        EventKind::Moved => Some(Delta::Moved {
+            mailbox_id: event.mailbox_id?,
+            message_id: event.message_id?,
+        }),
+        EventKind::Deleted => Some(Delta::Deleted {
+            mailbox_id: event.mailbox_id?,
+            message_id: event.message_id?,
+        }),
+        EventKind::Unspecified
+        | EventKind::SyncState
+        | EventKind::SendResult
+        | EventKind::RuleFired
+        | EventKind::AiSummary => None,
     }
 }
 

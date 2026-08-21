@@ -2,7 +2,7 @@
 //! shows what `rmail_core`'s parser decoded rather than decoding again.
 
 use rmail_core::message::parse::parse_message;
-use rmail_proto::v1::{Attachment, FullMessage, Message as ProtoMessage};
+use rmail_proto::v1::{Attachment, Event, EventKind, FullMessage, Message as ProtoMessage};
 
 use super::*;
 
@@ -370,4 +370,206 @@ fn folders_come_from_the_sync_status_rows() {
     assert_eq!(folder.id, 12);
     assert_eq!(folder.name, "INBOX");
     assert_eq!(folder.message_count, 431);
+}
+
+// ---- ledger_delta ----
+
+#[test]
+fn ledger_delta_decodes_new_mail_as_arrived() {
+    let event = Event {
+        kind: EventKind::NewMail as i32,
+        mailbox_id: Some(2),
+        message_id: Some(3),
+        payload: r#"{"uid":7}"#.to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(
+        ledger_delta(&event),
+        Some(Delta::Arrived {
+            mailbox_id: 2,
+            message_id: 3,
+        })
+    );
+}
+
+#[test]
+fn ledger_delta_decodes_flag_changed_with_its_flag_set() {
+    let event = Event {
+        kind: EventKind::FlagChanged as i32,
+        mailbox_id: Some(2),
+        message_id: Some(3),
+        payload: r#"{"uid":7,"flags":["\\Seen","\\Flagged"]}"#.to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(
+        ledger_delta(&event),
+        Some(Delta::Flags {
+            mailbox_id: 2,
+            message_id: 3,
+            flags: vec!["\\Seen".to_owned(), "\\Flagged".to_owned()],
+        })
+    );
+}
+
+#[test]
+fn ledger_delta_decodes_moved_from_the_top_level_mailbox_id_with_no_payload_at_all() {
+    // A real `Moved` event's top-level `Event.mailbox_id` is the *source*
+    // mailbox (`mail/mod.rs`'s `move_message`), and that is all
+    // `Delta::Moved` carries now that it never credits a destination (see
+    // its own doc comment) — proven here by an unparseable payload that
+    // would fail a `FlagChanged`-shaped decode but does not even get read.
+    let event = Event {
+        kind: EventKind::Moved as i32,
+        mailbox_id: Some(2),
+        message_id: Some(3),
+        payload: "not json, and not read".to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(
+        ledger_delta(&event),
+        Some(Delta::Moved {
+            mailbox_id: 2,
+            message_id: 3,
+        })
+    );
+}
+
+#[test]
+fn ledger_delta_decodes_deleted() {
+    let event = Event {
+        kind: EventKind::Deleted as i32,
+        mailbox_id: Some(2),
+        message_id: Some(3),
+        payload: r#"{"uid":7}"#.to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(
+        ledger_delta(&event),
+        Some(Delta::Deleted {
+            mailbox_id: 2,
+            message_id: 3,
+        })
+    );
+}
+
+#[test]
+fn ledger_delta_ignores_an_event_kind_the_ledger_has_no_use_for() {
+    for kind in [
+        EventKind::Unspecified,
+        EventKind::SyncState,
+        EventKind::SendResult,
+        EventKind::RuleFired,
+        EventKind::AiSummary,
+    ] {
+        let event = Event {
+            kind: kind as i32,
+            mailbox_id: Some(2),
+            message_id: Some(3),
+            ..Event::default()
+        };
+        assert_eq!(ledger_delta(&event), None, "{kind:?}");
+    }
+}
+
+#[test]
+fn ledger_delta_ignores_new_mail_missing_a_mailbox_or_message_id() {
+    let missing_mailbox = Event {
+        kind: EventKind::NewMail as i32,
+        mailbox_id: None,
+        message_id: Some(3),
+        payload: r#"{"uid":7}"#.to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(ledger_delta(&missing_mailbox), None);
+
+    let missing_message = Event {
+        kind: EventKind::NewMail as i32,
+        mailbox_id: Some(2),
+        message_id: None,
+        payload: r#"{"uid":7}"#.to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(ledger_delta(&missing_message), None);
+}
+
+#[test]
+fn ledger_delta_ignores_flag_changed_with_an_unparseable_payload() {
+    let event = Event {
+        kind: EventKind::FlagChanged as i32,
+        mailbox_id: Some(2),
+        message_id: Some(3),
+        payload: "not json".to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(ledger_delta(&event), None);
+}
+
+#[test]
+fn ledger_delta_ignores_flag_changed_missing_the_flags_key() {
+    let event = Event {
+        kind: EventKind::FlagChanged as i32,
+        mailbox_id: Some(2),
+        message_id: Some(3),
+        payload: r#"{"uid":7}"#.to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(ledger_delta(&event), None);
+}
+
+#[test]
+fn ledger_delta_ignores_moved_missing_a_mailbox_or_message_id() {
+    let missing_mailbox = Event {
+        kind: EventKind::Moved as i32,
+        mailbox_id: None,
+        message_id: Some(3),
+        ..Event::default()
+    };
+    assert_eq!(ledger_delta(&missing_mailbox), None);
+
+    let missing_message = Event {
+        kind: EventKind::Moved as i32,
+        mailbox_id: Some(2),
+        message_id: None,
+        ..Event::default()
+    };
+    assert_eq!(ledger_delta(&missing_message), None);
+}
+
+#[test]
+fn ledger_delta_ignores_an_event_with_no_message_id_regardless_of_kind() {
+    let event = Event {
+        kind: EventKind::Deleted as i32,
+        mailbox_id: Some(2),
+        message_id: None,
+        payload: r#"{"uid":7}"#.to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(ledger_delta(&event), None);
+}
+
+#[test]
+fn ledger_delta_ignores_extra_unknown_payload_keys() {
+    // serde's default behavior ignores fields it was not told to expect —
+    // proven directly rather than assumed, since a future
+    // `#[serde(deny_unknown_fields)]` addition to `FlagChangedPayload`
+    // would silently break decoding every real event's own `uid` key. Must
+    // be `FlagChanged`: it is the only kind whose decoding touches
+    // `payload` at all (`NewMail`/`Moved`/`Deleted` read only the
+    // top-level `mailbox_id`/`message_id`), so any other kind here would
+    // pass regardless of what `payload` said and prove nothing.
+    let event = Event {
+        kind: EventKind::FlagChanged as i32,
+        mailbox_id: Some(2),
+        message_id: Some(3),
+        payload: r#"{"uid":7,"flags":["\\Seen"],"something_new":"unexpected"}"#.to_owned(),
+        ..Event::default()
+    };
+    assert_eq!(
+        ledger_delta(&event),
+        Some(Delta::Flags {
+            mailbox_id: 2,
+            message_id: 3,
+            flags: vec!["\\Seen".to_owned()],
+        })
+    );
 }

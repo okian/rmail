@@ -527,6 +527,131 @@ fn switching_accounts_clears_what_belonged_to_the_old_one() {
 }
 
 #[test]
+fn switching_accounts_resets_the_ledger_too() {
+    // `Ledger` is keyed by `mailbox_id`, so an account switch does not
+    // invalidate its entries the way clearing `model.folders` invalidates
+    // the folder pane — nothing about a stale `mailbox_id` key is unsafe on
+    // its own. The reset happens anyway, and deliberately: `Cmd::Watch`
+    // below resubscribes with `since_seq: 0`, replaying whatever the daemon
+    // still retains, and a live session should not let that replay (or a
+    // straggler from the stream just superseded) answer against numbers
+    // seeded under a different account. See `use_account`'s own comment and
+    // `tui::ledger`'s module doc ("a stale replay cannot double up on a
+    // fresh seed") for the full reasoning.
+    let mut model = loaded();
+    let messages = model.messages.clone();
+    update(
+        &mut model,
+        Msg::Messages {
+            mailbox_id: 1,
+            result: Ok(messages),
+        },
+    );
+    assert_eq!(
+        model.ledger.get(1),
+        crate::tui::ledger::Estimate::Estimated(2),
+        "seeded from the fixture's own two unread rows"
+    );
+
+    run(&mut model, "account use 8");
+    assert_eq!(
+        model.ledger.get(1),
+        crate::tui::ledger::Estimate::Unknown,
+        "a fresh account starts with an honestly empty ledger"
+    );
+}
+
+#[test]
+fn switching_accounts_preserves_last_seq_so_the_floor_still_defends_the_new_account() {
+    // `switching_accounts_resets_the_ledger_too` proves every folder goes
+    // back to `Unknown` — but `Ledger::default()` would satisfy that
+    // assertion too, and would also throw away the seq watermark that
+    // gives the floor its meaning (see `ledger.rs`'s own module doc and
+    // `ledger::tests::resetting_clears_every_folder_but_preserves_last_seq`
+    // for the unit-level version of this same claim). This is the
+    // model-level proof that `use_account` really calls `reset()` and not
+    // `Ledger::default()`: seed one account's folder, advance the ledger's
+    // watermark past some seq, switch accounts, seed the *new* account's
+    // own folder, then replay a delta below that watermark and confirm the
+    // floor still rejects it rather than corrupting the fresh seed.
+    let mut model = loaded();
+    let messages = model.messages.clone();
+    update(
+        &mut model,
+        Msg::Messages {
+            mailbox_id: 1,
+            result: Ok(messages),
+        },
+    );
+    update(
+        &mut model,
+        Msg::LedgerDelta(vec![crate::tui::ledger::SeqDelta {
+            seq: 100,
+            delta: crate::tui::ledger::Delta::Arrived {
+                mailbox_id: 1,
+                message_id: 999,
+            },
+        }]),
+    );
+    assert_eq!(
+        model.ledger.get(1),
+        crate::tui::ledger::Estimate::Estimated(3),
+        "the ledger's own last_seq is now at least 100"
+    );
+
+    run(&mut model, "account use 8");
+
+    // Account 8's own folder — a different mailbox id, seeded directly the
+    // same way `loaded()` seeds account 7's, since no real daemon backs
+    // this test. `use_account` clears `open_folder`; a real session would
+    // set it again once `Msg::Folders` auto-opens INBOX.
+    model.open_folder = Some(9);
+    update(
+        &mut model,
+        Msg::Messages {
+            mailbox_id: 9,
+            result: Ok(vec![MessageRow {
+                id: 20,
+                subject: "subject 20".to_owned(),
+                from: "Alice".to_owned(),
+                from_addr: Some("alice@example.com".to_owned()),
+                date: Some(1_700_000_020),
+                flags: Vec::new(),
+                has_attachments: false,
+                has_note: false,
+                to: None,
+                tags: Vec::new(),
+                ai: None,
+            }]),
+        },
+    );
+    assert_eq!(
+        model.ledger.get(9),
+        crate::tui::ledger::Estimate::Estimated(1),
+        "seeded fresh under the new account"
+    );
+
+    // A delta at seq 50 — below the 100 the ledger reached under account 7
+    // — replayed for the new account's own folder. If `use_account` had
+    // reset `last_seq` to zero, this would clear the floor and apply.
+    update(
+        &mut model,
+        Msg::LedgerDelta(vec![crate::tui::ledger::SeqDelta {
+            seq: 50,
+            delta: crate::tui::ledger::Delta::Arrived {
+                mailbox_id: 9,
+                message_id: 21,
+            },
+        }]),
+    );
+    assert_eq!(
+        model.ledger.get(9),
+        crate::tui::ledger::Estimate::Estimated(1),
+        "seq 50 predates the preserved watermark of (at least) 100 and is rejected"
+    );
+}
+
+#[test]
 fn switching_to_the_account_already_open_does_nothing_at_all() {
     // Somebody asking for the account they are on wants nothing to happen, and
     // throwing away their cursor and their open message to fetch the same rows

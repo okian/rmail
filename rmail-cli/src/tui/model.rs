@@ -63,6 +63,7 @@ use super::form::FormPane;
 use super::help::{self, HelpPane};
 use super::history::History;
 use super::layout::{self, Card};
+use super::ledger::{self, Ledger};
 use super::manual;
 use super::overlays;
 use super::overlays::{
@@ -839,6 +840,15 @@ pub enum Msg {
     /// no payload beyond "something changed" on purpose: the model re-reads
     /// local state rather than trying to patch rows from an event.
     Changed,
+    /// Every `WatchEvents` frame the unread ledger can act on that arrived
+    /// since the last one of these — see `tui::ledger`'s own module doc.
+    /// Batched on the *same* 300&nbsp;ms ticker as [`Msg::Changed`], for the
+    /// same reason that variant is: `model::drive`'s run loop repaints
+    /// after every `Msg`, and one message per historical event during a
+    /// backlog replay would mean one full frame build per row. Covers
+    /// folders that are not the one currently open, which `Msg::Changed`
+    /// never touches.
+    LedgerDelta(Vec<ledger::SeqDelta>),
     /// The `WatchEvents` subscription ended, with the reason.
     ///
     /// Deliberately not a [`Msg::Done`]: nobody asked for the stream and
@@ -2567,6 +2577,10 @@ pub struct Model {
     /// poll incrementing it would pin the marker on forever — see
     /// `tui::status`' module docs.
     pub daemon: Daemon,
+    /// Per-folder unread-count estimates — task 111, `tui::ledger`'s own
+    /// module doc for the full lifecycle. Seeded from a loaded page,
+    /// adjusted from `WatchEvents` deltas, never trusted as exact.
+    pub ledger: Ledger,
     /// The bindings in force. Replaced wholesale when `keys.toml` changes;
     /// never patched, so a half-applied reload cannot exist.
     pub keymap: Keymap,
@@ -2692,6 +2706,7 @@ impl Model {
             generation: 0,
             visual: None,
             daemon: Daemon::default(),
+            ledger: Ledger::default(),
             block: None,
             rule_draft: None,
             keymap: Keymap::defaults(),
@@ -3249,6 +3264,7 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                     if model.open_folder != Some(mailbox_id) {
                         return Vec::new();
                     }
+                    model.ledger.seed(mailbox_id, &messages);
                     model.messages = messages;
                     model.clamp();
                     model.info(format!("{} message(s)", model.messages.len()));
@@ -3675,6 +3691,15 @@ fn dispatch(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
             None => Vec::new(),
         },
+        // No `inflight` arithmetic, same reasoning as `Msg::Daemon`: nobody
+        // asked for this, it costs no RPC, and it is not the kind of "work"
+        // the busy marker means.
+        Msg::LedgerDelta(deltas) => {
+            for ledger::SeqDelta { seq, delta } in deltas {
+                model.ledger.apply(seq, &delta);
+            }
+            Vec::new()
+        }
     }
 }
 
@@ -6742,6 +6767,17 @@ fn use_account(model: &mut Model, id: i64) -> Vec<Cmd> {
     model.summary_for = None;
     model.summary_failed = None;
     model.summary_pinned = None;
+    // `Cmd::Watch` below re-subscribes with `since_seq: 0`, replaying
+    // everything still in the daemon's retention window — see
+    // `tui::ledger`'s own module doc ("a stale replay cannot double up on
+    // a fresh seed — mostly"). Carrying the old account's folder entries
+    // forward would let that replay land on entries the new subscription
+    // knows nothing about; `reset` (not `Ledger::default()`) clears every
+    // folder back to honestly `Unknown` while keeping `last_seq` — the
+    // daemon's `events.seq` is one sequence shared by every account, so
+    // whatever this ledger has already processed stays a valid floor no
+    // matter which account the replay that follows belongs to.
+    model.ledger.reset();
     model.focus = Focus::Folders;
     // The viewer and the manual are screens over an account's mail; the list is
     // where a freshly switched account can actually be looked at.

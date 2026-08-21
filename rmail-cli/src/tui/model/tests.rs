@@ -1290,6 +1290,60 @@ fn a_change_event_before_any_folder_is_open_does_nothing() {
 }
 
 #[test]
+fn a_ledger_delta_reaches_the_ledger_and_issues_no_command() {
+    // No `Cmd`, no `inflight` change — applying a delta is a pure local
+    // mutation, the same reasoning `Msg::Daemon` documents for itself.
+    // `loaded()` pokes `model.messages` directly rather than going through
+    // `Msg::Messages`, so it never seeds the ledger — seed for real first,
+    // or the delta below has no folder to apply against and this test
+    // would be asserting the no-op path instead of the one it names.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Messages {
+            mailbox_id: 1,
+            result: Ok(vec![row(10)]),
+        },
+    );
+    let cmds = update(
+        &mut model,
+        Msg::LedgerDelta(vec![crate::tui::ledger::SeqDelta {
+            seq: 1,
+            delta: crate::tui::ledger::Delta::Arrived {
+                mailbox_id: 1,
+                message_id: 99,
+            },
+        }]),
+    );
+    assert!(cmds.is_empty());
+    assert_eq!(
+        model.ledger.get(1),
+        crate::tui::ledger::Estimate::Estimated(2),
+        "the seeded row plus the arrival"
+    );
+}
+
+#[test]
+fn a_loaded_page_seeds_the_ledger_from_its_own_rows() {
+    // `loaded()` pokes `model.messages` directly, bypassing `update()`
+    // entirely, so it proves nothing about seeding on its own — dispatch a
+    // real `Msg::Messages` here instead.
+    let mut model = loaded();
+    update(
+        &mut model,
+        Msg::Messages {
+            mailbox_id: 1,
+            result: Ok(vec![row(10), row(11), row(12)]),
+        },
+    );
+    assert_eq!(
+        model.ledger.get(1),
+        crate::tui::ledger::Estimate::Estimated(3),
+        "all three fixture rows are unseen"
+    );
+}
+
+#[test]
 fn losing_the_event_stream_is_reported_and_does_not_disturb_the_inflight_count() {
     // This crate installs no tracing subscriber, so a swallowed stream error
     // would leave the user with a TUI that has quietly stopped noticing new

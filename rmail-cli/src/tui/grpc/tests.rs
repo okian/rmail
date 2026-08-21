@@ -1497,6 +1497,69 @@ async fn shutdown_stops_the_event_stream_rather_than_leaving_it_running() {
 }
 
 #[tokio::test]
+async fn a_real_flag_change_reaches_the_ledger_as_a_delta_not_just_a_coalesced_reload() {
+    // `wire::tests` already covers `wire::ledger_delta` against synthetic
+    // `Event` values exhaustively; this is the one thing that can't prove —
+    // that `watch()` actually calls it on what a real mutation really
+    // produces, end to end through a real daemon. `since_seq: 0` means the
+    // subscription backfills from the start of the log regardless of
+    // whether it or the mutation below wins the race to run first.
+    let daemon = Daemon::start().await;
+    let exec = daemon.exec().await;
+    let (tx, mut rx) = channel();
+
+    exec.exec(
+        Cmd::Watch {
+            account_id: daemon.account_id,
+        },
+        tx.clone(),
+    );
+    exec.exec(
+        Cmd::SetFlags {
+            message_id: daemon.message_id,
+            flags: vec![crate::tui::model::SEEN.to_owned()],
+            label: "marked read".to_owned(),
+        },
+        tx.clone(),
+    );
+
+    // The mutation's own `Msg::Done` and the watch stream's signals can
+    // interleave in either order — drain until the ledger delta this test
+    // actually cares about shows up, relying on `next`'s own timeout for
+    // the "it never arrives" failure every other test here already trusts.
+    // `LedgerDelta` now carries a coalesced batch rather than a single
+    // delta (see `ledger::SeqDelta`), so a batch that happens to land
+    // before the flag change's own delta is on the wire is skipped rather
+    // than trusted outright.
+    let delta = loop {
+        match next(&mut rx, "a ledger delta from the flag change").await {
+            Msg::LedgerDelta(deltas) => {
+                if let Some(delta) = deltas
+                    .into_iter()
+                    .map(|sd| sd.delta)
+                    .find(|d| matches!(d, crate::tui::ledger::Delta::Flags { .. }))
+                {
+                    break delta;
+                }
+            }
+            Msg::Done { .. } | Msg::Changed => {}
+            other => unreachable!("expected a ledger delta, Done, or Changed, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        delta,
+        crate::tui::ledger::Delta::Flags {
+            mailbox_id: daemon.inbox_id,
+            message_id: daemon.message_id,
+            flags: vec![crate::tui::model::SEEN.to_owned()],
+        }
+    );
+
+    exec.shutdown();
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn cmd_write_keybinding_runs_through_the_real_executor_and_reports_back() {
     // `Cmd::WriteKeybinding` reaches no RPC at all — every `model::tests`
     // covering it hand-calls `write_keybinding` and hand-builds

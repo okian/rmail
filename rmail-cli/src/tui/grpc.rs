@@ -130,6 +130,7 @@ use super::commands;
 use super::config_block::{ConfigBlock, ReadOnlyReason};
 use super::history;
 use super::html::{self, CommandOpener};
+use super::ledger;
 use super::model::drive::CmdExec;
 use super::model::{
     wire, write_keybinding, AskEvent, Cmd, Credential, Effect, FinderEvent, FormEvent, Msg,
@@ -158,6 +159,19 @@ const COALESCE: Duration = Duration::from_millis(300);
 /// page server-side; this is a client-side statement of what fits on screen
 /// with room to scroll, not an attempt to fetch the folder.
 const PAGE_SIZE: i32 = 500;
+
+/// How many pending ledger deltas `watch()` accumulates before flushing
+/// early, ahead of the usual `COALESCE` tick. Ordinary bursts stay well
+/// under this and flush on schedule; a fresh subscription's `since_seq: 0`
+/// backlog replay does not — a large mailbox can hand the stream thousands
+/// of events inside one 300&nbsp;ms window, and holding all of them (each a
+/// `Delta::Flags` owning its own `Vec<String>`) until the tick would let
+/// that one buffer grow with no bound but the backlog's own size. Bounds
+/// that one `Vec`'s growth, matching `PAGE_SIZE` for the same reason a
+/// folder listing does — not a cap on total outstanding memory, since `out`
+/// is an unbounded channel and a slow-draining consumer can still queue up
+/// more than one flushed batch behind it.
+const DELTA_BATCH: usize = 500;
 
 /// How long a keystroke waits before its search goes out.
 ///
@@ -4315,11 +4329,22 @@ impl GrpcExec {
             let mut stream = response.into_inner();
             let mut ticker = tokio::time::interval(COALESCE);
             let mut dirty = false;
+            // Batched on the same ticker as `Msg::Changed`, not sent per
+            // event — see `ledger.rs`'s own module doc ("where a `Delta`
+            // actually comes from, and why it is batched") for why an
+            // earlier, uncoalesced draft of this loop turned a backlog
+            // replay into one full repaint per historical row.
+            let mut deltas: Vec<ledger::SeqDelta> = Vec::new();
             loop {
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => return,
                     _ = ticker.tick() => {
+                        if !deltas.is_empty()
+                            && out.send(Msg::LedgerDelta(std::mem::take(&mut deltas))).is_err()
+                        {
+                            return;
+                        }
                         if dirty {
                             dirty = false;
                             if out.send(Msg::Changed).is_err() {
@@ -4328,7 +4353,47 @@ impl GrpcExec {
                         }
                     }
                     next = stream.next() => match next {
-                        Some(Ok(_)) => dirty = true,
+                        Some(Ok(event)) => {
+                            dirty = true;
+                            if let Some(delta) = wire::ledger_delta(&event) {
+                                deltas.push(ledger::SeqDelta {
+                                    seq: event.seq,
+                                    delta,
+                                });
+                                // Early flush: see `DELTA_BATCH`'s own doc.
+                                // A backlog replay is the only realistic way
+                                // to hit this: ordinary live traffic never
+                                // gets remotely close inside one tick.
+                                if deltas.len() >= DELTA_BATCH
+                                    && out.send(Msg::LedgerDelta(std::mem::take(&mut deltas))).is_err()
+                                {
+                                    return;
+                                }
+                            } else {
+                                // The subscription itself is filtered to
+                                // `NewMail`/`FlagChanged`/`Moved`/`Deleted`
+                                // (see `request` above), so in practice
+                                // every `None` here is a genuine anomaly —
+                                // a relevant kind missing the ids it needs,
+                                // or a `FlagChanged` payload that failed to
+                                // parse — not routine kind filtering. Costs
+                                // nothing to record even though it goes
+                                // nowhere today: this binary installs no
+                                // `tracing` subscriber (see this function's
+                                // own note on why `LiveUpdatesStopped`,
+                                // not `tracing`, is what actually reaches a
+                                // user below), so this is dormant until
+                                // something wires one up, not a live
+                                // diagnostic yet.
+                                tracing::debug!(
+                                    seq = event.seq,
+                                    kind = ?event.kind(),
+                                    mailbox_id = ?event.mailbox_id,
+                                    message_id = ?event.message_id,
+                                    "watch event did not decode to a ledger delta"
+                                );
+                            }
+                        }
                         // A stream error is terminal for this subscription
                         // (a retention gap is the documented case). Ending
                         // the task is right; resubscribing from a fresh

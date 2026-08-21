@@ -1471,7 +1471,7 @@ sequenced first and everything else depends on them transitively.
   session's memory (`ai-operator-example-hint-never-matches`) for whoever picks either one up.
 
 ## 111. Client unread ledger
-- [ ] status
+- [x] status
 - **depends-on:** none
 - **parallel-safe:** yes
 - **acceptance:**
@@ -1489,6 +1489,56 @@ sequenced first and everything else depends on them transitively.
 - **verify:** `cargo nextest run -p rmail-cli tui::ledger` (initial estimate from a loaded
   page, increment/decrement from synthetic `WatchEvents` deltas, `Unknown` vs `Estimated`
   rendering contract, convergence under an interleaved event replay)
+- **closed at merge — round 1 found two P0s, two P1s and a P2:** `Delta::Moved` originally
+  credited the destination folder directly under the message's old id — wrong, since
+  `MailStore::move_message` (`rmail-core/src/mail/mod.rs`) deletes the local row outright and
+  the destination discovers the message fresh, under a new id, via its own later `NewMail`;
+  fixed by reshaping `Delta::Moved` to carry only the source (identical to `Delta::Deleted`)
+  and merging their `apply()` handling, with the destination credited only by its own genuine
+  `Arrived`. A `since_seq: 0` re-subscription (every account switch) replays the daemon's whole
+  retention window on top of an already-accurate seed — fixed with three complementary layers:
+  a `last_seq`/`floor` seq watermark on `Ledger` rejecting anything a folder's estimate already
+  reflects, `model.ledger` reset on every account switch, and delta batching (below) narrowing
+  the window a stale event can land in — documented throughout as a defence, not a complete
+  guarantee. `model/drive.rs` repaints on every single `Msg`, so uncoalesced per-event delivery
+  meant one full frame build per historical row on every reconnect — fixed by batching deltas
+  onto the same 300ms ticker `Msg::Changed` already uses (`Msg::LedgerDelta` now carries
+  `Vec<SeqDelta>`). `Delta::Arrived` crediting every arrival as unread is backwards for a
+  backlog walk of a backgrounded folder (most of what a walk discovers is already-read mail) —
+  kept the behavior per this task's own acceptance wording rather than reaching for an
+  out-of-scope daemon/proto change, and rewrote the module doc to honestly document it as a
+  bounded, self-correcting limitation instead of silently overclaiming precision. Added
+  `Estimate::label()` (`•`/`~N`) as the one sanctioned rendering path.
+- **closed at merge — round 2 found a P1 and two P2s:** the seq floor did not defend the case
+  it was named for — a fresh `Ledger`'s `last_seq` starts at `0`, so its first-ever seed stamps
+  a floor of `0` and the entire first-subscription replay sails through unfiltered. Fixed with
+  `Ledger::reset()` (keeps `last_seq` across an account switch instead of `Ledger::default()`
+  zeroing it — `events.seq` is one `AUTOINCREMENT` sequence shared by every account, so a seq
+  already processed is safe to keep as a floor no matter which account's replay follows) plus
+  an honest doc correction: the residual first-subscription gap remains and relies on the
+  existing `Msg::Changed` reseed cycle to converge. A doc claim that `FolderStatus.full_sync_done`
+  was unavailable to gate on was factually wrong (it reaches the client; `wire::folder` just
+  discards it) — corrected to the real blocker, refresh cadence: gating on a snapshot that goes
+  stale mid-session would trade today's bounded overcount for a permanent undercount. A test
+  asserting unknown-payload-key tolerance built a `NewMail` event whose decode path never reads
+  `payload`, proving nothing — fixed to use `FlagChanged`.
+- **closed at merge — round 3 approved, with one non-blocking P2 taken anyway:** a redelivered
+  `Arrived` for a message the seed had correctly recorded as read flipped it back to unread and
+  incremented — fixed to credit only a `message_id` with no existing record at all, leaning on
+  `NewMail` firing only for a freshly inserted row (`outcome.inserted`-gated in
+  `rmail-core/src/sync/{full,delta}.rs`), closing the more damaging half of the first-subscription
+  replay gap. Added a model-level test proving account-switch calls `reset()` and not
+  `Ledger::default()` (nothing previously distinguished the two). Documented two more honest
+  blind spots: `Estimated(n)` only covers one loaded page (`PAGE_SIZE` 500), not the whole
+  folder; and a delta racing an in-flight `List` can under- as well as over-count.
+- **note (round 4, doc-precision only, no code changes):** round 3's claim that the `Arrived`
+  fix "narrows" backlog-walk overcounting was wrong — it only helps a *replay* of a row already
+  in `known`; a live backlog walk by construction always discovers rows outside it, so that
+  blind spot is unchanged. A claim that the floor is "largely redundant" for `Arrived` was also
+  wrong — three existing tests prove it is still load-bearing (an arrive-then-delete-then-replay
+  sequence has no `known` record left to lean on). Both corrected, along with a comment
+  overclaiming a schema-guaranteed fresh id on every insert (no `AUTOINCREMENT` on `messages.id`;
+  softened to the property that actually holds) and a self-contradictory closing line.
 
 ## 112. Undo stack (session-local inverse operations)
 - [ ] status
